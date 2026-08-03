@@ -44,11 +44,32 @@ int main(int argc, char **argv) {
     return EXIT_SUCCESS;
   }
 
+  /* automation flags (tests/CI): exit after N frames, dump a screenshot */
+  uint32_t exit_frames = 0;
+  const char *shot_path = NULL;
+  int force_mode = -1, tf_preset = -1;
+  int win_w = 1280, win_h = 720;
+  float cam0[5] = {0.5f, 0.5f, -1.5f, 0.0f, 0.0f}; /* pos, yaw, pitch */
+  bool no_vsync = false;
+  for (int i = 1; i < argc; i++) {
+    if (i < argc - 1 && strcmp(argv[i], "--frames") == 0) exit_frames = (uint32_t)atoi(argv[i + 1]);
+    if (i < argc - 1 && strcmp(argv[i], "--shot") == 0) shot_path = argv[i + 1];
+    if (i < argc - 1 && strcmp(argv[i], "--mode") == 0) force_mode = atoi(argv[i + 1]);
+    if (i < argc - 1 && strcmp(argv[i], "--tf") == 0) tf_preset = atoi(argv[i + 1]);
+    if (i < argc - 2 && strcmp(argv[i], "--size") == 0) {
+      win_w = atoi(argv[i + 1]);
+      win_h = atoi(argv[i + 2]);
+    }
+    if (i < argc - 5 && strcmp(argv[i], "--cam") == 0)
+      for (int k = 0; k < 5; k++) cam0[k] = (float)atof(argv[i + 1 + k]);
+    if (strcmp(argv[i], "--no-vsync") == 0) no_vsync = true;
+  }
+
   if (!SDL_Init(SDL_INIT_VIDEO)) {
     fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
     return EXIT_FAILURE;
   }
-  SDL_Window *win = SDL_CreateWindow("render3d", 1280, 720,
+  SDL_Window *win = SDL_CreateWindow("render3d", win_w, win_h,
                                      SDL_WINDOW_RESIZABLE | SDL_WINDOW_VULKAN);
   if (!win) {
     fprintf(stderr, "SDL_CreateWindow: %s\n", SDL_GetError());
@@ -56,17 +77,7 @@ int main(int argc, char **argv) {
     return EXIT_FAILURE;
   }
 
-  /* automation flags (tests/CI): exit after N frames, dump a screenshot */
-  uint32_t exit_frames = 0;
-  const char *shot_path = NULL;
-  int force_mode = -1;
-  for (int i = 1; i < argc - 1; i++) {
-    if (strcmp(argv[i], "--frames") == 0) exit_frames = (uint32_t)atoi(argv[i + 1]);
-    if (strcmp(argv[i], "--shot") == 0) shot_path = argv[i + 1];
-    if (strcmp(argv[i], "--mode") == 0) force_mode = atoi(argv[i + 1]);
-  }
-
-  r3d_config cfg = {.validate = false, .vsync = true, .spv_dir = R3D_SPV_DIR};
+  r3d_config cfg = {.validate = false, .vsync = !no_vsync, .spv_dir = R3D_SPV_DIR};
   r3d_renderer *renderer = NULL;
   if (r3d_create(win, &cfg, &renderer) != 0) {
     fprintf(stderr, "renderer init failed\n");
@@ -90,9 +101,18 @@ int main(int argc, char **argv) {
     mode = R3D_MODE_FULL;
   }
   if (force_mode >= 0) mode = (uint32_t)force_mode % R3D_MODE_COUNT;
+  if (tf_preset >= 0) {
+    r3d_tf tf;
+    uint8_t lut[256][4];
+    r3d_tf_preset((uint32_t)tf_preset, &tf);
+    r3d_tf_build(&tf, lut);
+    r3d_set_transfer(renderer, lut);
+  }
 
   r3d_camera cam;
-  r3d_camera_init(&cam, v3(0.5f, 0.5f, -1.5f));
+  r3d_camera_init(&cam, v3(cam0[0], cam0[1], cam0[2]));
+  cam.yaw = cam0[3];
+  cam.pitch = cam0[4];
   r3d_input in = {0};
   r3d_stats stats;
   r3d_stats_init(&stats);

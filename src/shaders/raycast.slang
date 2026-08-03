@@ -54,6 +54,10 @@ void main(uint3 tid: SV_DispatchThreadID) {
     return;
   }
 
+  // ray-cone footprint: pixel angular size (cam_up is pre-scaled by tan(fov/2))
+  float cone = 2.0 * length(pc.cam_up) / float(pc.viewport.y);
+  float max_lod = min(pc.max_mip, float(levels - 1));
+
   float dt = pc.step_voxels * voxel;
   float jitter = hash12(tid.xy, pc.frame_index);
   float t = tn + jitter * dt;
@@ -66,7 +70,10 @@ void main(uint3 tid: SV_DispatchThreadID) {
   bool shaded = pc.mode == MODE_FULL;
 
   for (; t < tf_ && steps < MAX_STEPS; steps++) {
-    float lod = clamp(pc.lod_bias, 0.0, pc.max_mip);
+    // LOD-on-distance: mip where the ray cone's width matches the voxel pitch;
+    // step size scales with it so far-field marching is proportionally cheap.
+    float lod = clamp(log2(max(t * cone / voxel, 1.0)) + pc.lod_bias, 0.0, max_lod);
+    float lod_step = exp2(floor(lod));
     float3 p = pc.cam_origin + t * dir;
     float v = volume.SampleLevel(p, lod);
     if (v > mip_max) mip_max = v;
@@ -75,7 +82,7 @@ void main(uint3 tid: SV_DispatchThreadID) {
     if (composite) {
       float4 s = tf.SampleLevel(v, 0);
       // opacity correction: appearance invariant under step-size changes
-      float a = 1.0 - pow(1.0 - s.a, pc.density * pc.step_voxels);
+      float a = 1.0 - pow(1.0 - s.a, pc.density * pc.step_voxels * lod_step);
       if (a > 0.003) {
         float3 col = s.rgb;
         if (shaded) {
@@ -102,7 +109,7 @@ void main(uint3 tid: SV_DispatchThreadID) {
         if (acc.a >= ALPHA_CUTOFF) break;
       }
     }
-    t += dt;
+    t += dt * lod_step;
   }
 
   float3 color;

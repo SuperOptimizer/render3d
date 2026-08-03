@@ -41,3 +41,13 @@ bricks (PHercParis4 z230-237/y136-143/x122-129, all 512 files present) →
 User decision: GUI via cimgui (C bindings over Dear ImGui) + imgui SDL3/Vulkan
 backends, vendored pinned like slang. Project code stays pure C; only the
 vendored imgui core compiles as C++.
+
+## 2026-08-03 — M1 step 11: 1024³ scale-up (dev preset, 1280×720 FIFO)
+
+- 1 GiB R8 + 11 mips uploads in 339 ms via host-image-copy (3.17 GB/s) vs
+  **251 ms via staging slabs (4.28 GB/s)** — staging wins on Turnip today;
+  host-image-copy kept as default anyway (no staging RAM spike, and the gap
+  is one-time init cost). Revisit if upload becomes interactive-path.
+- GPU mip chain (10 3D blits): 22–29 ms.
+- Exterior view full shading: 2.3 ms GPU; interior dense-papyrus view: 8.0 ms.
+  62 fps vsync-locked at 720p. Ray-cone LOD + adaptive dt active.
