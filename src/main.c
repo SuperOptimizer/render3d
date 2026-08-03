@@ -3,12 +3,19 @@
 #include <SDL3/SDL.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "core/stats.h"
+#include "vk/vkctx.h"
 
 int main(int argc, char **argv) {
-  (void)argc;
-  (void)argv;
+  if (argc > 1 && strcmp(argv[1], "--probe") == 0) {
+    r3d_vkctx vk;
+    if (r3d_vkctx_create(&vk, NULL, 0, false) != 0) return EXIT_FAILURE;
+    r3d_vkctx_print_caps(&vk);
+    r3d_vkctx_destroy(&vk);
+    return EXIT_SUCCESS;
+  }
 
   if (!SDL_Init(SDL_INIT_VIDEO)) {
     fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
