@@ -52,7 +52,8 @@ find_package(Threads REQUIRED)
 
 # --- core (backend-agnostic: math, camera, volume, transfer, stats) ---
 add_library(r3d_core STATIC
-  src/core/stats.c)
+  src/core/stats.c
+  src/core/volume.c)
 target_include_directories(r3d_core PUBLIC src)
 target_link_libraries(r3d_core PRIVATE r3d_warnings r3d_sanitize r3d_harden
                                PUBLIC m Threads::Threads)
@@ -66,6 +67,12 @@ target_compile_definitions(render3d PRIVATE R3D_SPV_DIR="${R3D_SPV_DIR}")
 add_dependencies(render3d r3d_shaders)
 target_link_libraries(render3d PRIVATE r3d_core SDL3::SDL3
                                        r3d_warnings r3d_sanitize r3d_harden)
+
+# --- tools ---
+add_executable(assemble tools/assemble/main.c)
+target_link_libraries(assemble PRIVATE m r3d_warnings r3d_sanitize r3d_harden)
+add_executable(mkvol tools/mkvol/main.c)
+target_link_libraries(mkvol PRIVATE m r3d_warnings r3d_sanitize r3d_harden)
 
 # --- tests ---
 enable_testing()
