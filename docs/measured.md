@@ -51,3 +51,17 @@ vendored imgui core compiles as C++.
 - GPU mip chain (10 3D blits): 22–29 ms.
 - Exterior view full shading: 2.3 ms GPU; interior dense-papyrus view: 8.0 ms.
   62 fps vsync-locked at 720p. Ray-cone LOD + adaptive dt active.
+
+## 2026-08-03 — M1 step 12: perf sweep (release/ThinLTO, 1920×1080, uncapped, 1024³ scroll)
+
+Workgroup sweep (mode FULL, scroll TF):
+- **16×8 (one wave): 4.33 ms exterior / 3.62 ms interior — winner, default**
+- 8×8: 4.40–4.50 ms; 16×16: 4.39–4.50 ms (all within ~5%; wave-sized wins)
+
+Mode cost (exterior view):
+- FULL (shaded): 4.34 ms · FLAT (no shading): 2.24 ms → gradient shading ≈ +2 ms
+- HEATMAP: 7.1 ms · MIP: 17.2 ms (no early termination — expected worst case)
+
+Verdict: 60 fps @ 1080p target exceeded ~4× (225 fps shaded). CPU frame cost
+4.4 ms in lockstep with GPU (single queue, 2-in-flight pacing works).
+Thermal soak (cold vs 10-min) still to be recorded before claiming sustained.

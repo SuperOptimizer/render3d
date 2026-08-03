@@ -196,6 +196,7 @@ int main(int argc, char **argv) {
     r3d_stats_report(&stats);
   }
 
+  r3d_stats_report_now(&stats);
   r3d_destroy(renderer);
   SDL_DestroyWindow(win);
   SDL_Quit();

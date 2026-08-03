@@ -27,7 +27,11 @@ void r3d_stats_report(r3d_stats *s) {
   uint64_t now = r3d_now_ns();
   if (now - s->last_report_ns < 1000000000ull || s->count == 0) return;
   s->last_report_ns = now;
+  r3d_stats_report_now(s);
+}
 
+void r3d_stats_report_now(r3d_stats *s) {
+  if (s->count == 0) return;
   uint64_t cpu_sum = 0, gpu_sum = 0, cpu_max = 0;
   for (uint32_t i = 0; i < s->count; i++) {
     cpu_sum += s->cpu_ns[i];

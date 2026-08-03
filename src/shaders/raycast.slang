@@ -31,8 +31,15 @@ float2 box_hit(float3 o, float3 d) {
   return float2(max(max(tmin.x, tmin.y), tmin.z), min(min(tmax.x, tmax.y), tmax.z));
 }
 
+// Workgroup size: 16x8 = one Adreno wave (subgroup 128). An 8x8 variant is
+// built alongside for the occupancy sweep (R3D_WG env; docs/measured.md).
+#ifndef WG_X
+#define WG_X 16
+#define WG_Y 8
+#endif
+
 [shader("compute")]
-[numthreads(16, 8, 1)]
+[numthreads(WG_X, WG_Y, 1)]
 void main(uint3 tid: SV_DispatchThreadID) {
   if (tid.x >= pc.viewport.x || tid.y >= pc.viewport.y) return;
   float3 dir = ray_dir(tid.xy);

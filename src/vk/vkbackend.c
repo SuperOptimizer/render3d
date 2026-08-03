@@ -37,6 +37,8 @@ struct r3d_renderer {
   VkDescriptorPool dpool;
   VkDescriptorSet dset;
 
+  uint32_t wg_x, wg_y; /* raycast workgroup size (R3D_WG=8x8|16x8|16x16) */
+
   VkCommandPool pool;
   VkCommandBuffer cmd[FRAMES_IN_FLIGHT];
   VkSemaphore acquire[FRAMES_IN_FLIGHT];
@@ -131,9 +133,20 @@ static int create_pipeline(r3d_renderer *r) {
   };
   if (vkCreatePipelineLayout(r->vk.dev, &plci, NULL, &r->pipe_layout) != VK_SUCCESS) return -1;
 
+  const char *wg = getenv("R3D_WG");
+  const char *spv_name = "raycast.spv";
+  r->wg_x = 16;
+  r->wg_y = 8;
+  if (wg && strcmp(wg, "8x8") == 0) {
+    spv_name = "raycast_8x8.spv";
+    r->wg_x = r->wg_y = 8;
+  } else if (wg && strcmp(wg, "16x16") == 0) {
+    spv_name = "raycast_16x16.spv";
+    r->wg_x = r->wg_y = 16;
+  }
   uint32_t *spv = NULL;
   size_t spv_n = 0;
-  if (load_spv(r->cfg.spv_dir, "raycast.spv", &spv, &spv_n) != 0) return -1;
+  if (load_spv(r->cfg.spv_dir, spv_name, &spv, &spv_n) != 0) return -1;
   VkShaderModuleCreateInfo smci = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
                                    .codeSize = spv_n,
                                    .pCode = spv};
@@ -568,7 +581,8 @@ int r3d_frame(r3d_renderer *r, const r3d_frame_params *p, r3d_frame_stats *st) {
                           NULL);
   vkCmdPushConstants(cmd, r->pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                      sizeof(r3d_frame_params), p);
-  vkCmdDispatch(cmd, (r->swap.extent.width + 15) / 16, (r->swap.extent.height + 7) / 8, 1);
+  vkCmdDispatch(cmd, (r->swap.extent.width + r->wg_x - 1) / r->wg_x,
+                (r->swap.extent.height + r->wg_y - 1) / r->wg_y, 1);
   if (r->query)
     vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, r->query, slot * 2 + 1);
   r->slot_has_query[slot] = r->query != VK_NULL_HANDLE;
