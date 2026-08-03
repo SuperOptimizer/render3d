@@ -1,0 +1,29 @@
+/* The render-backend interface — the only rendering header main/core include.
+ * One implementation per backend (Vulkan now, GL 4.6 later); no backend types
+ * cross this boundary. SDL_Window* is the sole platform type. */
+#ifndef R3D_RENDER_H
+#define R3D_RENDER_H
+
+#include <stdint.h>
+
+#include "render/render_types.h"
+
+typedef struct SDL_Window SDL_Window;
+typedef struct r3d_renderer r3d_renderer; /* opaque, backend-owned */
+
+/* All functions return 0 on success, nonzero on failure (errors to stderr). */
+int r3d_create(SDL_Window *win, const r3d_config *cfg, r3d_renderer **out);
+void r3d_destroy(r3d_renderer *r);
+
+int r3d_upload_volume(r3d_renderer *r, const r3d_volume_desc *d, const uint8_t *voxels);
+int r3d_set_transfer(r3d_renderer *r, const uint8_t rgba[256][4]);
+
+/* Acquire -> raycast -> blit -> present. Fills st (may be zero). */
+int r3d_frame(r3d_renderer *r, const r3d_frame_params *p, r3d_frame_stats *st);
+int r3d_resize(r3d_renderer *r);
+
+/* Copy the last rendered frame to caller-provided RGBA8 buffer (screenshot).
+ * Pass rgba=NULL to query size via *w,*h first; buffer must hold (*w)*(*h)*4. */
+int r3d_read_frame(r3d_renderer *r, uint8_t *rgba, uint32_t *w, uint32_t *h);
+
+#endif /* R3D_RENDER_H */

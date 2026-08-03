@@ -60,9 +60,12 @@ target_link_libraries(r3d_core PRIVATE r3d_warnings r3d_sanitize r3d_harden
 
 # --- vulkan backend ---
 add_library(r3d_vk STATIC
-  src/vk/vkctx.c)
+  src/vk/vkctx.c
+  src/vk/vkswap.c
+  src/vk/vkres.c
+  src/vk/vkbackend.c)
 target_include_directories(r3d_vk PUBLIC src)
-target_link_libraries(r3d_vk PUBLIC Vulkan::Vulkan
+target_link_libraries(r3d_vk PUBLIC Vulkan::Vulkan SDL3::SDL3
                              PRIVATE r3d_warnings r3d_sanitize r3d_harden)
 
 # --- shaders (Slang -> SPIR-V) ---
