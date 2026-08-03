@@ -22,10 +22,14 @@ cmake --preset release && cmake --build --preset release
 
 ## Controls
 
-Click captures the mouse (Esc releases; Esc again quits). WASD + Q/E fly,
-Shift = 5×. Tab cycles render mode (full / MIP / depth / step-heatmap /
-ray-dir / flat). T cycles transfer-function presets. `[` `]` step size,
-`,` `.` density, `-` `=` LOD bias. F12 screenshot (PPM).
+Default **orbit** camera: click-hold-drag rotates the cube (turntable around
+its center), scroll wheel zooms, WASD + Q/E pans the pivot (Shift = 5×).
+Switch to **fly** in the GUI (or start with `--cam`): click captures the
+mouse (Esc releases; Esc again quits), WASD + Q/E fly.
+
+Tab cycles render mode (full / MIP / depth / step-heatmap / ray-dir / flat).
+T cycles transfer-function presets. `[` `]` step size, `,` `.` density,
+`-` `=` LOD bias. F12 screenshot (PPM).
 
 Useful flags: `--size W H`, `--cam x y z yaw pitch`, `--tf N`, `--mode N`,
 `--no-vsync`, `--frames N --shot out.ppm` (headless capture), `--probe`

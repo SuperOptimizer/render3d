@@ -19,13 +19,17 @@ typedef struct r3d_input {
   float step_scale;  /* '['=×1.25 ']'=×0.8, 1.0 otherwise */
   float density_scale; /* ','=×0.8 '.'=×1.25 */
   float lod_delta;   /* '-'/'=' adjust lod bias by ∓0.25 */
+  float wheel;       /* scroll this frame (+away from user) */
   /* persistent */
-  bool captured;
+  bool captured;     /* fly mode: pointer grabbed until Esc */
+  bool dragging;     /* orbit mode: LMB held */
 } r3d_input;
 
 /* hook (may be NULL) sees every event first (e.g. GUI). allow_capture=false
- * suppresses click-to-capture (e.g. pointer over GUI). */
+ * suppresses click-to-capture/drag (e.g. pointer over GUI). fly_mode picks
+ * click semantics: capture-and-fly vs hold-drag-to-rotate. */
 void r3d_input_poll(r3d_input *in, SDL_Window *win,
-                    void (*hook)(void *ud, const SDL_Event *ev), void *ud, bool allow_capture);
+                    void (*hook)(void *ud, const SDL_Event *ev), void *ud, bool allow_capture,
+                    bool fly_mode);
 
 #endif /* R3D_INPUT_H */

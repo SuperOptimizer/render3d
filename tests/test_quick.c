@@ -82,6 +82,24 @@ static void test_camera(void) {
   CHECK(feq(c.pos.z, 2.0f) && feq(c.pos.x, 0.0f));
 }
 
+static void test_orbit(void) {
+  r3d_camera c;
+  r3d_camera_init(&c, v3(0, 0, 0));
+  r3d_camera_orbit_set(&c, v3(0.5f, 0.5f, 0.5f), 2.0f);
+  CHECK(feq(c.pos.x, 0.5f) && feq(c.pos.y, 0.5f) && feq(c.pos.z, -1.5f));
+  r3d_camera_orbit_zoom(&c, 0.5f);
+  CHECK(feq(c.dist, 1.0f) && feq(c.pos.z, -0.5f));
+  /* quarter turn: camera ends on the -X side, same distance */
+  r3d_camera_orbit_drag(&c, 3.14159265f / 2.0f, 0.0f);
+  CHECK(feq(v3_len(v3_sub(c.pos, c.target)), 1.0f));
+  CHECK(fabsf(c.pos.x - (-0.5f)) < 1e-5f && fabsf(c.pos.z - 0.5f) < 1e-5f);
+  /* pan moves target and pos together */
+  r3d_v3 before = v3_sub(c.pos, c.target);
+  r3d_camera_orbit_pan(&c, v3(0, 1, 0), 0.25f);
+  r3d_v3 after = v3_sub(c.pos, c.target);
+  CHECK(feq(c.target.y, 0.75f) && feq(v3_len(v3_sub(after, before)), 0.0f));
+}
+
 static void test_transfer(void) {
   r3d_tf tf;
   uint8_t lut[256][4];
@@ -103,6 +121,7 @@ int main(void) {
   test_mathx();
   test_volume();
   test_camera();
+  test_orbit();
   test_transfer();
   if (failures) {
     fprintf(stderr, "%d failure(s)\n", failures);

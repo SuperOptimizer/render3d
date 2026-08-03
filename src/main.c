@@ -20,7 +20,10 @@
 #endif
 
 #define MOUSE_SENS 0.0025f
+#define ORBIT_SENS 0.006f
 #define BASE_SPEED 0.4f /* volume units per second */
+
+enum { CAM_ORBIT = 0, CAM_FLY = 1 };
 
 static void gui_event_hook(void *ud, const SDL_Event *ev) {
   r3d_gui_event((r3d_renderer *)ud, ev);
@@ -114,10 +117,17 @@ int main(int argc, char **argv) {
     r3d_set_transfer(renderer, lut);
   }
 
+  /* orbit (turntable around the volume) is the default; --cam implies fly */
+  bool cam_given = false;
+  for (int i = 1; i < argc; i++)
+    if (strcmp(argv[i], "--cam") == 0) cam_given = true;
+  int cam_mode = cam_given ? CAM_FLY : CAM_ORBIT;
+
   r3d_camera cam;
   r3d_camera_init(&cam, v3(cam0[0], cam0[1], cam0[2]));
   cam.yaw = cam0[3];
   cam.pitch = cam0[4];
+  if (cam_mode == CAM_ORBIT) r3d_camera_orbit_set(&cam, v3(0.5f, 0.5f, 0.5f), 2.0f);
   r3d_input in = {0};
   r3d_stats stats;
   r3d_stats_init(&stats);
@@ -137,7 +147,8 @@ int main(int argc, char **argv) {
     if (dt > 0.1f) dt = 0.1f;
 
     ImGuiIO *io = igGetIO_Nil(); /* Want* flags reflect last frame — fine */
-    r3d_input_poll(&in, win, gui_event_hook, renderer, !io->WantCaptureMouse);
+    r3d_input_poll(&in, win, gui_event_hook, renderer, !io->WantCaptureMouse,
+                   cam_mode == CAM_FLY);
     if (io->WantCaptureKeyboard && !in.captured)
       in.move[0] = in.move[1] = in.move[2] = 0.0f;
     if (in.quit) running = false;
@@ -158,9 +169,20 @@ int main(int argc, char **argv) {
     step_voxels *= in.step_scale;
     density *= in.density_scale;
     lod_bias += in.lod_delta;
-    r3d_camera_look(&cam, in.look[0] * MOUSE_SENS, -in.look[1] * MOUSE_SENS);
-    float speed = BASE_SPEED * (in.fast ? 5.0f : 1.0f);
-    r3d_camera_move(&cam, v3(in.move[0], in.move[1], in.move[2]), speed * dt);
+    if (cam_mode == CAM_ORBIT) {
+      /* drag "grabs" the cube: drag right spins it right, wheel zooms, WASD pans */
+      if (in.dragging)
+        r3d_camera_orbit_drag(&cam, -in.look[0] * ORBIT_SENS, -in.look[1] * ORBIT_SENS);
+      if (in.wheel != 0.0f && !io->WantCaptureMouse)
+        r3d_camera_orbit_zoom(&cam, powf(0.9f, in.wheel));
+      float pan = BASE_SPEED * cam.dist * (in.fast ? 5.0f : 1.0f);
+      if (in.move[0] != 0.0f || in.move[1] != 0.0f || in.move[2] != 0.0f)
+        r3d_camera_orbit_pan(&cam, v3(in.move[0], in.move[1], in.move[2]), pan * dt);
+    } else {
+      r3d_camera_look(&cam, in.look[0] * MOUSE_SENS, -in.look[1] * MOUSE_SENS);
+      float speed = BASE_SPEED * (in.fast ? 5.0f : 1.0f);
+      r3d_camera_move(&cam, v3(in.move[0], in.move[1], in.move[2]), speed * dt);
+    }
 
     int w = 0, h = 0;
     SDL_GetWindowSizeInPixels(win, &w, &h);
@@ -180,6 +202,10 @@ int main(int argc, char **argv) {
     int m = (int)mode;
     if (igCombo_Str("mode", &m, "full\0mip\0depth\0heatmap\0raydir\0flat\0", 6))
       mode = (uint32_t)m;
+    int prev_cm = cam_mode;
+    igCombo_Str("camera", &cam_mode, "orbit\0fly\0", 2);
+    if (cam_mode == CAM_ORBIT && prev_cm == CAM_FLY)
+      r3d_camera_orbit_set(&cam, v3(0.5f, 0.5f, 0.5f), 2.0f);
     int t = (int)tf_idx;
     if (igCombo_Str("transfer fn", &t, "gray\0scroll\0high-pass\0", 3)) {
       tf_idx = (uint32_t)t;
@@ -194,7 +220,10 @@ int main(int argc, char **argv) {
     igSliderFloat("lod bias", &lod_bias, -2.0f, 4.0f, "%.2f", 0);
     igText("cam (%.2f %.2f %.2f) yaw %.2f pitch %.2f", (double)cam.pos.x, (double)cam.pos.y,
            (double)cam.pos.z, (double)cam.yaw, (double)cam.pitch);
-    igTextDisabled("click: fly mode   Esc: release   F12: screenshot");
+    if (cam_mode == CAM_ORBIT)
+      igTextDisabled("drag: rotate   wheel: zoom   WASD: pan   F12: shot");
+    else
+      igTextDisabled("click: fly (Esc releases)   WASD+QE: move   F12: shot");
     igEnd();
 
     r3d_frame_params p = {
