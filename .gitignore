@@ -1,0 +1,6 @@
+build/
+tools/slang/
+*.u8
+*.ppm
+.cache/
+compile_commands.json

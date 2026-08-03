@@ -1,0 +1,16 @@
+# Driver/desktop-stack allocations LeakSanitizer misattributes to us in the dev
+# preset. Our own code must stay leak-free — only system libraries are listed.
+leak:libfontconfig
+leak:libpango
+leak:libpangoft2
+leak:libglib
+leak:libgobject
+leak:libgtk
+leak:libdbus
+leak:libwayland
+leak:libdecor
+leak:libvulkan
+leak:libvulkan_freedreno
+leak:libEGL
+leak:libGLX
+leak:_mesa_
