@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "core/camera.h"
+#include "core/volume.h"
 #include "core/input.h"
 #include "core/screenshot.h"
 #include "core/stats.h"
@@ -71,6 +72,21 @@ int main(int argc, char **argv) {
     return EXIT_FAILURE;
   }
 
+  /* positional args: <volume.u8> <nx> <ny> <nz> */
+  uint32_t mode = R3D_MODE_RAYDIR;
+  if (argc >= 5 && argv[1][0] != '-') {
+    r3d_volume vol;
+    if (r3d_volume_open(&vol, argv[1], (uint32_t)atoi(argv[2]), (uint32_t)atoi(argv[3]),
+                        (uint32_t)atoi(argv[4])) != 0)
+      return EXIT_FAILURE;
+    r3d_volume_desc desc = {
+        .nx = vol.nx, .ny = vol.ny, .nz = vol.nz, .brick_dim = R3D_BRICK_DIM};
+    int up = r3d_upload_volume(renderer, &desc, vol.voxels);
+    r3d_volume_close(&vol); /* GPU has it; drop the mapping */
+    if (up != 0) return EXIT_FAILURE;
+    mode = R3D_MODE_MIP;
+  }
+
   r3d_camera cam;
   r3d_camera_init(&cam, v3(0.5f, 0.5f, -1.5f));
   r3d_input in = {0};
@@ -78,7 +94,6 @@ int main(int argc, char **argv) {
   r3d_stats_init(&stats);
 
   float step_voxels = 1.0f, density = 1.0f, lod_bias = 0.0f;
-  uint32_t mode = R3D_MODE_RAYDIR;
   uint32_t frame_index = 0;
   uint64_t prev_ns = r3d_now_ns();
 

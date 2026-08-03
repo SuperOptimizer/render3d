@@ -45,10 +45,14 @@ void r3d_vkbuf_destroy(r3d_vkctx *c, r3d_vkbuf *b) {
 int r3d_vkimage_create(r3d_vkctx *c, VkFormat format, VkExtent3D extent, uint32_t mips,
                        VkImageUsageFlags usage, r3d_vkimage *im) {
   memset(im, 0, sizeof *im);
-  bool is3d = extent.depth > 1;
+  /* dimensionality heuristic: depth>1 -> 3D, height>1 -> 2D, else 1D
+   * (callers wanting a 1-slice 3D image must pass depth>=2) */
+  VkImageType type = extent.depth > 1   ? VK_IMAGE_TYPE_3D
+                     : extent.height > 1 ? VK_IMAGE_TYPE_2D
+                                         : VK_IMAGE_TYPE_1D;
   VkImageCreateInfo ici = {
       .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-      .imageType = is3d ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D,
+      .imageType = type,
       .format = format,
       .extent = extent,
       .mipLevels = mips,
@@ -82,7 +86,9 @@ int r3d_vkimage_create(r3d_vkctx *c, VkFormat format, VkExtent3D extent, uint32_
   VkImageViewCreateInfo vci = {
       .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
       .image = im->img,
-      .viewType = is3d ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D,
+      .viewType = type == VK_IMAGE_TYPE_3D   ? VK_IMAGE_VIEW_TYPE_3D
+                  : type == VK_IMAGE_TYPE_2D ? VK_IMAGE_VIEW_TYPE_2D
+                                             : VK_IMAGE_VIEW_TYPE_1D,
       .format = format,
       .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, mips, 0, 1},
   };

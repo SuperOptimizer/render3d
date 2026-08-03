@@ -35,3 +35,9 @@ offline compilers (slangc/glslc/dxc). slangc pinned + vendored via
 Reuse ~/compressor/corpus/full: verified contiguous 8×8×8 grid of 128³ u8
 bricks (PHercParis4 z230-237/y136-143/x122-129, all 512 files present) →
 `tools/assemble` concatenates into 1024³ `volume.u8`. No network needed.
+
+## 2026-08-03 — GUI: cimgui
+
+User decision: GUI via cimgui (C bindings over Dear ImGui) + imgui SDL3/Vulkan
+backends, vendored pinned like slang. Project code stays pure C; only the
+vendored imgui core compiles as C++.
