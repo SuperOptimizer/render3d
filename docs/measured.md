@@ -75,3 +75,34 @@ project code stays C via cimgui.h. GUI draws as a dynamic-rendering LOAD pass
 directly on the swapchain image after the raycast blit (swapchain gained
 COLOR_ATTACHMENT usage; dynamicRendering feature now required). GUI cost is
 lost in the noise at 60 fps vsync (gpu 3.8 ms with panel vs 3.6 without).
+
+## 2026-08-03 — profiling infrastructure + optimization pass (release, 1080p uncapped, real 1024³)
+
+Instrumentation: GPU timestamp zones (raycast/blit/gui) + CPU phases
+(wait/acquire/record/submit) in r3d_frame_stats; GUI "profile" section;
+`profile avg` exit line; scripted camera benches (`--bench orbit|zoom|fly`) +
+tools/perf.sh suite.
+
+Baseline finding: 100% raycast-bound (blit 0.07 ms, gui 0.01, CPU phases <0.5).
+Low-cut made frames SLOWER (4.8 vs 4.4 ms) — rays sampled voxels just to cut
+them. Bench orbit was the true worst case: 35.6 ms.
+
+Optimizations, measured one at a time:
+1. **8³-block occupancy skip** (CPU-built max pyramid, 26-neighbor dilation for
+   trilinear safety, ~0.4 s build at upload; nearest-sampled binding 3).
+   First cut checked occ EVERY step → dense views regressed 15% (16.6→19.2 ms).
+   Fix: consult occ only when the fine sample is already below the gate —
+   dense paths pay zero. fly 9.6→8.6, zoom 7.8→7.0, dense views back at
+   baseline. Verified conservative: gpu conformance test unchanged, lowcut
+   image diff 0.13 LSB.
+2. **Continuous LOD step scaling** (`exp2(lod)` not `exp2(floor(lod))`):
+   fractional ray-cone lod now widens dt smoothly. orbit 33.2→**19.7 ms**
+   (−41%), exterior 4.6→**3.3 ms**. Image diff vs pre-pass render: 0.16 LSB.
+3. MIP saturation early-exit (mip_max≥0.999 break): no measurable change on
+   scroll data (max rarely saturates); kept, it's free.
+
+Result: orbit 35.6→19.7, exterior 4.5→3.3, fly 9.6→8.8, zoom 7.8→7.2 ms.
+Static interior dense stays ~16.5-17.6 ms — genuinely dense near field at
+step=1; the honest fix is quality-trading lod_bias (slider) or future
+per-brick adaptive sampling, not marching tricks. Run-to-run thermal noise
+is ±10% — trust deltas above that.

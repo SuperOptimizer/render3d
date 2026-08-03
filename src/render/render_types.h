@@ -44,7 +44,16 @@ typedef struct r3d_frame_params {
 static_assert(sizeof(r3d_frame_params) == 84, "must mirror shader FrameParams");
 
 typedef struct r3d_frame_stats {
-  uint64_t gpu_ns; /* raycast dispatch time (0 if timestamps unsupported) */
+  /* GPU zones from timestamp queries (0 if unsupported); lag 2 frames */
+  uint64_t gpu_ns;         /* whole submitted command buffer */
+  uint64_t gpu_raycast_ns; /* compute dispatch */
+  uint64_t gpu_blit_ns;    /* offscreen -> swapchain blit */
+  uint64_t gpu_gui_ns;     /* ImGui color pass (0 when no GUI drawn) */
+  /* CPU phases inside r3d_frame, current frame */
+  uint64_t cpu_wait_ns;    /* timeline wait for slot reuse */
+  uint64_t cpu_acquire_ns; /* vkAcquireNextImageKHR */
+  uint64_t cpu_record_ns;  /* command buffer recording */
+  uint64_t cpu_submit_ns;  /* queue submit + present */
 } r3d_frame_stats;
 
 #endif /* R3D_RENDER_TYPES_H */

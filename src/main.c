@@ -60,6 +60,7 @@ int main(int argc, char **argv) {
   float cam0[5] = {0.5f, 0.5f, -1.5f, 0.0f, 0.0f}; /* pos, yaw, pitch */
   bool no_vsync = false;
   float lowcut0 = 0.0f;
+  const char *bench = NULL; /* scripted camera path: orbit | zoom | fly */
   for (int i = 1; i < argc; i++) {
     if (i < argc - 1 && strcmp(argv[i], "--frames") == 0) exit_frames = (uint32_t)atoi(argv[i + 1]);
     if (i < argc - 1 && strcmp(argv[i], "--shot") == 0) shot_path = argv[i + 1];
@@ -73,7 +74,9 @@ int main(int argc, char **argv) {
       for (int k = 0; k < 5; k++) cam0[k] = (float)atof(argv[i + 1 + k]);
     if (strcmp(argv[i], "--no-vsync") == 0) no_vsync = true;
     if (i < argc - 1 && strcmp(argv[i], "--lowcut") == 0) lowcut0 = (float)atof(argv[i + 1]);
+    if (i < argc - 1 && strcmp(argv[i], "--bench") == 0) bench = argv[i + 1];
   }
+  if (bench && exit_frames == 0) exit_frames = 300;
 
   if (!SDL_Init(SDL_INIT_VIDEO)) {
     fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
@@ -140,6 +143,9 @@ int main(int argc, char **argv) {
   uint32_t frame_index = 0;
   float fps_smooth = 60.0f;
   uint64_t last_gpu_ns = 0;
+  r3d_frame_stats prof = {0};   /* EMA-smoothed for display */
+  r3d_frame_stats prof_sum = {0}; /* running sums for the exit report */
+  uint64_t prof_frames = 0;
   uint64_t prev_ns = r3d_now_ns();
 
   bool running = true;
@@ -193,6 +199,27 @@ int main(int argc, char **argv) {
       SDL_Delay(50);
       continue;
     }
+
+    /* scripted camera paths for reproducible perf runs (override user input) */
+    if (bench) {
+      float ph = (float)frame_index / (float)exit_frames; /* 0..1 over the run */
+      float tau = 6.2831853f;
+      if (strcmp(bench, "orbit") == 0) {
+        cam.yaw = ph * tau;
+        cam.pitch = 0.5f * sinf(ph * tau * 2.0f);
+        r3d_camera_orbit_set(&cam, v3(0.5f, 0.5f, 0.5f), 2.0f);
+      } else if (strcmp(bench, "zoom") == 0) {
+        cam.yaw = ph * tau * 0.5f;
+        cam.pitch = 0.2f;
+        r3d_camera_orbit_set(&cam, v3(0.5f, 0.5f, 0.5f),
+                             1.75f - 1.55f * sinf(ph * 3.14159265f));
+      } else { /* fly: weaving pass straight through the volume */
+        cam.pos = v3(0.5f + 0.15f * sinf(ph * tau * 1.5f), 0.5f + 0.1f * sinf(ph * tau),
+                     -0.3f + 1.6f * ph);
+        cam.yaw = 0.15f * sinf(ph * tau);
+        cam.pitch = 0.1f * cosf(ph * tau);
+      }
+    }
     r3d_v3 right, up, fwd;
     r3d_camera_basis(&cam, (float)w / (float)h, &right, &up, &fwd);
 
@@ -224,6 +251,16 @@ int main(int argc, char **argv) {
     igSliderFloat("lod bias", &lod_bias, -2.0f, 4.0f, "%.2f", 0);
     igText("cam (%.2f %.2f %.2f) yaw %.2f pitch %.2f", (double)cam.pos.x, (double)cam.pos.y,
            (double)cam.pos.z, (double)cam.yaw, (double)cam.pitch);
+    if (igCollapsingHeader_TreeNodeFlags("profile", 0)) {
+      igText("gpu total   %6.2f ms", (double)prof.gpu_ns / 1e6);
+      igText("  raycast   %6.2f ms", (double)prof.gpu_raycast_ns / 1e6);
+      igText("  blit      %6.2f ms", (double)prof.gpu_blit_ns / 1e6);
+      igText("  gui       %6.2f ms", (double)prof.gpu_gui_ns / 1e6);
+      igText("cpu wait    %6.2f ms", (double)prof.cpu_wait_ns / 1e6);
+      igText("cpu acquire %6.2f ms", (double)prof.cpu_acquire_ns / 1e6);
+      igText("cpu record  %6.2f ms", (double)prof.cpu_record_ns / 1e6);
+      igText("cpu submit  %6.2f ms", (double)prof.cpu_submit_ns / 1e6);
+    }
     if (cam_mode == CAM_ORBIT)
       igTextDisabled("drag: rotate   wheel: zoom   WASD: pan   F12: shot");
     else
@@ -246,7 +283,16 @@ int main(int argc, char **argv) {
     };
     r3d_frame_stats st = {0};
     int frc = r3d_frame(renderer, &p, &st);
-    if (frc == 0) last_gpu_ns = st.gpu_ns;
+    if (frc == 0) {
+      last_gpu_ns = st.gpu_ns;
+      const uint64_t *sv = (const uint64_t *)&st;
+      uint64_t *pv = (uint64_t *)&prof, *qv = (uint64_t *)&prof_sum;
+      for (size_t k = 0; k < sizeof st / sizeof(uint64_t); k++) {
+        pv[k] = (uint64_t)((double)pv[k] * 0.95 + (double)sv[k] * 0.05);
+        qv[k] += sv[k];
+      }
+      prof_frames++;
+    }
     if (frc < 0) {
       fprintf(stderr, "r3d_frame failed\n");
       running = false;
@@ -269,6 +315,16 @@ int main(int argc, char **argv) {
   }
 
   r3d_stats_report_now(&stats);
+  if (prof_frames > 2) {
+    /* skip warmup skew: averages include first frames with empty queries */
+    double n = (double)prof_frames;
+    printf("profile avg: gpu %.2f (raycast %.2f blit %.2f gui %.2f) | "
+           "wait %.2f acquire %.2f record %.2f submit %.2f ms\n",
+           (double)prof_sum.gpu_ns / n / 1e6, (double)prof_sum.gpu_raycast_ns / n / 1e6,
+           (double)prof_sum.gpu_blit_ns / n / 1e6, (double)prof_sum.gpu_gui_ns / n / 1e6,
+           (double)prof_sum.cpu_wait_ns / n / 1e6, (double)prof_sum.cpu_acquire_ns / n / 1e6,
+           (double)prof_sum.cpu_record_ns / n / 1e6, (double)prof_sum.cpu_submit_ns / n / 1e6);
+  }
   r3d_destroy(renderer);
   SDL_DestroyWindow(win);
   SDL_Quit();

@@ -6,6 +6,10 @@ import common;
 [[vk::binding(0, 0)]] Sampler3D<float> volume;
 [[vk::binding(1, 0)]] Sampler1D<float4> tf;
 [[vk::binding(2, 0)]] RWTexture2D<float4> out_image;
+// per-8^3-block max, dilated 1 block (nearest sampler) — empty-space skipping
+[[vk::binding(3, 0)]] Sampler3D<float> occ;
+
+static const float OCC_BLOCK = 8.0;
 
 static const uint MODE_FULL = 0;
 static const uint MODE_MIP = 1;
@@ -76,16 +80,32 @@ void main(uint3 tid: SV_DispatchThreadID) {
   bool composite = pc.mode == MODE_FULL || pc.mode == MODE_FLAT;
   bool shaded = pc.mode == MODE_FULL;
 
-  for (; t < tf_ && steps < MAX_STEPS; steps++) {
+  float bs = OCC_BLOCK * voxel;                     // skip-block edge, volume units
+  float occ_gate = max(pc.threshold, 0.5 / 255.0);  // block max below this = void
+
+  while (t < tf_ && steps < MAX_STEPS) {
+    steps++;
     // LOD-on-distance: mip where the ray cone's width matches the voxel pitch;
     // step size scales with it so far-field marching is proportionally cheap.
     float lod = clamp(log2(max(t * cone / voxel, 1.0)) + pc.lod_bias, 0.0, max_lod);
-    float lod_step = exp2(floor(lod));
+    float lod_step = exp2(lod); /* continuous: fractional lod still widens dt */
     float3 p = pc.cam_origin + t * dir;
+
     float v = volume.SampleLevel(p, lod);
     bool cut = v < pc.threshold; // low-cut: below-threshold voxels are void
     if (cut) v = 0.0;
+
+    // empty-space skip, checked only where the fine sample is already void so
+    // dense marching pays nothing: if the whole (dilated) 8^3 block max is
+    // below the gate, leap to the block exit instead of stepping through it.
+    if (v < occ_gate && occ.SampleLevel(p, 0) < occ_gate) {
+      float3 nextp = (floor(p / bs) + max(sign(dir), float3(0))) * bs;
+      float3 tex = select(abs(dir) > 1e-8, (nextp - pc.cam_origin) / dir, float3(1e30));
+      t = max(min(min(tex.x, tex.y), tex.z), t) + bs * 0.01;
+      continue;
+    }
     if (v > mip_max) mip_max = v;
+    if (pc.mode == MODE_MIP && mip_max >= 0.999) break; // saturated: nothing to gain
     if (first_hit < 0.0 && v > 0.05) first_hit = t;
 
     if (composite && !cut) {

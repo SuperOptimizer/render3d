@@ -4,6 +4,7 @@
  * WSI, timestamp queries around the dispatch. */
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -26,8 +27,10 @@ struct r3d_renderer {
   r3d_vkimage offscreen; /* RGBA8 storage image at drawable size */
   r3d_vkimage volume;    /* R8 3D + full mip chain (dummy 2^3 until upload) */
   r3d_vkimage tf;        /* 256x1 RGBA8 transfer function */
+  r3d_vkimage occ;       /* per-8^3-block max (dilated), for empty-space skip */
   VkSampler samp_vol;    /* trilinear + mip linear, clamp */
   VkSampler samp_tf;     /* linear, clamp */
+  VkSampler samp_near;   /* nearest, clamp (occupancy) */
 
   PFN_vkTransitionImageLayoutEXT fp_transition;
   PFN_vkCopyMemoryToImageEXT fp_copy_mem;
@@ -46,7 +49,7 @@ struct r3d_renderer {
   VkSemaphore timeline;
   uint64_t timeline_value;
   uint64_t slot_value[FRAMES_IN_FLIGHT];
-  uint64_t slot_gpu_ns[FRAMES_IN_FLIGHT];
+  uint64_t slot_gpu[FRAMES_IN_FLIGHT][4]; /* total, raycast, blit, gui (ns) */
   VkQueryPool query;
   bool slot_has_query[FRAMES_IN_FLIGHT];
   uint32_t slot;
@@ -118,10 +121,14 @@ static int create_pipeline(r3d_renderer *r) {
        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
        .descriptorCount = 1,
        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT},
+      {.binding = 3,
+       .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+       .descriptorCount = 1,
+       .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT},
   };
   VkDescriptorSetLayoutCreateInfo dslci = {
       .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-      .bindingCount = 3,
+      .bindingCount = 4,
       .pBindings = bindings,
   };
   if (vkCreateDescriptorSetLayout(r->vk.dev, &dslci, NULL, &r->dsl) != VK_SUCCESS) return -1;
@@ -173,7 +180,7 @@ static int create_pipeline(r3d_renderer *r) {
 
   VkDescriptorPoolSize sizes[] = {
       {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1},
-      {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2},
+      {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3},
   };
   VkDescriptorPoolCreateInfo dpci = {
       .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
@@ -190,6 +197,84 @@ static int create_pipeline(r3d_renderer *r) {
   };
   if (vkAllocateDescriptorSets(r->vk.dev, &dsai, &r->dset) != VK_SUCCESS) return -1;
   return 0;
+}
+
+/* --- occupancy build: per-8^3-block max, then 26-neighbor max dilation so
+ * trilinear fine samples near block borders can never read past a "skipped"
+ * verdict. Parallel over z-blocks. --- */
+#define OCC_BLOCK 8u
+
+typedef struct occ_job {
+  const uint8_t *vox;
+  uint8_t *out;
+  uint32_t nx, ny, nz, ox, oy, oz, z0, z1;
+} occ_job;
+
+static void *occ_worker(void *arg) {
+  occ_job *j = arg;
+  for (uint32_t bz = j->z0; bz < j->z1; bz++) {
+    uint32_t zlo = bz * OCC_BLOCK, zhi = zlo + OCC_BLOCK > j->nz ? j->nz : zlo + OCC_BLOCK;
+    for (uint32_t by = 0; by < j->oy; by++) {
+      uint32_t ylo = by * OCC_BLOCK, yhi = ylo + OCC_BLOCK > j->ny ? j->ny : ylo + OCC_BLOCK;
+      for (uint32_t bx = 0; bx < j->ox; bx++) {
+        uint32_t xlo = bx * OCC_BLOCK, xhi = xlo + OCC_BLOCK > j->nx ? j->nx : xlo + OCC_BLOCK;
+        uint8_t m = 0;
+        for (uint32_t z = zlo; z < zhi; z++)
+          for (uint32_t y = ylo; y < yhi; y++) {
+            const uint8_t *row = j->vox + ((size_t)z * j->ny + y) * j->nx;
+            for (uint32_t x = xlo; x < xhi; x++)
+              if (row[x] > m) m = row[x];
+          }
+        j->out[((size_t)bz * j->oy + by) * j->ox + bx] = m;
+      }
+    }
+  }
+  return NULL;
+}
+
+static uint8_t *build_occupancy(const uint8_t *vox, uint32_t nx, uint32_t ny, uint32_t nz,
+                                uint32_t *ox_out, uint32_t *oy_out, uint32_t *oz_out) {
+  uint32_t ox = (nx + OCC_BLOCK - 1) / OCC_BLOCK, oy = (ny + OCC_BLOCK - 1) / OCC_BLOCK,
+           oz = (nz + OCC_BLOCK - 1) / OCC_BLOCK;
+  size_t n = (size_t)ox * oy * oz;
+  uint8_t *raw = malloc(n), *dil = malloc(n);
+  if (!raw || !dil) {
+    free(raw);
+    free(dil);
+    return NULL;
+  }
+
+  uint32_t nthreads = oz < 12 ? oz : 12;
+  pthread_t tids[12];
+  occ_job jobs[12];
+  for (uint32_t i = 0; i < nthreads; i++) {
+    jobs[i] = (occ_job){.vox = vox, .out = raw, .nx = nx, .ny = ny, .nz = nz,
+                        .ox = ox, .oy = oy, .oz = oz,
+                        .z0 = oz * i / nthreads, .z1 = oz * (i + 1) / nthreads};
+    pthread_create(&tids[i], NULL, occ_worker, &jobs[i]);
+  }
+  for (uint32_t i = 0; i < nthreads; i++) pthread_join(tids[i], NULL);
+
+  for (uint32_t z = 0; z < oz; z++)
+    for (uint32_t y = 0; y < oy; y++)
+      for (uint32_t x = 0; x < ox; x++) {
+        uint8_t m = 0;
+        for (int dz = -1; dz <= 1; dz++)
+          for (int dy = -1; dy <= 1; dy++)
+            for (int dx = -1; dx <= 1; dx++) {
+              int zz = (int)z + dz, yy = (int)y + dy, xx = (int)x + dx;
+              if (zz < 0 || yy < 0 || xx < 0 || zz >= (int)oz || yy >= (int)oy || xx >= (int)ox)
+                continue;
+              uint8_t v = raw[((size_t)zz * oy + (size_t)yy) * ox + (size_t)xx];
+              if (v > m) m = v;
+            }
+        dil[((size_t)z * oy + y) * ox + x] = m;
+      }
+  free(raw);
+  *ox_out = ox;
+  *oy_out = oy;
+  *oz_out = oz;
+  return dil;
 }
 
 static uint64_t now_ns(void) {
@@ -332,7 +417,7 @@ int r3d_create(SDL_Window *win, const r3d_config *cfg, r3d_renderer **out) {
     VkQueryPoolCreateInfo qci = {
         .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
         .queryType = VK_QUERY_TYPE_TIMESTAMP,
-        .queryCount = FRAMES_IN_FLIGHT * 2,
+        .queryCount = FRAMES_IN_FLIGHT * 4,
     };
     if (vkCreateQueryPool(r->vk.dev, &qci, NULL, &r->query) != VK_SUCCESS) goto fail;
   }
@@ -352,6 +437,9 @@ int r3d_create(SDL_Window *win, const r3d_config *cfg, r3d_renderer **out) {
   smci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
   smci.maxLod = 0.0f;
   if (vkCreateSampler(r->vk.dev, &smci, NULL, &r->samp_tf) != VK_SUCCESS) goto fail;
+  smci.magFilter = VK_FILTER_NEAREST;
+  smci.minFilter = VK_FILTER_NEAREST;
+  if (vkCreateSampler(r->vk.dev, &smci, NULL, &r->samp_near) != VK_SUCCESS) goto fail;
 
   /* dummy 2^3 volume so the descriptor set is valid before the real upload
    * (2, not 1: vkres dimensionality heuristic needs depth>1 for a 3D image) */
@@ -364,6 +452,16 @@ int r3d_create(SDL_Window *win, const r3d_config *cfg, r3d_renderer **out) {
     if (upload_small_image(r, &r->volume, zeros, sizeof zeros) != 0) goto fail;
     write_image_dset(r, 0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, r->volume.view,
                      r->samp_vol, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    /* dummy occupancy: fully occupied so nothing is skipped before upload */
+    uint8_t full[8];
+    memset(full, 0xff, sizeof full);
+    if (r3d_vkimage_create(&r->vk, VK_FORMAT_R8_UNORM, (VkExtent3D){2, 2, 2}, 1,
+                           VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                           &r->occ) != 0)
+      goto fail;
+    if (upload_small_image(r, &r->occ, full, sizeof full) != 0) goto fail;
+    write_image_dset(r, 3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, r->occ.view, r->samp_near,
+                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
   }
   /* default transfer function: grayscale ramp, linear alpha */
   {
@@ -423,8 +521,10 @@ void r3d_destroy(r3d_renderer *r) {
   if (r->dsl) vkDestroyDescriptorSetLayout(r->vk.dev, r->dsl, NULL);
   if (r->samp_vol) vkDestroySampler(r->vk.dev, r->samp_vol, NULL);
   if (r->samp_tf) vkDestroySampler(r->vk.dev, r->samp_tf, NULL);
+  if (r->samp_near) vkDestroySampler(r->vk.dev, r->samp_near, NULL);
   r3d_vkimage_destroy(&r->vk, &r->volume);
   r3d_vkimage_destroy(&r->vk, &r->tf);
+  r3d_vkimage_destroy(&r->vk, &r->occ);
   r3d_vkimage_destroy(&r->vk, &r->offscreen);
   r3d_vkswap_destroy(&r->vk, &r->swap);
   r3d_vkctx_destroy(&r->vk);
@@ -537,10 +637,45 @@ int r3d_upload_volume(r3d_renderer *r, const r3d_volume_desc *d, const uint8_t *
          d->nx, d->ny, d->nz, total >> 20, mips, use_hic ? "host-image-copy" : "staging", up_ms,
          (double)total / up_ms / 1e6, mip_ms);
 
+  /* occupancy pyramid for empty-space skipping */
+  t0 = now_ns();
+  uint32_t ox, oy, oz;
+  uint8_t *occ = build_occupancy(voxels, d->nx, d->ny, d->nz, &ox, &oy, &oz);
+  if (!occ) goto fail;
+  r3d_vkimage occ_im;
+  if (oz < 2) { /* keep the image 3D (vkres heuristic): duplicate the layer */
+    uint8_t *grown = realloc(occ, (size_t)ox * oy * 2);
+    if (!grown) {
+      free(occ);
+      goto fail;
+    }
+    occ = grown;
+    memcpy(occ + (size_t)ox * oy, occ, (size_t)ox * oy);
+    oz = 2;
+  }
+  if (r3d_vkimage_create(&r->vk, VK_FORMAT_R8_UNORM, (VkExtent3D){ox, oy, oz}, 1,
+                         VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                         &occ_im) != 0) {
+    free(occ);
+    goto fail;
+  }
+  int occ_rc = upload_small_image(r, &occ_im, occ, (VkDeviceSize)ox * oy * oz);
+  free(occ);
+  if (occ_rc != 0) {
+    r3d_vkimage_destroy(&r->vk, &occ_im);
+    goto fail;
+  }
+  printf("volume: occupancy %ux%ux%u built+uploaded in %.0f ms\n", ox, oy, oz,
+         (double)(now_ns() - t0) / 1e6);
+
   vkDeviceWaitIdle(r->vk.dev);
   r3d_vkimage_destroy(&r->vk, &r->volume);
+  r3d_vkimage_destroy(&r->vk, &r->occ);
   r->volume = im;
+  r->occ = occ_im;
   write_image_dset(r, 0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, r->volume.view, r->samp_vol,
+                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+  write_image_dset(r, 3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, r->occ.view, r->samp_near,
                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
   return 0;
 fail:
@@ -554,8 +689,9 @@ int r3d_set_transfer(r3d_renderer *r, const uint8_t rgba[256][4]) {
 }
 
 int r3d_frame(r3d_renderer *r, const r3d_frame_params *p, r3d_frame_stats *st) {
-  if (st) st->gpu_ns = 0;
+  if (st) memset(st, 0, sizeof *st);
   uint32_t slot = r->slot;
+  uint64_t tp = now_ns();
 
   /* pace: wait for this slot's previous submission, then read its timestamps */
   if (r->slot_value[slot]) {
@@ -567,17 +703,30 @@ int r3d_frame(r3d_renderer *r, const r3d_frame_params *p, r3d_frame_stats *st) {
     };
     if (vkWaitSemaphores(r->vk.dev, &wi, UINT64_MAX) != VK_SUCCESS) return -1;
     if (r->slot_has_query[slot]) {
-      uint64_t ts[2] = {0, 0};
-      if (vkGetQueryPoolResults(r->vk.dev, r->query, slot * 2, 2, sizeof ts, ts, sizeof ts[0],
-                                VK_QUERY_RESULT_64_BIT) == VK_SUCCESS)
-        r->slot_gpu_ns[slot] = (uint64_t)((double)(ts[1] - ts[0]) * r->vk.caps.ts_period_ns);
+      uint64_t ts[4] = {0};
+      if (vkGetQueryPoolResults(r->vk.dev, r->query, slot * 4, 4, sizeof ts, ts, sizeof ts[0],
+                                VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+        double period = r->vk.caps.ts_period_ns;
+        r->slot_gpu[slot][0] = (uint64_t)((double)(ts[3] - ts[0]) * period);
+        r->slot_gpu[slot][1] = (uint64_t)((double)(ts[1] - ts[0]) * period);
+        r->slot_gpu[slot][2] = (uint64_t)((double)(ts[2] - ts[1]) * period);
+        r->slot_gpu[slot][3] = (uint64_t)((double)(ts[3] - ts[2]) * period);
+      }
     }
   }
-  if (st) st->gpu_ns = r->slot_gpu_ns[slot];
+  if (st) {
+    st->gpu_ns = r->slot_gpu[slot][0];
+    st->gpu_raycast_ns = r->slot_gpu[slot][1];
+    st->gpu_blit_ns = r->slot_gpu[slot][2];
+    st->gpu_gui_ns = r->slot_gpu[slot][3];
+    st->cpu_wait_ns = now_ns() - tp;
+  }
 
+  tp = now_ns();
   uint32_t img = 0;
   VkResult ar = vkAcquireNextImageKHR(r->vk.dev, r->swap.swapchain, UINT64_MAX,
                                       r->acquire[slot], VK_NULL_HANDLE, &img);
+  if (st) st->cpu_acquire_ns = now_ns() - tp;
   if (ar == VK_ERROR_OUT_OF_DATE_KHR) {
     if (r->gui_open) {
       r3d_vkgui_discard();
@@ -588,13 +737,14 @@ int r3d_frame(r3d_renderer *r, const r3d_frame_params *p, r3d_frame_stats *st) {
   }
   if (ar != VK_SUCCESS && ar != VK_SUBOPTIMAL_KHR) return -1;
 
+  tp = now_ns();
   VkCommandBuffer cmd = r->cmd[slot];
   vkResetCommandBuffer(cmd, 0);
   VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
                                  .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
   vkBeginCommandBuffer(cmd, &bi);
 
-  if (r->query) vkCmdResetQueryPool(cmd, r->query, slot * 2, 2);
+  if (r->query) vkCmdResetQueryPool(cmd, r->query, slot * 4, 4);
 
   /* offscreen: whatever -> GENERAL for compute write (contents fully overwritten) */
   r3d_vk_image_barrier(cmd, r->offscreen.img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
@@ -603,7 +753,7 @@ int r3d_frame(r3d_renderer *r, const r3d_frame_params *p, r3d_frame_stats *st) {
                        0, 1);
 
   if (r->query)
-    vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, r->query, slot * 2);
+    vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, r->query, slot * 4);
   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r->raycast);
   vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r->pipe_layout, 0, 1, &r->dset, 0,
                           NULL);
@@ -612,7 +762,7 @@ int r3d_frame(r3d_renderer *r, const r3d_frame_params *p, r3d_frame_stats *st) {
   vkCmdDispatch(cmd, (r->swap.extent.width + r->wg_x - 1) / r->wg_x,
                 (r->swap.extent.height + r->wg_y - 1) / r->wg_y, 1);
   if (r->query)
-    vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, r->query, slot * 2 + 1);
+    vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, r->query, slot * 4 + 1);
   r->slot_has_query[slot] = r->query != VK_NULL_HANDLE;
 
   /* offscreen -> blit src; swapchain image -> blit dst */
@@ -644,6 +794,8 @@ int r3d_frame(r3d_renderer *r, const r3d_frame_params *p, r3d_frame_stats *st) {
       .filter = VK_FILTER_NEAREST,
   };
   vkCmdBlitImage2(cmd, &blit);
+  if (r->query)
+    vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_BLIT_BIT, r->query, slot * 4 + 2);
 
   if (r->gui_open) {
     r3d_vk_image_barrier(cmd, r->swap.images[img], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
@@ -666,8 +818,12 @@ int r3d_frame(r3d_renderer *r, const r3d_frame_params *p, r3d_frame_stats *st) {
                          VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0,
                          0, 1);
   }
+  if (r->query)
+    vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, r->query, slot * 4 + 3);
   vkEndCommandBuffer(cmd);
+  if (st) st->cpu_record_ns = now_ns() - tp;
 
+  tp = now_ns();
   uint64_t signal_value = ++r->timeline_value;
   VkSemaphoreSubmitInfo waits[] = {
       {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
@@ -712,6 +868,7 @@ int r3d_frame(r3d_renderer *r, const r3d_frame_params *p, r3d_frame_stats *st) {
     return -1;
   }
 
+  if (st) st->cpu_submit_ns = now_ns() - tp;
   r->slot = (slot + 1) % FRAMES_IN_FLIGHT;
   return 0;
 }
