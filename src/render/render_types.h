@@ -21,6 +21,8 @@ enum {
   R3D_MODE_DEPTH = 2,   /* first-hit depth */
   R3D_MODE_HEATMAP = 3, /* step-count heatmap */
   R3D_MODE_RAYDIR = 4,  /* ray-direction color (wiring check) */
+  R3D_MODE_FLAT = 5,    /* full compositing, shading off (perf A/B + tests) */
+  R3D_MODE_COUNT = 6,
 };
 
 typedef struct r3d_volume_desc {

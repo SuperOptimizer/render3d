@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "core/camera.h"
+#include "core/transfer.h"
 #include "core/volume.h"
 #include "core/input.h"
 #include "core/screenshot.h"
@@ -58,9 +59,11 @@ int main(int argc, char **argv) {
   /* automation flags (tests/CI): exit after N frames, dump a screenshot */
   uint32_t exit_frames = 0;
   const char *shot_path = NULL;
+  int force_mode = -1;
   for (int i = 1; i < argc - 1; i++) {
     if (strcmp(argv[i], "--frames") == 0) exit_frames = (uint32_t)atoi(argv[i + 1]);
     if (strcmp(argv[i], "--shot") == 0) shot_path = argv[i + 1];
+    if (strcmp(argv[i], "--mode") == 0) force_mode = atoi(argv[i + 1]);
   }
 
   r3d_config cfg = {.validate = false, .vsync = true, .spv_dir = R3D_SPV_DIR};
@@ -84,8 +87,9 @@ int main(int argc, char **argv) {
     int up = r3d_upload_volume(renderer, &desc, vol.voxels);
     r3d_volume_close(&vol); /* GPU has it; drop the mapping */
     if (up != 0) return EXIT_FAILURE;
-    mode = R3D_MODE_MIP;
+    mode = R3D_MODE_FULL;
   }
+  if (force_mode >= 0) mode = (uint32_t)force_mode % R3D_MODE_COUNT;
 
   r3d_camera cam;
   r3d_camera_init(&cam, v3(0.5f, 0.5f, -1.5f));
@@ -94,6 +98,7 @@ int main(int argc, char **argv) {
   r3d_stats_init(&stats);
 
   float step_voxels = 1.0f, density = 1.0f, lod_bias = 0.0f;
+  uint32_t tf_idx = 0;
   uint32_t frame_index = 0;
   uint64_t prev_ns = r3d_now_ns();
 
@@ -108,8 +113,17 @@ int main(int argc, char **argv) {
     if (in.quit) running = false;
     if (in.resized) r3d_resize(renderer);
     if (in.mode_delta) {
-      mode = (mode + (uint32_t)in.mode_delta) % 5;
+      mode = (mode + (uint32_t)in.mode_delta) % R3D_MODE_COUNT;
       printf("mode: %u\n", mode);
+    }
+    if (in.tf_delta) {
+      tf_idx = (tf_idx + 1) % r3d_tf_preset(UINT32_MAX, NULL);
+      r3d_tf tf;
+      uint8_t lut[256][4];
+      r3d_tf_preset(tf_idx, &tf);
+      r3d_tf_build(&tf, lut);
+      r3d_set_transfer(renderer, lut);
+      printf("tf preset: %u\n", tf_idx);
     }
     step_voxels *= in.step_scale;
     density *= in.density_scale;

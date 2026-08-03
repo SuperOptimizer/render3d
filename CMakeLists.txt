@@ -55,6 +55,7 @@ add_library(r3d_core STATIC
   src/core/stats.c
   src/core/volume.c
   src/core/camera.c
+  src/core/transfer.c
   src/core/input.c
   src/core/screenshot.c)
 target_include_directories(r3d_core PUBLIC src)
@@ -93,3 +94,9 @@ add_executable(test_quick tests/test_quick.c)
 target_link_libraries(test_quick PRIVATE r3d_core r3d_warnings r3d_sanitize r3d_harden)
 add_test(NAME quick COMMAND test_quick)
 set_tests_properties(quick PROPERTIES LABELS quick TIMEOUT 30)
+
+add_executable(test_gpu tests/test_gpu.c)
+target_link_libraries(test_gpu PRIVATE r3d_core r3d_warnings r3d_sanitize r3d_harden)
+add_test(NAME gpu COMMAND test_gpu $<TARGET_FILE:render3d>)
+set_tests_properties(gpu PROPERTIES LABELS gpu TIMEOUT 120
+  ENVIRONMENT "LSAN_OPTIONS=suppressions=${CMAKE_SOURCE_DIR}/lsan.supp")

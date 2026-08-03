@@ -6,6 +6,7 @@ void r3d_input_poll(r3d_input *in, SDL_Window *win) {
   in->resized = false;
   in->look[0] = in->look[1] = 0.0f;
   in->mode_delta = 0;
+  in->tf_delta = 0;
   in->step_scale = 1.0f;
   in->density_scale = 1.0f;
   in->lod_delta = 0.0f;
@@ -44,6 +45,7 @@ void r3d_input_poll(r3d_input *in, SDL_Window *win) {
         break;
       case SDLK_F12: in->screenshot = true; break;
       case SDLK_TAB: in->mode_delta = 1; break;
+      case SDLK_T: in->tf_delta = 1; break;
       case SDLK_LEFTBRACKET: in->step_scale = 1.25f; break;
       case SDLK_RIGHTBRACKET: in->step_scale = 0.8f; break;
       case SDLK_COMMA: in->density_scale = 0.8f; break;

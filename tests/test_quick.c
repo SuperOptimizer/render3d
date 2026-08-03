@@ -8,6 +8,7 @@
 
 #include "core/camera.h"
 #include "core/mathx.h"
+#include "core/transfer.h"
 #include "core/volume.h"
 
 static int failures = 0;
@@ -81,10 +82,28 @@ static void test_camera(void) {
   CHECK(feq(c.pos.z, 2.0f) && feq(c.pos.x, 0.0f));
 }
 
+static void test_transfer(void) {
+  r3d_tf tf;
+  uint8_t lut[256][4];
+  CHECK(r3d_tf_preset(0, &tf) == 0);
+  r3d_tf_build(&tf, lut);
+  CHECK(lut[0][0] == 0 && lut[0][3] == 0);
+  CHECK(lut[255][0] == 255 && lut[255][3] == 255);
+  CHECK(lut[128][0] == 128); /* identity ramp */
+  CHECK(r3d_tf_preset(UINT32_MAX, NULL) == 3); /* preset count */
+  CHECK(r3d_tf_preset(1, &tf) == 1);
+  r3d_tf_build(&tf, lut);
+  CHECK(lut[20][3] == 0);   /* air transparent */
+  CHECK(lut[255][3] == 255);
+  /* monotone alpha between declared points */
+  CHECK(lut[100][3] >= lut[60][3]);
+}
+
 int main(void) {
   test_mathx();
   test_volume();
   test_camera();
+  test_transfer();
   if (failures) {
     fprintf(stderr, "%d failure(s)\n", failures);
     return EXIT_FAILURE;
