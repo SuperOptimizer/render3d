@@ -57,8 +57,13 @@ target_include_directories(r3d_core PUBLIC src)
 target_link_libraries(r3d_core PRIVATE r3d_warnings r3d_sanitize r3d_harden
                                PUBLIC m Threads::Threads)
 
+# --- shaders (Slang -> SPIR-V) ---
+include(src/shaders/shaders.cmake)
+
 # --- app ---
 add_executable(render3d src/main.c)
+target_compile_definitions(render3d PRIVATE R3D_SPV_DIR="${R3D_SPV_DIR}")
+add_dependencies(render3d r3d_shaders)
 target_link_libraries(render3d PRIVATE r3d_core SDL3::SDL3
                                        r3d_warnings r3d_sanitize r3d_harden)
 
