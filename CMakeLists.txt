@@ -53,10 +53,13 @@ find_package(Threads REQUIRED)
 # --- core (backend-agnostic: math, camera, volume, transfer, stats) ---
 add_library(r3d_core STATIC
   src/core/stats.c
-  src/core/volume.c)
+  src/core/volume.c
+  src/core/camera.c
+  src/core/input.c
+  src/core/screenshot.c)
 target_include_directories(r3d_core PUBLIC src)
 target_link_libraries(r3d_core PRIVATE r3d_warnings r3d_sanitize r3d_harden
-                               PUBLIC m Threads::Threads)
+                               PUBLIC m Threads::Threads SDL3::SDL3)
 
 # --- vulkan backend ---
 add_library(r3d_vk STATIC

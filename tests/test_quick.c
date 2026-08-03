@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include <unistd.h>
 
+#include "core/camera.h"
 #include "core/mathx.h"
 #include "core/volume.h"
 
@@ -61,9 +62,29 @@ static void test_volume(void) {
   unlink(path);
 }
 
+static void test_camera(void) {
+  r3d_camera c;
+  r3d_camera_init(&c, v3(0, 0, 0));
+  r3d_v3 r, u, f;
+  r3d_camera_basis(&c, 2.0f, &r, &u, &f);
+  /* yaw=0,pitch=0 looks +Z; right=-X? cross(fwd,up)=cross(+Z,+Y)=-X... check handedness */
+  CHECK(feq(f.x, 0) && feq(f.y, 0) && feq(f.z, 1));
+  CHECK(feq(v3_dot(r, f), 0.0f) && feq(v3_dot(u, f), 0.0f)); /* orthogonal basis */
+  CHECK(feq(v3_len(u), tanf(c.fov_y * 0.5f)));               /* fov pre-scale */
+  CHECK(feq(v3_len(r), 2.0f * tanf(c.fov_y * 0.5f)));        /* aspect pre-scale */
+  /* pitch clamps */
+  r3d_camera_look(&c, 0.0f, 10.0f);
+  CHECK(c.pitch < 1.5708f);
+  /* forward motion moves along view */
+  r3d_camera_init(&c, v3(0, 0, 0));
+  r3d_camera_move(&c, v3(0, 0, 1), 2.0f);
+  CHECK(feq(c.pos.z, 2.0f) && feq(c.pos.x, 0.0f));
+}
+
 int main(void) {
   test_mathx();
   test_volume();
+  test_camera();
   if (failures) {
     fprintf(stderr, "%d failure(s)\n", failures);
     return EXIT_FAILURE;
