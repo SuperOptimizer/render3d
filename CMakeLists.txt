@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.28)
-project(render3d VERSION 0.0.1 LANGUAGES C)
+project(render3d VERSION 0.0.1 LANGUAGES C CXX)
+# C is the project language; CXX exists solely for the vendored imgui/cimgui.
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set(CMAKE_C_STANDARD 23)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -62,14 +65,38 @@ target_include_directories(r3d_core PUBLIC src)
 target_link_libraries(r3d_core PRIVATE r3d_warnings r3d_sanitize r3d_harden
                                PUBLIC m Threads::Threads SDL3::SDL3)
 
+# --- vendored cimgui/imgui (C++; the only non-C code in the tree) ---
+if(NOT EXISTS "${CMAKE_SOURCE_DIR}/tools/cimgui/cimgui.cpp")
+  message(FATAL_ERROR "cimgui not vendored — run tools/fetch_cimgui.sh first")
+endif()
+add_library(r3d_imgui STATIC
+  tools/cimgui/cimgui.cpp
+  tools/cimgui/cimgui_impl.cpp
+  tools/cimgui/imgui/imgui.cpp
+  tools/cimgui/imgui/imgui_demo.cpp
+  tools/cimgui/imgui/imgui_draw.cpp
+  tools/cimgui/imgui/imgui_tables.cpp
+  tools/cimgui/imgui/imgui_widgets.cpp
+  tools/cimgui/imgui/backends/imgui_impl_sdl3.cpp
+  tools/cimgui/imgui/backends/imgui_impl_vulkan.cpp)
+target_include_directories(r3d_imgui SYSTEM PUBLIC
+  tools/cimgui tools/cimgui/imgui tools/cimgui/imgui/backends)
+target_compile_definitions(r3d_imgui
+  PRIVATE "IMGUI_IMPL_API=extern \"C\""
+  PUBLIC CIMGUI_USE_SDL3 CIMGUI_USE_VULKAN IMGUI_DISABLE_OBSOLETE_FUNCTIONS=1
+         $<$<COMPILE_LANGUAGE:C>:CIMGUI_DEFINE_ENUMS_AND_STRUCTS=1>)
+target_link_libraries(r3d_imgui PUBLIC SDL3::SDL3 Vulkan::Vulkan
+                                PRIVATE r3d_sanitize)
+
 # --- vulkan backend ---
 add_library(r3d_vk STATIC
   src/vk/vkctx.c
   src/vk/vkswap.c
   src/vk/vkres.c
-  src/vk/vkbackend.c)
+  src/vk/vkbackend.c
+  src/vk/vkgui.c)
 target_include_directories(r3d_vk PUBLIC src)
-target_link_libraries(r3d_vk PUBLIC Vulkan::Vulkan SDL3::SDL3
+target_link_libraries(r3d_vk PUBLIC Vulkan::Vulkan SDL3::SDL3 r3d_imgui
                              PRIVATE r3d_warnings r3d_sanitize r3d_harden)
 
 # --- shaders (Slang -> SPIR-V) ---

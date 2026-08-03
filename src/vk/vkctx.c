@@ -178,9 +178,10 @@ int r3d_vkctx_create(r3d_vkctx *c, const char *const *inst_exts, uint32_t n_inst
   VkPhysicalDeviceFeatures2 f2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
                                   .pNext = &f12};
   vkGetPhysicalDeviceFeatures2(c->phys, &f2);
-  if (!f12.timelineSemaphore || !f13.synchronization2 || !f13.maintenance4) {
-    fprintf(stderr, "vk: missing core features (timeline=%u sync2=%u maint4=%u)\n",
-            f12.timelineSemaphore, f13.synchronization2, f13.maintenance4);
+  if (!f12.timelineSemaphore || !f13.synchronization2 || !f13.maintenance4 ||
+      !f13.dynamicRendering) {
+    fprintf(stderr, "vk: missing core features (timeline=%u sync2=%u maint4=%u dynrender=%u)\n",
+            f12.timelineSemaphore, f13.synchronization2, f13.maintenance4, f13.dynamicRendering);
     return -1;
   }
   c->caps.host_image_copy = want_hic && hicf.hostImageCopy;
@@ -200,6 +201,7 @@ int r3d_vkctx_create(r3d_vkctx *c, const char *const *inst_exts, uint32_t n_inst
       .pNext = c->caps.host_image_copy ? &en_hic : NULL,
       .synchronization2 = VK_TRUE,
       .maintenance4 = VK_TRUE,
+      .dynamicRendering = VK_TRUE, /* GUI pass renders without render passes */
   };
   VkPhysicalDeviceVulkan12Features en12 = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,

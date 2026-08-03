@@ -65,3 +65,13 @@ Mode cost (exterior view):
 Verdict: 60 fps @ 1080p target exceeded ~4× (225 fps shaded). CPU frame cost
 4.4 ms in lockstep with GPU (single queue, 2-in-flight pacing works).
 Thermal soak (cold vs 10-min) still to be recorded before claiming sustained.
+
+## 2026-08-03 — cimgui integration (M1 addendum)
+
+cimgui 1.92.9 vendored (tools/fetch_cimgui.sh) with bundled imgui + SDL3/Vulkan
+backends compiled as C++ (`IMGUI_IMPL_API=extern "C"`,
+IMGUI_DISABLE_OBSOLETE_FUNCTIONS to avoid C-linkage overload clash); all
+project code stays C via cimgui.h. GUI draws as a dynamic-rendering LOAD pass
+directly on the swapchain image after the raycast blit (swapchain gained
+COLOR_ATTACHMENT usage; dynamicRendering feature now required). GUI cost is
+lost in the noise at 60 fps vsync (gpu 3.8 ms with panel vs 3.6 without).

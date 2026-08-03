@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "cimgui.h"
 #include "core/camera.h"
 #include "core/transfer.h"
 #include "core/volume.h"
@@ -20,6 +21,10 @@
 
 #define MOUSE_SENS 0.0025f
 #define BASE_SPEED 0.4f /* volume units per second */
+
+static void gui_event_hook(void *ud, const SDL_Event *ev) {
+  r3d_gui_event((r3d_renderer *)ud, ev);
+}
 
 static void take_screenshot(r3d_renderer *renderer, uint64_t frame) {
   uint32_t w = 0, h = 0;
@@ -118,8 +123,10 @@ int main(int argc, char **argv) {
   r3d_stats_init(&stats);
 
   float step_voxels = 1.0f, density = 1.0f, lod_bias = 0.0f;
-  uint32_t tf_idx = 0;
+  uint32_t tf_idx = tf_preset > 0 ? (uint32_t)tf_preset : 0;
   uint32_t frame_index = 0;
+  float fps_smooth = 60.0f;
+  uint64_t last_gpu_ns = 0;
   uint64_t prev_ns = r3d_now_ns();
 
   bool running = true;
@@ -129,7 +136,10 @@ int main(int argc, char **argv) {
     prev_ns = t0;
     if (dt > 0.1f) dt = 0.1f;
 
-    r3d_input_poll(&in, win);
+    ImGuiIO *io = igGetIO_Nil(); /* Want* flags reflect last frame — fine */
+    r3d_input_poll(&in, win, gui_event_hook, renderer, !io->WantCaptureMouse);
+    if (io->WantCaptureKeyboard && !in.captured)
+      in.move[0] = in.move[1] = in.move[2] = 0.0f;
     if (in.quit) running = false;
     if (in.resized) r3d_resize(renderer);
     if (in.mode_delta) {
@@ -161,6 +171,32 @@ int main(int argc, char **argv) {
     r3d_v3 right, up, fwd;
     r3d_camera_basis(&cam, (float)w / (float)h, &right, &up, &fwd);
 
+    /* control panel */
+    fps_smooth = fps_smooth * 0.95f + (dt > 0 ? 0.05f / dt : 0.0f);
+    r3d_gui_begin(renderer);
+    igSetNextWindowPos((ImVec2){10, 10}, ImGuiCond_FirstUseEver, (ImVec2){0, 0});
+    igBegin("render3d", NULL, ImGuiWindowFlags_AlwaysAutoResize);
+    igText("%.0f fps   gpu %.2f ms", (double)fps_smooth, (double)last_gpu_ns / 1e6);
+    int m = (int)mode;
+    if (igCombo_Str("mode", &m, "full\0mip\0depth\0heatmap\0raydir\0flat\0", 6))
+      mode = (uint32_t)m;
+    int t = (int)tf_idx;
+    if (igCombo_Str("transfer fn", &t, "gray\0scroll\0high-pass\0", 3)) {
+      tf_idx = (uint32_t)t;
+      r3d_tf tfp;
+      uint8_t lut[256][4];
+      r3d_tf_preset(tf_idx, &tfp);
+      r3d_tf_build(&tfp, lut);
+      r3d_set_transfer(renderer, lut);
+    }
+    igSliderFloat("step (voxels)", &step_voxels, 0.25f, 4.0f, "%.2f", 0);
+    igSliderFloat("density", &density, 0.1f, 8.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
+    igSliderFloat("lod bias", &lod_bias, -2.0f, 4.0f, "%.2f", 0);
+    igText("cam (%.2f %.2f %.2f) yaw %.2f pitch %.2f", (double)cam.pos.x, (double)cam.pos.y,
+           (double)cam.pos.z, (double)cam.yaw, (double)cam.pitch);
+    igTextDisabled("click: fly mode   Esc: release   F12: screenshot");
+    igEnd();
+
     r3d_frame_params p = {
         .cam_origin = {cam.pos.x, cam.pos.y, cam.pos.z},
         .cam_right = {right.x, right.y, right.z},
@@ -175,7 +211,9 @@ int main(int argc, char **argv) {
         .frame_index = frame_index++,
     };
     r3d_frame_stats st = {0};
-    if (r3d_frame(renderer, &p, &st) < 0) {
+    int frc = r3d_frame(renderer, &p, &st);
+    if (frc == 0) last_gpu_ns = st.gpu_ns;
+    if (frc < 0) {
       fprintf(stderr, "r3d_frame failed\n");
       running = false;
     }

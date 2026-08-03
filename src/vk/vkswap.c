@@ -61,7 +61,7 @@ static int create_swapchain(r3d_vkctx *c, SDL_Window *win, bool vsync, r3d_vkswa
       .imageColorSpace = pick.colorSpace,
       .imageExtent = extent,
       .imageArrayLayers = 1,
-      .imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+      .imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
       .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
       .preTransform = caps.currentTransform,
       .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
@@ -79,10 +79,25 @@ static int create_swapchain(r3d_vkctx *c, SDL_Window *win, bool vsync, r3d_vkswa
   s->format = pick.format;
   s->extent = extent;
 
+  for (uint32_t i = 0; i < R3D_MAX_SWAP_IMAGES; i++)
+    if (s->views[i]) {
+      vkDestroyImageView(c->dev, s->views[i], NULL);
+      s->views[i] = VK_NULL_HANDLE;
+    }
   s->nimages = 0;
   vkGetSwapchainImagesKHR(c->dev, sc, &s->nimages, NULL);
   if (s->nimages > R3D_MAX_SWAP_IMAGES) s->nimages = R3D_MAX_SWAP_IMAGES;
   vkGetSwapchainImagesKHR(c->dev, sc, &s->nimages, s->images);
+  for (uint32_t i = 0; i < s->nimages; i++) {
+    VkImageViewCreateInfo vci = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .image = s->images[i],
+        .viewType = VK_IMAGE_VIEW_TYPE_2D,
+        .format = s->format,
+        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+    };
+    if (vkCreateImageView(c->dev, &vci, NULL, &s->views[i]) != VK_SUCCESS) return -1;
+  }
 
   for (uint32_t i = 0; i < s->nimages; i++) {
     if (s->render_done[i]) continue;
@@ -113,8 +128,10 @@ int r3d_vkswap_recreate(r3d_vkctx *c, SDL_Window *win, bool vsync, r3d_vkswap *s
 }
 
 void r3d_vkswap_destroy(r3d_vkctx *c, r3d_vkswap *s) {
-  for (uint32_t i = 0; i < R3D_MAX_SWAP_IMAGES; i++)
+  for (uint32_t i = 0; i < R3D_MAX_SWAP_IMAGES; i++) {
+    if (s->views[i]) vkDestroyImageView(c->dev, s->views[i], NULL);
     if (s->render_done[i]) vkDestroySemaphore(c->dev, s->render_done[i], NULL);
+  }
   if (s->swapchain) vkDestroySwapchainKHR(c->dev, s->swapchain, NULL);
   if (s->surface) vkDestroySurfaceKHR(c->instance, s->surface, NULL);
   memset(s, 0, sizeof *s);

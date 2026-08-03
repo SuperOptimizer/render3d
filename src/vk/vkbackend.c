@@ -11,6 +11,7 @@
 
 #include "render/render.h"
 #include "vk/vkctx.h"
+#include "vk/vkgui.h"
 #include "vk/vkres.h"
 #include "vk/vkswap.h"
 
@@ -51,6 +52,9 @@ struct r3d_renderer {
   uint32_t slot;
 
   r3d_vkbuf readback; /* lazily sized for screenshots */
+
+  bool gui_up;   /* cimgui initialized */
+  bool gui_open; /* NewFrame issued, awaiting render/discard */
 };
 
 static int load_spv(const char *dir, const char *name, uint32_t **words, size_t *nbytes) {
@@ -377,6 +381,9 @@ int r3d_create(SDL_Window *win, const r3d_config *cfg, r3d_renderer **out) {
                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
   }
 
+  if (r3d_vkgui_init(&r->vk, win, r->swap.format, r->swap.nimages) != 0) goto fail;
+  r->gui_up = true;
+
   *out = r;
   return 0;
 fail:
@@ -384,9 +391,26 @@ fail:
   return -1;
 }
 
+int r3d_gui_begin(r3d_renderer *r) {
+  if (!r->gui_up) return -1;
+  if (!r->gui_open) {
+    r3d_vkgui_new_frame();
+    r->gui_open = true;
+  }
+  return 0;
+}
+
+void r3d_gui_event(r3d_renderer *r, const SDL_Event *ev) {
+  if (r->gui_up) r3d_vkgui_event(ev);
+}
+
 void r3d_destroy(r3d_renderer *r) {
   if (!r) return;
   if (r->vk.dev) vkDeviceWaitIdle(r->vk.dev);
+  if (r->gui_up) {
+    if (r->gui_open) r3d_vkgui_discard();
+    r3d_vkgui_shutdown();
+  }
   r3d_vkbuf_destroy(&r->vk, &r->readback);
   if (r->query) vkDestroyQueryPool(r->vk.dev, r->query, NULL);
   if (r->timeline) vkDestroySemaphore(r->vk.dev, r->timeline, NULL);
@@ -555,6 +579,10 @@ int r3d_frame(r3d_renderer *r, const r3d_frame_params *p, r3d_frame_stats *st) {
   VkResult ar = vkAcquireNextImageKHR(r->vk.dev, r->swap.swapchain, UINT64_MAX,
                                       r->acquire[slot], VK_NULL_HANDLE, &img);
   if (ar == VK_ERROR_OUT_OF_DATE_KHR) {
+    if (r->gui_open) {
+      r3d_vkgui_discard();
+      r->gui_open = false;
+    }
     int rc = r3d_resize(r);
     return rc == 0 ? 1 : rc; /* 1 = frame skipped, retry next loop */
   }
@@ -617,10 +645,27 @@ int r3d_frame(r3d_renderer *r, const r3d_frame_params *p, r3d_frame_stats *st) {
   };
   vkCmdBlitImage2(cmd, &blit);
 
-  r3d_vk_image_barrier(cmd, r->swap.images[img], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                       VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_PIPELINE_STAGE_2_BLIT_BIT,
-                       VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0, 0,
-                       1);
+  if (r->gui_open) {
+    r3d_vk_image_barrier(cmd, r->swap.images[img], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                         VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_2_BLIT_BIT,
+                         VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                         VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                         VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT |
+                             VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                         0, 1);
+    r3d_vkgui_render(cmd, r->swap.views[img], r->swap.extent);
+    r->gui_open = false;
+    r3d_vk_image_barrier(cmd, r->swap.images[img], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                         VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                         VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                         VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                         VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0, 0, 1);
+  } else {
+    r3d_vk_image_barrier(cmd, r->swap.images[img], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                         VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_PIPELINE_STAGE_2_BLIT_BIT,
+                         VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0,
+                         0, 1);
+  }
   vkEndCommandBuffer(cmd);
 
   uint64_t signal_value = ++r->timeline_value;

@@ -1,6 +1,7 @@
 #include "core/input.h"
 
-void r3d_input_poll(r3d_input *in, SDL_Window *win) {
+void r3d_input_poll(r3d_input *in, SDL_Window *win,
+                    void (*hook)(void *ud, const SDL_Event *ev), void *ud, bool allow_capture) {
   in->quit = false;
   in->screenshot = false;
   in->resized = false;
@@ -13,6 +14,7 @@ void r3d_input_poll(r3d_input *in, SDL_Window *win) {
 
   SDL_Event ev;
   while (SDL_PollEvent(&ev)) {
+    if (hook) hook(ud, &ev);
     switch (ev.type) {
     case SDL_EVENT_QUIT:
       in->quit = true;
@@ -21,7 +23,7 @@ void r3d_input_poll(r3d_input *in, SDL_Window *win) {
       in->resized = true;
       break;
     case SDL_EVENT_MOUSE_BUTTON_DOWN:
-      if (!in->captured) {
+      if (!in->captured && allow_capture) {
         SDL_SetWindowRelativeMouseMode(win, true);
         in->captured = true;
       }

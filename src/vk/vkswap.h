@@ -18,6 +18,7 @@ typedef struct r3d_vkswap {
   VkExtent2D extent;
   uint32_t nimages;
   VkImage images[R3D_MAX_SWAP_IMAGES];
+  VkImageView views[R3D_MAX_SWAP_IMAGES];       /* for the GUI color-attachment pass */
   VkSemaphore render_done[R3D_MAX_SWAP_IMAGES]; /* per-image, signaled by submit */
 } r3d_vkswap;
 

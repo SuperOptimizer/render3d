@@ -23,6 +23,9 @@ typedef struct r3d_input {
   bool captured;
 } r3d_input;
 
-void r3d_input_poll(r3d_input *in, SDL_Window *win);
+/* hook (may be NULL) sees every event first (e.g. GUI). allow_capture=false
+ * suppresses click-to-capture (e.g. pointer over GUI). */
+void r3d_input_poll(r3d_input *in, SDL_Window *win,
+                    void (*hook)(void *ud, const SDL_Event *ev), void *ud, bool allow_capture);
 
 #endif /* R3D_INPUT_H */

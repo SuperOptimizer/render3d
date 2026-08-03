@@ -9,6 +9,7 @@
 #include "render/render_types.h"
 
 typedef struct SDL_Window SDL_Window;
+typedef union SDL_Event SDL_Event;
 typedef struct r3d_renderer r3d_renderer; /* opaque, backend-owned */
 
 /* All functions return 0 on success, nonzero on failure (errors to stderr). */
@@ -21,6 +22,12 @@ int r3d_set_transfer(r3d_renderer *r, const uint8_t rgba[256][4]);
 /* Acquire -> raycast -> blit -> present. Fills st (may be zero). */
 int r3d_frame(r3d_renderer *r, const r3d_frame_params *p, r3d_frame_stats *st);
 int r3d_resize(r3d_renderer *r);
+
+/* GUI (Dear ImGui via cimgui). Call r3d_gui_event for every SDL event, then
+ * r3d_gui_begin once per frame BEFORE building widgets with cimgui.h calls;
+ * r3d_frame draws the accumulated UI over the volume image. */
+int r3d_gui_begin(r3d_renderer *r);
+void r3d_gui_event(r3d_renderer *r, const SDL_Event *ev);
 
 /* Copy the last rendered frame to caller-provided RGBA8 buffer (screenshot).
  * Pass rgba=NULL to query size via *w,*h first; buffer must hold (*w)*(*h)*4. */
