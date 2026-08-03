@@ -10,6 +10,7 @@ struct FrameParams {
   uint2 viewport;                            // drawable size in pixels
   uint mode;                                 // 0=full 1=MIP 2=depth 3=heatmap 4=raydir
   uint frame_index;
+  float threshold;                           // voxels below this (0..1) are zeroed/transparent
 };
 
 [[vk::push_constant]] FrameParams pc;

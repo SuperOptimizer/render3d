@@ -59,6 +59,7 @@ int main(int argc, char **argv) {
   int win_w = 1280, win_h = 720;
   float cam0[5] = {0.5f, 0.5f, -1.5f, 0.0f, 0.0f}; /* pos, yaw, pitch */
   bool no_vsync = false;
+  float lowcut0 = 0.0f;
   for (int i = 1; i < argc; i++) {
     if (i < argc - 1 && strcmp(argv[i], "--frames") == 0) exit_frames = (uint32_t)atoi(argv[i + 1]);
     if (i < argc - 1 && strcmp(argv[i], "--shot") == 0) shot_path = argv[i + 1];
@@ -71,6 +72,7 @@ int main(int argc, char **argv) {
     if (i < argc - 5 && strcmp(argv[i], "--cam") == 0)
       for (int k = 0; k < 5; k++) cam0[k] = (float)atof(argv[i + 1 + k]);
     if (strcmp(argv[i], "--no-vsync") == 0) no_vsync = true;
+    if (i < argc - 1 && strcmp(argv[i], "--lowcut") == 0) lowcut0 = (float)atof(argv[i + 1]);
   }
 
   if (!SDL_Init(SDL_INIT_VIDEO)) {
@@ -133,6 +135,7 @@ int main(int argc, char **argv) {
   r3d_stats_init(&stats);
 
   float step_voxels = 1.0f, density = 1.0f, lod_bias = 0.0f;
+  float low_cut = lowcut0; /* voxel-value threshold, 0..255 */
   uint32_t tf_idx = tf_preset > 0 ? (uint32_t)tf_preset : 0;
   uint32_t frame_index = 0;
   float fps_smooth = 60.0f;
@@ -217,6 +220,7 @@ int main(int argc, char **argv) {
     }
     igSliderFloat("step (voxels)", &step_voxels, 0.25f, 4.0f, "%.2f", 0);
     igSliderFloat("density", &density, 0.1f, 8.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
+    igSliderFloat("low cut", &low_cut, 0.0f, 255.0f, "%.0f", 0);
     igSliderFloat("lod bias", &lod_bias, -2.0f, 4.0f, "%.2f", 0);
     igText("cam (%.2f %.2f %.2f) yaw %.2f pitch %.2f", (double)cam.pos.x, (double)cam.pos.y,
            (double)cam.pos.z, (double)cam.yaw, (double)cam.pitch);
@@ -238,6 +242,7 @@ int main(int argc, char **argv) {
         .viewport = {(uint32_t)w, (uint32_t)h},
         .mode = mode,
         .frame_index = frame_index++,
+        .threshold = low_cut / 255.0f,
     };
     r3d_frame_stats st = {0};
     int frc = r3d_frame(renderer, &p, &st);

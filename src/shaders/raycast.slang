@@ -83,10 +83,12 @@ void main(uint3 tid: SV_DispatchThreadID) {
     float lod_step = exp2(floor(lod));
     float3 p = pc.cam_origin + t * dir;
     float v = volume.SampleLevel(p, lod);
+    bool cut = v < pc.threshold; // low-cut: below-threshold voxels are void
+    if (cut) v = 0.0;
     if (v > mip_max) mip_max = v;
     if (first_hit < 0.0 && v > 0.05) first_hit = t;
 
-    if (composite) {
+    if (composite && !cut) {
       float4 s = tf.SampleLevel(v, 0);
       // opacity correction: appearance invariant under step-size changes
       float a = 1.0 - pow(1.0 - s.a, pc.density * pc.step_voxels * lod_step);

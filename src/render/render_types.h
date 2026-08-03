@@ -39,8 +39,9 @@ typedef struct r3d_frame_params {
   uint32_t viewport[2];
   uint32_t mode;
   uint32_t frame_index;
+  float threshold; /* voxels below this (normalized 0..1) are zeroed/transparent */
 } r3d_frame_params;
-static_assert(sizeof(r3d_frame_params) == 80, "must mirror shader FrameParams");
+static_assert(sizeof(r3d_frame_params) == 84, "must mirror shader FrameParams");
 
 typedef struct r3d_frame_stats {
   uint64_t gpu_ns; /* raycast dispatch time (0 if timestamps unsupported) */
