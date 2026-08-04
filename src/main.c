@@ -61,7 +61,8 @@ int main(int argc, char **argv) {
   bool no_vsync = false;
   float lowcut0 = 0.0f;
   const char *bench = NULL; /* scripted camera path: orbit | zoom | fly */
-  uint32_t slab_wz = 0;     /* nonzero = slab mode ring depth */
+  uint32_t slab_wz = 0;     /* nonzero = slab mode, max visible depth */
+  int depth0 = 0;           /* initial visible depth (default = max) */
   for (int i = 1; i < argc; i++) {
     if (i < argc - 1 && strcmp(argv[i], "--frames") == 0) exit_frames = (uint32_t)atoi(argv[i + 1]);
     if (i < argc - 1 && strcmp(argv[i], "--shot") == 0) shot_path = argv[i + 1];
@@ -76,6 +77,7 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "--no-vsync") == 0) no_vsync = true;
     if (i < argc - 1 && strcmp(argv[i], "--lowcut") == 0) lowcut0 = (float)atof(argv[i + 1]);
     if (i < argc - 1 && strcmp(argv[i], "--bench") == 0) bench = argv[i + 1];
+    if (i < argc - 1 && strcmp(argv[i], "--depth") == 0) depth0 = atoi(argv[i + 1]);
     if (strcmp(argv[i], "--slab") == 0) {
       slab_wz = 32;
       if (i < argc - 1 && argv[i + 1][0] >= '0' && argv[i + 1][0] <= '9')
@@ -115,11 +117,14 @@ int main(int argc, char **argv) {
                         (uint32_t)atoi(argv[4])) != 0)
       return EXIT_FAILURE;
     if (slab_wz) {
-      r3d_slab_desc sd = {.nx = vol.nx, .ny = vol.ny, .nz = vol.nz, .wz = slab_wz};
+      /* --slab N = max visible depth; ring holds N+2 so face filtering never
+       * crosses the seam and depth changes need no re-upload */
+      uint32_t ring = slab_wz + 2;
+      r3d_slab_desc sd = {.nx = vol.nx, .ny = vol.ny, .nz = vol.nz, .wz = ring};
       if (r3d_slab_init(renderer, &sd) != 0) return EXIT_FAILURE;
       slab_src = vol;
-      slab_z0 = (vol.nz - slab_wz) / 2; /* start mid-depth */
-      slab_z0_max = vol.nz - slab_wz;
+      slab_z0 = (vol.nz - ring) / 2; /* start mid-depth */
+      slab_z0_max = vol.nz - ring;
       if (r3d_slab_window(renderer, &slab_src, slab_z0) != 0) return EXIT_FAILURE;
     } else {
       r3d_volume_desc desc = {
@@ -156,7 +161,7 @@ int main(int argc, char **argv) {
     if (slab_wz) {
       /* orbit the thin slab: target its center, sit back along z */
       float ey = (float)slab_src.ny / (float)slab_src.nx;
-      float ez = (float)(slab_wz - 1) / (float)slab_src.nx;
+      float ez = (float)slab_wz / (float)slab_src.nx;
       r3d_camera_orbit_set(&cam, v3(0.5f, ey * 0.5f, ez * 0.5f), 1.4f);
     } else {
       r3d_camera_orbit_set(&cam, v3(0.5f, 0.5f, 0.5f), 2.0f);
@@ -171,6 +176,7 @@ int main(int argc, char **argv) {
   bool auto_scroll = false;
   float auto_speed = 10.0f; /* slices per second */
   float auto_accum = 0.0f;
+  int slab_depth = depth0 >= 2 && depth0 <= (int)slab_wz ? depth0 : (int)slab_wz;
   uint32_t tf_idx = tf_preset > 0 ? (uint32_t)tf_preset : 0;
   uint32_t frame_index = 0;
   float fps_smooth = 60.0f;
@@ -199,7 +205,7 @@ int main(int argc, char **argv) {
       printf("mode: %u\n", mode);
     }
     if (slab_wz) {
-      int64_t nz0 = (int64_t)slab_z0 + in.zdelta + (int64_t)in.zpage * (int64_t)slab_wz;
+      int64_t nz0 = (int64_t)slab_z0 + in.zdelta + (int64_t)in.zpage * (int64_t)slab_depth;
       if (bench && strcmp(bench, "zsweep") == 0) /* scripted scroll for perf/tests */
         nz0 = (int64_t)((float)slab_z0_max * (float)frame_index / (float)exit_frames);
       if (auto_scroll) {
@@ -305,8 +311,9 @@ int main(int argc, char **argv) {
     igSliderFloat("density", &density, 0.1f, 8.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
     igSliderFloat("low cut", &low_cut, 0.0f, 255.0f, "%.0f", 0);
     if (slab_wz) {
+      igSliderInt("depth (voxels)", &slab_depth, 2, (int)slab_wz, "%d", 0);
       int z0i = (int)slab_z0;
-      if (igSliderInt("z window", &z0i, 0, (int)slab_z0_max, "%d", 0)) {
+      if (igSliderInt("z position", &z0i, 0, (int)slab_z0_max, "%d", 0)) {
         slab_z0 = (uint32_t)z0i;
         r3d_slab_window(renderer, &slab_src, slab_z0);
       }
@@ -347,7 +354,10 @@ int main(int argc, char **argv) {
         .frame_index = frame_index++,
         .threshold = low_cut / 255.0f,
     };
-    if (slab_wz) r3d_slab_params(renderer, &p);
+    if (slab_wz) {
+      r3d_slab_params(renderer, &p);
+      p.slab_depth = (uint32_t)slab_depth;
+    }
     r3d_frame_stats st = {0};
     int frc = r3d_frame(renderer, &p, &st);
     if (frc == 0) {

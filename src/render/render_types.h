@@ -46,8 +46,9 @@ typedef struct r3d_frame_params {
   float slab_z0;      /* window start slice */
   float slab_nx, slab_ny; /* source xy dims (voxels) */
   float slab_px, slab_py; /* tile payload (voxels) */
+  uint32_t slab_depth;    /* rendered thickness in voxels (<= ring - 2) */
 } r3d_frame_params;
-static_assert(sizeof(r3d_frame_params) == 112, "must mirror shader FrameParams");
+static_assert(sizeof(r3d_frame_params) == 116, "must mirror shader FrameParams");
 
 typedef struct r3d_frame_stats {
   /* GPU zones from timestamp queries (0 if unsupported); lag 2 frames */

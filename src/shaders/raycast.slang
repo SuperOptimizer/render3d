@@ -28,7 +28,9 @@ bool is_slab() { return pc.slab_grid != 0; }
 // wz-1 seam-safe slices, all in units of 1/nx.
 float3 vol_extent() {
   if (!is_slab()) return float3(1);
-  return float3(1.0, pc.slab_ny / pc.slab_nx, (float(pc.slab_wz) - 1.0) / pc.slab_nx);
+  // box is exactly slab_depth voxels thick; the ring holds depth+2 slices so
+  // filtering at the faces never crosses the ring seam
+  return float3(1.0, pc.slab_ny / pc.slab_nx, float(pc.slab_depth) / pc.slab_nx);
 }
 
 float sample_tile(float3 uvw, uint idx) {

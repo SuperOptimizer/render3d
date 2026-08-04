@@ -17,6 +17,7 @@ struct FrameParams {
   float slab_z0;                             // window start slice
   float slab_nx, slab_ny;                    // source xy dims (voxels)
   float slab_px, slab_py;                    // tile payload (voxels)
+  uint slab_depth;                           // rendered thickness in voxels
 };
 
 [[vk::push_constant]] FrameParams pc;

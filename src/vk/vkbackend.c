@@ -857,6 +857,7 @@ void r3d_slab_params(const r3d_renderer *r, r3d_frame_params *p) {
   p->slab_ny = (float)r->slab.ny;
   p->slab_px = (float)r->slab.px;
   p->slab_py = (float)r->slab.py;
+  p->slab_depth = r->slab.wz - 2; /* max; caller may lower it per frame */
 }
 
 int r3d_frame(r3d_renderer *r, const r3d_frame_params *p, r3d_frame_stats *st) {
