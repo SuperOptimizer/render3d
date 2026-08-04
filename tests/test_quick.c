@@ -128,8 +128,13 @@ static void test_slab(void) {
   /* wide: 2x2 grid */
   CHECK(r3d_slab_layout_init(&l, 4092, 4092, 192, 32) == 0);
   CHECK(l.gx == 2 && l.gy == 2 && l.px == 2046 && r3d_slab_tile_w(&l) == 2048);
+  /* 3-wide and 4x4 grids */
+  CHECK(r3d_slab_layout_init(&l, 4093, 1024, 192, 32) == 0);
+  CHECK(l.gx == 3 && l.gy == 1 && l.px == 1365);
+  CHECK(r3d_slab_layout_init(&l, 8184, 8184, 48, 18) == 0);
+  CHECK(l.gx == 4 && l.gy == 4 && l.px == 2046);
   /* too wide */
-  CHECK(r3d_slab_layout_init(&l, 4093, 1024, 192, 32) == -1);
+  CHECK(r3d_slab_layout_init(&l, 8185, 1024, 192, 32) == -1);
   /* bad ring */
   CHECK(r3d_slab_layout_init(&l, 1024, 1024, 16, 32) == -1);
 

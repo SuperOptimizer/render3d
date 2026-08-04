@@ -5,8 +5,8 @@
 //    (see src/core/slab.h for the layout math mirrored here).
 import common;
 
-// slab tiles (element j*2+i); cube mode binds the same monolithic texture x4
-[[vk::binding(0, 0)]] Sampler3D<float> volumes[4];
+// slab tiles (element j*4+i, up to 4x4); cube mode binds the monolithic x16
+[[vk::binding(0, 0)]] Sampler3D<float> volumes[16];
 [[vk::binding(1, 0)]] Sampler1D<float4> tf;
 [[vk::binding(2, 0)]] RWTexture2D<float4> out_image;
 // per-8^3-block max, dilated 1 block (nearest sampler) — empty-space skipping
@@ -38,6 +38,18 @@ float sample_tile(float3 uvw, uint idx) {
   case 1: return volumes[1].SampleLevel(uvw, 0);
   case 2: return volumes[2].SampleLevel(uvw, 0);
   case 3: return volumes[3].SampleLevel(uvw, 0);
+  case 4: return volumes[4].SampleLevel(uvw, 0);
+  case 5: return volumes[5].SampleLevel(uvw, 0);
+  case 6: return volumes[6].SampleLevel(uvw, 0);
+  case 7: return volumes[7].SampleLevel(uvw, 0);
+  case 8: return volumes[8].SampleLevel(uvw, 0);
+  case 9: return volumes[9].SampleLevel(uvw, 0);
+  case 10: return volumes[10].SampleLevel(uvw, 0);
+  case 11: return volumes[11].SampleLevel(uvw, 0);
+  case 12: return volumes[12].SampleLevel(uvw, 0);
+  case 13: return volumes[13].SampleLevel(uvw, 0);
+  case 14: return volumes[14].SampleLevel(uvw, 0);
+  case 15: return volumes[15].SampleLevel(uvw, 0);
   default: return volumes[0].SampleLevel(uvw, 0);
   }
 }
@@ -50,13 +62,13 @@ float vol_sample(float3 p, float lod) {
   float wy = p.y * pc.slab_nx;
   float zc = pc.slab_z0 + 0.5 + p.z * pc.slab_nx; // ring z, seam-safe by box extent
   uint gx = pc.slab_grid & 0xffu, gy = pc.slab_grid >> 8;
-  uint ix = (gx > 1 && wx >= pc.slab_px) ? 1 : 0;
-  uint iy = (gy > 1 && wy >= pc.slab_py) ? 1 : 0;
+  uint ix = min(uint(max(wx, 0.0) / pc.slab_px), gx - 1);
+  uint iy = min(uint(max(wy, 0.0) / pc.slab_py), gy - 1);
   float tw = pc.slab_px + 2.0, th = pc.slab_py + 2.0;
   float u = (wx - float(ix) * pc.slab_px + 1.0) / tw;
   float v = (wy - float(iy) * pc.slab_py + 1.0) / th;
   float w = frac(zc / float(pc.slab_wz)); // REPEAT sampler wraps the ring
-  return sample_tile(float3(u, v, w), iy * 2 + ix);
+  return sample_tile(float3(u, v, w), iy * 4 + ix);
 }
 
 float3 ray_dir(uint2 pix) {

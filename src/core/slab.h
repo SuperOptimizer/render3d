@@ -13,7 +13,7 @@
 
 #include <stdint.h>
 
-#define R3D_SLAB_MAX_GRID 2u
+#define R3D_SLAB_MAX_GRID 4u   /* up to 4x4 tiles = 8184^2 composite */
 #define R3D_SLAB_MAX_TILE 2048u /* maxImageDimension3D on target hardware */
 
 typedef struct r3d_slab_layout {
@@ -37,11 +37,11 @@ static inline int r3d_slab_layout_init(r3d_slab_layout *l, uint32_t nx, uint32_t
   l->nz = nz;
   l->wz = wz;
   uint32_t maxp = R3D_SLAB_MAX_TILE - 2;
-  l->gx = nx <= maxp ? 1 : 2;
-  l->gy = ny <= maxp ? 1 : 2;
+  l->gx = (nx + maxp - 1) / maxp;
+  l->gy = (ny + maxp - 1) / maxp;
+  if (l->gx > R3D_SLAB_MAX_GRID || l->gy > R3D_SLAB_MAX_GRID) return -1;
   l->px = (nx + l->gx - 1) / l->gx;
   l->py = (ny + l->gy - 1) / l->gy;
-  if (l->px > maxp || l->py > maxp) return -1; /* would need >2x2 */
   return 0;
 }
 
