@@ -19,6 +19,8 @@ typedef struct r3d_input {
   float step_scale;  /* '['=×1.25 ']'=×0.8, 1.0 otherwise */
   float density_scale; /* ','=×0.8 '.'=×1.25 */
   float lod_delta;   /* '-'/'=' adjust lod bias by ∓0.25 */
+  int zdelta;        /* slab window scroll in slices: R/F = ±1 (repeats) */
+  int zpage;         /* slab window scroll in pages: PgUp/PgDn = ±1 */
   float wheel;       /* scroll this frame (+away from user) */
   /* persistent */
   bool captured;     /* fly mode: pointer grabbed until Esc */

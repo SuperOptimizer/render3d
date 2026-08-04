@@ -6,6 +6,7 @@
 
 #include <stdint.h>
 
+#include "core/volume.h"
 #include "render/render_types.h"
 
 typedef struct SDL_Window SDL_Window;
@@ -17,6 +18,19 @@ int r3d_create(SDL_Window *win, const r3d_config *cfg, r3d_renderer **out);
 void r3d_destroy(r3d_renderer *r);
 
 int r3d_upload_volume(r3d_renderer *r, const r3d_volume_desc *d, const uint8_t *voxels);
+
+/* Tiled-slab mode: a thin, wide z-window over a large source volume, rendered
+ * from up to 2x2 tile textures with a ring-buffered z axis (see core/slab.h).
+ * init creates the tiles; window uploads/scrolls to start slice z0 (clamped),
+ * incrementally when the move is < ring depth. The source volume must stay
+ * open across window calls. Fills p->slab_* fields via r3d_slab_params. */
+typedef struct r3d_slab_desc {
+  uint32_t nx, ny, nz; /* source dims */
+  uint32_t wz;         /* ring depth (window slices), e.g. 32 */
+} r3d_slab_desc;
+int r3d_slab_init(r3d_renderer *r, const r3d_slab_desc *d);
+int r3d_slab_window(r3d_renderer *r, const r3d_volume *src, uint32_t z0);
+void r3d_slab_params(const r3d_renderer *r, r3d_frame_params *p); /* set slab_* fields */
 int r3d_set_transfer(r3d_renderer *r, const uint8_t rgba[256][4]);
 
 /* Acquire -> raycast -> blit -> present. Fills st (may be zero). */

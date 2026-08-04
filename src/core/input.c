@@ -13,6 +13,8 @@ void r3d_input_poll(r3d_input *in, SDL_Window *win,
   in->density_scale = 1.0f;
   in->lod_delta = 0.0f;
   in->wheel = 0.0f;
+  in->zdelta = 0;
+  in->zpage = 0;
 
   SDL_Event ev;
   while (SDL_PollEvent(&ev)) {
@@ -50,6 +52,9 @@ void r3d_input_poll(r3d_input *in, SDL_Window *win,
       in->wheel += ev.wheel.y;
       break;
     case SDL_EVENT_KEY_DOWN:
+      /* z-scroll keys repeat on hold */
+      if (ev.key.key == SDLK_R) in->zdelta += 1;
+      if (ev.key.key == SDLK_F) in->zdelta -= 1;
       if (ev.key.repeat) break;
       switch (ev.key.key) {
       case SDLK_ESCAPE:
@@ -70,6 +75,8 @@ void r3d_input_poll(r3d_input *in, SDL_Window *win,
       case SDLK_PERIOD: in->density_scale = 1.25f; break;
       case SDLK_MINUS: in->lod_delta = -0.25f; break;
       case SDLK_EQUALS: in->lod_delta = 0.25f; break;
+      case SDLK_PAGEUP: in->zpage += 1; break;
+      case SDLK_PAGEDOWN: in->zpage -= 1; break;
       default: break;
       }
       break;

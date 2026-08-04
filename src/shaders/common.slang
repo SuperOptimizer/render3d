@@ -11,6 +11,12 @@ struct FrameParams {
   uint mode;                                 // 0=full 1=MIP 2=depth 3=heatmap 4=raydir
   uint frame_index;
   float threshold;                           // voxels below this (0..1) are zeroed/transparent
+  // slab mode (tiled thin z-window); slab_grid == 0 selects cube mode
+  uint slab_grid;                            // gx | gy<<8
+  uint slab_wz;                              // ring depth (slices)
+  float slab_z0;                             // window start slice
+  float slab_nx, slab_ny;                    // source xy dims (voxels)
+  float slab_px, slab_py;                    // tile payload (voxels)
 };
 
 [[vk::push_constant]] FrameParams pc;

@@ -40,8 +40,14 @@ typedef struct r3d_frame_params {
   uint32_t mode;
   uint32_t frame_index;
   float threshold; /* voxels below this (normalized 0..1) are zeroed/transparent */
+  /* slab mode (tiled thin window); slab_grid == 0 selects cube mode */
+  uint32_t slab_grid; /* gx | gy<<8 */
+  uint32_t slab_wz;   /* ring depth (slices) */
+  float slab_z0;      /* window start slice */
+  float slab_nx, slab_ny; /* source xy dims (voxels) */
+  float slab_px, slab_py; /* tile payload (voxels) */
 } r3d_frame_params;
-static_assert(sizeof(r3d_frame_params) == 84, "must mirror shader FrameParams");
+static_assert(sizeof(r3d_frame_params) == 112, "must mirror shader FrameParams");
 
 typedef struct r3d_frame_stats {
   /* GPU zones from timestamp queries (0 if unsupported); lag 2 frames */

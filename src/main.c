@@ -61,6 +61,7 @@ int main(int argc, char **argv) {
   bool no_vsync = false;
   float lowcut0 = 0.0f;
   const char *bench = NULL; /* scripted camera path: orbit | zoom | fly */
+  uint32_t slab_wz = 0;     /* nonzero = slab mode ring depth */
   for (int i = 1; i < argc; i++) {
     if (i < argc - 1 && strcmp(argv[i], "--frames") == 0) exit_frames = (uint32_t)atoi(argv[i + 1]);
     if (i < argc - 1 && strcmp(argv[i], "--shot") == 0) shot_path = argv[i + 1];
@@ -75,6 +76,11 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "--no-vsync") == 0) no_vsync = true;
     if (i < argc - 1 && strcmp(argv[i], "--lowcut") == 0) lowcut0 = (float)atof(argv[i + 1]);
     if (i < argc - 1 && strcmp(argv[i], "--bench") == 0) bench = argv[i + 1];
+    if (strcmp(argv[i], "--slab") == 0) {
+      slab_wz = 32;
+      if (i < argc - 1 && argv[i + 1][0] >= '0' && argv[i + 1][0] <= '9')
+        slab_wz = (uint32_t)atoi(argv[i + 1]);
+    }
   }
   if (bench && exit_frames == 0) exit_frames = 300;
 
@@ -101,17 +107,31 @@ int main(int argc, char **argv) {
 
   /* positional args: <volume.u8> <nx> <ny> <nz> */
   uint32_t mode = R3D_MODE_RAYDIR;
+  r3d_volume slab_src = {0}; /* stays open in slab mode (window scrolls it) */
+  uint32_t slab_z0 = 0, slab_z0_max = 0;
   if (argc >= 5 && argv[1][0] != '-') {
     r3d_volume vol;
     if (r3d_volume_open(&vol, argv[1], (uint32_t)atoi(argv[2]), (uint32_t)atoi(argv[3]),
                         (uint32_t)atoi(argv[4])) != 0)
       return EXIT_FAILURE;
-    r3d_volume_desc desc = {
-        .nx = vol.nx, .ny = vol.ny, .nz = vol.nz, .brick_dim = R3D_BRICK_DIM};
-    int up = r3d_upload_volume(renderer, &desc, vol.voxels);
-    r3d_volume_close(&vol); /* GPU has it; drop the mapping */
-    if (up != 0) return EXIT_FAILURE;
+    if (slab_wz) {
+      r3d_slab_desc sd = {.nx = vol.nx, .ny = vol.ny, .nz = vol.nz, .wz = slab_wz};
+      if (r3d_slab_init(renderer, &sd) != 0) return EXIT_FAILURE;
+      slab_src = vol;
+      slab_z0 = (vol.nz - slab_wz) / 2; /* start mid-depth */
+      slab_z0_max = vol.nz - slab_wz;
+      if (r3d_slab_window(renderer, &slab_src, slab_z0) != 0) return EXIT_FAILURE;
+    } else {
+      r3d_volume_desc desc = {
+          .nx = vol.nx, .ny = vol.ny, .nz = vol.nz, .brick_dim = R3D_BRICK_DIM};
+      int up = r3d_upload_volume(renderer, &desc, vol.voxels);
+      r3d_volume_close(&vol); /* GPU has it; drop the mapping */
+      if (up != 0) return EXIT_FAILURE;
+    }
     mode = R3D_MODE_FULL;
+  } else if (slab_wz) {
+    fprintf(stderr, "--slab needs a volume argument\n");
+    return EXIT_FAILURE;
   }
   if (force_mode >= 0) mode = (uint32_t)force_mode % R3D_MODE_COUNT;
   if (tf_preset >= 0) {
@@ -132,13 +152,25 @@ int main(int argc, char **argv) {
   r3d_camera_init(&cam, v3(cam0[0], cam0[1], cam0[2]));
   cam.yaw = cam0[3];
   cam.pitch = cam0[4];
-  if (cam_mode == CAM_ORBIT) r3d_camera_orbit_set(&cam, v3(0.5f, 0.5f, 0.5f), 2.0f);
+  if (cam_mode == CAM_ORBIT) {
+    if (slab_wz) {
+      /* orbit the thin slab: target its center, sit back along z */
+      float ey = (float)slab_src.ny / (float)slab_src.nx;
+      float ez = (float)(slab_wz - 1) / (float)slab_src.nx;
+      r3d_camera_orbit_set(&cam, v3(0.5f, ey * 0.5f, ez * 0.5f), 1.4f);
+    } else {
+      r3d_camera_orbit_set(&cam, v3(0.5f, 0.5f, 0.5f), 2.0f);
+    }
+  }
   r3d_input in = {0};
   r3d_stats stats;
   r3d_stats_init(&stats);
 
   float step_voxels = 1.0f, density = 1.0f, lod_bias = 0.0f;
   float low_cut = lowcut0; /* voxel-value threshold, 0..255 */
+  bool auto_scroll = false;
+  float auto_speed = 10.0f; /* slices per second */
+  float auto_accum = 0.0f;
   uint32_t tf_idx = tf_preset > 0 ? (uint32_t)tf_preset : 0;
   uint32_t frame_index = 0;
   float fps_smooth = 60.0f;
@@ -165,6 +197,30 @@ int main(int argc, char **argv) {
     if (in.mode_delta) {
       mode = (mode + (uint32_t)in.mode_delta) % R3D_MODE_COUNT;
       printf("mode: %u\n", mode);
+    }
+    if (slab_wz) {
+      int64_t nz0 = (int64_t)slab_z0 + in.zdelta + (int64_t)in.zpage * (int64_t)slab_wz;
+      if (bench && strcmp(bench, "zsweep") == 0) /* scripted scroll for perf/tests */
+        nz0 = (int64_t)((float)slab_z0_max * (float)frame_index / (float)exit_frames);
+      if (auto_scroll) {
+        auto_accum += auto_speed * dt;
+        float whole = floorf(auto_accum);
+        nz0 += (int64_t)whole;
+        auto_accum -= whole;
+        if (nz0 >= (int64_t)slab_z0_max) { /* bounce at the ends */
+          nz0 = slab_z0_max;
+          auto_speed = -auto_speed;
+        } else if (nz0 <= 0 && auto_speed < 0) {
+          nz0 = 0;
+          auto_speed = -auto_speed;
+        }
+      }
+      if (nz0 < 0) nz0 = 0;
+      if (nz0 > (int64_t)slab_z0_max) nz0 = slab_z0_max;
+      if ((uint32_t)nz0 != slab_z0) {
+        slab_z0 = (uint32_t)nz0;
+        r3d_slab_window(renderer, &slab_src, slab_z0);
+      }
     }
     if (in.tf_delta) {
       tf_idx = (tf_idx + 1) % r3d_tf_preset(UINT32_MAX, NULL);
@@ -213,12 +269,12 @@ int main(int argc, char **argv) {
         cam.pitch = 0.2f;
         r3d_camera_orbit_set(&cam, v3(0.5f, 0.5f, 0.5f),
                              1.75f - 1.55f * sinf(ph * 3.14159265f));
-      } else { /* fly: weaving pass straight through the volume */
+      } else if (strcmp(bench, "fly") == 0) { /* weaving pass through the volume */
         cam.pos = v3(0.5f + 0.15f * sinf(ph * tau * 1.5f), 0.5f + 0.1f * sinf(ph * tau),
                      -0.3f + 1.6f * ph);
         cam.yaw = 0.15f * sinf(ph * tau);
         cam.pitch = 0.1f * cosf(ph * tau);
-      }
+      } /* other bench names (zsweep) keep the default camera */
     }
     r3d_v3 right, up, fwd;
     r3d_camera_basis(&cam, (float)w / (float)h, &right, &up, &fwd);
@@ -248,6 +304,16 @@ int main(int argc, char **argv) {
     igSliderFloat("step (voxels)", &step_voxels, 0.25f, 4.0f, "%.2f", 0);
     igSliderFloat("density", &density, 0.1f, 8.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
     igSliderFloat("low cut", &low_cut, 0.0f, 255.0f, "%.0f", 0);
+    if (slab_wz) {
+      int z0i = (int)slab_z0;
+      if (igSliderInt("z window", &z0i, 0, (int)slab_z0_max, "%d", 0)) {
+        slab_z0 = (uint32_t)z0i;
+        r3d_slab_window(renderer, &slab_src, slab_z0);
+      }
+      igCheckbox("auto-scroll", &auto_scroll);
+      igSameLine(0, 10);
+      igSliderFloat("slices/s", &auto_speed, -60.0f, 60.0f, "%.0f", 0);
+    }
     igSliderFloat("lod bias", &lod_bias, -2.0f, 4.0f, "%.2f", 0);
     igText("cam (%.2f %.2f %.2f) yaw %.2f pitch %.2f", (double)cam.pos.x, (double)cam.pos.y,
            (double)cam.pos.z, (double)cam.yaw, (double)cam.pitch);
@@ -281,6 +347,7 @@ int main(int argc, char **argv) {
         .frame_index = frame_index++,
         .threshold = low_cut / 255.0f,
     };
+    if (slab_wz) r3d_slab_params(renderer, &p);
     r3d_frame_stats st = {0};
     int frc = r3d_frame(renderer, &p, &st);
     if (frc == 0) {
@@ -315,6 +382,7 @@ int main(int argc, char **argv) {
   }
 
   r3d_stats_report_now(&stats);
+  if (slab_src.voxels) r3d_volume_close(&slab_src);
   if (prof_frames > 2) {
     /* skip warmup skew: averages include first frames with empty queries */
     double n = (double)prof_frames;

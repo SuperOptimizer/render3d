@@ -1,15 +1,16 @@
-// Volume raycaster: fixed-step marching through a monolithic R8 3D texture.
-// M1 assumes a cubic volume in [0,1]^3 (spec/volume.md). The loop is written
-// so a later outer brick-DDA can wrap the inner fixed-step march unchanged.
+// Volume raycaster: fixed-step marching, two data modes.
+//  - cube: one monolithic 3D texture in [0,1]^3 (volumes[0], all 4 slots alias)
+//  - slab: up to 2x2 tile textures (payload + 1-voxel apron) covering a wide
+//    thin z-window; z is a ring buffer sampled with a REPEAT-W sampler
+//    (see src/core/slab.h for the layout math mirrored here).
 import common;
 
-[[vk::binding(0, 0)]] Sampler3D<float> volume;
+// slab tiles (element j*2+i); cube mode binds the same monolithic texture x4
+[[vk::binding(0, 0)]] Sampler3D<float> volumes[4];
 [[vk::binding(1, 0)]] Sampler1D<float4> tf;
 [[vk::binding(2, 0)]] RWTexture2D<float4> out_image;
 // per-8^3-block max, dilated 1 block (nearest sampler) — empty-space skipping
 [[vk::binding(3, 0)]] Sampler3D<float> occ;
-
-static const float OCC_BLOCK = 8.0;
 
 static const uint MODE_FULL = 0;
 static const uint MODE_MIP = 1;
@@ -19,6 +20,42 @@ static const uint MODE_RAYDIR = 4;
 static const uint MODE_FLAT = 5; // full compositing, shading off (perf A/B + tests)
 static const uint MAX_STEPS = 4096; // hard driver-safety clamp
 static const float ALPHA_CUTOFF = 0.98;
+static const float OCC_BLOCK = 8.0;
+
+bool is_slab() { return pc.slab_grid != 0; }
+
+// World box the ray marches: cube = [0,1]^3; slab = thin box whose z spans the
+// wz-1 seam-safe slices, all in units of 1/nx.
+float3 vol_extent() {
+  if (!is_slab()) return float3(1);
+  return float3(1.0, pc.slab_ny / pc.slab_nx, (float(pc.slab_wz) - 1.0) / pc.slab_nx);
+}
+
+float sample_tile(float3 uvw, uint idx) {
+  switch (idx) { // literal indices: no descriptor-indexing features needed
+  case 1: return volumes[1].SampleLevel(uvw, 0);
+  case 2: return volumes[2].SampleLevel(uvw, 0);
+  case 3: return volumes[3].SampleLevel(uvw, 0);
+  default: return volumes[0].SampleLevel(uvw, 0);
+  }
+}
+
+// p in world units (see vol_extent); lod used in cube mode only.
+float vol_sample(float3 p, float lod) {
+  if (!is_slab()) return volumes[0].SampleLevel(p, lod);
+  // voxel coords (units of 1/nx per axis)
+  float wx = p.x * pc.slab_nx;
+  float wy = p.y * pc.slab_nx;
+  float zc = pc.slab_z0 + 0.5 + p.z * pc.slab_nx; // ring z, seam-safe by box extent
+  uint gx = pc.slab_grid & 0xffu, gy = pc.slab_grid >> 8;
+  uint ix = (gx > 1 && wx >= pc.slab_px) ? 1 : 0;
+  uint iy = (gy > 1 && wy >= pc.slab_py) ? 1 : 0;
+  float tw = pc.slab_px + 2.0, th = pc.slab_py + 2.0;
+  float u = (wx - float(ix) * pc.slab_px + 1.0) / tw;
+  float v = (wy - float(iy) * pc.slab_py + 1.0) / th;
+  float w = frac(zc / float(pc.slab_wz)); // REPEAT sampler wraps the ring
+  return sample_tile(float3(u, v, w), iy * 2 + ix);
+}
 
 float3 ray_dir(uint2 pix) {
   float2 uv = (float2(pix) + 0.5) / float2(pc.viewport);
@@ -26,11 +63,11 @@ float3 ray_dir(uint2 pix) {
   return normalize(pc.cam_forward + ndc.x * pc.cam_right + ndc.y * pc.cam_up);
 }
 
-// slab test against [0,1]^3; returns (tnear, tfar), tnear<=tfar means hit
-float2 box_hit(float3 o, float3 d) {
+// slab test against [0, ext]; returns (tnear, tfar), tnear<=tfar means hit
+float2 box_hit(float3 o, float3 d, float3 ext) {
   float3 inv = 1.0 / d;
   float3 t0 = (float3(0) - o) * inv;
-  float3 t1 = (float3(1) - o) * inv;
+  float3 t1 = (ext - o) * inv;
   float3 tmin = min(t0, t1), tmax = max(t0, t1);
   return float2(max(max(tmin.x, tmin.y), tmin.z), min(min(tmax.x, tmax.y), tmax.z));
 }
@@ -53,12 +90,21 @@ void main(uint3 tid: SV_DispatchThreadID) {
     return;
   }
 
-  uint3 vdim;
-  uint levels;
-  volume.GetDimensions(0, vdim.x, vdim.y, vdim.z, levels);
-  float voxel = 1.0 / float(max(vdim.x, max(vdim.y, vdim.z)));
+  float voxel;
+  float max_lod;
+  if (is_slab()) {
+    voxel = 1.0 / pc.slab_nx;
+    max_lod = 0.0; // slab tiles have no mips (v1)
+  } else {
+    uint3 vdim;
+    uint levels;
+    volumes[0].GetDimensions(0, vdim.x, vdim.y, vdim.z, levels);
+    voxel = 1.0 / float(max(vdim.x, max(vdim.y, vdim.z)));
+    max_lod = min(pc.max_mip, float(levels - 1));
+  }
+  float3 ext = vol_extent();
 
-  float2 hit = box_hit(pc.cam_origin, dir);
+  float2 hit = box_hit(pc.cam_origin, dir, ext);
   float tn = max(hit.x, 0.0), tf_ = hit.y;
   if (tn >= tf_) {
     out_image[tid.xy] = float4(0.02, 0.02, 0.03, 1); // background
@@ -67,7 +113,6 @@ void main(uint3 tid: SV_DispatchThreadID) {
 
   // ray-cone footprint: pixel angular size (cam_up is pre-scaled by tan(fov/2))
   float cone = 2.0 * length(pc.cam_up) / float(pc.viewport.y);
-  float max_lod = min(pc.max_mip, float(levels - 1));
 
   float dt = pc.step_voxels * voxel;
   float jitter = hash12(tid.xy, pc.frame_index);
@@ -91,19 +136,19 @@ void main(uint3 tid: SV_DispatchThreadID) {
     float lod_step = exp2(lod); /* continuous: fractional lod still widens dt */
     float3 p = pc.cam_origin + t * dir;
 
-    float v = volume.SampleLevel(p, lod);
+    float v = vol_sample(p, lod);
     bool cut = v < pc.threshold; // low-cut: below-threshold voxels are void
     if (cut) v = 0.0;
 
-    // empty-space skip, checked only where the fine sample is already void so
-    // dense marching pays nothing: if the whole (dilated) 8^3 block max is
-    // below the gate, leap to the block exit instead of stepping through it.
-    if (v < occ_gate && occ.SampleLevel(p, 0) < occ_gate) {
+    // empty-space skip (cube mode; slab occ is a dummy full texture), checked
+    // only where the fine sample is already void so dense marching pays nothing
+    if (!is_slab() && v < occ_gate && occ.SampleLevel(p, 0) < occ_gate) {
       float3 nextp = (floor(p / bs) + max(sign(dir), float3(0))) * bs;
       float3 tex = select(abs(dir) > 1e-8, (nextp - pc.cam_origin) / dir, float3(1e30));
       t = max(min(min(tex.x, tex.y), tex.z), t) + bs * 0.01;
       continue;
     }
+
     if (v > mip_max) mip_max = v;
     if (pc.mode == MODE_MIP && mip_max >= 0.999) break; // saturated: nothing to gain
     if (first_hit < 0.0 && v > 0.05) first_hit = t;
@@ -116,11 +161,11 @@ void main(uint3 tid: SV_DispatchThreadID) {
         float3 col = s.rgb;
         if (shaded) {
           // gradient-modulated Blinn-Phong; homogeneous regions stay unshaded
-          float e = voxel * exp2(floor(lod));
+          float e = voxel * lod_step;
           float3 g = float3(
-              volume.SampleLevel(p + float3(e, 0, 0), lod) - volume.SampleLevel(p - float3(e, 0, 0), lod),
-              volume.SampleLevel(p + float3(0, e, 0), lod) - volume.SampleLevel(p - float3(0, e, 0), lod),
-              volume.SampleLevel(p + float3(0, 0, e), lod) - volume.SampleLevel(p - float3(0, 0, e), lod));
+              vol_sample(p + float3(e, 0, 0), lod) - vol_sample(p - float3(e, 0, 0), lod),
+              vol_sample(p + float3(0, e, 0), lod) - vol_sample(p - float3(0, e, 0), lod),
+              vol_sample(p + float3(0, 0, e), lod) - vol_sample(p - float3(0, 0, e), lod));
           float gm = length(g);
           if (gm > 1e-4) {
             float3 n = g / gm;

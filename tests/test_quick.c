@@ -8,6 +8,7 @@
 
 #include "core/camera.h"
 #include "core/mathx.h"
+#include "core/slab.h"
 #include "core/transfer.h"
 #include "core/volume.h"
 
@@ -117,8 +118,56 @@ static void test_transfer(void) {
   CHECK(lut[100][3] >= lut[60][3]);
 }
 
+static void test_slab(void) {
+  r3d_slab_layout l;
+  /* small cube: single tile */
+  CHECK(r3d_slab_layout_init(&l, 1024, 1024, 1024, 32) == 0);
+  CHECK(l.gx == 1 && l.gy == 1 && l.px == 1024 && l.py == 1024);
+  CHECK(r3d_slab_tile_w(&l) == 1026);
+  CHECK(r3d_slab_z0_max(&l) == 992);
+  /* wide: 2x2 grid */
+  CHECK(r3d_slab_layout_init(&l, 4092, 4092, 192, 32) == 0);
+  CHECK(l.gx == 2 && l.gy == 2 && l.px == 2046 && r3d_slab_tile_w(&l) == 2048);
+  /* too wide */
+  CHECK(r3d_slab_layout_init(&l, 4093, 1024, 192, 32) == -1);
+  /* bad ring */
+  CHECK(r3d_slab_layout_init(&l, 1024, 1024, 16, 32) == -1);
+
+  /* apron source mapping: tile 0 col 0 clamps to world 0; col 1 = world 0;
+   * tile 1 col 0 duplicates world px-1 (tile 0's last payload col) */
+  CHECK(r3d_slab_layout_init(&l, 4092, 4092, 192, 32) == 0);
+  CHECK(r3d_slab_src_col(&l, 0, 0) == 0);
+  CHECK(r3d_slab_src_col(&l, 0, 1) == 0);
+  CHECK(r3d_slab_src_col(&l, 0, 2) == 1);
+  CHECK(r3d_slab_src_col(&l, 0, 2047) == 2046); /* tile0 apron = tile1 col 0 */
+  CHECK(r3d_slab_src_col(&l, 1, 0) == 2045);    /* tile1 apron = tile0 last */
+  CHECK(r3d_slab_src_col(&l, 1, 1) == 2046);
+  CHECK(r3d_slab_src_col(&l, 1, 2047) == 4091); /* clamped at volume edge */
+
+  /* ring layers wrap */
+  CHECK(r3d_slab_ring_layer(&l, 0) == 0);
+  CHECK(r3d_slab_ring_layer(&l, 31) == 31);
+  CHECK(r3d_slab_ring_layer(&l, 32) == 0);
+  CHECK(r3d_slab_ring_layer(&l, 100) == 100 % 32);
+
+  /* scroll ranges */
+  uint32_t s0, s1;
+  int full;
+  r3d_slab_scroll_range(&l, -1, 0, &s0, &s1, &full); /* first upload */
+  CHECK(full == 1 && s0 == 0 && s1 == 32);
+  r3d_slab_scroll_range(&l, 10, 13, &s0, &s1, &full); /* +3 deeper */
+  CHECK(full == 0 && s0 == 42 && s1 == 45);
+  r3d_slab_scroll_range(&l, 13, 10, &s0, &s1, &full); /* -3 back */
+  CHECK(full == 0 && s0 == 10 && s1 == 13);
+  r3d_slab_scroll_range(&l, 10, 10, &s0, &s1, &full); /* no-op */
+  CHECK(full == 0 && s0 == s1);
+  r3d_slab_scroll_range(&l, 10, 100, &s0, &s1, &full); /* jump */
+  CHECK(full == 1 && s0 == 100 && s1 == 132);
+}
+
 int main(void) {
   test_mathx();
+  test_slab();
   test_volume();
   test_camera();
   test_orbit();
