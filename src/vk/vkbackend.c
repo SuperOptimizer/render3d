@@ -52,6 +52,7 @@ struct r3d_renderer {
   /* bricks mode (c5d GPU-decoded atlas) */
   r3d_vkc5d *c5d;
   r3d_vkimage brick_atlas;
+  VkImageView brick_atlas_mip0; /* single-mip storage view for the pack kernel */
   r3d_vkbuf page_buf;
   uint32_t bricks_bpa, bricks_abpa;
 
@@ -592,6 +593,7 @@ void r3d_destroy(r3d_renderer *r) {
   if (r->dsl) vkDestroyDescriptorSetLayout(r->vk.dev, r->dsl, NULL);
   r3d_vkclip_destroy(r->clipm);
   r3d_vkc5d_destroy(r->c5d);
+  if (r->brick_atlas_mip0) vkDestroyImageView(r->vk.dev, r->brick_atlas_mip0, NULL);
   r3d_vkimage_destroy(&r->vk, &r->brick_atlas);
   r3d_vkbuf_destroy(&r->vk, &r->page_buf);
   if (r->samp_vol) vkDestroySampler(r->vk.dev, r->samp_vol, NULL);
@@ -980,17 +982,27 @@ int r3d_bricks_begin(r3d_renderer *r, const char *c5s_path) {
   uint32_t abpa = bpa; /* v1: all bricks resident, atlas mirrors the shard */
   uint32_t adim = abpa * 128;
 
-  if (r3d_vkimage_create(&r->vk, VK_FORMAT_R8_UNORM, (VkExtent3D){adim, adim, adim}, 1,
-                         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+  const uint32_t amips = 4; /* 128 -> 16 per brick; far-field sampling relief */
+  if (r3d_vkimage_create(&r->vk, VK_FORMAT_R8_UNORM, (VkExtent3D){adim, adim, adim}, amips,
+                         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                             VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                          &r->brick_atlas) != 0) {
     c5d_shard_close_reader(&sr);
     return -1;
   }
+  VkImageViewCreateInfo m0v = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+      .image = r->brick_atlas.img,
+      .viewType = VK_IMAGE_VIEW_TYPE_3D,
+      .format = VK_FORMAT_R8_UNORM,
+      .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+  };
+  if (vkCreateImageView(r->vk.dev, &m0v, NULL, &r->brick_atlas_mip0) != VK_SUCCESS) return -1;
   VkCommandBuffer cmd = r3d_vk_oneshot_begin(&r->vk, r->pool);
   r3d_vk_image_barrier(cmd, r->brick_atlas.img, VK_IMAGE_LAYOUT_UNDEFINED,
                        VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0,
                        VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-                       VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT, 0, 1);
+                       VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT, 0, amips);
   if (r3d_vk_oneshot_end(&r->vk, r->pool, cmd) != 0) return -1;
 
   if (r3d_vkc5d_create(&r->c5d, &r->vk, r->cfg.spv_dir, 8) != 0) return -1;
@@ -1012,7 +1024,7 @@ int r3d_bricks_begin(r3d_renderer *r, const char *c5s_path) {
   printf("bricks: decoding %u/%u bricks on GPU (%s)...\n", np, nb,
          getenv("R3D_C5D_HYBRID") ? "hybrid" : "full-GPU");
   uint64_t t0 = now_ns();
-  int rc = r3d_vkc5d_decode(r->c5d, srcs, np, r->brick_atlas.view, maxes);
+  int rc = r3d_vkc5d_decode(r->c5d, srcs, np, r->brick_atlas_mip0, maxes);
   double ms = (double)(now_ns() - t0) / 1e6;
   if (rc != 0) {
     fprintf(stderr, "bricks: GPU decode failed\n");
@@ -1020,6 +1032,44 @@ int r3d_bricks_begin(r3d_renderer *r, const char *c5s_path) {
   }
   printf("bricks: decoded %u bricks in %.0f ms (%.0f bricks/s, %.2f GB/s raw)\n", np, ms,
          (double)np * 1000.0 / ms, (double)np * 2.097152 / ms);
+
+  /* mip chain (whole-atlas blits; shader insets its sampling by 0.5*2^lod
+   * texels so cross-slot bleed at coarse mips is never read) */
+  cmd = r3d_vk_oneshot_begin(&r->vk, r->pool);
+  uint32_t md = adim;
+  for (uint32_t m = 1; m < amips; m++) {
+    uint32_t nd = md / 2;
+    VkImageBlit2 blit = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_BLIT_2,
+        .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, m - 1, 0, 1},
+        .srcOffsets = {{0, 0, 0}, {(int32_t)md, (int32_t)md, (int32_t)md}},
+        .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, m, 0, 1},
+        .dstOffsets = {{0, 0, 0}, {(int32_t)nd, (int32_t)nd, (int32_t)nd}},
+    };
+    VkBlitImageInfo2 bi2 = {
+        .sType = VK_STRUCTURE_TYPE_BLIT_IMAGE_INFO_2,
+        .srcImage = r->brick_atlas.img,
+        .srcImageLayout = VK_IMAGE_LAYOUT_GENERAL,
+        .dstImage = r->brick_atlas.img,
+        .dstImageLayout = VK_IMAGE_LAYOUT_GENERAL,
+        .regionCount = 1,
+        .pRegions = &blit,
+        .filter = VK_FILTER_LINEAR,
+    };
+    vkCmdBlitImage2(cmd, &bi2);
+    r3d_vk_image_barrier(cmd, r->brick_atlas.img, VK_IMAGE_LAYOUT_GENERAL,
+                         VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_BLIT_BIT,
+                         VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_BLIT_BIT,
+                         VK_ACCESS_2_TRANSFER_READ_BIT, m, 1);
+    md = nd;
+  }
+  /* fill complete: the atlas is only sampled from here on. READ_ONLY_OPTIMAL
+   * (vs GENERAL) lets the driver keep bandwidth compression on the tiler. */
+  r3d_vk_image_barrier(cmd, r->brick_atlas.img, VK_IMAGE_LAYOUT_GENERAL,
+                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_BLIT_BIT,
+                       VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                       VK_ACCESS_2_SHADER_SAMPLED_READ_BIT, 0, amips);
+  if (r3d_vk_oneshot_end(&r->vk, r->pool, cmd) != 0) return -1;
 
   /* page table */
   r3d_vkbuf_destroy(&r->vk, &r->page_buf);
@@ -1037,7 +1087,7 @@ int r3d_bricks_begin(r3d_renderer *r, const char *c5s_path) {
 
   vkDeviceWaitIdle(r->vk.dev);
   write_image_dset(r, 4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, r->brick_atlas.view,
-                   r->samp_vol, VK_IMAGE_LAYOUT_GENERAL);
+                   r->samp_vol, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
   VkDescriptorBufferInfo pbi = {.buffer = r->page_buf.buf, .range = VK_WHOLE_SIZE};
   VkWriteDescriptorSet pw = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
                              .dstSet = r->dset,

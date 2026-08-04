@@ -228,3 +228,21 @@ now FASTER than hybrid (4.8 s) — compressed-bytes-to-GPU wins as intended.
 Gap to upstream's 2.35 GB/s streaming bench = their 3-deep pipelined
 submission vs our serial batch+fence fills; follow-up when fills need to
 be interactive (streaming residency milestone).
+
+## 2026-08-04 — bricks-mode optimization pass (release, 1080p uncapped)
+
+Baselines: exterior 10.7 ms, orbit 19.2, close/dense 58.9 (vs cube ~17).
+1. Atlas mip chain (4 levels, whole-atlas blits; sampling inset grows
+   0.5*2^lod texels so coarse mips never bleed across slots) + lod-aware
+   fetch: exterior 10.7 -> 4.6, close 58.9 -> 32.6.
+2. Atlas SHADER_READ_ONLY_OPTIMAL after fill: no measurable change on
+   Turnip (kept — correct for drivers where GENERAL defeats compression).
+3. Brick-context caching across marcher steps (page resolve only on brick
+   crossings; gradient taps reuse slot+local coords): close 32.6 -> 25.7,
+   exterior -> 4.05.
+Net: exterior 2.6x, close 2.3x; default-720p worst view ~11 ms -> 60 fps.
+Bricks-mode diff vs cube render improved 0.875 -> 0.317 mean LSB (mips
+filter like cube's now). Remaining gap vs cube on dense interiors
+(25.7 vs ~17 @1080p): cube's 8^3 occupancy skips intra-brick gaps; bricks
+skip is 128^3-granular. Proper fix = hierarchical occupancy in the page
+table — belongs to the streaming-residency milestone.
