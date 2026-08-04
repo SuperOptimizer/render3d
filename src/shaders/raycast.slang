@@ -176,8 +176,12 @@ void main(uint3 tid: SV_DispatchThreadID) {
     max_lod = min(pc.max_mip, float(levels - 1));
   }
   float3 ext = vol_extent();
+  /* move the ray into volume space: the model transform rotates the box about
+   * its center and translates it; marching/shading all happen in this space */
+  float3 ro = to_volume_point(pc.cam_origin, ext * 0.5);
+  dir = to_volume_dir(dir);
 
-  float2 hit = box_hit(pc.cam_origin, dir, ext);
+  float2 hit = box_hit(ro, dir, ext);
   float tn = max(hit.x, 0.0), tf_ = hit.y;
   if (tn >= tf_) {
     out_image[tid.xy] = float4(0.02, 0.02, 0.03, 1); // background
@@ -209,7 +213,7 @@ void main(uint3 tid: SV_DispatchThreadID) {
     float lod_step = exp2(lod); /* continuous: fractional lod still widens dt */
     if (is_slab() || is_clip()) // keep >=4 samples along THIS ray's box segment
       lod_step = min(lod_step, max(1.0, (tf_ - tn) / (4.0 * dt)));
-    float3 p = pc.cam_origin + t * dir;
+    float3 p = ro + t * dir;
 
     int cl_lvl = -1; // clip: pick the level once; gradient taps reuse it
     float v;
@@ -226,7 +230,7 @@ void main(uint3 tid: SV_DispatchThreadID) {
     // only where the fine sample is already void so dense marching pays nothing
     if (!is_slab() && v < occ_gate && occ.SampleLevel(p, 0) < occ_gate) {
       float3 nextp = (floor(p / bs) + max(sign(dir), float3(0))) * bs;
-      float3 tex = select(abs(dir) > 1e-8, (nextp - pc.cam_origin) / dir, float3(1e30));
+      float3 tex = select(abs(dir) > 1e-8, (nextp - ro) / dir, float3(1e30));
       t = max(min(min(tex.x, tex.y), tex.z), t) + bs * 0.01;
       continue;
     }

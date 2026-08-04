@@ -21,7 +21,22 @@ struct FrameParams {
   // clip mode; clip_valid == 0 selects slab/cube (see render_types.h notes)
   uint clip_valid;                           // bit L set = level filled
   float2 clip_orig[6];                       // world voxel of payload texel (0,0)
+  // model (volume) transform: rows of R packed with the translation
+  // (scalars: float3 would 16-align and break the C mirror)
+  float vol_r00, vol_r01, vol_r02, vol_tx;
+  float vol_r10, vol_r11, vol_r12, vol_ty;
+  float vol_r20, vol_r21, vol_r22, vol_tz;
 };
+
+// world -> volume space (R^T rotate about the box center, minus translation)
+float3 to_volume_dir(float3 d) {
+  return float3(dot(float3(pc.vol_r00, pc.vol_r10, pc.vol_r20), d),
+                dot(float3(pc.vol_r01, pc.vol_r11, pc.vol_r21), d),
+                dot(float3(pc.vol_r02, pc.vol_r12, pc.vol_r22), d));
+}
+float3 to_volume_point(float3 p, float3 center) {
+  return to_volume_dir(p - float3(pc.vol_tx, pc.vol_ty, pc.vol_tz) - center) + center;
+}
 
 [[vk::push_constant]] FrameParams pc;
 

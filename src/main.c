@@ -61,6 +61,7 @@ int main(int argc, char **argv) {
   bool no_vsync = false;
   float lowcut0 = 0.0f;
   const char *bench = NULL; /* scripted camera path: orbit | zoom | fly */
+  float volpos0[3] = {0, 0, 0}, volrot0[3] = {0, 0, 0};
   uint32_t slab_wz = 0;     /* nonzero = slab mode, max visible depth */
   int depth0 = 0;           /* initial visible depth (default = max) */
   bool clip_mode = false;   /* clipmap over the shard band */
@@ -78,6 +79,10 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "--no-vsync") == 0) no_vsync = true;
     if (i < argc - 1 && strcmp(argv[i], "--lowcut") == 0) lowcut0 = (float)atof(argv[i + 1]);
     if (i < argc - 1 && strcmp(argv[i], "--bench") == 0) bench = argv[i + 1];
+    if (i < argc - 3 && strcmp(argv[i], "--volpos") == 0)
+      for (int k = 0; k < 3; k++) volpos0[k] = (float)atof(argv[i + 1 + k]);
+    if (i < argc - 3 && strcmp(argv[i], "--volrot") == 0)
+      for (int k = 0; k < 3; k++) volrot0[k] = (float)atof(argv[i + 1 + k]) / 57.29578f;
     if (i < argc - 1 && strcmp(argv[i], "--depth") == 0) depth0 = atoi(argv[i + 1]);
     if (strcmp(argv[i], "--clipmap") == 0) clip_mode = true;
     if (strcmp(argv[i], "--slab") == 0) {
@@ -196,6 +201,11 @@ int main(int argc, char **argv) {
   int slab_depth = depth0 >= 2 && depth0 <= (int)slab_wz ? depth0 : (int)slab_wz;
   int clip_depth = depth0 >= 2 && depth0 <= (int)CLIP_DEPTH_MAX ? depth0 : (int)CLIP_DEPTH_MAX;
   uint32_t clip_valid_disp = 0;
+
+  /* volume (model) transform: translation in world units, rotation ypr */
+  r3d_v3 vol_t = v3(volpos0[0], volpos0[1], volpos0[2]);
+  float vol_rot[3] = {volrot0[0], volrot0[1], volrot0[2]}; /* yaw, pitch, roll (radians) */
+  float fov_deg = 60.0f;
   uint32_t tf_idx = tf_preset > 0 ? (uint32_t)tf_preset : 0;
   uint32_t frame_index = 0;
   float fps_smooth = 60.0f;
@@ -265,10 +275,27 @@ int main(int argc, char **argv) {
     step_voxels *= in.step_scale;
     density *= in.density_scale;
     lod_bias += in.lod_delta;
+    cam.fov_y = fov_deg * 0.01745329f;
     if (cam_mode == CAM_ORBIT) {
-      /* drag "grabs" the cube: drag right spins it right, wheel zooms, WASD pans */
-      if (in.dragging)
+      /* drag grabs the cube; Shift pans the camera; Ctrl translates the
+       * volume; Ctrl+Shift rotates the volume */
+      if (in.dragging && (in.ctrl || in.fast)) {
+        r3d_v3 br, bu, bf;
+        r3d_camera_basis(&cam, 1.0f, &br, &bu, &bf);
+        r3d_v3 ru = v3_norm(br), uu = v3_norm(bu);
+        float k = cam.dist * 0.0012f;
+        if (in.ctrl && in.fast) { /* rotate volume */
+          vol_rot[0] += in.look[0] * ORBIT_SENS;
+          vol_rot[1] += in.look[1] * ORBIT_SENS;
+        } else if (in.ctrl) { /* translate volume in the view plane */
+          vol_t = v3_add(vol_t, v3_add(v3_scale(ru, in.look[0] * k),
+                                       v3_scale(uu, -in.look[1] * k)));
+        } else { /* pan camera (grab-the-world) */
+          r3d_camera_orbit_pan(&cam, v3(-in.look[0], in.look[1], 0), k);
+        }
+      } else if (in.dragging) {
         r3d_camera_orbit_drag(&cam, -in.look[0] * ORBIT_SENS, -in.look[1] * ORBIT_SENS);
+      }
       if (in.wheel != 0.0f && !io->WantCaptureMouse)
         r3d_camera_orbit_zoom(&cam, powf(0.9f, in.wheel));
       float pan = BASE_SPEED * cam.dist * (in.fast ? 5.0f : 1.0f);
@@ -361,6 +388,27 @@ int main(int argc, char **argv) {
              (clip_valid_disp & 32) ? " L5" : "");
     }
     igSliderFloat("lod bias", &lod_bias, -2.0f, 4.0f, "%.2f", 0);
+    if (igCollapsingHeader_TreeNodeFlags("transform", 0)) {
+      float vt[3] = {vol_t.x, vol_t.y, vol_t.z};
+      if (igDragFloat3("volume pos", vt, 0.002f, -4.0f, 4.0f, "%.3f", 0))
+        vol_t = v3(vt[0], vt[1], vt[2]);
+      float vr[3] = {vol_rot[0] * 57.29578f, vol_rot[1] * 57.29578f, vol_rot[2] * 57.29578f};
+      if (igDragFloat3("volume rot (ypr)", vr, 0.5f, -180.0f, 180.0f, "%.1f", 0))
+        for (int k = 0; k < 3; k++) vol_rot[k] = vr[k] / 57.29578f;
+      if (igButton("reset volume", (ImVec2){0, 0})) {
+        vol_t = v3(0, 0, 0);
+        vol_rot[0] = vol_rot[1] = vol_rot[2] = 0.0f;
+      }
+      igSeparator();
+      float ct[3] = {cam.target.x, cam.target.y, cam.target.z};
+      if (igDragFloat3("cam target", ct, 0.002f, -4.0f, 4.0f, "%.3f", 0) &&
+          cam_mode == CAM_ORBIT)
+        r3d_camera_orbit_set(&cam, v3(ct[0], ct[1], ct[2]), cam.dist);
+      if (igDragFloat("cam dist", &cam.dist, 0.005f, 0.02f, 20.0f, "%.3f", 0) &&
+          cam_mode == CAM_ORBIT)
+        r3d_camera_orbit_set(&cam, cam.target, cam.dist);
+      igSliderFloat("fov", &fov_deg, 20.0f, 120.0f, "%.0f°", 0);
+    }
     igText("cam (%.2f %.2f %.2f) yaw %.2f pitch %.2f", (double)cam.pos.x, (double)cam.pos.y,
            (double)cam.pos.z, (double)cam.yaw, (double)cam.pitch);
     if (igCollapsingHeader_TreeNodeFlags("profile", 0)) {
@@ -374,7 +422,8 @@ int main(int argc, char **argv) {
       igText("cpu submit  %6.2f ms", (double)prof.cpu_submit_ns / 1e6);
     }
     if (cam_mode == CAM_ORBIT)
-      igTextDisabled("drag: rotate   wheel: zoom   WASD: pan   F12: shot");
+      igTextDisabled("drag orbit | shift+drag pan cam | ctrl+drag move vol\n"
+                     "ctrl+shift+drag rot vol | wheel zoom | WASD pan | F12 shot");
     else
       igTextDisabled("click: fly (Esc releases)   WASD+QE: move   F12: shot");
     igEnd();
@@ -393,17 +442,28 @@ int main(int argc, char **argv) {
         .frame_index = frame_index++,
         .threshold = low_cut / 255.0f,
     };
+    r3d_m3 vm = m3_ypr(vol_rot[0], vol_rot[1], vol_rot[2]);
+    memcpy(p.vol_r0, &vm.r0, 12);
+    memcpy(p.vol_r1, &vm.r1, 12);
+    memcpy(p.vol_r2, &vm.r2, 12);
+    p.vol_tx = vol_t.x;
+    p.vol_ty = vol_t.y;
+    p.vol_tz = vol_t.z;
     if (slab_wz) {
       r3d_slab_params(renderer, &p);
       p.slab_depth = (uint32_t)slab_depth;
     }
     if (clip_mode) {
-      /* focus = where the view axis crosses the slab plane (world voxels) */
+      /* focus = where the view axis crosses the slab plane, computed in
+       * VOLUME space so it tracks the model transform */
       float ezc = (float)CLIP_DEPTH_MAX / (float)CLIP_NX * 0.5f;
-      float tt = fwd.z != 0.0f ? (ezc - cam.pos.z) / fwd.z : 0.0f;
+      r3d_v3 vc = v3(0.5f, 0.5f, ezc);
+      r3d_v3 vo = v3_add(m3_tmul(vm, v3_sub(v3_sub(cam.pos, vol_t), vc)), vc);
+      r3d_v3 vd = m3_tmul(vm, fwd);
+      float tt = vd.z != 0.0f ? (ezc - vo.z) / vd.z : 0.0f;
       if (tt < 0.0f) tt = 0.0f;
-      double fx = (double)(cam.pos.x + fwd.x * tt) * CLIP_NX;
-      double fy = (double)(cam.pos.y + fwd.y * tt) * CLIP_NX;
+      double fx = (double)(vo.x + vd.x * tt) * CLIP_NX;
+      double fy = (double)(vo.y + vd.y * tt) * CLIP_NX;
       if (fx < 0) fx = 0;
       if (fy < 0) fy = 0;
       if (fx > CLIP_NX) fx = CLIP_NX;

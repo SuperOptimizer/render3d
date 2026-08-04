@@ -165,3 +165,13 @@ chunk-cache would cut recenter to ~60 ms).
 
 Scaling: architecture handles the full 68608-slice volume once more bands are
 fetched; textures stay 6×~150 MB regardless of extent.
+
+## 2026-08-04 — model transform + camera controls
+
+Volume (model) transform in push constants (R rows + translation, scalars to
+dodge std430 float3 16-alignment; 216 B total, device max 256 checked at clip
+init). Rays transformed world->volume once per pixel; works in cube/slab/clip;
+clip focus intersection done in volume space. Identity transform keeps the
+gpu conformance test bit-stable. Gestures: drag=orbit, shift=pan camera,
+ctrl=translate volume, ctrl+shift=rotate volume; GUI numeric transform
+section + fov; --volpos/--volrot for headless runs.

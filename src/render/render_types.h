@@ -52,8 +52,13 @@ typedef struct r3d_frame_params {
    * (max depth -> per-level ring size), slab_depth (visible depth). */
   uint32_t clip_valid;    /* bit ℓ set = level ℓ filled and sampleable */
   float clip_orig[6][2];  /* world voxel of payload texel (0,0) per level */
+  /* model (volume) transform: rays are moved into volume space by
+   * p_v = R^T (p_w - vol_t - c) + c with c = extent/2. Rows of R here. */
+  float vol_r0[3]; float vol_tx;
+  float vol_r1[3]; float vol_ty;
+  float vol_r2[3]; float vol_tz;
 } r3d_frame_params;
-static_assert(sizeof(r3d_frame_params) == 168, "must mirror shader FrameParams");
+static_assert(sizeof(r3d_frame_params) == 216, "must mirror shader FrameParams");
 
 typedef struct r3d_frame_stats {
   /* GPU zones from timestamp queries (0 if unsupported); lag 2 frames */

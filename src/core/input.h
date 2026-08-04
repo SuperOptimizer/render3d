@@ -14,6 +14,7 @@ typedef struct r3d_input {
   float move[3];     /* right, up, forward in -1..1 (WASD + Q/E) */
   float look[2];     /* accumulated mouse delta this frame (pixels) */
   bool fast;         /* shift held */
+  bool ctrl;         /* ctrl held (volume-transform drag modifier) */
   int mode_delta;    /* Tab cycles debug mode */
   int tf_delta;      /* T cycles transfer-function preset */
   float step_scale;  /* '['=×1.25 ']'=×0.8, 1.0 otherwise */
