@@ -63,6 +63,7 @@ int main(int argc, char **argv) {
   const char *bench = NULL; /* scripted camera path: orbit | zoom | fly */
   uint32_t slab_wz = 0;     /* nonzero = slab mode, max visible depth */
   int depth0 = 0;           /* initial visible depth (default = max) */
+  bool clip_mode = false;   /* clipmap over the shard band */
   for (int i = 1; i < argc; i++) {
     if (i < argc - 1 && strcmp(argv[i], "--frames") == 0) exit_frames = (uint32_t)atoi(argv[i + 1]);
     if (i < argc - 1 && strcmp(argv[i], "--shot") == 0) shot_path = argv[i + 1];
@@ -78,6 +79,7 @@ int main(int argc, char **argv) {
     if (i < argc - 1 && strcmp(argv[i], "--lowcut") == 0) lowcut0 = (float)atof(argv[i + 1]);
     if (i < argc - 1 && strcmp(argv[i], "--bench") == 0) bench = argv[i + 1];
     if (i < argc - 1 && strcmp(argv[i], "--depth") == 0) depth0 = atoi(argv[i + 1]);
+    if (strcmp(argv[i], "--clipmap") == 0) clip_mode = true;
     if (strcmp(argv[i], "--slab") == 0) {
       slab_wz = 32;
       if (i < argc - 1 && argv[i + 1][0] >= '0' && argv[i + 1][0] <= '9')
@@ -138,6 +140,18 @@ int main(int argc, char **argv) {
     fprintf(stderr, "--slab needs a volume argument\n");
     return EXIT_FAILURE;
   }
+
+  /* clipmap: 43k^2 cross sections from the shard band + pyramid */
+  const uint32_t CLIP_NX = 43008, CLIP_BAND_Z = 33, CLIP_DEPTH_MAX = 32;
+  uint64_t clip_z0 = 0, clip_z0_min = 0, clip_z0_max = 0;
+  if (clip_mode) {
+    if (r3d_clip_begin(renderer, "band", "pyramid", CLIP_BAND_Z, CLIP_DEPTH_MAX) != 0)
+      return EXIT_FAILURE;
+    clip_z0_min = (uint64_t)CLIP_BAND_Z * 1024;
+    clip_z0_max = clip_z0_min + 1024 - CLIP_DEPTH_MAX;
+    clip_z0 = clip_z0_min + 512 - CLIP_DEPTH_MAX / 2;
+    mode = R3D_MODE_FULL;
+  }
   if (force_mode >= 0) mode = (uint32_t)force_mode % R3D_MODE_COUNT;
   if (tf_preset >= 0) {
     r3d_tf tf;
@@ -158,7 +172,10 @@ int main(int argc, char **argv) {
   cam.yaw = cam0[3];
   cam.pitch = cam0[4];
   if (cam_mode == CAM_ORBIT) {
-    if (slab_wz) {
+    if (clip_mode) {
+      float ez = (float)CLIP_DEPTH_MAX / (float)CLIP_NX;
+      r3d_camera_orbit_set(&cam, v3(0.5f, 0.5f, ez * 0.5f), 1.3f);
+    } else if (slab_wz) {
       /* orbit the thin slab: target its center, sit back along z */
       float ey = (float)slab_src.ny / (float)slab_src.nx;
       float ez = (float)slab_wz / (float)slab_src.nx;
@@ -177,6 +194,8 @@ int main(int argc, char **argv) {
   float auto_speed = 10.0f; /* slices per second */
   float auto_accum = 0.0f;
   int slab_depth = depth0 >= 2 && depth0 <= (int)slab_wz ? depth0 : (int)slab_wz;
+  int clip_depth = depth0 >= 2 && depth0 <= (int)CLIP_DEPTH_MAX ? depth0 : (int)CLIP_DEPTH_MAX;
+  uint32_t clip_valid_disp = 0;
   uint32_t tf_idx = tf_preset > 0 ? (uint32_t)tf_preset : 0;
   uint32_t frame_index = 0;
   float fps_smooth = 60.0f;
@@ -203,6 +222,12 @@ int main(int argc, char **argv) {
     if (in.mode_delta) {
       mode = (mode + (uint32_t)in.mode_delta) % R3D_MODE_COUNT;
       printf("mode: %u\n", mode);
+    }
+    if (clip_mode) {
+      int64_t nz0 = (int64_t)clip_z0 + in.zdelta + (int64_t)in.zpage * (int64_t)clip_depth;
+      if (nz0 < (int64_t)clip_z0_min) nz0 = (int64_t)clip_z0_min;
+      if (nz0 > (int64_t)clip_z0_max) nz0 = (int64_t)clip_z0_max;
+      clip_z0 = (uint64_t)nz0;
     }
     if (slab_wz) {
       int64_t nz0 = (int64_t)slab_z0 + in.zdelta + (int64_t)in.zpage * (int64_t)slab_depth;
@@ -280,6 +305,10 @@ int main(int argc, char **argv) {
                      -0.3f + 1.6f * ph);
         cam.yaw = 0.15f * sinf(ph * tau);
         cam.pitch = 0.1f * cosf(ph * tau);
+      } else if (strcmp(bench, "clippan") == 0) { /* sweep across the cross-section */
+        cam.pos = v3(0.25f + 0.5f * ph, 0.5f, -0.02f);
+        cam.yaw = 0.0f;
+        cam.pitch = 0.0f;
       } /* other bench names (zsweep) keep the default camera */
     }
     r3d_v3 right, up, fwd;
@@ -321,6 +350,16 @@ int main(int argc, char **argv) {
       igSameLine(0, 10);
       igSliderFloat("slices/s", &auto_speed, -60.0f, 60.0f, "%.0f", 0);
     }
+    if (clip_mode) {
+      igSliderInt("depth (voxels)", &clip_depth, 2, (int)CLIP_DEPTH_MAX, "%d", 0);
+      int z0i = (int)(clip_z0 - clip_z0_min);
+      if (igSliderInt("z position", &z0i, 0, (int)(clip_z0_max - clip_z0_min), "%d", 0))
+        clip_z0 = clip_z0_min + (uint64_t)z0i;
+      igText("levels ready:%s%s%s%s%s%s", (clip_valid_disp & 1) ? " L0" : "",
+             (clip_valid_disp & 2) ? " L1" : "", (clip_valid_disp & 4) ? " L2" : "",
+             (clip_valid_disp & 8) ? " L3" : "", (clip_valid_disp & 16) ? " L4" : "",
+             (clip_valid_disp & 32) ? " L5" : "");
+    }
     igSliderFloat("lod bias", &lod_bias, -2.0f, 4.0f, "%.2f", 0);
     igText("cam (%.2f %.2f %.2f) yaw %.2f pitch %.2f", (double)cam.pos.x, (double)cam.pos.y,
            (double)cam.pos.z, (double)cam.yaw, (double)cam.pitch);
@@ -357,6 +396,24 @@ int main(int argc, char **argv) {
     if (slab_wz) {
       r3d_slab_params(renderer, &p);
       p.slab_depth = (uint32_t)slab_depth;
+    }
+    if (clip_mode) {
+      /* focus = where the view axis crosses the slab plane (world voxels) */
+      float ezc = (float)CLIP_DEPTH_MAX / (float)CLIP_NX * 0.5f;
+      float tt = fwd.z != 0.0f ? (ezc - cam.pos.z) / fwd.z : 0.0f;
+      if (tt < 0.0f) tt = 0.0f;
+      double fx = (double)(cam.pos.x + fwd.x * tt) * CLIP_NX;
+      double fy = (double)(cam.pos.y + fwd.y * tt) * CLIP_NX;
+      if (fx < 0) fx = 0;
+      if (fy < 0) fy = 0;
+      if (fx > CLIP_NX) fx = CLIP_NX;
+      if (fy > CLIP_NX) fy = CLIP_NX;
+      p.slab_depth = (uint32_t)clip_depth;
+      if (r3d_clip_frame(renderer, fx, fy, clip_z0, &p) != 0) running = false;
+      if (p.clip_valid != clip_valid_disp)
+        printf("clip: valid=0x%02x z0=%llu focus=(%.0f,%.0f)\n", p.clip_valid,
+               (unsigned long long)clip_z0, fx, fy);
+      clip_valid_disp = p.clip_valid;
     }
     r3d_frame_stats st = {0};
     int frc = r3d_frame(renderer, &p, &st);

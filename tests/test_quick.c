@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include "core/camera.h"
+#include "core/clip.h"
 #include "core/mathx.h"
 #include "core/slab.h"
 #include "core/transfer.h"
@@ -170,9 +171,39 @@ static void test_slab(void) {
   CHECK(full == 1 && s0 == 100 && s1 == 132);
 }
 
+static void test_clip(void) {
+  r3d_clip c;
+  r3d_clip_init(&c, 43008, 43008, 68608, 32, 21504, 21504);
+  CHECK(c.lv[0].s == 1 && c.lv[5].s == 32);
+  CHECK(r3d_clip_coverage(&c, 0) == 2046);
+  CHECK(r3d_clip_coverage(&c, 5) == 65472); /* > whole 43k cross-section */
+  /* ring depths: window/s + 3, min 4 */
+  CHECK(c.lv[0].wzl == 35 && c.lv[3].wzl == 7 && c.lv[5].wzl == 4);
+  /* origins snapped to 16*s and centered-ish on focus */
+  CHECK(c.lv[0].ox % 16 == 0 && c.lv[2].ox % 64 == 0);
+  CHECK(c.lv[0].ox <= 21504 - 900 && c.lv[0].ox >= 21504 - 1200);
+  /* L5 covers everything -> clamped to 0, never recenters */
+  CHECK(c.lv[5].ox == 0 && c.lv[5].oy == 0);
+  CHECK(!r3d_clip_need_recenter(&c, 5, 0, 0));
+  /* containment + recenter policy at L0 */
+  CHECK(r3d_clip_contains(&c, 0, 21504, 21504, 1));
+  CHECK(!r3d_clip_contains(&c, 0, 21504 + 2000, 21504, 1));
+  CHECK(!r3d_clip_need_recenter(&c, 0, 21504 + 400, 21504));
+  CHECK(r3d_clip_need_recenter(&c, 0, 21504 + 600, 21504));
+  /* recenter clamps at the volume edge */
+  r3d_clip_recenter(&c, 1, 0, 0);
+  CHECK(c.lv[1].ox == 0 && c.lv[1].oy == 0 && !c.lv[1].valid);
+  r3d_clip_recenter(&c, 1, 43008, 43008);
+  CHECK(c.lv[1].ox + (int64_t)r3d_clip_coverage(&c, 1) <= 43008);
+  /* ring layers */
+  CHECK(r3d_clip_ring_layer(&c, 0, 35) == 0);
+  CHECK(r3d_clip_ring_layer(&c, 5, 1056) == 1056 % 4);
+}
+
 int main(void) {
   test_mathx();
   test_slab();
+  test_clip();
   test_volume();
   test_camera();
   test_orbit();

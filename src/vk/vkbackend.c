@@ -10,8 +10,10 @@
 #include <string.h>
 #include <time.h>
 
+#include "core/clip.h"
 #include "core/slab.h"
 #include "render/render.h"
+#include "vk/vkclip.h"
 #include "vk/vkctx.h"
 #include "vk/vkgui.h"
 #include "vk/vkres.h"
@@ -42,6 +44,8 @@ struct r3d_renderer {
   uint8_t *slice_buf;    /* CPU assembly buffer, tile_w * tile_h bytes */
   r3d_vkimage overview;  /* whole composite at 1/4 res (anti-alias far field) */
   uint8_t *ov_buf;       /* downsampled slice, ov dims */
+
+  r3d_vkclip *clipm;     /* clipmap mode (NULL unless r3d_clip_begin) */
 
   PFN_vkTransitionImageLayoutEXT fp_transition;
   PFN_vkCopyMemoryToImageEXT fp_copy_mem;
@@ -549,6 +553,7 @@ void r3d_destroy(r3d_renderer *r) {
   if (r->raycast) vkDestroyPipeline(r->vk.dev, r->raycast, NULL);
   if (r->pipe_layout) vkDestroyPipelineLayout(r->vk.dev, r->pipe_layout, NULL);
   if (r->dsl) vkDestroyDescriptorSetLayout(r->vk.dev, r->dsl, NULL);
+  r3d_vkclip_destroy(r->clipm);
   if (r->samp_vol) vkDestroySampler(r->vk.dev, r->samp_vol, NULL);
   if (r->samp_tf) vkDestroySampler(r->vk.dev, r->samp_tf, NULL);
   if (r->samp_near) vkDestroySampler(r->vk.dev, r->samp_near, NULL);
@@ -918,6 +923,61 @@ void r3d_slab_params(const r3d_renderer *r, r3d_frame_params *p) {
   p->slab_px = (float)r->slab.px;
   p->slab_py = (float)r->slab.py;
   p->slab_depth = r->slab.wz - 2; /* max; caller may lower it per frame */
+}
+
+int r3d_clip_begin(r3d_renderer *r, const char *band_dir, const char *pyramid_dir,
+                   uint32_t band_z, uint32_t depth_max) {
+  if (!r->vk.caps.host_image_copy || !r->fp_transition || !r->fp_copy_mem) {
+    fprintf(stderr, "clip: needs VK_EXT_host_image_copy\n");
+    return -1;
+  }
+  if (r->vk.caps.max_push_bytes < sizeof(r3d_frame_params)) {
+    fprintf(stderr, "clip: push constants %zu > device max %u\n", sizeof(r3d_frame_params),
+            r->vk.caps.max_push_bytes);
+    return -1;
+  }
+  if (!r->samp_slab) { /* REPEAT-W ring sampler (shared with slab mode) */
+    VkSamplerCreateInfo smci = {
+        .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+        .magFilter = VK_FILTER_LINEAR,
+        .minFilter = VK_FILTER_LINEAR,
+        .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+        .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+    };
+    if (vkCreateSampler(r->vk.dev, &smci, NULL, &r->samp_slab) != VK_SUCCESS) return -1;
+  }
+  uint64_t z0 = (uint64_t)band_z * 1024 + 512 - depth_max / 2;
+  if (r3d_vkclip_create(&r->clipm, &r->vk, r->fp_transition, r->fp_copy_mem, band_dir,
+                        pyramid_dir, band_z, depth_max, 21504, 21504, z0) != 0)
+    return -1;
+
+  VkDescriptorImageInfo ii[16];
+  for (uint32_t e = 0; e < 16; e++) {
+    uint32_t l = e < R3D_CLIP_LEVELS ? e : R3D_CLIP_LEVELS - 1;
+    ii[e] = (VkDescriptorImageInfo){.sampler = r->samp_slab,
+                                    .imageView = r3d_vkclip_view(r->clipm, l),
+                                    .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
+  }
+  VkWriteDescriptorSet w = {
+      .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+      .dstSet = r->dset,
+      .dstBinding = 0,
+      .descriptorCount = 16,
+      .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+      .pImageInfo = ii,
+  };
+  vkUpdateDescriptorSets(r->vk.dev, 1, &w, 0, NULL);
+  return 0;
+}
+
+int r3d_clip_frame(r3d_renderer *r, double fx, double fy, uint64_t z0, r3d_frame_params *p) {
+  if (!r->clipm) return -1;
+  r3d_vkclip_update(r->clipm, (int64_t)fx, (int64_t)fy, z0);
+  if (r3d_vkclip_pump(r->clipm, r->timeline, r->timeline_value) != 0) return -1;
+  r3d_vkclip_params(r->clipm, p);
+  return 0;
 }
 
 int r3d_frame(r3d_renderer *r, const r3d_frame_params *p, r3d_frame_stats *st) {

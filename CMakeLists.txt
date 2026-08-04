@@ -109,9 +109,10 @@ add_library(r3d_vk STATIC
   src/vk/vkswap.c
   src/vk/vkres.c
   src/vk/vkbackend.c
+  src/vk/vkclip.c
   src/vk/vkgui.c)
 target_include_directories(r3d_vk PUBLIC src)
-target_link_libraries(r3d_vk PUBLIC Vulkan::Vulkan SDL3::SDL3 r3d_imgui
+target_link_libraries(r3d_vk PUBLIC Vulkan::Vulkan SDL3::SDL3 r3d_imgui r3d_shard
                              PRIVATE r3d_warnings r3d_sanitize r3d_harden)
 
 # --- shaders (Slang -> SPIR-V) ---
@@ -127,6 +128,8 @@ target_link_libraries(render3d PRIVATE r3d_core r3d_vk SDL3::SDL3
 # --- tools ---
 add_executable(assemble tools/assemble/main.c)
 target_link_libraries(assemble PRIVATE m r3d_warnings r3d_sanitize r3d_harden)
+add_executable(mkpyramid tools/mkpyramid/main.c)
+target_link_libraries(mkpyramid PRIVATE r3d_shard r3d_warnings r3d_sanitize r3d_harden)
 add_executable(mkvol tools/mkvol/main.c)
 target_link_libraries(mkvol PRIVATE m r3d_warnings r3d_sanitize r3d_harden)
 

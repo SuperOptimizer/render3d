@@ -140,3 +140,28 @@ host_image_copy into permanently-GENERAL tiles after a timeline wait.
   Initial window (34 slices x 16 tiles + overview) 3.2 s; scroll ~95 ms/slice
   at this width — CPU assembly/downsample is single-threaded; threading it is
   the next lever if wide-slab scrolling needs to be smoother.
+
+## 2026-08-04 — streaming clipmap: full 43k² PHercParis3 cross-sections
+
+Data path: user's dct3d-sharded zarr v3 export (1024³ shards, 16³ chunks,
+~56× compression) → local band Z=33 (1764 shards, 33 GB, ~75 min download)
+→ mkpyramid L2-L5 (33 GB, 9 min, 0.3 s/shard) → 6-level XY clipmap
+(2046-payload octaves, per-level ring z, async worker fill: L0/L1 live
+threaded dct3d decode at 19.4 µs/chunk, L2-L5 pyramid mmap).
+
+Bugs caught during bring-up: fills enqueued fine-to-coarse starved L5 behind
+~10 s of L0/L1 decode (fix: coarse-first, screen never empty); fly camera had
+no focus (fix: view-axis × slab-plane intersection); per-sample 6-level walk
+with a 16-case switch inside the march loop cost 79-112 ms zoomed (fix: pick
+level once per sample, gradient taps reuse it → 3.2× faster).
+
+Perf (release, 1080p uncapped): whole cross-section 2.6 ms; zoomed full-res
+32 ms; clippan sweep (recenter churn incl.) 33 ms. Default 720p vsync: 60 fps
+everywhere. Recenter refill: L5..L2 < 200 ms; L1 ~1 s, L0 ~0.5 s (visible as
+brief blur, never a stall). Known gaps: dct3d 16³ block seams visible at L0
+(codec quality 32, no deblocking — c5d's normative deblock will fix);
+L0 slice fills decode each 16-slice chunk row per slice (16× redundant work,
+chunk-cache would cut recenter to ~60 ms).
+
+Scaling: architecture handles the full 68608-slice volume once more bands are
+fetched; textures stay 6×~150 MB regardless of extent.

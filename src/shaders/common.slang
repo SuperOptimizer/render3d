@@ -18,6 +18,9 @@ struct FrameParams {
   float slab_nx, slab_ny;                    // source xy dims (voxels)
   float slab_px, slab_py;                    // tile payload (voxels)
   uint slab_depth;                           // rendered thickness in voxels
+  // clip mode; clip_valid == 0 selects slab/cube (see render_types.h notes)
+  uint clip_valid;                           // bit L set = level filled
+  float2 clip_orig[6];                       // world voxel of payload texel (0,0)
 };
 
 [[vk::push_constant]] FrameParams pc;

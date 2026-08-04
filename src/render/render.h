@@ -31,6 +31,14 @@ typedef struct r3d_slab_desc {
 int r3d_slab_init(r3d_renderer *r, const r3d_slab_desc *d);
 int r3d_slab_window(r3d_renderer *r, const r3d_volume *src, uint32_t z0);
 void r3d_slab_params(const r3d_renderer *r, r3d_frame_params *p); /* set slab_* fields */
+
+/* Clipmap mode: 6 nested octaves over a dct3d shard band + pyramid files
+ * (43k^2 cross sections; see core/clip.h + src/vk/vkclip.h). Call
+ * r3d_clip_frame once per frame BEFORE r3d_frame: it recenters on the focus
+ * (world voxels), pumps async fills, and sets the clip_* params fields. */
+int r3d_clip_begin(r3d_renderer *r, const char *band_dir, const char *pyramid_dir,
+                   uint32_t band_z, uint32_t depth_max);
+int r3d_clip_frame(r3d_renderer *r, double fx, double fy, uint64_t z0, r3d_frame_params *p);
 int r3d_set_transfer(r3d_renderer *r, const uint8_t rgba[256][4]);
 
 /* Acquire -> raycast -> blit -> present. Fills st (may be zero). */

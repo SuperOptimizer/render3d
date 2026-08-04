@@ -47,8 +47,13 @@ typedef struct r3d_frame_params {
   float slab_nx, slab_ny; /* source xy dims (voxels) */
   float slab_px, slab_py; /* tile payload (voxels) */
   uint32_t slab_depth;    /* rendered thickness in voxels (<= ring - 2) */
+  /* clip mode (nested-octave clipmap); clip_valid == 0 selects slab/cube.
+   * Reuses slab_nx/ny (volume dims), slab_z0 (window start, world), slab_wz
+   * (max depth -> per-level ring size), slab_depth (visible depth). */
+  uint32_t clip_valid;    /* bit ℓ set = level ℓ filled and sampleable */
+  float clip_orig[6][2];  /* world voxel of payload texel (0,0) per level */
 } r3d_frame_params;
-static_assert(sizeof(r3d_frame_params) == 116, "must mirror shader FrameParams");
+static_assert(sizeof(r3d_frame_params) == 168, "must mirror shader FrameParams");
 
 typedef struct r3d_frame_stats {
   /* GPU zones from timestamp queries (0 if unsupported); lag 2 frames */

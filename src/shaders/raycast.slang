@@ -23,11 +23,18 @@ static const float ALPHA_CUTOFF = 0.98;
 static const float OCC_BLOCK = 8.0;
 
 bool is_slab() { return pc.slab_grid != 0; }
+bool is_clip() { return pc.clip_valid != 0; }
+
+// mirror of core/clip.h ring sizing: depth_max/2^l + 3, min 4
+float clip_wzl(uint l) {
+  uint w = (pc.slab_wz >> l) + 3;
+  return float(max(w, 4u));
+}
 
 // World box the ray marches: cube = [0,1]^3; slab = thin box whose z spans the
 // wz-1 seam-safe slices, all in units of 1/nx.
 float3 vol_extent() {
-  if (!is_slab()) return float3(1);
+  if (!is_slab() && !is_clip()) return float3(1);
   // box is exactly slab_depth voxels thick; the ring holds depth+2 slices so
   // filtering at the faces never crosses the ring seam
   return float3(1.0, pc.slab_ny / pc.slab_nx, float(pc.slab_depth) / pc.slab_nx);
@@ -54,8 +61,51 @@ float sample_tile(float3 uvw, uint idx) {
   }
 }
 
+// --- clip mode: level pick is separated from sampling so the marcher picks
+// once per sample and gradient taps reuse the level (7x fewer walks) ---
+
+float sample_clip_level(uint l, float3 p) {
+  float s = float(1u << l);
+  float wx = p.x * pc.slab_nx, wy = p.y * pc.slab_nx;
+  float zw = pc.slab_z0 + 0.5 + p.z * pc.slab_nx;
+  float3 uvw = float3((wx - pc.clip_orig[l].x) / s + 1.0, (wy - pc.clip_orig[l].y) / s + 1.0,
+                      0.0) /
+               float3(2048.0, 2048.0, 1.0);
+  uvw.z = frac(zw / s / clip_wzl(l)); // REPEAT-W ring per level
+  switch (l) {                        // literal indices, 6 clip levels only
+  case 0: return volumes[0].SampleLevel(uvw, 0);
+  case 1: return volumes[1].SampleLevel(uvw, 0);
+  case 2: return volumes[2].SampleLevel(uvw, 0);
+  case 3: return volumes[3].SampleLevel(uvw, 0);
+  case 4: return volumes[4].SampleLevel(uvw, 0);
+  default: return volumes[5].SampleLevel(uvw, 0);
+  }
+}
+
+// Finest usable level for p (coarser-preferred from `desired`); -1 = none.
+int pick_clip_level(float3 p, float lod) {
+  float wx = p.x * pc.slab_nx, wy = p.y * pc.slab_nx;
+  int desired = int(clamp(lod, 0.0, 5.0));
+  for (int step = 0; step < 6; step++) {
+    int li = desired + step;
+    if (li > 5) li = 5 - step; /* wrapped: try coarser first, then finer */
+    if (li < 0) continue;
+    if ((pc.clip_valid & (1u << uint(li))) == 0) continue;
+    float s = float(1u << uint(li));
+    float tx = (wx - pc.clip_orig[li].x) / s + 1.0;
+    float ty = (wy - pc.clip_orig[li].y) / s + 1.0;
+    if (tx < 1.0 || tx >= 2047.0 || ty < 1.0 || ty >= 2047.0) continue;
+    return li;
+  }
+  return -1;
+}
+
 // p in world units (see vol_extent).
 float vol_sample(float3 p, float lod) {
+  if (is_clip()) {
+    int l = pick_clip_level(p, lod);
+    return l < 0 ? 0.0 : sample_clip_level(uint(l), p);
+  }
   if (!is_slab()) return volumes[0].SampleLevel(p, lod);
   // voxel coords (units of 1/nx per axis)
   float wx = p.x * pc.slab_nx;
@@ -112,7 +162,10 @@ void main(uint3 tid: SV_DispatchThreadID) {
 
   float voxel;
   float max_lod;
-  if (is_slab()) {
+  if (is_clip()) {
+    voxel = 1.0 / pc.slab_nx;
+    max_lod = 7.0; // levels end at 5; extra lod keeps widening far-field steps
+  } else if (is_slab()) {
     voxel = 1.0 / pc.slab_nx;
     max_lod = 4.0; // lod >= 1.75 switches to the 1/4-res overview texture
   } else {
@@ -154,11 +207,18 @@ void main(uint3 tid: SV_DispatchThreadID) {
     // step size scales with it so far-field marching is proportionally cheap.
     float lod = clamp(log2(max(t * cone / voxel, 1.0)) + pc.lod_bias, 0.0, max_lod);
     float lod_step = exp2(lod); /* continuous: fractional lod still widens dt */
-    if (is_slab()) // keep >=4 samples through the slab thickness
-      lod_step = min(lod_step, max(1.0, float(pc.slab_depth) * 0.25));
+    if (is_slab() || is_clip()) // keep >=4 samples along THIS ray's box segment
+      lod_step = min(lod_step, max(1.0, (tf_ - tn) / (4.0 * dt)));
     float3 p = pc.cam_origin + t * dir;
 
-    float v = vol_sample(p, lod);
+    int cl_lvl = -1; // clip: pick the level once; gradient taps reuse it
+    float v;
+    if (is_clip()) {
+      cl_lvl = pick_clip_level(p, lod);
+      v = cl_lvl < 0 ? 0.0 : sample_clip_level(uint(cl_lvl), p);
+    } else {
+      v = vol_sample(p, lod);
+    }
     bool cut = v < pc.threshold; // low-cut: below-threshold voxels are void
     if (cut) v = 0.0;
 
@@ -184,10 +244,21 @@ void main(uint3 tid: SV_DispatchThreadID) {
         if (shaded) {
           // gradient-modulated Blinn-Phong; homogeneous regions stay unshaded
           float e = voxel * lod_step;
-          float3 g = float3(
-              vol_sample(p + float3(e, 0, 0), lod) - vol_sample(p - float3(e, 0, 0), lod),
-              vol_sample(p + float3(0, e, 0), lod) - vol_sample(p - float3(0, e, 0), lod),
-              vol_sample(p + float3(0, 0, e), lod) - vol_sample(p - float3(0, 0, e), lod));
+          float3 g;
+          if (cl_lvl >= 0) {
+            uint gl = uint(cl_lvl);
+            g = float3(sample_clip_level(gl, p + float3(e, 0, 0)) -
+                           sample_clip_level(gl, p - float3(e, 0, 0)),
+                       sample_clip_level(gl, p + float3(0, e, 0)) -
+                           sample_clip_level(gl, p - float3(0, e, 0)),
+                       sample_clip_level(gl, p + float3(0, 0, e)) -
+                           sample_clip_level(gl, p - float3(0, 0, e)));
+          } else {
+            g = float3(
+                vol_sample(p + float3(e, 0, 0), lod) - vol_sample(p - float3(e, 0, 0), lod),
+                vol_sample(p + float3(0, e, 0), lod) - vol_sample(p - float3(0, e, 0), lod),
+                vol_sample(p + float3(0, 0, e), lod) - vol_sample(p - float3(0, 0, e), lod));
+          }
           float gm = length(g);
           if (gm > 1e-4) {
             float3 n = g / gm;
