@@ -225,6 +225,8 @@ int main(int argc, char **argv) {
   uint32_t tf_idx = tf_preset > 0 ? (uint32_t)tf_preset : 0;
   uint32_t frame_index = 0;
   float fps_smooth = 60.0f;
+  bool adaptive_res = true; /* half-res rendering while the camera moves */
+  int settle = 0;
   uint64_t last_gpu_ns = 0;
   r3d_frame_stats prof = {0};   /* EMA-smoothed for display */
   r3d_frame_stats prof_sum = {0}; /* running sums for the exit report */
@@ -358,6 +360,19 @@ int main(int argc, char **argv) {
     r3d_v3 right, up, fwd;
     r3d_camera_basis(&cam, (float)w / (float)h, &right, &up, &fwd);
 
+    /* adaptive resolution: drop to half res while interacting (4x fewer
+     * rays), snap back to full once the camera settles */
+    bool moving = in.dragging || in.captured || in.wheel != 0.0f || in.zdelta || in.zpage ||
+                  auto_scroll ||
+                  in.move[0] != 0.0f || in.move[1] != 0.0f || in.move[2] != 0.0f;
+    settle = moving ? 15 : (settle > 0 ? settle - 1 : 0);
+    bool half_res = adaptive_res && settle > 0;
+    if (getenv("R3D_FORCE_HALF")) half_res = true; /* testing/benching the path */
+    else if (in.screenshot || (exit_frames && shot_path && frame_index + 1 >= exit_frames))
+      half_res = false; /* captures always full res */
+    uint32_t rvw = half_res ? (uint32_t)w / 2 : (uint32_t)w;
+    uint32_t rvh = half_res ? (uint32_t)h / 2 : (uint32_t)h;
+
     /* control panel */
     fps_smooth = fps_smooth * 0.95f + (dt > 0 ? 0.05f / dt : 0.0f);
     r3d_gui_begin(renderer);
@@ -406,6 +421,7 @@ int main(int argc, char **argv) {
              (clip_valid_disp & 32) ? " L5" : "");
     }
     igSliderFloat("lod bias", &lod_bias, -2.0f, 4.0f, "%.2f", 0);
+    igCheckbox("half-res while moving", &adaptive_res);
     if (igCollapsingHeader_TreeNodeFlags("transform", 0)) {
       float vt[3] = {vol_t.x, vol_t.y, vol_t.z};
       if (igDragFloat3("volume pos", vt, 0.002f, -4.0f, 4.0f, "%.3f", 0))
@@ -455,7 +471,7 @@ int main(int argc, char **argv) {
         .density = density,
         .lod_bias = lod_bias,
         .max_mip = 10.0f,
-        .viewport = {(uint32_t)w, (uint32_t)h},
+        .viewport = {rvw, rvh},
         .mode = mode,
         .frame_index = frame_index++,
         .threshold = low_cut / 255.0f,

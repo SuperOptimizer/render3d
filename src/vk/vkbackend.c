@@ -1351,10 +1351,15 @@ int r3d_frame(r3d_renderer *r, const r3d_frame_params *p, r3d_frame_stats *st) {
   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r->raycast[rmode]);
   vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r->pipe_layout, 0, 1, &r->dset, 0,
                           NULL);
+  /* p->viewport may be smaller than the drawable (adaptive resolution while
+   * the camera moves): render into the top-left region, blit upscales */
+  uint32_t rw = p->viewport[0] ? p->viewport[0] : r->swap.extent.width;
+  uint32_t rh = p->viewport[1] ? p->viewport[1] : r->swap.extent.height;
+  if (rw > r->offscreen.extent.width) rw = r->offscreen.extent.width;
+  if (rh > r->offscreen.extent.height) rh = r->offscreen.extent.height;
   vkCmdPushConstants(cmd, r->pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                      sizeof(r3d_frame_params), p);
-  vkCmdDispatch(cmd, (r->swap.extent.width + wgx - 1) / wgx,
-                (r->swap.extent.height + wgy - 1) / wgy, 1);
+  vkCmdDispatch(cmd, (rw + wgx - 1) / wgx, (rh + wgy - 1) / wgy, 1);
   if (r->query)
     vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, r->query, slot * 4 + 1);
   r->slot_has_query[slot] = r->query != VK_NULL_HANDLE;
@@ -1371,8 +1376,7 @@ int r3d_frame(r3d_renderer *r, const r3d_frame_params *p, r3d_frame_stats *st) {
   VkImageBlit2 region = {
       .sType = VK_STRUCTURE_TYPE_IMAGE_BLIT_2,
       .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-      .srcOffsets = {{0, 0, 0},
-                     {(int32_t)r->offscreen.extent.width, (int32_t)r->offscreen.extent.height, 1}},
+      .srcOffsets = {{0, 0, 0}, {(int32_t)rw, (int32_t)rh, 1}},
       .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
       .dstOffsets = {{0, 0, 0},
                      {(int32_t)r->swap.extent.width, (int32_t)r->swap.extent.height, 1}},
@@ -1385,7 +1389,8 @@ int r3d_frame(r3d_renderer *r, const r3d_frame_params *p, r3d_frame_stats *st) {
       .dstImageLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
       .regionCount = 1,
       .pRegions = &region,
-      .filter = VK_FILTER_NEAREST,
+      /* LINEAR: identity when rendering at full size, smooth when upscaling */
+      .filter = VK_FILTER_LINEAR,
   };
   vkCmdBlitImage2(cmd, &blit);
   if (r->query)

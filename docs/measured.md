@@ -279,3 +279,12 @@ slot pitch (132) in the 3D mip chain. Reverted to 128-slot/4-mip geometry
 behind APRON>0 + R3D_NO_APRON + R3D_DUMP_MIP1 for a future retry; next
 attempt should try 136 (8-aligned) slots or per-slot compute-generated
 mips instead of whole-atlas blits.
+
+## 2026-08-04 — optimization round 4: adaptive resolution
+
+Half-res rendering while the camera moves (drag/pan/zoom/scroll/keys), full
+res once settled (~1/4 s): p.viewport drives dispatch + blit-source region,
+LINEAR upscale blit (identity at full res). Captures and benches always run
+full res; R3D_FORCE_HALF tests the path. Worst-case dense view during
+interaction: 29 -> 8.4 ms @1080p (4x fewer rays) — navigation is 60 fps
+everywhere including 1080p windows; stills render at full quality.
