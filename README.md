@@ -31,6 +31,14 @@ Tab cycles render mode (full / MIP / depth / step-heatmap / ray-dir / flat).
 T cycles transfer-function presets. `[` `]` step size, `,` `.` density,
 `-` `=` LOD bias. F12 screenshot (PPM).
 
+**Slab mode** (`--slab [wz]`): renders a thin, wide z-window (default 32
+slices) of a large volume from up to 2×2 tile textures (max 4092² XY) with a
+ring-buffered, scrollable z axis. R/F scroll by slice (hold to repeat),
+PgUp/PgDn by window, GUI has a z slider + auto-scroll. Fetch wide regions with
+`tools/fetch_slab.py out.u8 Z0 NZ Y0 NY X0 NX`, e.g.
+`tools/fetch_slab.py slab3072.u8 29824 96 16384 3072 14592 3072` then
+`./build/release/render3d slab3072.u8 3072 3072 96 --slab 32 --tf 1`.
+
 Useful flags: `--size W H`, `--cam x y z yaw pitch`, `--tf N`, `--mode N`,
 `--no-vsync`, `--frames N --shot out.ppm` (headless capture), `--probe`
 (print device capabilities and exit).
