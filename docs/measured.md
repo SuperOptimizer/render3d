@@ -288,3 +288,15 @@ LINEAR upscale blit (identity at full res). Captures and benches always run
 full res; R3D_FORCE_HALF tests the path. Worst-case dense view during
 interaction: 29 -> 8.4 ms @1080p (4x fewer rays) — navigation is 60 fps
 everywhere including 1080p windows; stills render at full quality.
+
+## 2026-08-04 — optimization round 5: identity residency fast path
+
+v1 full-shard residency maps slot == brick index, making the atlas layout
+IDENTICAL to world layout — the page-table indirection is provably a no-op.
+Backend detects this (brick_mode bit 16) and the shader samples the atlas
+directly at p, cube-style; the indirected path remains for future streaming
+(non-identity) residency. Dense close 29 -> 21.9 ms @1080p — parity with
+cube mode; exterior 4.0 ms; diff vs cube improved 0.317 -> 0.196 and brick
+seams vanish (continuous sampling, no slot borders). The indirected-path
+costs return only when streaming remaps slots — at which point aprons
+(retry plan in round 3) become the relevant fix.

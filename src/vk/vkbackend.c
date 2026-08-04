@@ -56,6 +56,7 @@ struct r3d_renderer {
   r3d_vkimage brick_occ;        /* 8^3-block occupancy reduced from the atlas */
   r3d_vkbuf page_buf;
   uint32_t bricks_bpa, bricks_abpa;
+  bool bricks_identity; /* atlas layout == world layout: direct sampling */
 
   PFN_vkTransitionImageLayoutEXT fp_transition;
   PFN_vkCopyMemoryToImageEXT fp_copy_mem;
@@ -1107,8 +1108,12 @@ int r3d_bricks_begin(r3d_renderer *r, const char *c5s_path) {
     return -1;
   uint32_t *page = r->page_buf.mapped;
   for (uint32_t b = 0; b < nb; b++) page[b] = 0xFFFFFFFFu;
-  for (uint32_t k = 0; k < np; k++)
+  bool identity = np == nb; /* every brick resident at slot == index */
+  for (uint32_t k = 0; k < np; k++) {
     page[idx[k]] = idx[k] | ((uint32_t)maxes[k] << 24); /* slot == brick idx (v1) */
+    if (idx[k] != k) identity = false;
+  }
+  r->bricks_identity = identity;
   free(srcs);
   free(idx);
   free(maxes);
@@ -1222,7 +1227,8 @@ int r3d_bricks_begin(r3d_renderer *r, const char *c5s_path) {
 }
 
 void r3d_bricks_params(const r3d_renderer *r, r3d_frame_params *p) {
-  p->brick_mode = r->bricks_bpa | (r->bricks_abpa << 8);
+  p->brick_mode = r->bricks_bpa | (r->bricks_abpa << 8) |
+                  (r->bricks_identity ? 0x10000u : 0u);
 }
 
 int r3d_clip_begin(r3d_renderer *r, const char *band_dir, const char *pyramid_dir,

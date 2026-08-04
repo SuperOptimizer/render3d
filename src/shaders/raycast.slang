@@ -293,22 +293,28 @@ void main(uint3 tid: SV_DispatchThreadID) {
       cl_lvl = pick_clip_level(p, lod);
       v = cl_lvl < 0 ? 0.0 : sample_clip_level(uint(cl_lvl), p);
     } else if (is_bricks()) {
-      float3 vp = saturate(p) * b_N;
-      uint3 bc = min(uint3(vp) >> 7u, uint3(b_bpa - 1u));
-      uint bi = (bc.z * b_bpa + bc.y) * b_bpa + bc.x;
-      if (bi != b_last) { /* page resolve only on brick crossings */
-        b_last = bi;
-        uint e = page[bi];
-        b_ok = e != 0xFFFFFFFFu;
-        b_max = b_ok ? float(e >> 24u) / 255.0 : 0.0;
-        uint abpa = (pc.brick_mode >> 8) & 0xffu;
-        uint slot = e & 0xFFFFFFu;
-        b_slot = float3(uint3(slot % abpa, (slot / abpa) % abpa, slot / (abpa * abpa))) *
-                     BR_SLOT + BR_AP;
-      }
-      b_bl = vp - float3(bc << 7u);
       blod = clamp(lod, 0.0, 3.0); /* atlas has 4 mips */
-      v = b_ok ? bricks_fetch(b_slot, b_bl, blod, b_inv) : 0.0;
+      if ((pc.brick_mode & 0x10000u) != 0) {
+        /* identity residency (v1 full shard): atlas layout == world layout,
+         * so the page indirection is a no-op — sample like cube mode */
+        v = brick_atlas.SampleLevel(p, blod);
+      } else {
+        float3 vp = saturate(p) * b_N;
+        uint3 bc = min(uint3(vp) >> 7u, uint3(b_bpa - 1u));
+        uint bi = (bc.z * b_bpa + bc.y) * b_bpa + bc.x;
+        if (bi != b_last) { /* page resolve only on brick crossings */
+          b_last = bi;
+          uint e = page[bi];
+          b_ok = e != 0xFFFFFFFFu;
+          b_max = b_ok ? float(e >> 24u) / 255.0 : 0.0;
+          uint abpa = (pc.brick_mode >> 8) & 0xffu;
+          uint slot = e & 0xFFFFFFu;
+          b_slot = float3(uint3(slot % abpa, (slot / abpa) % abpa, slot / (abpa * abpa))) *
+                       BR_SLOT + BR_AP;
+        }
+        b_bl = vp - float3(bc << 7u);
+        v = b_ok ? bricks_fetch(b_slot, b_bl, blod, b_inv) : 0.0;
+      }
     } else {
       v = vol_sample(p, lod);
     }
@@ -326,7 +332,9 @@ void main(uint3 tid: SV_DispatchThreadID) {
        * skipped block (invisible) and restores cube-grade skipping */
       float bgate = max(occ_gate, 4.5 / 255.0);
       if (v < bgate) {
-        if (b_max < bgate) { /* whole brick void (cached page entry) */
+        if ((pc.brick_mode & 0x10000u) != 0) { /* identity: 8^3 occ only */
+          if (occ.SampleLevel(p, 0) < bgate) void_blk = true;
+        } else if (b_max < bgate) { /* whole brick void (cached page entry) */
           void_blk = true;
           bsz = 128.0 * voxel;
         } else if (occ.SampleLevel(p, 0) < bgate) { /* 8^3 block void */
@@ -357,7 +365,14 @@ void main(uint3 tid: SV_DispatchThreadID) {
           // gradient-modulated Blinn-Phong; homogeneous regions stay unshaded
           float e = voxel * lod_step;
           float3 g;
-          if (is_bricks()) {
+          if (is_bricks() && (pc.brick_mode & 0x10000u) != 0) {
+            g = float3(brick_atlas.SampleLevel(p + float3(e, 0, 0), blod) -
+                           brick_atlas.SampleLevel(p - float3(e, 0, 0), blod),
+                       brick_atlas.SampleLevel(p + float3(0, e, 0), blod) -
+                           brick_atlas.SampleLevel(p - float3(0, e, 0), blod),
+                       brick_atlas.SampleLevel(p + float3(0, 0, e), blod) -
+                           brick_atlas.SampleLevel(p - float3(0, 0, e), blod));
+          } else if (is_bricks()) {
             /* taps reuse the cached brick (offsets in voxels) */
             float ev = lod_step;
             g = float3(bricks_fetch(b_slot, b_bl + float3(ev, 0, 0), blod, b_inv) -
