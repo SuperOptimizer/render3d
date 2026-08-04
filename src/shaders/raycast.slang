@@ -45,6 +45,11 @@ struct BrickCtx {
   float3 slot_org; /* atlas mip0 texel origin of the slot */
 };
 
+// slot geometry: 132^3 = 128 payload + 2-voxel apron per side (seamless
+// trilinear across bricks; clamp only guards coarse mips)
+static const float BR_SLOT = 128.0;
+static const float BR_AP = 0.0;
+
 BrickCtx bricks_locate(float3 p) {
   uint bpa = pc.brick_mode & 0xffu;
   uint abpa = (pc.brick_mode >> 8) & 0xffu;
@@ -56,24 +61,24 @@ BrickCtx bricks_locate(float3 p) {
   c.maxv = c.ok ? float(e >> 24u) / 255.0 : 0.0;
   uint slot = e & 0xFFFFFFu;
   uint3 sc = uint3(slot % abpa, (slot / abpa) % abpa, slot / (abpa * abpa));
-  c.slot_org = float3(sc * 128u);
+  c.slot_org = float3(sc) * BR_SLOT + BR_AP; /* payload texel origin */
   c.bl = vp - float3(bc << 7u);
   return c;
 }
 
-/* bl_off: brick-local voxel coords (already offset for gradient taps). The
- * clamp inset grows with lod so coarse mips never filter across the
- * neighboring slot (no aprons). */
-float bricks_fetch(float3 slot_org, float3 bl_off, float lod) {
-  float inset = 0.5 * exp2(lod);
+/* bl_off: brick-local voxel coords (already offset for gradient taps).
+ * inset is negative at fine mips (the apron covers filtering) and only
+ * clamps once a mip's footprint would pass the 2-voxel apron. */
+float bricks_fetch(float3 slot_org, float3 bl_off, float lod, float inv_adim) {
+  float inset = max(0.5 * exp2(lod) - BR_AP, 0.5);
   float3 l = clamp(bl_off, float3(inset), float3(128.0 - inset));
-  uint abpa = (pc.brick_mode >> 8) & 0xffu;
-  return brick_atlas.SampleLevel((slot_org + l) / float(abpa * 128u), lod);
+  return brick_atlas.SampleLevel((slot_org + l) * inv_adim, lod);
 }
 
 float bricks_sample(float3 p) { /* generic path (non-marcher callers) */
   BrickCtx c = bricks_locate(p);
-  return c.ok ? bricks_fetch(c.slot_org, c.bl, 0.0) : 0.0;
+  float inv = 1.0 / (float((pc.brick_mode >> 8) & 0xffu) * BR_SLOT);
+  return c.ok ? bricks_fetch(c.slot_org, c.bl, 0.0, inv) : 0.0;
 }
 
 // mirror of core/clip.h ring sizing: depth_max/2^l + 3, min 4
@@ -264,6 +269,7 @@ void main(uint3 tid: SV_DispatchThreadID) {
   // bricks mode: page entry cached across steps (rays cross bricks rarely)
   uint b_bpa = pc.brick_mode & 0xffu;
   float b_N = float(b_bpa * 128u);
+  float b_inv = 1.0 / (float((pc.brick_mode >> 8) & 0xffu) * BR_SLOT);
   uint b_last = 0xFFFFFFFFu;
   bool b_ok = false;
   float b_max = 0.0;
@@ -297,11 +303,12 @@ void main(uint3 tid: SV_DispatchThreadID) {
         b_max = b_ok ? float(e >> 24u) / 255.0 : 0.0;
         uint abpa = (pc.brick_mode >> 8) & 0xffu;
         uint slot = e & 0xFFFFFFu;
-        b_slot = float3(uint3(slot % abpa, (slot / abpa) % abpa, slot / (abpa * abpa)) * 128u);
+        b_slot = float3(uint3(slot % abpa, (slot / abpa) % abpa, slot / (abpa * abpa))) *
+                     BR_SLOT + BR_AP;
       }
       b_bl = vp - float3(bc << 7u);
       blod = clamp(lod, 0.0, 3.0); /* atlas has 4 mips */
-      v = b_ok ? bricks_fetch(b_slot, b_bl, blod) : 0.0;
+      v = b_ok ? bricks_fetch(b_slot, b_bl, blod, b_inv) : 0.0;
     } else {
       v = vol_sample(p, lod);
     }
@@ -353,12 +360,12 @@ void main(uint3 tid: SV_DispatchThreadID) {
           if (is_bricks()) {
             /* taps reuse the cached brick (offsets in voxels) */
             float ev = lod_step;
-            g = float3(bricks_fetch(b_slot, b_bl + float3(ev, 0, 0), blod) -
-                           bricks_fetch(b_slot, b_bl + float3(-ev, 0, 0), blod),
-                       bricks_fetch(b_slot, b_bl + float3(0, ev, 0), blod) -
-                           bricks_fetch(b_slot, b_bl + float3(0, -ev, 0), blod),
-                       bricks_fetch(b_slot, b_bl + float3(0, 0, ev), blod) -
-                           bricks_fetch(b_slot, b_bl + float3(0, 0, -ev), blod));
+            g = float3(bricks_fetch(b_slot, b_bl + float3(ev, 0, 0), blod, b_inv) -
+                           bricks_fetch(b_slot, b_bl + float3(-ev, 0, 0), blod, b_inv),
+                       bricks_fetch(b_slot, b_bl + float3(0, ev, 0), blod, b_inv) -
+                           bricks_fetch(b_slot, b_bl + float3(0, -ev, 0), blod, b_inv),
+                       bricks_fetch(b_slot, b_bl + float3(0, 0, ev), blod, b_inv) -
+                           bricks_fetch(b_slot, b_bl + float3(0, 0, -ev), blod, b_inv));
           } else if (cl_lvl >= 0) {
             uint gl = uint(cl_lvl);
             g = float3(sample_clip_level(gl, p + float3(e, 0, 0)) -

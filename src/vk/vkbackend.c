@@ -982,9 +982,12 @@ int r3d_bricks_begin(r3d_renderer *r, const char *c5s_path) {
   }
   uint32_t bpa = sr.foot.shard_dim / 128, nb = sr.foot.nbricks;
   uint32_t abpa = bpa; /* v1: all bricks resident, atlas mirrors the shard */
-  uint32_t adim = abpa * 128;
-
-  const uint32_t amips = 4; /* 128 -> 16 per brick; far-field sampling relief */
+  /* slot = 132^3: 128 payload + 2-voxel apron per side, filled from decoded
+   * neighbors — trilinear is then seamless across bricks and the fetch clamp
+   * only guards coarse mips. 132 = 4*33, so 3 mip levels stay slot-aligned. */
+  const uint32_t SLOT = 128, APRON = 0;
+  uint32_t adim = abpa * SLOT;
+  const uint32_t amips = 4;
   if (r3d_vkimage_create(&r->vk, VK_FORMAT_R8_UNORM, (VkExtent3D){adim, adim, adim}, amips,
                          VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
                              VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
@@ -1020,7 +1023,8 @@ int r3d_bricks_begin(r3d_renderer *r, const char *c5s_path) {
     if (!blob) continue; /* missing brick: page stays invalid */
     uint32_t bz = b / (bpa * bpa), by = (b / bpa) % bpa, bx = b % bpa;
     srcs[np] = (r3d_c5d_src){.blob = blob, .n = n,
-                             .sx = bx * 128, .sy = by * 128, .sz = bz * 128};
+                             .sx = bx * SLOT + APRON, .sy = by * SLOT + APRON,
+                             .sz = bz * SLOT + APRON};
     idx[np++] = b;
   }
   printf("bricks: decoding %u/%u bricks on GPU (%s)...\n", np, nb,
@@ -1035,8 +1039,30 @@ int r3d_bricks_begin(r3d_renderer *r, const char *c5s_path) {
   printf("bricks: decoded %u bricks in %.0f ms (%.0f bricks/s, %.2f GB/s raw)\n", np, ms,
          (double)np * 1000.0 / ms, (double)np * 2.097152 / ms);
 
-  /* mip chain (whole-atlas blits; shader insets its sampling by 0.5*2^lod
-   * texels so cross-slot bleed at coarse mips is never read) */
+  /* apron fill: copy the 2-voxel shells from decoded neighbors so trilinear
+   * is seamless across bricks; volume edges duplicate. Before mips, so
+   * coarse levels inherit consistent borders. */
+  if (APRON > 0 && !getenv("R3D_NO_APRON")) { /* parked: see measured.md */
+    VkDescriptorType at[1] = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE};
+    r3d_vkcomp ap;
+    char sp[1024];
+    snprintf(sp, sizeof sp, "%s/apron.spv", r->cfg.spv_dir);
+    if (r3d_vkcomp_create(&r->vk, sp, at, 1, 4, &ap) != 0) return -1;
+    r3d_vkcomp_bind_image(&r->vk, &ap, 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                          r->brick_atlas_mip0, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL);
+    cmd = r3d_vk_oneshot_begin(&r->vk, r->pool);
+    uint32_t g = (adim + 3) / 4;
+    r3d_vkcomp_dispatch(cmd, &ap, &abpa, 4, g, g, g);
+    r3d_vk_image_barrier(cmd, r->brick_atlas.img, VK_IMAGE_LAYOUT_GENERAL,
+                         VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                         VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, VK_PIPELINE_STAGE_2_BLIT_BIT,
+                         VK_ACCESS_2_TRANSFER_READ_BIT, 0, 1);
+    if (r3d_vk_oneshot_end(&r->vk, r->pool, cmd) != 0) return -1;
+    r3d_vkcomp_destroy(&r->vk, &ap);
+  }
+
+  /* mip chain (whole-atlas blits; the shader's lod-scaled inset keeps coarse
+   * mips from filtering past the apron) */
   cmd = r3d_vk_oneshot_begin(&r->vk, r->pool);
   uint32_t md = adim;
   for (uint32_t m = 1; m < amips; m++) {
@@ -1065,11 +1091,12 @@ int r3d_bricks_begin(r3d_renderer *r, const char *c5s_path) {
                          VK_ACCESS_2_TRANSFER_READ_BIT, m, 1);
     md = nd;
   }
-  /* fill complete: the atlas is only sampled from here on. READ_ONLY_OPTIMAL
-   * (vs GENERAL) lets the driver keep bandwidth compression on the tiler. */
-  r3d_vk_image_barrier(cmd, r->brick_atlas.img, VK_IMAGE_LAYOUT_GENERAL,
-                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_BLIT_BIT,
-                       VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+  /* fill complete: the atlas is only sampled from here on */
+  VkImageLayout alayout = getenv("R3D_ATLAS_GENERAL") ? VK_IMAGE_LAYOUT_GENERAL
+                                                      : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  r3d_vk_image_barrier(cmd, r->brick_atlas.img, VK_IMAGE_LAYOUT_GENERAL, alayout,
+                       VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                       VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                        VK_ACCESS_2_SHADER_SAMPLED_READ_BIT, 0, amips);
   if (r3d_vk_oneshot_end(&r->vk, r->pool, cmd) != 0) return -1;
 
@@ -1087,11 +1114,42 @@ int r3d_bricks_begin(r3d_renderer *r, const char *c5s_path) {
   free(maxes);
   c5d_shard_close_reader(&sr);
 
+  if (getenv("R3D_DUMP_MIP1")) { /* debug: write one z-slice of mip1 as PGM */
+    uint32_t d1 = adim / 2;
+    r3d_vkbuf rb;
+    if (r3d_vkbuf_create_host(&r->vk, (VkDeviceSize)d1 * d1, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                              &rb) == 0) {
+      VkCommandBuffer dc = r3d_vk_oneshot_begin(&r->vk, r->pool);
+      r3d_vk_image_barrier(dc, r->brick_atlas.img, alayout,
+                           VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0,
+                           VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT, 1, 1);
+      VkBufferImageCopy reg = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 1, 0, 1},
+                               .imageOffset = {0, 0, (int32_t)(d1 / 2)},
+                               .imageExtent = {d1, d1, 1}};
+      vkCmdCopyImageToBuffer(dc, r->brick_atlas.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                             rb.buf, 1, &reg);
+      r3d_vk_image_barrier(dc, r->brick_atlas.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           alayout,
+                           VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+                           VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0, 1, 1);
+      r3d_vk_oneshot_end(&r->vk, r->pool, dc);
+      FILE *f = fopen("mip1_slice.pgm", "wb");
+      if (f) {
+        fprintf(f, "P5\n%u %u\n255\n", d1, d1);
+        fwrite(rb.mapped, 1, (size_t)d1 * d1, f);
+        fclose(f);
+        printf("bricks: dumped mip1_slice.pgm (%ux%u)\n", d1, d1);
+      }
+      r3d_vkbuf_destroy(&r->vk, &rb);
+    }
+  }
+
   /* 8^3-block occupancy from the atlas (GPU max-reduce + 3^3 dilate) so the
    * marcher can skip intra-brick gaps like cube mode does. Valid because v1
    * slots are identity-mapped (atlas layout == world layout). */
   {
-    uint32_t odim = adim / 8;
+    uint32_t odim = bpa * 16; /* world-space 8^3 blocks */
     r3d_vkimage occ_raw;
     if (r3d_vkimage_create(&r->vk, VK_FORMAT_R8_UNORM, (VkExtent3D){odim, odim, odim}, 1,
                            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
@@ -1109,8 +1167,7 @@ int r3d_bricks_begin(r3d_renderer *r, const char *c5s_path) {
     snprintf(sp, sizeof sp, "%s/occdilate.spv", r->cfg.spv_dir);
     if (r3d_vkcomp_create(&r->vk, sp, tt, 2, 4, &odil) != 0) return -1;
     r3d_vkcomp_bind_image(&r->vk, &omax, 0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-                          r->brick_atlas.view, r->samp_near,
-                          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                          r->brick_atlas.view, r->samp_near, alayout);
     r3d_vkcomp_bind_image(&r->vk, &omax, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, occ_raw.view,
                           VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL);
     r3d_vkcomp_bind_image(&r->vk, &odil, 0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
@@ -1150,7 +1207,7 @@ int r3d_bricks_begin(r3d_renderer *r, const char *c5s_path) {
 
   vkDeviceWaitIdle(r->vk.dev);
   write_image_dset(r, 4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, r->brick_atlas.view,
-                   r->samp_vol, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                   r->samp_vol, alayout);
   VkDescriptorBufferInfo pbi = {.buffer = r->page_buf.buf, .range = VK_WHOLE_SIZE};
   VkWriteDescriptorSet pw = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
                              .dstSet = r->dset,

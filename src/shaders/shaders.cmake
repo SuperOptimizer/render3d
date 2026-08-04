@@ -51,7 +51,7 @@ foreach(_ck entropy dequant_idct deblock)
     VERBATIM)
   list(APPEND _spv_outputs "${_out}")
 endforeach()
-foreach(_gk pack occmax occdilate)
+foreach(_gk pack occmax occdilate apron)
   add_custom_command(
     OUTPUT "${_spv_dir}/${_gk}.spv"
     COMMAND "${R3D_GLSLC}" -O --target-env=vulkan1.1 -o "${_spv_dir}/${_gk}.spv"

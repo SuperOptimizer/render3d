@@ -263,3 +263,19 @@ clamp) or finer skip trees. At the default 720p window every view holds
 60 fps. Thermal drift across long bench sessions is +-10-15% — compare
 paired runs only. Generic r3d_vkcomp helper added to vkres for one-off
 compute passes.
+
+## 2026-08-04 — optimization round 3: apron experiment FAILED, reverted
+
+Attempted 132^3 slots (2-voxel aprons copied from neighbors via a new
+apron.comp; goal: seamless cross-brick trilinear + drop the fetch clamp).
+Result: deterministic ~16-32 voxel tiling artifacts whenever sampling
+lod > 0, spatially patterned, identical with aprons on/off and in both
+GENERAL and READ_ONLY layouts. Bisection: mip0-only sampling clean (0.874);
+any mip1 use corrupt (7.4); yet mip1 CONTENT dumps clean at three z planes
+(boundary + interior + deep). Sampling math hand-verified repeatedly.
+Root cause not found — suspected Turnip interaction with the non-pow2
+slot pitch (132) in the 3D mip chain. Reverted to 128-slot/4-mip geometry
+(diff back to 0.317; exterior 4.3 ms, close ~29 ms). Scaffolding kept
+behind APRON>0 + R3D_NO_APRON + R3D_DUMP_MIP1 for a future retry; next
+attempt should try 136 (8-aligned) slots or per-slot compute-generated
+mips instead of whole-atlas blits.

@@ -1,0 +1,27 @@
+#version 450
+/* Fill each slot's 2-voxel apron shell from the decoded neighbor bricks
+ * (identity slot mapping: world voxel v lives in slot v/128 at texel
+ * v%128 + APRON). Runs once after decode, before mip generation, so coarse
+ * mips inherit consistent borders. Volume edges duplicate the nearest voxel. */
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+
+layout(binding = 0, r8) uniform image3D atlas;
+
+layout(push_constant) uniform PC { uint abpa; } pc;
+
+const int SLOT = 132;
+const int AP = 2;
+
+void main() {
+  ivec3 t = ivec3(gl_GlobalInvocationID);
+  int adim = int(pc.abpa) * SLOT;
+  if (any(greaterThanEqual(t, ivec3(adim)))) return;
+  ivec3 sl = t / SLOT;
+  ivec3 lo = t - sl * SLOT;
+  if (all(greaterThanEqual(lo, ivec3(AP))) && all(lessThan(lo, ivec3(SLOT - AP)))) return;
+  ivec3 w = sl * 128 + lo - AP; /* world voxel this apron texel mirrors */
+  ivec3 wc = clamp(w, ivec3(0), ivec3(int(pc.abpa) * 128 - 1));
+  ivec3 sb = wc >> 7;
+  ivec3 src = sb * SLOT + AP + (wc - (sb << 7));
+  imageStore(atlas, t, imageLoad(atlas, src));
+}
