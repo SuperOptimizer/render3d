@@ -7,3 +7,4 @@ compile_commands.json
 band/
 *.shard
 pyramid/
+*.c5s

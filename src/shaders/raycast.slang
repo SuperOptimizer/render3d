@@ -11,6 +11,10 @@ import common;
 [[vk::binding(2, 0)]] RWTexture2D<float4> out_image;
 // per-8^3-block max, dilated 1 block (nearest sampler) — empty-space skipping
 [[vk::binding(3, 0)]] Sampler3D<float> occ;
+// bricks mode: c5d GPU-decoded brick atlas + page table
+// page[bi] = slot_index | brick_max<<24, 0xFFFFFFFF = not resident
+[[vk::binding(4, 0)]] Sampler3D<float> brick_atlas;
+[[vk::binding(5, 0)]] StructuredBuffer<uint> page;
 
 static const uint MODE_FULL = 0;
 static const uint MODE_MIP = 1;
@@ -24,6 +28,33 @@ static const float OCC_BLOCK = 8.0;
 
 bool is_slab() { return pc.slab_grid != 0; }
 bool is_clip() { return pc.clip_valid != 0; }
+bool is_bricks() { return pc.brick_mode != 0; }
+
+/* bricks mode: sample via the page table; p in [0,1]^3 (cubic volume) */
+float bricks_sample(float3 p) {
+  uint bpa = pc.brick_mode & 0xffu;
+  uint abpa = (pc.brick_mode >> 8) & 0xffu;
+  float3 vp = saturate(p) * float(bpa * 128u);
+  uint3 bc = min(uint3(vp) >> 7u, uint3(bpa - 1u));
+  uint e = page[(bc.z * bpa + bc.y) * bpa + bc.x];
+  if (e == 0xFFFFFFFFu) return 0.0;
+  uint slot = e & 0xFFFFFFu;
+  // clamp half a texel inside the brick: no aprons yet (v1), border filtering
+  // would otherwise bleed the neighboring slot
+  float3 local = clamp(vp - float3(bc << 7u), float3(0.5), float3(127.5));
+  uint3 sc = uint3(slot % abpa, (slot / abpa) % abpa, slot / (abpa * abpa));
+  float3 uvw = (float3(sc * 128u) + local) / float(abpa * 128u);
+  return brick_atlas.SampleLevel(uvw, 0);
+}
+
+/* brick max (for empty-brick skip); 0 when not resident */
+float bricks_max(float3 p) {
+  uint bpa = pc.brick_mode & 0xffu;
+  float3 vp = saturate(p) * float(bpa * 128u);
+  uint3 bc = min(uint3(vp) >> 7u, uint3(bpa - 1u));
+  uint e = page[(bc.z * bpa + bc.y) * bpa + bc.x];
+  return e == 0xFFFFFFFFu ? 0.0 : float(e >> 24u) / 255.0;
+}
 
 // mirror of core/clip.h ring sizing: depth_max/2^l + 3, min 4
 float clip_wzl(uint l) {
@@ -106,6 +137,7 @@ float vol_sample(float3 p, float lod) {
     int l = pick_clip_level(p, lod);
     return l < 0 ? 0.0 : sample_clip_level(uint(l), p);
   }
+  if (is_bricks()) return bricks_sample(p);
   if (!is_slab()) return volumes[0].SampleLevel(p, lod);
   // voxel coords (units of 1/nx per axis)
   float wx = p.x * pc.slab_nx;
@@ -165,6 +197,9 @@ void main(uint3 tid: SV_DispatchThreadID) {
   if (is_clip()) {
     voxel = 1.0 / pc.slab_nx;
     max_lod = 7.0; // levels end at 5; extra lod keeps widening far-field steps
+  } else if (is_bricks()) {
+    voxel = 1.0 / float((pc.brick_mode & 0xffu) * 128u);
+    max_lod = 3.0; // atlas has no mips; lod only widens far-field steps
   } else if (is_slab()) {
     voxel = 1.0 / pc.slab_nx;
     max_lod = 4.0; // lod >= 1.75 switches to the 1/4-res overview texture
@@ -226,12 +261,23 @@ void main(uint3 tid: SV_DispatchThreadID) {
     bool cut = v < pc.threshold; // low-cut: below-threshold voxels are void
     if (cut) v = 0.0;
 
-    // empty-space skip (cube mode; slab occ is a dummy full texture), checked
-    // only where the fine sample is already void so dense marching pays nothing
-    if (!is_slab() && v < occ_gate && occ.SampleLevel(p, 0) < occ_gate) {
-      float3 nextp = (floor(p / bs) + max(sign(dir), float3(0))) * bs;
+    // empty-space skip, checked only where the fine sample is already void so
+    // dense marching pays nothing. Cube mode: 8^3 occupancy blocks; bricks
+    // mode: whole 128^3 bricks via the page-table max byte.
+    bool void_blk = false;
+    float bsz = bs;
+    if (is_bricks()) {
+      if (v < occ_gate && bricks_max(p) < occ_gate) {
+        void_blk = true;
+        bsz = 128.0 * voxel;
+      }
+    } else if (!is_slab() && !is_clip() && v < occ_gate && occ.SampleLevel(p, 0) < occ_gate) {
+      void_blk = true;
+    }
+    if (void_blk) {
+      float3 nextp = (floor(p / bsz) + max(sign(dir), float3(0))) * bsz;
       float3 tex = select(abs(dir) > 1e-8, (nextp - ro) / dir, float3(1e30));
-      t = max(min(min(tex.x, tex.y), tex.z), t) + bs * 0.01;
+      t = max(min(min(tex.x, tex.y), tex.z), t) + bsz * 0.01;
       continue;
     }
 

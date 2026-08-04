@@ -39,6 +39,12 @@ void r3d_slab_params(const r3d_renderer *r, r3d_frame_params *p); /* set slab_* 
 int r3d_clip_begin(r3d_renderer *r, const char *band_dir, const char *pyramid_dir,
                    uint32_t band_z, uint32_t depth_max);
 int r3d_clip_frame(r3d_renderer *r, double fx, double fy, uint64_t z0, r3d_frame_params *p);
+
+/* Bricks mode: a c5d .c5s shard decoded ON the GPU (entropy/IDCT/deblock
+ * compute kernels) into an R8 atlas image — compressed bytes are all that
+ * crosses to the GPU. v1: full static residency of one shard. */
+int r3d_bricks_begin(r3d_renderer *r, const char *c5s_path);
+void r3d_bricks_params(const r3d_renderer *r, r3d_frame_params *p);
 int r3d_set_transfer(r3d_renderer *r, const uint8_t rgba[256][4]);
 
 /* Acquire -> raycast -> blit -> present. Fills st (may be zero). */

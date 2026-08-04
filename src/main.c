@@ -65,6 +65,7 @@ int main(int argc, char **argv) {
   uint32_t slab_wz = 0;     /* nonzero = slab mode, max visible depth */
   int depth0 = 0;           /* initial visible depth (default = max) */
   bool clip_mode = false;   /* clipmap over the shard band */
+  const char *bricks_path = NULL; /* c5d shard for GPU-decoded bricks mode */
   for (int i = 1; i < argc; i++) {
     if (i < argc - 1 && strcmp(argv[i], "--frames") == 0) exit_frames = (uint32_t)atoi(argv[i + 1]);
     if (i < argc - 1 && strcmp(argv[i], "--shot") == 0) shot_path = argv[i + 1];
@@ -85,6 +86,7 @@ int main(int argc, char **argv) {
       for (int k = 0; k < 3; k++) volrot0[k] = (float)atof(argv[i + 1 + k]) / 57.29578f;
     if (i < argc - 1 && strcmp(argv[i], "--depth") == 0) depth0 = atoi(argv[i + 1]);
     if (strcmp(argv[i], "--clipmap") == 0) clip_mode = true;
+    if (i < argc - 1 && strcmp(argv[i], "--bricks") == 0) bricks_path = argv[i + 1];
     if (strcmp(argv[i], "--slab") == 0) {
       slab_wz = 32;
       if (i < argc - 1 && argv[i + 1][0] >= '0' && argv[i + 1][0] <= '9')
@@ -144,6 +146,11 @@ int main(int argc, char **argv) {
   } else if (slab_wz) {
     fprintf(stderr, "--slab needs a volume argument\n");
     return EXIT_FAILURE;
+  }
+
+  if (bricks_path) {
+    if (r3d_bricks_begin(renderer, bricks_path) != 0) return EXIT_FAILURE;
+    mode = R3D_MODE_FULL;
   }
 
   /* clipmap: 43k^2 cross sections from the shard band + pyramid */
@@ -453,6 +460,7 @@ int main(int argc, char **argv) {
       r3d_slab_params(renderer, &p);
       p.slab_depth = (uint32_t)slab_depth;
     }
+    if (bricks_path) r3d_bricks_params(renderer, &p);
     if (clip_mode) {
       /* focus = where the view axis crosses the slab plane, computed in
        * VOLUME space so it tracks the model transform */

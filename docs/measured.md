@@ -175,3 +175,29 @@ clip focus intersection done in volume space. Identity transform keeps the
 gpu conformance test bit-stable. Gestures: drag=orbit, shift=pan camera,
 ctrl=translate volume, ctrl+shift=rotate volume; GUI numeric transform
 section + fov; --volpos/--volrot for headless runs.
+
+## 2026-08-04 — c5d GPU decode + GPU-resident brick cache (--bricks)
+
+Target architecture proven end to end: .c5s shard -> compressed brick blobs
+(only bytes that cross to the GPU) -> batched GPU decode (c5d's entropy/
+dequant-IDCT/deblock kernels from the compressor working tree, flat batched
+entropy dispatch) -> our pack.comp imageStores u8 into an R8 atlas 3D image
+(the GPU cache) -> raycast samples via a page-table SSBO (entry = slot |
+brick_max<<24; the max byte gives whole-brick empty skipping).
+
+- Conformance (test_c5dgpu, both paths): 16.7M voxels, 10 at 1 LSB, 0 above.
+- volume.u8 1 GiB -> volume.c5s 44.4 MB (24.2x, q=2) at 3.6 GB/s encode (12T).
+- Bricks-mode render matches cube mode at 0.875 mean LSB (codec error, not
+  renderer error); 60 fps vsync, GPU 10.2 ms vs cube's ~4.5 (page-table
+  lookup + per-sample clamp; optimization headroom noted).
+- Atlas fill, 512 bricks (1 GiB raw): full-GPU 7.9-8.4 s (61-64 bricks/s,
+  0.14 GB/s — upstream's naive 32-lane entropy kernel is the bottleneck);
+  hybrid (R3D_C5D_HYBRID=1) 10.8 s here because our he_decode calls are
+  serial per brick (gputest's hybrid numbers pre-stage; threading he_decode
+  across bricks would flip this). Either way: one-time fill cost.
+- Real data: c5dpack band 33/20/20 (3ddct -> c5d transcode) = 16.3 MB for
+  1 GiB raw (65.8x on already-lossy source; generational loss accepted for
+  the bridge period until native c5d exports exist).
+- Known gaps -> follow-ups: brick-border seams (no aprons, brick-local
+  deblock), no streaming/LRU residency yet (v1 = full static shard),
+  atlas has no mips, entropy kernel speed is upstream work.

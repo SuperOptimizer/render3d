@@ -26,6 +26,8 @@ struct FrameParams {
   float vol_r00, vol_r01, vol_r02, vol_tx;
   float vol_r10, vol_r11, vol_r12, vol_ty;
   float vol_r20, vol_r21, vol_r22, vol_tz;
+  // bricks mode (c5d GPU-decoded atlas): 0 = off; else bpa | atlas_bpa<<8
+  uint brick_mode;
 };
 
 // world -> volume space (R^T rotate about the box center, minus translation)

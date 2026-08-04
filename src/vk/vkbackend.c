@@ -13,6 +13,8 @@
 #include "core/clip.h"
 #include "core/slab.h"
 #include "render/render.h"
+#include "shard.h" /* c5d .c5s reader */
+#include "vk/vkc5d.h"
 #include "vk/vkclip.h"
 #include "vk/vkctx.h"
 #include "vk/vkgui.h"
@@ -46,6 +48,12 @@ struct r3d_renderer {
   uint8_t *ov_buf;       /* downsampled slice, ov dims */
 
   r3d_vkclip *clipm;     /* clipmap mode (NULL unless r3d_clip_begin) */
+
+  /* bricks mode (c5d GPU-decoded atlas) */
+  r3d_vkc5d *c5d;
+  r3d_vkimage brick_atlas;
+  r3d_vkbuf page_buf;
+  uint32_t bricks_bpa, bricks_abpa;
 
   PFN_vkTransitionImageLayoutEXT fp_transition;
   PFN_vkCopyMemoryToImageEXT fp_copy_mem;
@@ -140,10 +148,18 @@ static int create_pipeline(r3d_renderer *r) {
        .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
        .descriptorCount = 1,
        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT},
+      {.binding = 4, /* bricks mode: c5d atlas */
+       .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+       .descriptorCount = 1,
+       .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT},
+      {.binding = 5, /* bricks mode: page table */
+       .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+       .descriptorCount = 1,
+       .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT},
   };
   VkDescriptorSetLayoutCreateInfo dslci = {
       .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-      .bindingCount = 4,
+      .bindingCount = 6,
       .pBindings = bindings,
   };
   if (vkCreateDescriptorSetLayout(r->vk.dev, &dslci, NULL, &r->dsl) != VK_SUCCESS) return -1;
@@ -195,12 +211,13 @@ static int create_pipeline(r3d_renderer *r) {
 
   VkDescriptorPoolSize sizes[] = {
       {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1},
-      {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 18},
+      {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 19},
+      {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1},
   };
   VkDescriptorPoolCreateInfo dpci = {
       .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
       .maxSets = 1,
-      .poolSizeCount = 2,
+      .poolSizeCount = 3,
       .pPoolSizes = sizes,
   };
   if (vkCreateDescriptorPool(r->vk.dev, &dpci, NULL, &r->dpool) != VK_SUCCESS) return -1;
@@ -512,6 +529,22 @@ int r3d_create(SDL_Window *win, const r3d_config *cfg, r3d_renderer **out) {
     write_image_dset(r, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, r->tf.view, r->samp_tf,
                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
   }
+  /* bricks-mode dummies: atlas = dummy volume view; page = 4-byte buffer */
+  {
+    if (r3d_vkbuf_create_host(&r->vk, 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &r->page_buf) != 0)
+      goto fail;
+    ((uint32_t *)r->page_buf.mapped)[0] = 0xFFFFFFFFu;
+    write_image_dset(r, 4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, r->volume.view,
+                     r->samp_vol, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    VkDescriptorBufferInfo pbi = {.buffer = r->page_buf.buf, .range = VK_WHOLE_SIZE};
+    VkWriteDescriptorSet pw = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                               .dstSet = r->dset,
+                               .dstBinding = 5,
+                               .descriptorCount = 1,
+                               .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                               .pBufferInfo = &pbi};
+    vkUpdateDescriptorSets(r->vk.dev, 1, &pw, 0, NULL);
+  }
 
   if (r3d_vkgui_init(&r->vk, win, r->swap.format, r->swap.nimages) != 0) goto fail;
   r->gui_up = true;
@@ -554,6 +587,9 @@ void r3d_destroy(r3d_renderer *r) {
   if (r->pipe_layout) vkDestroyPipelineLayout(r->vk.dev, r->pipe_layout, NULL);
   if (r->dsl) vkDestroyDescriptorSetLayout(r->vk.dev, r->dsl, NULL);
   r3d_vkclip_destroy(r->clipm);
+  r3d_vkc5d_destroy(r->c5d);
+  r3d_vkimage_destroy(&r->vk, &r->brick_atlas);
+  r3d_vkbuf_destroy(&r->vk, &r->page_buf);
   if (r->samp_vol) vkDestroySampler(r->vk.dev, r->samp_vol, NULL);
   if (r->samp_tf) vkDestroySampler(r->vk.dev, r->samp_tf, NULL);
   if (r->samp_near) vkDestroySampler(r->vk.dev, r->samp_near, NULL);
@@ -923,6 +959,96 @@ void r3d_slab_params(const r3d_renderer *r, r3d_frame_params *p) {
   p->slab_px = (float)r->slab.px;
   p->slab_py = (float)r->slab.py;
   p->slab_depth = r->slab.wz - 2; /* max; caller may lower it per frame */
+}
+
+int r3d_bricks_begin(r3d_renderer *r, const char *c5s_path) {
+  c5d_shard_reader sr;
+  if (c5d_shard_open(c5s_path, &sr) != 0) {
+    fprintf(stderr, "bricks: cannot open %s\n", c5s_path);
+    return -1;
+  }
+  if (sr.foot.brick_dim != 128) {
+    fprintf(stderr, "bricks: brick_dim %u unsupported\n", sr.foot.brick_dim);
+    c5d_shard_close_reader(&sr);
+    return -1;
+  }
+  uint32_t bpa = sr.foot.shard_dim / 128, nb = sr.foot.nbricks;
+  uint32_t abpa = bpa; /* v1: all bricks resident, atlas mirrors the shard */
+  uint32_t adim = abpa * 128;
+
+  if (r3d_vkimage_create(&r->vk, VK_FORMAT_R8_UNORM, (VkExtent3D){adim, adim, adim}, 1,
+                         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                         &r->brick_atlas) != 0) {
+    c5d_shard_close_reader(&sr);
+    return -1;
+  }
+  VkCommandBuffer cmd = r3d_vk_oneshot_begin(&r->vk, r->pool);
+  r3d_vk_image_barrier(cmd, r->brick_atlas.img, VK_IMAGE_LAYOUT_UNDEFINED,
+                       VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0,
+                       VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                       VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT, 0, 1);
+  if (r3d_vk_oneshot_end(&r->vk, r->pool, cmd) != 0) return -1;
+
+  if (r3d_vkc5d_create(&r->c5d, &r->vk, r->cfg.spv_dir, 8) != 0) return -1;
+
+  r3d_c5d_src *srcs = calloc(nb, sizeof *srcs);
+  uint32_t *idx = calloc(nb, sizeof *idx); /* srcs[k] -> brick index */
+  uint8_t *maxes = calloc(nb, 1);
+  if (!srcs || !idx || !maxes) return -1;
+  uint32_t np = 0;
+  for (uint32_t b = 0; b < nb; b++) {
+    size_t n = 0;
+    const uint8_t *blob = c5d_shard_brick(&sr, b, &n);
+    if (!blob) continue; /* missing brick: page stays invalid */
+    uint32_t bz = b / (bpa * bpa), by = (b / bpa) % bpa, bx = b % bpa;
+    srcs[np] = (r3d_c5d_src){.blob = blob, .n = n,
+                             .sx = bx * 128, .sy = by * 128, .sz = bz * 128};
+    idx[np++] = b;
+  }
+  printf("bricks: decoding %u/%u bricks on GPU (%s)...\n", np, nb,
+         getenv("R3D_C5D_HYBRID") ? "hybrid" : "full-GPU");
+  uint64_t t0 = now_ns();
+  int rc = r3d_vkc5d_decode(r->c5d, srcs, np, r->brick_atlas.view, maxes);
+  double ms = (double)(now_ns() - t0) / 1e6;
+  if (rc != 0) {
+    fprintf(stderr, "bricks: GPU decode failed\n");
+    return -1;
+  }
+  printf("bricks: decoded %u bricks in %.0f ms (%.0f bricks/s, %.2f GB/s raw)\n", np, ms,
+         (double)np * 1000.0 / ms, (double)np * 2.097152 / ms);
+
+  /* page table */
+  r3d_vkbuf_destroy(&r->vk, &r->page_buf);
+  if (r3d_vkbuf_create_host(&r->vk, (VkDeviceSize)nb * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                            &r->page_buf) != 0)
+    return -1;
+  uint32_t *page = r->page_buf.mapped;
+  for (uint32_t b = 0; b < nb; b++) page[b] = 0xFFFFFFFFu;
+  for (uint32_t k = 0; k < np; k++)
+    page[idx[k]] = idx[k] | ((uint32_t)maxes[k] << 24); /* slot == brick idx (v1) */
+  free(srcs);
+  free(idx);
+  free(maxes);
+  c5d_shard_close_reader(&sr);
+
+  vkDeviceWaitIdle(r->vk.dev);
+  write_image_dset(r, 4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, r->brick_atlas.view,
+                   r->samp_vol, VK_IMAGE_LAYOUT_GENERAL);
+  VkDescriptorBufferInfo pbi = {.buffer = r->page_buf.buf, .range = VK_WHOLE_SIZE};
+  VkWriteDescriptorSet pw = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                             .dstSet = r->dset,
+                             .dstBinding = 5,
+                             .descriptorCount = 1,
+                             .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                             .pBufferInfo = &pbi};
+  vkUpdateDescriptorSets(r->vk.dev, 1, &pw, 0, NULL);
+  r->bricks_bpa = bpa;
+  r->bricks_abpa = abpa;
+  return 0;
+}
+
+void r3d_bricks_params(const r3d_renderer *r, r3d_frame_params *p) {
+  p->brick_mode = r->bricks_bpa | (r->bricks_abpa << 8);
 }
 
 int r3d_clip_begin(r3d_renderer *r, const char *band_dir, const char *pyramid_dir,

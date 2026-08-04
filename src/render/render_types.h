@@ -57,8 +57,10 @@ typedef struct r3d_frame_params {
   float vol_r0[3]; float vol_tx;
   float vol_r1[3]; float vol_ty;
   float vol_r2[3]; float vol_tz;
+  /* bricks mode (c5d GPU-decoded atlas): 0 = off; else bpa | atlas_bpa<<8 */
+  uint32_t brick_mode;
 } r3d_frame_params;
-static_assert(sizeof(r3d_frame_params) == 216, "must mirror shader FrameParams");
+static_assert(sizeof(r3d_frame_params) == 220, "must mirror shader FrameParams");
 
 typedef struct r3d_frame_stats {
   /* GPU zones from timestamp queries (0 if unsupported); lag 2 frames */
