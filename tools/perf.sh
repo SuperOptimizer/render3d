@@ -25,3 +25,8 @@ run "bench fly   lowcut=110"   --bench fly --lowcut 110
 run "static exterior"
 run "static interior dense"    --cam 0.5 0.5 0.35 0.0 0.15
 run "static MIP worst-case"    --mode 1
+run "slab zsweep (1-tile)"     --slab 32 --bench zsweep
+if [ -f slab3072.u8 ]; then
+  line=$(timeout 120 "$BIN" slab3072.u8 3072 3072 96 $COMMON --slab 32 --bench zsweep 2>/dev/null | grep 'profile avg' || echo 'FAILED')
+  printf '%-28s %s\n' "slab zsweep (2x2 3072^2)" "$line"
+fi

@@ -106,3 +106,21 @@ Static interior dense stays ~16.5-17.6 ms — genuinely dense near field at
 step=1; the honest fix is quality-trading lod_bias (slider) or future
 per-brick adaptive sampling, not marching tricks. Run-to-run thermal noise
 is ±10% — trust deltas above that.
+
+## 2026-08-04 — tiled slab renderer with z-scrolling (release, 1080p uncapped)
+
+Wide thin z-window over big volumes without atlas/page-table machinery: up to
+2x2 tile textures (payload 2046 + 1-voxel apron = 2048 cap; composite max
+4092²), ring-buffered z (REPEAT-W sampler, wz-1 seam-safe slices), scrolled by
+host_image_copy into permanently-GENERAL tiles after a timeline wait.
+
+- Apron correctness: seam 2nd-difference at tile boundary == reference regions
+  (synthetic continuous pattern, 2x2 @ 3072²).
+- Real data: fetched 3072x3072x96 (0.84 GiB) from PHercParis4 zarr in ~3 min
+  (tools/fetch_slab.py); renders seamlessly across tiles.
+- Perf (zsweep bench, continuous scrolling): 1-tile 1024² = 4.3 ms; 2x2 3072²
+  = 12.2 ms. Window jump (32 slices, 4 tiles) ~105 ms dev / ~50 ms release;
+  per-slice scroll a few ms.
+- Known gap: slab tiles have no mips (max_lod forced 0) → zoomed-out wide
+  views march at full voxel pitch (21.7 ms at 720p dev on 3072² overview).
+  Follow-up: per-tile mip chain or coarse overview texture.
