@@ -1,0 +1,33 @@
+#version 450
+/* Pack pass: c5d GPU decode leaves voxels as one int32 (0..255) per voxel in
+ * the Vol scratch SSBO; this writes them as R8_UNORM into the brick-atlas 3D
+ * image at the target slot. One workgroup per 16^3 chunk (mirrors
+ * dequant_idct's geometry); thread = one 16-voxel row. */
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer Vol { int vol[]; };
+layout(binding = 1, r8) uniform writeonly image3D atlas;
+
+layout(push_constant) uniform PC {
+  uint dim;      /* brick dim (128) */
+  uint bpa;      /* dim/16 */
+  uint vol_base; /* int offset of this brick in Vol */
+  uint slot_x, slot_y, slot_z; /* atlas texel origin of the slot */
+} pc;
+
+void main() {
+  uint ci = gl_WorkGroupID.x;
+  uint tid = gl_LocalInvocationID.x;
+  uint cz = ci / (pc.bpa * pc.bpa);
+  uint cy = (ci / pc.bpa) % pc.bpa;
+  uint cx = ci % pc.bpa;
+  uint z = cz * 16u + (tid >> 4u);
+  uint y = cy * 16u + (tid & 15u);
+  uint xbase = cx * 16u;
+  uint row = pc.vol_base + (z * pc.dim + y) * pc.dim + xbase;
+  ivec3 o = ivec3(int(pc.slot_x + xbase), int(pc.slot_y + y), int(pc.slot_z + z));
+  for (uint x = 0u; x < 16u; x++) {
+    float v = float(clamp(vol[row + x], 0, 255)) / 255.0;
+    imageStore(atlas, o + ivec3(int(x), 0, 0), vec4(v));
+  }
+}

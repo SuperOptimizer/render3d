@@ -65,6 +65,27 @@ target_include_directories(r3d_core PUBLIC src)
 target_link_libraries(r3d_core PRIVATE r3d_warnings r3d_sanitize r3d_harden
                                PUBLIC m Threads::Threads SDL3::SDL3)
 
+# --- c5d codec (sibling working tree, read-only dependency) ---
+# Sources compiled directly (not add_subdirectory) to keep test/target
+# namespaces separate; list mirrors the c5d lib in ${R3D_C5D_DIR}/CMakeLists.
+set(R3D_C5D_DIR "$ENV{HOME}/compressor" CACHE PATH "c5d compressor checkout")
+if(NOT EXISTS "${R3D_C5D_DIR}/src/brick.h")
+  message(FATAL_ERROR "c5d not found at ${R3D_C5D_DIR} (set R3D_C5D_DIR)")
+endif()
+add_library(r3d_c5d STATIC
+  ${R3D_C5D_DIR}/src/common/c5d_core.c
+  ${R3D_C5D_DIR}/src/common/pool.c
+  ${R3D_C5D_DIR}/src/transform/dct16.c
+  ${R3D_C5D_DIR}/src/entropy/rans.c
+  ${R3D_C5D_DIR}/src/entropy/priors.c
+  ${R3D_C5D_DIR}/src/brick.c
+  ${R3D_C5D_DIR}/src/gpu/host_entropy.c
+  ${R3D_C5D_DIR}/src/shard.c
+  ${R3D_C5D_DIR}/src/cache.c)
+target_include_directories(r3d_c5d SYSTEM PUBLIC ${R3D_C5D_DIR}/src)
+target_compile_options(r3d_c5d PRIVATE -ffast-math -fno-math-errno -O3)
+target_link_libraries(r3d_c5d PUBLIC m Threads::Threads PRIVATE r3d_sanitize)
+
 # --- shard store: vendored dct3d codec + zarr-v3 shard reader ---
 if(NOT EXISTS "${CMAKE_SOURCE_DIR}/tools/3ddct/dct3d.c")
   message(FATAL_ERROR "3ddct not vendored — run tools/fetch_3ddct.sh first")
@@ -110,9 +131,10 @@ add_library(r3d_vk STATIC
   src/vk/vkres.c
   src/vk/vkbackend.c
   src/vk/vkclip.c
+  src/vk/vkc5d.c
   src/vk/vkgui.c)
 target_include_directories(r3d_vk PUBLIC src)
-target_link_libraries(r3d_vk PUBLIC Vulkan::Vulkan SDL3::SDL3 r3d_imgui r3d_shard
+target_link_libraries(r3d_vk PUBLIC Vulkan::Vulkan SDL3::SDL3 r3d_imgui r3d_shard r3d_c5d
                              PRIVATE r3d_warnings r3d_sanitize r3d_harden)
 
 # --- shaders (Slang -> SPIR-V) ---
@@ -128,6 +150,8 @@ target_link_libraries(render3d PRIVATE r3d_core r3d_vk SDL3::SDL3
 # --- tools ---
 add_executable(assemble tools/assemble/main.c)
 target_link_libraries(assemble PRIVATE m r3d_warnings r3d_sanitize r3d_harden)
+add_executable(c5dpack tools/c5dpack/main.c)
+target_link_libraries(c5dpack PRIVATE r3d_c5d r3d_shard r3d_warnings r3d_sanitize r3d_harden)
 add_executable(mkpyramid tools/mkpyramid/main.c)
 target_link_libraries(mkpyramid PRIVATE r3d_shard r3d_warnings r3d_sanitize r3d_harden)
 add_executable(mkvol tools/mkvol/main.c)
@@ -144,6 +168,14 @@ add_executable(test_shard tests/test_shard.c)
 target_link_libraries(test_shard PRIVATE r3d_shard r3d_warnings r3d_sanitize r3d_harden)
 add_test(NAME shard COMMAND test_shard ${CMAKE_SOURCE_DIR}/band)
 set_tests_properties(shard PROPERTIES LABELS data TIMEOUT 60)
+
+add_executable(test_c5dgpu tests/test_c5dgpu.c)
+target_link_libraries(test_c5dgpu PRIVATE r3d_vk r3d_c5d r3d_warnings r3d_sanitize r3d_harden)
+add_dependencies(test_c5dgpu r3d_shaders)
+target_compile_definitions(test_c5dgpu PRIVATE R3D_SPV_DIR="${R3D_SPV_DIR}")
+add_test(NAME c5dgpu COMMAND test_c5dgpu)
+set_tests_properties(c5dgpu PROPERTIES LABELS gpu TIMEOUT 300
+  ENVIRONMENT "LSAN_OPTIONS=suppressions=${CMAKE_SOURCE_DIR}/lsan.supp")
 
 add_executable(test_gpu tests/test_gpu.c)
 target_link_libraries(test_gpu PRIVATE r3d_core r3d_warnings r3d_sanitize r3d_harden)

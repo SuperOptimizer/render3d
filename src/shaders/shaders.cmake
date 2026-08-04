@@ -34,6 +34,28 @@ foreach(_v ${_variants})
     VERBATIM)
   list(APPEND _spv_outputs "${_out}")
 endforeach()
+# c5d decode kernels (GLSL, from the compressor working tree) + our pack kernel
+find_program(R3D_GLSLC NAMES glslc REQUIRED)
+foreach(_ck entropy dequant_idct deblock)
+  set(_src "${R3D_C5D_DIR}/src/gpu/kernels/${_ck}.comp")
+  set(_out "${_spv_dir}/c5d_${_ck}.spv")
+  add_custom_command(
+    OUTPUT "${_out}"
+    COMMAND "${R3D_GLSLC}" -O --target-env=vulkan1.1 -o "${_out}" "${_src}"
+    DEPENDS "${_src}"
+    COMMENT "glslc c5d ${_ck}.comp"
+    VERBATIM)
+  list(APPEND _spv_outputs "${_out}")
+endforeach()
+add_custom_command(
+  OUTPUT "${_spv_dir}/pack.spv"
+  COMMAND "${R3D_GLSLC}" -O --target-env=vulkan1.1 -o "${_spv_dir}/pack.spv"
+          "${_shader_dir}/pack.comp"
+  DEPENDS "${_shader_dir}/pack.comp"
+  COMMENT "glslc pack.comp"
+  VERBATIM)
+list(APPEND _spv_outputs "${_spv_dir}/pack.spv")
+
 add_custom_target(r3d_shaders DEPENDS ${_spv_outputs})
 
 set(R3D_SPV_DIR "${_spv_dir}")
