@@ -72,6 +72,7 @@ int main(void) {
   size_t blob_n[NB];
   r3d_c5d_src src[NB];
   c5d_brick_params p = c5d_brick_defaults(2.0f); /* lossless/tau off (GPU reqs) */
+  p.nsub = 128; /* v1.4 GPU knob (what c5dpack writes) */
   for (uint32_t i = 0; i < NB; i++) {
     synth_brick(i, raw);
     if (c5d_brick_encode(&p, raw, BD, &blob[i], &blob_n[i]) != 0) return 1;

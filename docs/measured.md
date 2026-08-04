@@ -215,3 +215,16 @@ Same day: resynced vkc5d to upstream's committed sparse-entropy kernels
 (7a9909c, pairs+counts output, 6.5x entropy speedup): our conformance
 gate stays at 10/16.7M voxels at 1 LSB, 0 above; engine decode 8 bricks
 45 -> 15 ms full-GPU.
+
+## 2026-08-04 — resync to compressor HEAD (75938e1): packed-u8 + v1.4 nsub=128
+
+Upstream changes absorbed: Vol buffer now packed u8 (4 voxels/word — our
+pack.comp reads words, vol buffer 4x smaller), deblock dispatch total/4 on
+axes y/z, sub/status sized for nsub<=128, he_gpu slot2sym may be NULL
+(shared-mem binary search path). c5dpack + test_c5dgpu now encode with
+p.nsub=128 (v1.4 GPU knob). Conformance unchanged (10/16.7M at 1 LSB).
+512-brick atlas fill: full-GPU 8.1 -> 3.3 s (157 bricks/s, 0.33 GB/s) and
+now FASTER than hybrid (4.8 s) — compressed-bytes-to-GPU wins as intended.
+Gap to upstream's 2.35 GB/s streaming bench = their 3-deep pipelined
+submission vs our serial batch+fence fills; follow-up when fills need to
+be interactive (streaming residency milestone).

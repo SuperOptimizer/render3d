@@ -42,6 +42,7 @@ static void *enc_worker(void *arg) {
     return NULL;
   }
   c5d_brick_params p = c5d_brick_defaults(j->q);
+  p.nsub = 128; /* v1.4 GPU knob: 4x the entropy-decode parallelism */
   uint32_t nb = j->bpa * j->bpa * j->bpa;
   for (;;) {
     uint32_t b = atomic_fetch_add(&j->next, 1);

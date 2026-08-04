@@ -5,7 +5,7 @@
  * dequant_idct's geometry); thread = one 16-voxel row. */
 layout(local_size_x = 256) in;
 
-layout(std430, binding = 0) readonly buffer Vol { int vol[]; };
+layout(std430, binding = 0) readonly buffer Vol { uint vol[]; }; /* packed u8, 4/word */
 layout(binding = 1, r8) uniform writeonly image3D atlas;
 
 layout(push_constant) uniform PC {
@@ -24,10 +24,13 @@ void main() {
   uint z = cz * 16u + (tid >> 4u);
   uint y = cy * 16u + (tid & 15u);
   uint xbase = cx * 16u;
-  uint row = pc.vol_base + (z * pc.dim + y) * pc.dim + xbase;
+  uint row = pc.vol_base + (z * pc.dim + y) * pc.dim + xbase; /* voxel units, 16-aligned */
   ivec3 o = ivec3(int(pc.slot_x + xbase), int(pc.slot_y + y), int(pc.slot_z + z));
-  for (uint x = 0u; x < 16u; x++) {
-    float v = float(clamp(vol[row + x], 0, 255)) / 255.0;
-    imageStore(atlas, o + ivec3(int(x), 0, 0), vec4(v));
+  for (uint w = 0u; w < 4u; w++) {
+    uint word = vol[(row >> 2u) + w];
+    for (uint k = 0u; k < 4u; k++) {
+      float v = float((word >> (8u * k)) & 0xffu) / 255.0;
+      imageStore(atlas, o + ivec3(int(w * 4u + k), 0, 0), vec4(v));
+    }
   }
 }

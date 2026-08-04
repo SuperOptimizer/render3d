@@ -200,14 +200,14 @@ int r3d_vkc5d_create(r3d_vkc5d **out, r3d_vkctx *c, const char *spv_dir, uint32_
 
   VkBufferUsageFlags u = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
   if (r3d_vkbuf_create_host(c, (VkDeviceSize)K * LVS * 4, u, &d->lv) != 0 ||
-      r3d_vkbuf_create_host(c, (VkDeviceSize)K * NVOX * 4, u, &d->vol) != 0 ||
+      r3d_vkbuf_create_host(c, (VkDeviceSize)K * NVOX, u, &d->vol) != 0 ||
       r3d_vkbuf_create_host(c, (VkDeviceSize)K * (4u << 20), u, &d->pay) != 0 ||
       r3d_vkbuf_create_host(c, (VkDeviceSize)K * HE_NMODELS * HE_NTOK * 4, u, &d->freq) != 0 ||
       r3d_vkbuf_create_host(c, (VkDeviceSize)K * HE_NMODELS * (HE_NTOK + 1) * 4, u, &d->cum) !=
           0 ||
       r3d_vkbuf_create_host(c, (VkDeviceSize)K * HE_NMODELS * 4096 * 4, u, &d->slot) != 0 ||
-      r3d_vkbuf_create_host(c, (VkDeviceSize)K * 32 * 6 * 4, u, &d->sub) != 0 ||
-      r3d_vkbuf_create_host(c, (VkDeviceSize)K * 32 * 4, u, &d->stat) != 0 ||
+      r3d_vkbuf_create_host(c, (VkDeviceSize)K * 128 * 6 * 4, u, &d->sub) != 0 ||
+      r3d_vkbuf_create_host(c, (VkDeviceSize)K * 128 * 4, u, &d->stat) != 0 ||
       r3d_vkbuf_create_host(c, 4096 * 4, u, &d->scan) != 0 ||
       r3d_vkbuf_create_host(c, (VkDeviceSize)K * 512 * 4, u, &d->counts) != 0)
     goto fail;
@@ -306,7 +306,7 @@ int r3d_vkc5d_decode(r3d_vkc5d *d, const r3d_c5d_src *src, uint32_t n, VkImageVi
         he_gpu *g = &gpus[i];
         if (pay_off + g->payload_n > (size_t)d->max_batch * (4u << 20)) goto brick_fail;
         memcpy((uint8_t *)d->pay.mapped + pay_off, g->payload, g->payload_n);
-        uint32_t *si = (uint32_t *)d->sub.mapped + (size_t)i * 32 * 6;
+        uint32_t *si = (uint32_t *)d->sub.mapped + (size_t)i * 128 * 6;
         memcpy(si, g->subinfo, (size_t)g->nsub * 6 * 4);
         for (uint32_t ss = 0; ss < g->nsub; ss++) {
           si[ss * 6 + 0] += (uint32_t)pay_off;
@@ -316,8 +316,9 @@ int r3d_vkc5d_decode(r3d_vkc5d *d, const r3d_c5d_src *src, uint32_t n, VkImageVi
                (size_t)HE_NMODELS * HE_NTOK * 4);
         memcpy((uint32_t *)d->cum.mapped + (size_t)i * HE_NMODELS * (HE_NTOK + 1), g->cum,
                (size_t)HE_NMODELS * (HE_NTOK + 1) * 4);
-        memcpy((uint32_t *)d->slot.mapped + (size_t)i * HE_NMODELS * 4096, g->slot2sym,
-               (size_t)HE_NMODELS * 4096 * 4);
+        if (g->slot2sym) /* absent when the kernel's shared-mem search path is used */
+          memcpy((uint32_t *)d->slot.mapped + (size_t)i * HE_NMODELS * 4096, g->slot2sym,
+                 (size_t)HE_NMODELS * 4096 * 4);
         pay_off += (g->payload_n + 3) & ~(size_t)3;
       }
     }
@@ -349,8 +350,8 @@ int r3d_vkc5d_decode(r3d_vkc5d *d, const r3d_c5d_src *src, uint32_t n, VkImageVi
                    .brick0 = 0,
                    .lv_stride = LVS,
                    .tb_stride = HE_NMODELS,
-                   .sub_stride = 32 * 6,
-                   .st_stride = 32};
+                   .sub_stride = 128 * 6,
+                   .st_stride = 128};
       dispatch(d->cmd, &d->ent, &pe, sizeof pe, (nb * g0->nsub + 63) / 64);
       barrier_compute(d->cmd);
     }
@@ -367,9 +368,10 @@ int r3d_vkc5d_decode(r3d_vkc5d *d, const r3d_c5d_src *src, uint32_t n, VkImageVi
         const he_gpu *g = &gpus[i];
         if (!g->deblock) continue;
         uint32_t nface = g->dim / 16u - 1u;
+        uint32_t total = nface * g->dim * (axis == 0 ? g->dim : g->dim / 4u);
         pc_db pb = {.dim = g->dim, .axis = axis, .c = deblock_strength(g->q), .nface = nface,
                     .vol_base = i * NVOX};
-        dispatch(d->cmd, &d->db, &pb, sizeof pb, (nface * g->dim * g->dim + 63) / 64);
+        dispatch(d->cmd, &d->db, &pb, sizeof pb, (total + 63) / 64);
       }
       barrier_compute(d->cmd);
     }
@@ -408,19 +410,19 @@ int r3d_vkc5d_decode(r3d_vkc5d *d, const r3d_c5d_src *src, uint32_t n, VkImageVi
       const uint32_t *st = d->stat.mapped;
       for (uint32_t i = 0; i < nb; i++)
         for (uint32_t ss = 0; ss < gpus[i].nsub; ss++)
-          if (st[i * 32 + ss]) {
+          if (st[i * 128 + ss]) {
             fprintf(stderr, "vkc5d: truncated substream brick %u sub %u\n", i0 + i, ss);
             goto batch_fail;
           }
     }
     if (out_max) {
-      const int32_t *vol = d->vol.mapped;
+      const uint8_t *vol = d->vol.mapped; /* packed u8, 1 byte per voxel */
       for (uint32_t i = 0; i < nb; i++) {
-        int32_t m = 0;
-        const int32_t *v = vol + (size_t)i * NVOX;
+        uint8_t m = 0;
+        const uint8_t *v = vol + (size_t)i * NVOX;
         for (size_t k = 0; k < NVOX; k++)
           if (v[k] > m) m = v[k];
-        out_max[i0 + i] = (uint8_t)(m < 0 ? 0 : (m > 255 ? 255 : m));
+        out_max[i0 + i] = m;
       }
     }
     for (uint32_t i = 0; i < nb; i++) {
