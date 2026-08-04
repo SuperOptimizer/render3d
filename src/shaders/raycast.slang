@@ -257,8 +257,9 @@ void main(uint3 tid: SV_DispatchThreadID) {
   bool composite = pc.mode == MODE_FULL || pc.mode == MODE_FLAT;
   bool shaded = pc.mode == MODE_FULL;
 
-  float bs = OCC_BLOCK * voxel;                     // skip-block edge, volume units
-  float occ_gate = max(pc.threshold, 0.5 / 255.0);  // block max below this = void
+  float bs = OCC_BLOCK * voxel; // skip-block edge, volume units
+  // block max below this contributes nothing: low-cut OR zero TF alpha
+  float occ_gate = max(pc.skip_gate, 0.5 / 255.0);
 
   // bricks mode: page entry cached across steps (rays cross bricks rarely)
   uint b_bpa = pc.brick_mode & 0xffu;
@@ -313,9 +314,17 @@ void main(uint3 tid: SV_DispatchThreadID) {
     bool void_blk = false;
     float bsz = bs;
     if (is_bricks()) {
-      if (v < occ_gate && b_max < occ_gate) { /* cached page entry */
-        void_blk = true;
-        bsz = 128.0 * voxel;
+      /* decoded air carries 1-3 LSB codec noise, so exact-zero gating never
+       * fires; a ~4 LSB skip floor loses at most ~1% accumulated alpha per
+       * skipped block (invisible) and restores cube-grade skipping */
+      float bgate = max(occ_gate, 4.5 / 255.0);
+      if (v < bgate) {
+        if (b_max < bgate) { /* whole brick void (cached page entry) */
+          void_blk = true;
+          bsz = 128.0 * voxel;
+        } else if (occ.SampleLevel(p, 0) < bgate) { /* 8^3 block void */
+          void_blk = true;
+        }
       }
     } else if (!is_slab() && !is_clip() && v < occ_gate && occ.SampleLevel(p, 0) < occ_gate) {
       void_blk = true;

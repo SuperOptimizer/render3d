@@ -28,6 +28,7 @@ struct FrameParams {
   float vol_r20, vol_r21, vol_r22, vol_tz;
   // bricks mode (c5d GPU-decoded atlas): 0 = off; else bpa | atlas_bpa<<8
   uint brick_mode;
+  float skip_gate; // voxels below this are invisible under the current TF
 };
 
 // world -> volume space (R^T rotate about the box center, minus translation)

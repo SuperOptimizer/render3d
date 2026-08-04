@@ -1,0 +1,24 @@
+#version 450
+/* Max-reduce the brick atlas into an 8^3-block occupancy texture (one thread
+ * per occupancy texel). Runs once after the atlas fill; enables the same
+ * empty-space skipping in bricks mode that cube mode builds on the CPU. */
+layout(local_size_x = 64) in;
+
+layout(binding = 0) uniform sampler3D atlas;
+layout(binding = 1, r8) uniform writeonly image3D occ;
+
+layout(push_constant) uniform PC { uint odim; } pc;
+
+void main() {
+  uint id = gl_GlobalInvocationID.x;
+  uint n = pc.odim * pc.odim * pc.odim;
+  if (id >= n) return;
+  uint z = id / (pc.odim * pc.odim), y = (id / pc.odim) % pc.odim, x = id % pc.odim;
+  ivec3 b = ivec3(int(x), int(y), int(z)) * 8;
+  float m = 0.0;
+  for (int dz = 0; dz < 8; dz++)
+    for (int dy = 0; dy < 8; dy++)
+      for (int dx = 0; dx < 8; dx++)
+        m = max(m, texelFetch(atlas, b + ivec3(dx, dy, dz), 0).r);
+  imageStore(occ, ivec3(int(x), int(y), int(z)), vec4(m));
+}

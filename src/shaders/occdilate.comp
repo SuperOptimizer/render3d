@@ -1,0 +1,27 @@
+#version 450
+/* 3^3 max dilation of the raw occupancy so trilinear fine samples near block
+ * borders can never contradict a "skip" verdict (mirrors the CPU build in
+ * vkbackend.c build_occupancy). */
+layout(local_size_x = 64) in;
+
+layout(binding = 0) uniform sampler3D occ_raw;
+layout(binding = 1, r8) uniform writeonly image3D occ_out;
+
+layout(push_constant) uniform PC { uint odim; } pc;
+
+void main() {
+  uint id = gl_GlobalInvocationID.x;
+  uint n = pc.odim * pc.odim * pc.odim;
+  if (id >= n) return;
+  int d = int(pc.odim);
+  ivec3 c = ivec3(int(id % pc.odim), int((id / pc.odim) % pc.odim),
+                  int(id / (pc.odim * pc.odim)));
+  float m = 0.0;
+  for (int dz = -1; dz <= 1; dz++)
+    for (int dy = -1; dy <= 1; dy++)
+      for (int dx = -1; dx <= 1; dx++) {
+        ivec3 q = clamp(c + ivec3(dx, dy, dz), ivec3(0), ivec3(d - 1));
+        m = max(m, texelFetch(occ_raw, q, 0).r);
+      }
+  imageStore(occ_out, c, vec4(m));
+}

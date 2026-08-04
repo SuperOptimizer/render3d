@@ -1,6 +1,7 @@
 #include "vk/vkres.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 uint32_t r3d_vk_find_mem(const r3d_vkctx *c, uint32_t type_bits, VkMemoryPropertyFlags flags) {
@@ -104,6 +105,105 @@ void r3d_vkimage_destroy(r3d_vkctx *c, r3d_vkimage *im) {
   if (im->img) vkDestroyImage(c->dev, im->img, NULL);
   if (im->mem) vkFreeMemory(c->dev, im->mem, NULL);
   memset(im, 0, sizeof *im);
+}
+
+int r3d_vkcomp_create(r3d_vkctx *c, const char *spv_path, const VkDescriptorType *types,
+                      uint32_t ntypes, uint32_t push_size, r3d_vkcomp *out) {
+  memset(out, 0, sizeof *out);
+  VkDescriptorSetLayoutBinding binds[16];
+  VkDescriptorPoolSize sizes[16];
+  for (uint32_t i = 0; i < ntypes && i < 16; i++) {
+    binds[i] = (VkDescriptorSetLayoutBinding){.binding = i,
+                                              .descriptorType = types[i],
+                                              .descriptorCount = 1,
+                                              .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT};
+    sizes[i] = (VkDescriptorPoolSize){types[i], 1};
+  }
+  VkDescriptorSetLayoutCreateInfo dslci = {
+      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+      .bindingCount = ntypes,
+      .pBindings = binds};
+  if (vkCreateDescriptorSetLayout(c->dev, &dslci, NULL, &out->dsl) != VK_SUCCESS) return -1;
+  VkPushConstantRange pcr = {.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT, .size = push_size};
+  VkPipelineLayoutCreateInfo plci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+                                     .setLayoutCount = 1,
+                                     .pSetLayouts = &out->dsl,
+                                     .pushConstantRangeCount = push_size ? 1u : 0u,
+                                     .pPushConstantRanges = &pcr};
+  if (vkCreatePipelineLayout(c->dev, &plci, NULL, &out->layout) != VK_SUCCESS) return -1;
+
+  FILE *f = fopen(spv_path, "rb");
+  if (!f) {
+    fprintf(stderr, "vkcomp: missing %s\n", spv_path);
+    return -1;
+  }
+  fseek(f, 0, SEEK_END);
+  long n = ftell(f);
+  fseek(f, 0, SEEK_SET);
+  uint32_t *code = malloc((size_t)n);
+  if (!code || fread(code, 1, (size_t)n, f) != (size_t)n) {
+    fclose(f);
+    free(code);
+    return -1;
+  }
+  fclose(f);
+  VkShaderModuleCreateInfo smci = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+                                   .codeSize = (size_t)n,
+                                   .pCode = code};
+  VkShaderModule mod;
+  VkResult r = vkCreateShaderModule(c->dev, &smci, NULL, &mod);
+  free(code);
+  if (r != VK_SUCCESS) return -1;
+  VkComputePipelineCreateInfo cpci = {
+      .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+      .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+                .module = mod,
+                .pName = "main"},
+      .layout = out->layout};
+  r = vkCreateComputePipelines(c->dev, VK_NULL_HANDLE, 1, &cpci, NULL, &out->pipe);
+  vkDestroyShaderModule(c->dev, mod, NULL);
+  if (r != VK_SUCCESS) return -1;
+
+  VkDescriptorPoolCreateInfo dpci = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+                                     .maxSets = 1,
+                                     .poolSizeCount = ntypes,
+                                     .pPoolSizes = sizes};
+  if (vkCreateDescriptorPool(c->dev, &dpci, NULL, &out->dpool) != VK_SUCCESS) return -1;
+  VkDescriptorSetAllocateInfo dsai = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                                      .descriptorPool = out->dpool,
+                                      .descriptorSetCount = 1,
+                                      .pSetLayouts = &out->dsl};
+  return vkAllocateDescriptorSets(c->dev, &dsai, &out->dset) == VK_SUCCESS ? 0 : -1;
+}
+
+void r3d_vkcomp_destroy(r3d_vkctx *c, r3d_vkcomp *p) {
+  if (p->dpool) vkDestroyDescriptorPool(c->dev, p->dpool, NULL);
+  if (p->pipe) vkDestroyPipeline(c->dev, p->pipe, NULL);
+  if (p->layout) vkDestroyPipelineLayout(c->dev, p->layout, NULL);
+  if (p->dsl) vkDestroyDescriptorSetLayout(c->dev, p->dsl, NULL);
+  memset(p, 0, sizeof *p);
+}
+
+void r3d_vkcomp_bind_image(r3d_vkctx *c, r3d_vkcomp *p, uint32_t binding, VkDescriptorType type,
+                           VkImageView view, VkSampler sampler, VkImageLayout layout) {
+  VkDescriptorImageInfo ii = {.sampler = sampler, .imageView = view, .imageLayout = layout};
+  VkWriteDescriptorSet w = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                            .dstSet = p->dset,
+                            .dstBinding = binding,
+                            .descriptorCount = 1,
+                            .descriptorType = type,
+                            .pImageInfo = &ii};
+  vkUpdateDescriptorSets(c->dev, 1, &w, 0, NULL);
+}
+
+void r3d_vkcomp_dispatch(VkCommandBuffer cmd, r3d_vkcomp *p, const void *push,
+                         uint32_t push_size, uint32_t gx, uint32_t gy, uint32_t gz) {
+  vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p->pipe);
+  vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p->layout, 0, 1, &p->dset, 0,
+                          NULL);
+  if (push_size) vkCmdPushConstants(cmd, p->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, push_size, push);
+  vkCmdDispatch(cmd, gx, gy, gz);
 }
 
 VkCommandBuffer r3d_vk_oneshot_begin(r3d_vkctx *c, VkCommandPool pool) {

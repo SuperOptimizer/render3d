@@ -53,6 +53,7 @@ struct r3d_renderer {
   r3d_vkc5d *c5d;
   r3d_vkimage brick_atlas;
   VkImageView brick_atlas_mip0; /* single-mip storage view for the pack kernel */
+  r3d_vkimage brick_occ;        /* 8^3-block occupancy reduced from the atlas */
   r3d_vkbuf page_buf;
   uint32_t bricks_bpa, bricks_abpa;
 
@@ -595,6 +596,7 @@ void r3d_destroy(r3d_renderer *r) {
   r3d_vkc5d_destroy(r->c5d);
   if (r->brick_atlas_mip0) vkDestroyImageView(r->vk.dev, r->brick_atlas_mip0, NULL);
   r3d_vkimage_destroy(&r->vk, &r->brick_atlas);
+  r3d_vkimage_destroy(&r->vk, &r->brick_occ);
   r3d_vkbuf_destroy(&r->vk, &r->page_buf);
   if (r->samp_vol) vkDestroySampler(r->vk.dev, r->samp_vol, NULL);
   if (r->samp_tf) vkDestroySampler(r->vk.dev, r->samp_tf, NULL);
@@ -1084,6 +1086,67 @@ int r3d_bricks_begin(r3d_renderer *r, const char *c5s_path) {
   free(idx);
   free(maxes);
   c5d_shard_close_reader(&sr);
+
+  /* 8^3-block occupancy from the atlas (GPU max-reduce + 3^3 dilate) so the
+   * marcher can skip intra-brick gaps like cube mode does. Valid because v1
+   * slots are identity-mapped (atlas layout == world layout). */
+  {
+    uint32_t odim = adim / 8;
+    r3d_vkimage occ_raw;
+    if (r3d_vkimage_create(&r->vk, VK_FORMAT_R8_UNORM, (VkExtent3D){odim, odim, odim}, 1,
+                           VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                           &occ_raw) != 0 ||
+        r3d_vkimage_create(&r->vk, VK_FORMAT_R8_UNORM, (VkExtent3D){odim, odim, odim}, 1,
+                           VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                           &r->brick_occ) != 0)
+      return -1;
+    VkDescriptorType tt[2] = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                              VK_DESCRIPTOR_TYPE_STORAGE_IMAGE};
+    r3d_vkcomp omax, odil;
+    char sp[1024];
+    snprintf(sp, sizeof sp, "%s/occmax.spv", r->cfg.spv_dir);
+    if (r3d_vkcomp_create(&r->vk, sp, tt, 2, 4, &omax) != 0) return -1;
+    snprintf(sp, sizeof sp, "%s/occdilate.spv", r->cfg.spv_dir);
+    if (r3d_vkcomp_create(&r->vk, sp, tt, 2, 4, &odil) != 0) return -1;
+    r3d_vkcomp_bind_image(&r->vk, &omax, 0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                          r->brick_atlas.view, r->samp_near,
+                          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    r3d_vkcomp_bind_image(&r->vk, &omax, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, occ_raw.view,
+                          VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL);
+    r3d_vkcomp_bind_image(&r->vk, &odil, 0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                          occ_raw.view, r->samp_near, VK_IMAGE_LAYOUT_GENERAL);
+    r3d_vkcomp_bind_image(&r->vk, &odil, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, r->brick_occ.view,
+                          VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL);
+    cmd = r3d_vk_oneshot_begin(&r->vk, r->pool);
+    r3d_vk_image_barrier(cmd, occ_raw.img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                         VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0,
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                         VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, 0, 1);
+    r3d_vk_image_barrier(cmd, r->brick_occ.img, VK_IMAGE_LAYOUT_UNDEFINED,
+                         VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0,
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                         VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, 0, 1);
+    uint32_t on = odim * odim * odim;
+    r3d_vkcomp_dispatch(cmd, &omax, &odim, 4, (on + 63) / 64, 1, 1);
+    r3d_vk_image_barrier(cmd, occ_raw.img, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                         VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                         VK_ACCESS_2_SHADER_SAMPLED_READ_BIT, 0, 1);
+    r3d_vkcomp_dispatch(cmd, &odil, &odim, 4, (on + 63) / 64, 1, 1);
+    r3d_vk_image_barrier(cmd, r->brick_occ.img, VK_IMAGE_LAYOUT_GENERAL,
+                         VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                         VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                         VK_ACCESS_2_SHADER_SAMPLED_READ_BIT, 0, 1);
+    if (r3d_vk_oneshot_end(&r->vk, r->pool, cmd) != 0) return -1;
+    r3d_vkcomp_destroy(&r->vk, &omax);
+    r3d_vkcomp_destroy(&r->vk, &odil);
+    r3d_vkimage_destroy(&r->vk, &occ_raw);
+    /* binding 3 (cube-mode occupancy slot) now serves bricks mode too */
+    write_image_dset(r, 3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, r->brick_occ.view,
+                     r->samp_near, VK_IMAGE_LAYOUT_GENERAL);
+  }
 
   vkDeviceWaitIdle(r->vk.dev);
   write_image_dset(r, 4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, r->brick_atlas.view,

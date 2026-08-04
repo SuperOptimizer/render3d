@@ -36,6 +36,23 @@ void r3d_vkimage_destroy(r3d_vkctx *c, r3d_vkimage *im);
 VkCommandBuffer r3d_vk_oneshot_begin(r3d_vkctx *c, VkCommandPool pool);
 int r3d_vk_oneshot_end(r3d_vkctx *c, VkCommandPool pool, VkCommandBuffer cmd);
 
+/* Small generic compute pipeline (descriptor types given per binding). */
+typedef struct r3d_vkcomp {
+  VkDescriptorSetLayout dsl;
+  VkPipelineLayout layout;
+  VkPipeline pipe;
+  VkDescriptorPool dpool;
+  VkDescriptorSet dset;
+} r3d_vkcomp;
+
+int r3d_vkcomp_create(r3d_vkctx *c, const char *spv_path, const VkDescriptorType *types,
+                      uint32_t ntypes, uint32_t push_size, r3d_vkcomp *out);
+void r3d_vkcomp_destroy(r3d_vkctx *c, r3d_vkcomp *p);
+void r3d_vkcomp_bind_image(r3d_vkctx *c, r3d_vkcomp *p, uint32_t binding, VkDescriptorType type,
+                           VkImageView view, VkSampler sampler, VkImageLayout layout);
+void r3d_vkcomp_dispatch(VkCommandBuffer cmd, r3d_vkcomp *p, const void *push,
+                         uint32_t push_size, uint32_t gx, uint32_t gy, uint32_t gz);
+
 /* sync2 image barrier convenience */
 void r3d_vk_image_barrier(VkCommandBuffer cmd, VkImage img, VkImageLayout from, VkImageLayout to,
                           VkPipelineStageFlags2 src_stage, VkAccessFlags2 src_access,

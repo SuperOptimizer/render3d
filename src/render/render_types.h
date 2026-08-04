@@ -59,8 +59,12 @@ typedef struct r3d_frame_params {
   float vol_r2[3]; float vol_tz;
   /* bricks mode (c5d GPU-decoded atlas): 0 = off; else bpa | atlas_bpa<<8 */
   uint32_t brick_mode;
+  /* skip gate (0..1): voxels below this are invisible under the CURRENT
+   * transfer function + low-cut, so empty-space skipping may leap them.
+   * Exact, not approximate: TF alpha is zero below it by construction. */
+  float skip_gate;
 } r3d_frame_params;
-static_assert(sizeof(r3d_frame_params) == 220, "must mirror shader FrameParams");
+static_assert(sizeof(r3d_frame_params) == 224, "must mirror shader FrameParams");
 
 typedef struct r3d_frame_stats {
   /* GPU zones from timestamp queries (0 if unsupported); lag 2 frames */

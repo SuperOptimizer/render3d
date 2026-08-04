@@ -246,3 +246,20 @@ filter like cube's now). Remaining gap vs cube on dense interiors
 (25.7 vs ~17 @1080p): cube's 8^3 occupancy skips intra-brick gaps; bricks
 skip is 128^3-granular. Proper fix = hierarchical occupancy in the page
 table — belongs to the streaming-residency milestone.
+
+## 2026-08-04 — optimization round 2: GPU occupancy + TF-aware skip gate
+
+Added: GPU-built 8^3 occupancy for bricks mode (occmax + occdilate kernels
+reduce the atlas post-fill; valid under v1 identity slot mapping) wired into
+the marcher with a 4.5-LSB codec-noise floor, and a TF-aware skip gate
+(pc.skip_gate = max(low_cut, first-nonzero-TF-alpha)) — an EXACT skip that
+benefits all modes and all future TFs. Measured: lowcut-style gating fires
+well (dense close 26.3 -> 21.1 ms); the default scroll-TF interior view does
+NOT improve (~26-28 ms) because its inter-sheet gaps (10-20 vox) are below
+the dilated 8^3 skip granularity (~24 vox) — rays legitimately march there.
+Remaining bricks-vs-cube gap on dense interiors ~1.5x = per-sample page-cache
+branch + clamp/slot ALU on 7 fetches; further gains need aprons (drop the
+clamp) or finer skip trees. At the default 720p window every view holds
+60 fps. Thermal drift across long bench sessions is +-10-15% — compare
+paired runs only. Generic r3d_vkcomp helper added to vkres for one-off
+compute passes.

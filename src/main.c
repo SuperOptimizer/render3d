@@ -25,6 +25,13 @@
 
 enum { CAM_ORBIT = 0, CAM_FLY = 1 };
 
+/* first voxel value with nonzero TF alpha: below it, samples are invisible */
+static float tf_min_visible(const uint8_t lut[256][4]) {
+  for (uint32_t i = 0; i < 256; i++)
+    if (lut[i][3] != 0) return (float)i;
+  return 255.0f;
+}
+
 static void gui_event_hook(void *ud, const SDL_Event *ev) {
   r3d_gui_event((r3d_renderer *)ud, ev);
 }
@@ -165,12 +172,14 @@ int main(int argc, char **argv) {
     mode = R3D_MODE_FULL;
   }
   if (force_mode >= 0) mode = (uint32_t)force_mode % R3D_MODE_COUNT;
+  float tf_min_v = 1.0f; /* backend default ramp: alpha nonzero from value 1 */
   if (tf_preset >= 0) {
     r3d_tf tf;
     uint8_t lut[256][4];
     r3d_tf_preset((uint32_t)tf_preset, &tf);
     r3d_tf_build(&tf, lut);
     r3d_set_transfer(renderer, lut);
+    tf_min_v = tf_min_visible(lut);
   }
 
   /* orbit (turntable around the volume) is the default; --cam implies fly */
@@ -277,6 +286,7 @@ int main(int argc, char **argv) {
       r3d_tf_preset(tf_idx, &tf);
       r3d_tf_build(&tf, lut);
       r3d_set_transfer(renderer, lut);
+      tf_min_v = tf_min_visible(lut);
       printf("tf preset: %u\n", tf_idx);
     }
     step_voxels *= in.step_scale;
@@ -369,6 +379,7 @@ int main(int argc, char **argv) {
       r3d_tf_preset(tf_idx, &tfp);
       r3d_tf_build(&tfp, lut);
       r3d_set_transfer(renderer, lut);
+      tf_min_v = tf_min_visible(lut);
     }
     igSliderFloat("step (voxels)", &step_voxels, 0.25f, 4.0f, "%.2f", 0);
     igSliderFloat("density", &density, 0.1f, 8.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
@@ -448,6 +459,7 @@ int main(int argc, char **argv) {
         .mode = mode,
         .frame_index = frame_index++,
         .threshold = low_cut / 255.0f,
+        .skip_gate = fmaxf(low_cut, tf_min_v - 0.5f) / 255.0f,
     };
     r3d_m3 vm = m3_ypr(vol_rot[0], vol_rot[1], vol_rot[2]);
     memcpy(p.vol_r0, &vm.r0, 12);

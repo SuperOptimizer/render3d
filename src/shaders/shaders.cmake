@@ -51,14 +51,16 @@ foreach(_ck entropy dequant_idct deblock)
     VERBATIM)
   list(APPEND _spv_outputs "${_out}")
 endforeach()
-add_custom_command(
-  OUTPUT "${_spv_dir}/pack.spv"
-  COMMAND "${R3D_GLSLC}" -O --target-env=vulkan1.1 -o "${_spv_dir}/pack.spv"
-          "${_shader_dir}/pack.comp"
-  DEPENDS "${_shader_dir}/pack.comp"
-  COMMENT "glslc pack.comp"
-  VERBATIM)
-list(APPEND _spv_outputs "${_spv_dir}/pack.spv")
+foreach(_gk pack occmax occdilate)
+  add_custom_command(
+    OUTPUT "${_spv_dir}/${_gk}.spv"
+    COMMAND "${R3D_GLSLC}" -O --target-env=vulkan1.1 -o "${_spv_dir}/${_gk}.spv"
+            "${_shader_dir}/${_gk}.comp"
+    DEPENDS "${_shader_dir}/${_gk}.comp"
+    COMMENT "glslc ${_gk}.comp"
+    VERBATIM)
+  list(APPEND _spv_outputs "${_spv_dir}/${_gk}.spv")
+endforeach()
 
 add_custom_target(r3d_shaders DEPENDS ${_spv_outputs})
 
