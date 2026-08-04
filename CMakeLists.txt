@@ -65,6 +65,21 @@ target_include_directories(r3d_core PUBLIC src)
 target_link_libraries(r3d_core PRIVATE r3d_warnings r3d_sanitize r3d_harden
                                PUBLIC m Threads::Threads SDL3::SDL3)
 
+# --- shard store: vendored dct3d codec + zarr-v3 shard reader ---
+if(NOT EXISTS "${CMAKE_SOURCE_DIR}/tools/3ddct/dct3d.c")
+  message(FATAL_ERROR "3ddct not vendored — run tools/fetch_3ddct.sh first")
+endif()
+add_library(r3d_shard STATIC
+  tools/3ddct/dct3d.c
+  src/shard/shardio.c)
+target_include_directories(r3d_shard PUBLIC src)
+target_include_directories(r3d_shard SYSTEM PUBLIC tools/3ddct)
+# codec kernels are fast-math-first (c5d convention); shardio itself is exact
+set_source_files_properties(tools/3ddct/dct3d.c PROPERTIES
+  COMPILE_OPTIONS "-ffast-math;-fno-math-errno;-O3;-Wno-nan-infinity-disabled")
+target_link_libraries(r3d_shard PUBLIC m Threads::Threads
+                                PRIVATE r3d_sanitize r3d_harden)
+
 # --- vendored cimgui/imgui (C++; the only non-C code in the tree) ---
 if(NOT EXISTS "${CMAKE_SOURCE_DIR}/tools/cimgui/cimgui.cpp")
   message(FATAL_ERROR "cimgui not vendored — run tools/fetch_cimgui.sh first")
@@ -121,6 +136,11 @@ add_executable(test_quick tests/test_quick.c)
 target_link_libraries(test_quick PRIVATE r3d_core r3d_warnings r3d_sanitize r3d_harden)
 add_test(NAME quick COMMAND test_quick)
 set_tests_properties(quick PROPERTIES LABELS quick TIMEOUT 30)
+
+add_executable(test_shard tests/test_shard.c)
+target_link_libraries(test_shard PRIVATE r3d_shard r3d_warnings r3d_sanitize r3d_harden)
+add_test(NAME shard COMMAND test_shard ${CMAKE_SOURCE_DIR}/band)
+set_tests_properties(shard PROPERTIES LABELS data TIMEOUT 60)
 
 add_executable(test_gpu tests/test_gpu.c)
 target_link_libraries(test_gpu PRIVATE r3d_core r3d_warnings r3d_sanitize r3d_harden)

@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=64", "cffi>=1.15", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dct3d-zarr"
+version = "0.1.0"
+description = "Zarr v3 codec for the dct3d 16^3 lossy 3D-DCT volume codec"
+readme = "README-zarr.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "SuperOptimizer" }]
+keywords = ["zarr", "codec", "compression", "dct", "volume", "vesuvius"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: C",
+    "Topic :: Scientific/Engineering",
+    "Topic :: System :: Archiving :: Compression",
+]
+dependencies = [
+    "zarr>=3.0",
+    "numpy>=1.24",
+    "cffi>=1.15",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.urls]
+Homepage = "https://github.com/SuperOptimizer/3ddct"
+Source = "https://github.com/SuperOptimizer/3ddct"
+
+# The magic: on install, this registers the `dct3d` codec with zarr's registry.
+# A stock `zarr.open` on an array whose metadata names codec "dct3d" resolves it
+# here automatically — no user import required. The entry-point NAME must equal
+# the codec's registry name ("dct3d").
+[project.entry-points."zarr.codecs"]
+dct3d = "dct3d_zarr:Dct3dCodec"
+
+[tool.setuptools]
+packages = ["dct3d_zarr"]
+
+[tool.setuptools.package-data]
+dct3d_zarr = ["py.typed"]
+
+# The cffi API-mode extension (dct3d_zarr._dct3d, compiled from ../dct3d.c) is
+# wired via `cffi_modules` in setup.py — setuptools has no pyproject table for it.
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

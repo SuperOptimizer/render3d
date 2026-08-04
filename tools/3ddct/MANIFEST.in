@@ -1,0 +1,8 @@
+# The cffi extension is compiled from these at build time, so they must ride in
+# the sdist even though they live outside the Python package directory.
+include dct3d.c
+include dct3d.h
+include build_dct3d.py
+include LICENSE
+include README.md
+include README-zarr.md

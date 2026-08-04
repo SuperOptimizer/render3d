@@ -1,0 +1,87 @@
+name: build-wheels
+
+# Build binary wheels for dct3d-zarr across platforms so `pip install dct3d-zarr`
+# needs no C toolchain on the user's machine. Runs on tags and manual dispatch;
+# a quick test-only job runs on every push/PR.
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # Fast feedback: build once on Linux + run the pytest suite against real zarr.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install (source build) + test deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[test]"
+      - name: Run tests
+        run: pytest -q
+
+  build_wheels:
+    name: wheels on ${{ matrix.os }}
+    # Only spend the full matrix on tags / manual runs.
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-14, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build wheels
+        uses: pypa/cibuildwheel@v2.21
+        env:
+          # Pure-C extension; skip the slow/rare targets. musllinux included so
+          # Alpine/musl users (and Chimera-style stacks) get a wheel too.
+          CIBW_BUILD: "cp310-* cp311-* cp312-* cp313-*"
+          CIBW_SKIP: "*_i686 pp*"
+          CIBW_ARCHS_MACOS: "arm64 x86_64"
+          # Smoke-test each built wheel: install with zarr and round-trip.
+          CIBW_TEST_REQUIRES: "pytest zarr numpy"
+          CIBW_TEST_COMMAND: "pytest {project}/tests -q"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}
+          path: ./wheelhouse/*.whl
+
+  build_sdist:
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build sdist
+        run: |
+          python -m pip install --upgrade build
+          python -m build --sdist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: ./dist/*.tar.gz
+
+  # On a version tag, publish everything to PyPI via trusted publishing.
+  publish:
+    needs: [build_wheels, build_sdist]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1
