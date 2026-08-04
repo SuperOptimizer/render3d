@@ -54,20 +54,26 @@ float sample_tile(float3 uvw, uint idx) {
   }
 }
 
-// p in world units (see vol_extent); lod used in cube mode only.
+// p in world units (see vol_extent).
 float vol_sample(float3 p, float lod) {
   if (!is_slab()) return volumes[0].SampleLevel(p, lod);
   // voxel coords (units of 1/nx per axis)
   float wx = p.x * pc.slab_nx;
   float wy = p.y * pc.slab_nx;
   float zc = pc.slab_z0 + 0.5 + p.z * pc.slab_nx; // ring z, seam-safe by box extent
+  float w = frac(zc / float(pc.slab_wz)); // REPEAT sampler wraps the ring
+  if (lod >= 1.75) {
+    // far field: 1/4-res overview of the whole composite (binding 3 in slab
+    // mode) — pre-filtered, so wide zoom-outs neither alias nor cost full res
+    float ox = ceil(pc.slab_nx * 0.25), oy = ceil(pc.slab_ny * 0.25);
+    return occ.SampleLevel(float3(wx / (4.0 * ox), wy / (4.0 * oy), w), 0);
+  }
   uint gx = pc.slab_grid & 0xffu, gy = pc.slab_grid >> 8;
   uint ix = min(uint(max(wx, 0.0) / pc.slab_px), gx - 1);
   uint iy = min(uint(max(wy, 0.0) / pc.slab_py), gy - 1);
   float tw = pc.slab_px + 2.0, th = pc.slab_py + 2.0;
   float u = (wx - float(ix) * pc.slab_px + 1.0) / tw;
   float v = (wy - float(iy) * pc.slab_py + 1.0) / th;
-  float w = frac(zc / float(pc.slab_wz)); // REPEAT sampler wraps the ring
   return sample_tile(float3(u, v, w), iy * 4 + ix);
 }
 
@@ -108,7 +114,7 @@ void main(uint3 tid: SV_DispatchThreadID) {
   float max_lod;
   if (is_slab()) {
     voxel = 1.0 / pc.slab_nx;
-    max_lod = 0.0; // slab tiles have no mips (v1)
+    max_lod = 4.0; // lod >= 1.75 switches to the 1/4-res overview texture
   } else {
     uint3 vdim;
     uint levels;
@@ -148,6 +154,8 @@ void main(uint3 tid: SV_DispatchThreadID) {
     // step size scales with it so far-field marching is proportionally cheap.
     float lod = clamp(log2(max(t * cone / voxel, 1.0)) + pc.lod_bias, 0.0, max_lod);
     float lod_step = exp2(lod); /* continuous: fractional lod still widens dt */
+    if (is_slab()) // keep >=4 samples through the slab thickness
+      lod_step = min(lod_step, max(1.0, float(pc.slab_depth) * 0.25));
     float3 p = pc.cam_origin + t * dir;
 
     float v = vol_sample(p, lod);

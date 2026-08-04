@@ -124,3 +124,19 @@ host_image_copy into permanently-GENERAL tiles after a timeline wait.
 - Known gap: slab tiles have no mips (max_lod forced 0) → zoomed-out wide
   views march at full voxel pitch (21.7 ms at 720p dev on 3072² overview).
   Follow-up: per-tile mip chain or coarse overview texture.
+
+## 2026-08-04 — 4x4 slab grid (8184² composites) + overview LOD
+
+- Grid extended to 4x4 (16-slot descriptor array, literal-index switch);
+  composite cap now 8184². Seam metrics clean across all 3 internal
+  boundaries (synthetic pattern).
+- **Overview LOD**: whole composite at 1/4 res always fits ONE texture
+  (8184/4 = 2046), same ring z, bound at the occupancy slot (unused in slab
+  mode); shader switches to it at ray-cone lod >= 1.75. Kills far-field
+  aliasing AND cost: full-field view of real 8184² = **4.4 ms GPU / 62 fps**
+  (3072² overview was ~20 ms before this). Slab lod_step clamped to
+  depth/4 so thin slabs keep >=4 samples through their thickness.
+- Real data: 8184x8184x48 (3.2 GB) fetched from PHercParis4 zarr (~13 min).
+  Initial window (34 slices x 16 tiles + overview) 3.2 s; scroll ~95 ms/slice
+  at this width — CPU assembly/downsample is single-threaded; threading it is
+  the next lever if wide-slab scrolling needs to be smoother.
