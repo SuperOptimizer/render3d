@@ -13,10 +13,14 @@ file(MAKE_DIRECTORY "${_spv_dir}")
 
 set(_spv_outputs "")
 # name : source : extra slangc defines
+# per-mode specialization (register pressure: see docs/measured.md 2026-08-04)
 set(_variants
-  "raycast:raycast:-DWG_X=16 -DWG_Y=8"
-  "raycast_8x8:raycast:-DWG_X=8 -DWG_Y=8"
-  "raycast_16x16:raycast:-DWG_X=16 -DWG_Y=16")
+  "raycast_cube:raycast:-DR3D_MODE=0 -DWG_X=16 -DWG_Y=8"
+  "raycast_slab:raycast:-DR3D_MODE=1 -DWG_X=16 -DWG_Y=8"
+  "raycast_clip:raycast:-DR3D_MODE=2 -DWG_X=16 -DWG_Y=8"
+  "raycast_bricks:raycast:-DR3D_MODE=3 -DWG_X=16 -DWG_Y=8"
+  "raycast_8x8:raycast:-DR3D_MODE=0 -DWG_X=8 -DWG_Y=8"
+  "raycast_16x16:raycast:-DR3D_MODE=0 -DWG_X=16 -DWG_Y=16")
 foreach(_v ${_variants})
   string(REPLACE ":" ";" _parts "${_v}")
   list(GET _parts 0 _name)

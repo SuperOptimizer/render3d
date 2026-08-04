@@ -201,3 +201,17 @@ brick_max<<24; the max byte gives whole-brick empty skipping).
 - Known gaps -> follow-ups: brick-border seams (no aprons, brick-local
   deblock), no streaming/LRU residency yet (v1 = full static shard),
   atlas has no mips, entropy kernel speed is upstream work.
+
+## 2026-08-04 — perf regression: mega-shader → per-mode pipeline variants
+
+Adding bricks mode made raycast.slang carry FOUR sampling architectures in
+one kernel; register pressure cost cube mode 6.2x (3.3 -> 20.5 ms exterior
+@1080p). Fix: R3D_MODE compile-time specialization — four SPIR-V variants
+(cube/slab/clip/bricks), backend binds by frame params. After: cube 3.41 ms
+(baseline restored), bricks 28.3 -> 10.5 ms, clip whole-view 2.6 -> 1.9 ms.
+Lesson recorded: every new sampling mode gets its own pipeline variant.
+
+Same day: resynced vkc5d to upstream's committed sparse-entropy kernels
+(7a9909c, pairs+counts output, 6.5x entropy speedup): our conformance
+gate stays at 10/16.7M voxels at 1 LSB, 0 above; engine decode 8 bricks
+45 -> 15 ms full-GPU.

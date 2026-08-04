@@ -22,6 +22,7 @@ typedef struct pc_ent {
 typedef struct pc_dq {
   float q, hf_exp, dc_fine, dz_dq;
   uint32_t dim, bpa, levels_base, vol_base;
+  uint32_t sparse; /* 1: Levels holds (pos<<20|val) pairs + Counts */
 } pc_dq;
 typedef struct pc_db {
   uint32_t dim, axis;
@@ -44,7 +45,7 @@ struct r3d_vkc5d {
   r3d_vkctx *vk;
   uint32_t max_batch;
   pipe ent, dq, db, pk;
-  r3d_vkbuf lv, vol, pay, freq, cum, slot, sub, stat, scan;
+  r3d_vkbuf lv, vol, pay, freq, cum, slot, sub, stat, scan, counts;
   VkCommandPool pool;
   VkCommandBuffer cmd;
   VkFence fence;
@@ -191,8 +192,8 @@ int r3d_vkc5d_create(r3d_vkc5d **out, r3d_vkctx *c, const char *spv_dir, uint32_
   d->hybrid = getenv("R3D_C5D_HYBRID") && *getenv("R3D_C5D_HYBRID") == '1';
   uint32_t K = d->max_batch;
 
-  if (pipe_create(c, spv_dir, "c5d_entropy.spv", 8, false, sizeof(pc_ent), &d->ent) != 0 ||
-      pipe_create(c, spv_dir, "c5d_dequant_idct.spv", 2, false, sizeof(pc_dq), &d->dq) != 0 ||
+  if (pipe_create(c, spv_dir, "c5d_entropy.spv", 9, false, sizeof(pc_ent), &d->ent) != 0 ||
+      pipe_create(c, spv_dir, "c5d_dequant_idct.spv", 3, false, sizeof(pc_dq), &d->dq) != 0 ||
       pipe_create(c, spv_dir, "c5d_deblock.spv", 1, false, sizeof(pc_db), &d->db) != 0 ||
       pipe_create(c, spv_dir, "pack.spv", 1, true, sizeof(pc_pack), &d->pk) != 0)
     goto fail;
@@ -207,14 +208,16 @@ int r3d_vkc5d_create(r3d_vkc5d **out, r3d_vkctx *c, const char *spv_dir, uint32_
       r3d_vkbuf_create_host(c, (VkDeviceSize)K * HE_NMODELS * 4096 * 4, u, &d->slot) != 0 ||
       r3d_vkbuf_create_host(c, (VkDeviceSize)K * 32 * 6 * 4, u, &d->sub) != 0 ||
       r3d_vkbuf_create_host(c, (VkDeviceSize)K * 32 * 4, u, &d->stat) != 0 ||
-      r3d_vkbuf_create_host(c, 4096 * 4, u, &d->scan) != 0)
+      r3d_vkbuf_create_host(c, 4096 * 4, u, &d->scan) != 0 ||
+      r3d_vkbuf_create_host(c, (VkDeviceSize)K * 512 * 4, u, &d->counts) != 0)
     goto fail;
   for (uint32_t i = 0; i < 4096; i++) ((uint32_t *)d->scan.mapped)[i] = SCAN16_TAB[i];
 
-  r3d_vkbuf ent_bufs[8] = {d->lv, d->pay, d->freq, d->cum, d->slot, d->sub, d->scan, d->stat};
-  bind_buffers(c, &d->ent, ent_bufs, 8);
-  r3d_vkbuf dq_bufs[2] = {d->lv, d->vol};
-  bind_buffers(c, &d->dq, dq_bufs, 2);
+  r3d_vkbuf ent_bufs[9] = {d->lv, d->pay, d->freq, d->cum, d->slot,
+                           d->sub, d->scan, d->stat, d->counts};
+  bind_buffers(c, &d->ent, ent_bufs, 9);
+  r3d_vkbuf dq_bufs[3] = {d->lv, d->vol, d->counts};
+  bind_buffers(c, &d->dq, dq_bufs, 3);
   bind_buffers(c, &d->db, &d->vol, 1);
   bind_buffers(c, &d->pk, &d->vol, 1); /* image binding written per decode */
 
@@ -243,7 +246,7 @@ void r3d_vkc5d_destroy(r3d_vkc5d *d) {
   if (d->fence) vkDestroyFence(c->dev, d->fence, NULL);
   if (d->pool) vkDestroyCommandPool(c->dev, d->pool, NULL);
   r3d_vkbuf *bufs[] = {&d->lv, &d->vol, &d->pay, &d->freq, &d->cum,
-                       &d->slot, &d->sub, &d->stat, &d->scan};
+                       &d->slot, &d->sub, &d->stat, &d->scan, &d->counts};
   for (size_t i = 0; i < sizeof bufs / sizeof *bufs; i++) r3d_vkbuf_destroy(c, bufs[i]);
   pipe_destroy(c, &d->ent);
   pipe_destroy(c, &d->dq);
@@ -334,8 +337,8 @@ int r3d_vkc5d_decode(r3d_vkc5d *d, const r3d_c5d_src *src, uint32_t n, VkImageVi
                                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
     vkBeginCommandBuffer(d->cmd, &bi);
     if (!d->hybrid) {
-      vkCmdFillBuffer(d->cmd, d->lv.buf, 0, VK_WHOLE_SIZE, 0);
-      barrier_compute(d->cmd);
+      /* sparse output: entropy writes pairs + a count for every chunk, so no
+       * pre-zeroing is needed (the dense path was the one that required it) */
       const he_gpu *g0 = &gpus[0];
       pc_ent pe = {.chunks_per_sub = g0->chunks_per_sub,
                    .nchunk = g0->nchunk,
@@ -354,7 +357,8 @@ int r3d_vkc5d_decode(r3d_vkc5d *d, const r3d_c5d_src *src, uint32_t n, VkImageVi
     for (uint32_t i = 0; i < nb; i++) {
       const he_gpu *g = &gpus[i];
       pc_dq pd = {.q = g->q, .hf_exp = g->hf_exp, .dc_fine = g->dc_fine, .dz_dq = g->dz_dq,
-                  .dim = g->dim, .bpa = g->bpa, .levels_base = i * LVS, .vol_base = i * NVOX};
+                  .dim = g->dim, .bpa = g->bpa, .levels_base = i * LVS, .vol_base = i * NVOX,
+                  .sparse = d->hybrid ? 0u : 1u};
       dispatch(d->cmd, &d->dq, &pd, sizeof pd, g->nchunk);
     }
     barrier_compute(d->cmd);

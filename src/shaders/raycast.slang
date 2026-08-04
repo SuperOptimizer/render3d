@@ -26,9 +26,15 @@ static const uint MAX_STEPS = 4096; // hard driver-safety clamp
 static const float ALPHA_CUTOFF = 0.98;
 static const float OCC_BLOCK = 8.0;
 
-bool is_slab() { return pc.slab_grid != 0; }
-bool is_clip() { return pc.clip_valid != 0; }
-bool is_bricks() { return pc.brick_mode != 0; }
+// Mode is a COMPILE-TIME specialization (slangc -DR3D_MODE=n): carrying all
+// four sampling architectures in one kernel cost 6x in register pressure.
+// 0 = cube, 1 = slab, 2 = clip, 3 = bricks; the backend picks the pipeline.
+#ifndef R3D_MODE
+#define R3D_MODE 0
+#endif
+bool is_slab() { return R3D_MODE == 1; }
+bool is_clip() { return R3D_MODE == 2; }
+bool is_bricks() { return R3D_MODE == 3; }
 
 /* bricks mode: sample via the page table; p in [0,1]^3 (cubic volume) */
 float bricks_sample(float3 p) {

@@ -60,7 +60,7 @@ struct r3d_renderer {
 
   VkDescriptorSetLayout dsl;
   VkPipelineLayout pipe_layout;
-  VkPipeline raycast;
+  VkPipeline raycast[4]; /* per-mode variants: cube, slab, clip, bricks */
   VkDescriptorPool dpool;
   VkDescriptorSet dset;
 
@@ -175,39 +175,42 @@ static int create_pipeline(r3d_renderer *r) {
   };
   if (vkCreatePipelineLayout(r->vk.dev, &plci, NULL, &r->pipe_layout) != VK_SUCCESS) return -1;
 
+  /* one pipeline per sampling mode; R3D_WG workgroup sweep applies to cube */
   const char *wg = getenv("R3D_WG");
-  const char *spv_name = "raycast.spv";
+  const char *names[4] = {"raycast_cube.spv", "raycast_slab.spv", "raycast_clip.spv",
+                          "raycast_bricks.spv"};
   r->wg_x = 16;
   r->wg_y = 8;
   if (wg && strcmp(wg, "8x8") == 0) {
-    spv_name = "raycast_8x8.spv";
+    names[0] = "raycast_8x8.spv";
     r->wg_x = r->wg_y = 8;
   } else if (wg && strcmp(wg, "16x16") == 0) {
-    spv_name = "raycast_16x16.spv";
+    names[0] = "raycast_16x16.spv";
     r->wg_x = r->wg_y = 16;
   }
-  uint32_t *spv = NULL;
-  size_t spv_n = 0;
-  if (load_spv(r->cfg.spv_dir, spv_name, &spv, &spv_n) != 0) return -1;
-  VkShaderModuleCreateInfo smci = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-                                   .codeSize = spv_n,
-                                   .pCode = spv};
-  VkShaderModule mod;
-  VkResult res = vkCreateShaderModule(r->vk.dev, &smci, NULL, &mod);
-  free(spv);
-  if (res != VK_SUCCESS) return -1;
-
-  VkComputePipelineCreateInfo cpci = {
-      .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-      .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-                .stage = VK_SHADER_STAGE_COMPUTE_BIT,
-                .module = mod,
-                .pName = "main"},
-      .layout = r->pipe_layout,
-  };
-  res = vkCreateComputePipelines(r->vk.dev, VK_NULL_HANDLE, 1, &cpci, NULL, &r->raycast);
-  vkDestroyShaderModule(r->vk.dev, mod, NULL);
-  if (res != VK_SUCCESS) return -1;
+  for (uint32_t m = 0; m < 4; m++) {
+    uint32_t *spv = NULL;
+    size_t spv_n = 0;
+    if (load_spv(r->cfg.spv_dir, names[m], &spv, &spv_n) != 0) return -1;
+    VkShaderModuleCreateInfo smci = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+                                     .codeSize = spv_n,
+                                     .pCode = spv};
+    VkShaderModule mod;
+    VkResult res = vkCreateShaderModule(r->vk.dev, &smci, NULL, &mod);
+    free(spv);
+    if (res != VK_SUCCESS) return -1;
+    VkComputePipelineCreateInfo cpci = {
+        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                  .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+                  .module = mod,
+                  .pName = "main"},
+        .layout = r->pipe_layout,
+    };
+    res = vkCreateComputePipelines(r->vk.dev, VK_NULL_HANDLE, 1, &cpci, NULL, &r->raycast[m]);
+    vkDestroyShaderModule(r->vk.dev, mod, NULL);
+    if (res != VK_SUCCESS) return -1;
+  }
 
   VkDescriptorPoolSize sizes[] = {
       {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1},
@@ -583,7 +586,8 @@ void r3d_destroy(r3d_renderer *r) {
     if (r->acquire[i]) vkDestroySemaphore(r->vk.dev, r->acquire[i], NULL);
   if (r->pool) vkDestroyCommandPool(r->vk.dev, r->pool, NULL);
   if (r->dpool) vkDestroyDescriptorPool(r->vk.dev, r->dpool, NULL);
-  if (r->raycast) vkDestroyPipeline(r->vk.dev, r->raycast, NULL);
+  for (uint32_t m = 0; m < 4; m++)
+    if (r->raycast[m]) vkDestroyPipeline(r->vk.dev, r->raycast[m], NULL);
   if (r->pipe_layout) vkDestroyPipelineLayout(r->vk.dev, r->pipe_layout, NULL);
   if (r->dsl) vkDestroyDescriptorSetLayout(r->vk.dev, r->dsl, NULL);
   r3d_vkclip_destroy(r->clipm);
@@ -1172,13 +1176,15 @@ int r3d_frame(r3d_renderer *r, const r3d_frame_params *p, r3d_frame_stats *st) {
 
   if (r->query)
     vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, r->query, slot * 4);
-  vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r->raycast);
+  uint32_t rmode = p->clip_valid ? 2u : (p->brick_mode ? 3u : (p->slab_grid ? 1u : 0u));
+  uint32_t wgx = rmode == 0 ? r->wg_x : 16u, wgy = rmode == 0 ? r->wg_y : 8u;
+  vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r->raycast[rmode]);
   vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r->pipe_layout, 0, 1, &r->dset, 0,
                           NULL);
   vkCmdPushConstants(cmd, r->pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                      sizeof(r3d_frame_params), p);
-  vkCmdDispatch(cmd, (r->swap.extent.width + r->wg_x - 1) / r->wg_x,
-                (r->swap.extent.height + r->wg_y - 1) / r->wg_y, 1);
+  vkCmdDispatch(cmd, (r->swap.extent.width + wgx - 1) / wgx,
+                (r->swap.extent.height + wgy - 1) / wgy, 1);
   if (r->query)
     vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, r->query, slot * 4 + 1);
   r->slot_has_query[slot] = r->query != VK_NULL_HANDLE;
