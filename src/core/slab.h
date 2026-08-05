@@ -13,7 +13,7 @@
 
 #include <stdint.h>
 
-#define R3D_SLAB_MAX_GRID 16u   /* up to 16x16 tiles = 32736^2 composite */
+#define R3D_SLAB_MAX_GRID 22u   /* up to 22x22 tiles = 45012^2 composite (whole 43k plane) */
 #define R3D_SLAB_MAX_TILE 2048u /* maxImageDimension3D on target hardware */
 #define R3D_SLAB_TILES (R3D_SLAB_MAX_GRID * R3D_SLAB_MAX_GRID)
 

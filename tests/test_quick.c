@@ -144,8 +144,11 @@ static void test_slab(void) {
   /* 16x16 grid */
   CHECK(r3d_slab_layout_init(&l, 32736, 32736, 16, 10) == 0);
   CHECK(l.gx == 16 && l.gy == 16 && l.px == 2046 && l.ovs == 16);
+  /* 22x22 grid: the whole 43k cross section */
+  CHECK(r3d_slab_layout_init(&l, 43008, 43008, 16, 10) == 0);
+  CHECK(l.gx == 22 && l.gy == 22 && l.px == 1955 && l.ovs == 32);
   /* too wide */
-  CHECK(r3d_slab_layout_init(&l, 32737, 1024, 192, 32) == -1);
+  CHECK(r3d_slab_layout_init(&l, 45013, 1024, 192, 32) == -1);
   /* bad ring */
   CHECK(r3d_slab_layout_init(&l, 1024, 1024, 16, 32) == -1);
 

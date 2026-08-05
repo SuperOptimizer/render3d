@@ -375,3 +375,20 @@ of 23 GiB. 32k x 16-deep (ring 18, ~19.3 GB) fits arithmetically but was
 deliberately not defaulted: it leaves ~3 GB for OS + source page cache.
 Scroll at 32k = ~1 GB/slice assembly (untested rate; threading the
 assembly is the known lever). Suites green; 8184/16368 layouts unchanged.
+
+## 2026-08-05 — slab: whole-scroll plane via bbox trim; max_lod bug at ovs>16
+
+Goal "whole 43008^2 plane, 8 deep" (grid cap now 22): the untrimmed plane
+(18.5 GB GPU + 30 GB source mmap on a 30 GB machine) filled in 24 s but
+crashed intermittently — memory-pressure territory, not pursued. The
+export has wide empty margins: occupied bbox at the band is only
+35616 x 23840. Trimmed extract scrollplane.u8 (35712 x 24000 x 16,
+13.7 GB; numpy crop of the full-plane file) renders the ENTIRE scroll:
+depth 4 = 5.2 GB GPU, depth 8 = 8.6 GB, whole-composite view 0.6-1.0 ms.
+
+Bug found on the way: slab max_lod was hardcoded 4.0 (ovs=4 era). With
+ovs=32 the overview switch sits at lod 4.75 — unreachable past the clamp,
+so wide views marched full-res tiles forever (24.6 ms). At ovs=16 (32k)
+the 3.75 threshold cleared it by luck. max_lod is now log2(ovs)+2.
+Lesson: thresholds derived from a scale knob must be checked against
+every clamp on the same quantity.
