@@ -320,7 +320,9 @@ int main(int argc, char **argv) {
         r3d_camera_orbit_drag(&cam, -in.look[0] * ORBIT_SENS, -in.look[1] * ORBIT_SENS);
       }
       if (in.wheel != 0.0f && !io->WantCaptureMouse)
-        r3d_camera_orbit_zoom(&cam, powf(0.9f, in.wheel));
+        /* shift+wheel zooms 3x faster: whole-scroll to fiber scale is a ~3200x
+         * distance ratio, a long ride at 0.9/detent */
+        r3d_camera_orbit_zoom(&cam, powf(in.fast ? 0.73f : 0.9f, in.wheel));
       float pan = BASE_SPEED * cam.dist * (in.fast ? 5.0f : 1.0f);
       if (in.move[0] != 0.0f || in.move[1] != 0.0f || in.move[2] != 0.0f)
         r3d_camera_orbit_pan(&cam, v3(in.move[0], in.move[1], in.move[2]), pan * dt);
@@ -468,7 +470,7 @@ int main(int argc, char **argv) {
       if (igDragFloat3("cam target", ct, 0.002f, -4.0f, 4.0f, "%.3f", 0) &&
           cam_mode == CAM_ORBIT)
         r3d_camera_orbit_set(&cam, v3(ct[0], ct[1], ct[2]), cam.dist);
-      if (igDragFloat("cam dist", &cam.dist, 0.005f, 0.02f, 20.0f, "%.3f", 0) &&
+      if (igDragFloat("cam dist", &cam.dist, 0.005f, 0.0005f, 20.0f, "%.4f", 0) &&
           cam_mode == CAM_ORBIT)
         r3d_camera_orbit_set(&cam, cam.target, cam.dist);
       igSliderFloat("fov", &fov_deg, 20.0f, 120.0f, "%.0f°", 0);

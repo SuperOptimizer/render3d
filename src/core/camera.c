@@ -45,7 +45,9 @@ void r3d_camera_orbit_drag(r3d_camera *c, float dyaw, float dpitch) {
 }
 
 void r3d_camera_orbit_zoom(r3d_camera *c, float factor) {
-  c->dist = fclampf(c->dist * factor, 0.05f, 20.0f);
+  /* floor sized for the largest slabs: 0.0005 of a 35k-wide composite is
+   * ~18 voxels across the screen — past 1:1 voxel-per-pixel everywhere */
+  c->dist = fclampf(c->dist * factor, 0.0005f, 20.0f);
   orbit_sync(c);
 }
 
