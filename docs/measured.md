@@ -424,3 +424,19 @@ Results (same bench, same data): zoomio 96.2 -> 2.83 ms (34x, worst frame
 mid-zoom stills ~2.9 ms and visually clean (no seams/banding). Every zoom
 level of the whole scroll now renders at 60 fps with headroom. Suites
 green.
+
+## 2026-08-05 — upstream c5d sync: tau corrections on GPU + free dq speedup
+
+Pulled ~/compressor HEAD (73934ef): GPU tau support (corrections.comp,
+post-deblock CAS scatter; he_gpu/he_decoded expose (voxel,delta+512)
+pairs; he_gpu_setup no longer rejects FLAG_TAU), dq flat-chunk fast path,
+NEON CPU work, flat-chunk IDCT skip. render3d side: corrections pipeline +
+6 MB/brick pair staging in vkc5d (both legs), kernel added to the SPIR-V
+build, test_c5dgpu now encodes half its bricks q4/tau2 (~700 pairs each,
+verified flowing) with the amended contract (<=1 LSB plus <=8 bounded
+gate-flip voxels). Existing push structs unchanged this time.
+
+Results: all suites green both legs; bricks render vs cube unchanged
+(mean 0.100); full-GPU atlas fill 144 -> 228 bricks/s (0.30 -> 0.48 GB/s)
+free from upstream's dq fast path. GPU-path encodes may now use tau
+(lossless still rejected); c5dpack stays tau=0 by default.

@@ -71,9 +71,12 @@ int main(void) {
   uint8_t *blob[NB] = {0};
   size_t blob_n[NB];
   r3d_c5d_src src[NB];
-  c5d_brick_params p = c5d_brick_defaults(2.0f); /* lossless/tau off (GPU reqs) */
-  p.nsub = 128; /* v1.4 GPU knob (what c5dpack writes) */
   for (uint32_t i = 0; i < NB; i++) {
+    /* half the bricks encode with tau (q4/tau2) to exercise the GPU
+     * corrections scatter; the rest are the c5dpack default (q2, tau off) */
+    c5d_brick_params p = c5d_brick_defaults(i & 1 ? 4.0f : 2.0f);
+    p.nsub = 128; /* v1.4 GPU knob (what c5dpack writes) */
+    if (i & 1) p.tau = 2.0f;
     synth_brick(i, raw);
     if (c5d_brick_encode(&p, raw, BD, &blob[i], &blob_n[i]) != 0) return 1;
     cpu[i] = malloc((size_t)BD * BD * BD);
@@ -125,8 +128,23 @@ int main(void) {
       printf("brick %u: out_max %u vs cpu max %u\n", i, maxes[i], cmax);
       fail = 1;
     }
+    /* upstream contract (tau amendment): <=1 LSB everywhere except <=8
+     * bounded deblock gate-flip voxels per brick */
+    uint64_t flips = 0;
     if (md > 1) {
-      printf("brick %u: maxdiff %d > 1 LSB\n", i, md);
+      for (uint32_t v = 0; v < BD * BD * BD; v++) {
+        uint32_t z = v >> 14, y = (v >> 7) & 127, x = v & 127;
+        uint8_t g =
+            at[((size_t)(src[i].sz + z) * 256 + (src[i].sy + y)) * 256 + src[i].sx + x];
+        uint8_t c = cpu[i][v];
+        int dd = (int)g - (int)c;
+        if (dd < 0) dd = -dd;
+        if (dd > 1) flips++;
+      }
+    }
+    if (md > 24 || flips > 8) {
+      printf("brick %u: maxdiff %d, %llu gate-flip voxels (>8)\n", i, md,
+             (unsigned long long)flips);
       fail = 1;
     }
   }

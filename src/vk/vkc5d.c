@@ -32,6 +32,9 @@ typedef struct pc_db {
 typedef struct pc_pack {
   uint32_t dim, bpa, vol_base, sx, sy, sz;
 } pc_pack;
+typedef struct pc_corr {
+  uint32_t ncorr, corr_base, vol_base;
+} pc_corr;
 
 typedef struct pipe {
   VkDescriptorSetLayout dsl;
@@ -44,8 +47,8 @@ typedef struct pipe {
 struct r3d_vkc5d {
   r3d_vkctx *vk;
   uint32_t max_batch;
-  pipe ent, dq, db, pk;
-  r3d_vkbuf lv, vol, pay, freq, cum, slot, sub, stat, scan, counts;
+  pipe ent, dq, db, pk, cr;
+  r3d_vkbuf lv, vol, pay, freq, cum, slot, sub, stat, scan, counts, corr;
   VkCommandPool pool;
   VkCommandBuffer cmd;
   VkFence fence;
@@ -195,7 +198,8 @@ int r3d_vkc5d_create(r3d_vkc5d **out, r3d_vkctx *c, const char *spv_dir, uint32_
   if (pipe_create(c, spv_dir, "c5d_entropy.spv", 9, false, sizeof(pc_ent), &d->ent) != 0 ||
       pipe_create(c, spv_dir, "c5d_dequant_idct.spv", 3, false, sizeof(pc_dq), &d->dq) != 0 ||
       pipe_create(c, spv_dir, "c5d_deblock.spv", 1, false, sizeof(pc_db), &d->db) != 0 ||
-      pipe_create(c, spv_dir, "pack.spv", 1, true, sizeof(pc_pack), &d->pk) != 0)
+      pipe_create(c, spv_dir, "pack.spv", 1, true, sizeof(pc_pack), &d->pk) != 0 ||
+      pipe_create(c, spv_dir, "c5d_corrections.spv", 2, false, sizeof(pc_corr), &d->cr) != 0)
     goto fail;
 
   VkBufferUsageFlags u = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
@@ -209,7 +213,9 @@ int r3d_vkc5d_create(r3d_vkc5d **out, r3d_vkctx *c, const char *spv_dir, uint32_
       r3d_vkbuf_create_host(c, (VkDeviceSize)K * 128 * 6 * 4, u, &d->sub) != 0 ||
       r3d_vkbuf_create_host(c, (VkDeviceSize)K * 128 * 4, u, &d->stat) != 0 ||
       r3d_vkbuf_create_host(c, 4096 * 4, u, &d->scan) != 0 ||
-      r3d_vkbuf_create_host(c, (VkDeviceSize)K * 512 * 4, u, &d->counts) != 0)
+      r3d_vkbuf_create_host(c, (VkDeviceSize)K * 512 * 4, u, &d->counts) != 0 ||
+      /* tau pairs, post-deblock scatter (upstream worst case ~5.6 MB/brick) */
+      r3d_vkbuf_create_host(c, (VkDeviceSize)K * (6u << 20), u, &d->corr) != 0)
     goto fail;
   for (uint32_t i = 0; i < 4096; i++) ((uint32_t *)d->scan.mapped)[i] = SCAN16_TAB[i];
 
@@ -220,6 +226,8 @@ int r3d_vkc5d_create(r3d_vkc5d **out, r3d_vkctx *c, const char *spv_dir, uint32_
   bind_buffers(c, &d->dq, dq_bufs, 3);
   bind_buffers(c, &d->db, &d->vol, 1);
   bind_buffers(c, &d->pk, &d->vol, 1); /* image binding written per decode */
+  r3d_vkbuf cr_bufs[2] = {d->vol, d->corr};
+  bind_buffers(c, &d->cr, cr_bufs, 2);
 
   VkCommandPoolCreateInfo cpi = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
                                  .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
@@ -245,9 +253,10 @@ void r3d_vkc5d_destroy(r3d_vkc5d *d) {
   r3d_vkctx *c = d->vk;
   if (d->fence) vkDestroyFence(c->dev, d->fence, NULL);
   if (d->pool) vkDestroyCommandPool(c->dev, d->pool, NULL);
-  r3d_vkbuf *bufs[] = {&d->lv, &d->vol, &d->pay, &d->freq, &d->cum,
-                       &d->slot, &d->sub, &d->stat, &d->scan, &d->counts};
+  r3d_vkbuf *bufs[] = {&d->lv,   &d->vol, &d->pay,  &d->freq,   &d->cum,  &d->slot,
+                       &d->sub,  &d->stat, &d->scan, &d->counts, &d->corr};
   for (size_t i = 0; i < sizeof bufs / sizeof *bufs; i++) r3d_vkbuf_destroy(c, bufs[i]);
+  pipe_destroy(c, &d->cr);
   pipe_destroy(c, &d->ent);
   pipe_destroy(c, &d->dq);
   pipe_destroy(c, &d->db);
@@ -284,6 +293,8 @@ int r3d_vkc5d_decode(r3d_vkc5d *d, const r3d_c5d_src *src, uint32_t n, VkImageVi
 
     /* CPU front half + staging */
     size_t pay_off = 0;
+    size_t corr_off = 0;             /* pair index into the corr mega-buffer */
+    uint32_t corr_base[64], corr_n[64];
     for (uint32_t i = 0; i < nb; i++) {
       const r3d_c5d_src *s = &src[i0 + i];
       if (d->hybrid) {
@@ -321,6 +332,20 @@ int r3d_vkc5d_decode(r3d_vkc5d *d, const r3d_c5d_src *src, uint32_t n, VkImageVi
                  (size_t)HE_NMODELS * 4096 * 4);
         pay_off += (g->payload_n + 3) & ~(size_t)3;
       }
+    }
+
+    /* tau corrections (post-deblock scatter): stage pairs per brick */
+    for (uint32_t i = 0; i < nb; i++) {
+      const uint32_t *cp = d->hybrid ? hds[i].corr : gpus[i].corr;
+      uint32_t cn = d->hybrid ? hds[i].ncorr : gpus[i].ncorr;
+      corr_base[i] = (uint32_t)corr_off;
+      corr_n[i] = cn;
+      if (getenv("R3D_C5D_DEBUG") && cn)
+        fprintf(stderr, "vkc5d: brick %u: %u tau pairs\n", i0 + i, cn);
+      if (!cn) continue;
+      if ((corr_off + cn) * 8 > (size_t)d->max_batch * (6u << 20)) goto brick_fail;
+      memcpy((uint32_t *)d->corr.mapped + corr_off * 2, cp, (size_t)cn * 8);
+      corr_off += cn;
     }
 
     /* the flat entropy dispatch shares nway/ctx2/geometry across the batch */
@@ -374,6 +399,17 @@ int r3d_vkc5d_decode(r3d_vkc5d *d, const r3d_c5d_src *src, uint32_t n, VkImageVi
         dispatch(d->cmd, &d->db, &pb, sizeof pb, (total + 63) / 64);
       }
       barrier_compute(d->cmd);
+    }
+    {
+      bool any_corr = false;
+      for (uint32_t i = 0; i < nb; i++)
+        if (corr_n[i]) {
+          pc_corr pcr = {.ncorr = corr_n[i], .corr_base = corr_base[i],
+                         .vol_base = i * NVOX};
+          dispatch(d->cmd, &d->cr, &pcr, sizeof pcr, (corr_n[i] + 63) / 64);
+          any_corr = true;
+        }
+      if (any_corr) barrier_compute(d->cmd);
     }
     for (uint32_t i = 0; i < nb; i++) {
       const r3d_c5d_src *s = &src[i0 + i];

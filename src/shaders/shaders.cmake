@@ -40,7 +40,7 @@ foreach(_v ${_variants})
 endforeach()
 # c5d decode kernels (GLSL, from the compressor working tree) + our pack kernel
 find_program(R3D_GLSLC NAMES glslc REQUIRED)
-foreach(_ck entropy dequant_idct deblock)
+foreach(_ck entropy dequant_idct deblock corrections)
   set(_src "${R3D_C5D_DIR}/src/gpu/kernels/${_ck}.comp")
   set(_out "${_spv_dir}/c5d_${_ck}.spv")
   add_custom_command(
