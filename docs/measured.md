@@ -340,3 +340,26 @@ sampled by in-flight frames — pipelined handoff via the timeline semaphore
 is the known follow-up, as is zero-copy entropy reads straight from the warm
 buffer (needs c5d to expose the payload offset in he_gpu; today he_gpu_setup
 stages a CPU copy of the payload per decode, ~50 KB/brick, negligible).
+
+## 2026-08-05 — slab mode: 8x8 tile grid (16368^2 composites)
+
+Max slab composite doubled per axis: 8184^2 -> 16368^2 x up to 32-deep
+(R3D_SLAB_MAX_GRID 4 -> 8; vol[] descriptor array 16 -> 64, literal-index
+switch; tile stride j*8+i). The single-texture far-field overview
+generalizes from fixed 1/4-res to a computed downscale (ovs = 4 while the
+composite fits 2046, else 8), carried in slab_grid bits 16+; the shader
+switches to it at lod >= log2(ovs)-0.25. Descriptor pool sized 64+3.
+New tools/bandcut: threaded dct3d region decode of the local band ->
+flat .u8 (16368^2 x 32 of real PHercParis3 = 8.6 GB in ~2 min).
+
+Measured (bigslab.u8 16368^2x32, --slab 16, 720p, tf 1, no-vsync):
+- initial 18-slice window fill: 7.4 s (host_image_copy across 64 tiles +
+  1/8-res overview build); GPU memory ~4.9 GB of the 23 GiB heap.
+- whole-composite view after fill: 329 fps (1.9 ms GPU) — the overview
+  path keeps zoom-outs at 8184-slab cost.
+- z-scroll: 133 ms/slice (267 MB assemble+upload+downsample per slice,
+  4x the 8184 cost, CPU-bound in the slice assembly); continuous zsweep
+  averages ~37 fps. Threading the per-tile assembly is the lever if
+  faster scrolling at 16k matters.
+- 8184 regression: unchanged (312 fps, fill 1.8 s); quick-test layout
+  cases extended to 8x8 + ovs; all 4 suites green.

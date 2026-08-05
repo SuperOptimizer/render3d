@@ -1,12 +1,12 @@
 // Volume raycaster: fixed-step marching, two data modes.
 //  - cube: one monolithic 3D texture in [0,1]^3 (volumes[0], all 4 slots alias)
-//  - slab: up to 2x2 tile textures (payload + 1-voxel apron) covering a wide
+//  - slab: up to 8x8 tile textures (payload + 1-voxel apron) covering a wide
 //    thin z-window; z is a ring buffer sampled with a REPEAT-W sampler
 //    (see src/core/slab.h for the layout math mirrored here).
 import common;
 
-// slab tiles (element j*4+i, up to 4x4); cube mode binds the monolithic x16
-[[vk::binding(0, 0)]] Sampler3D<float> volumes[16];
+// slab tiles (element j*8+i, up to 8x8); cube mode binds the monolithic x64
+[[vk::binding(0, 0)]] Sampler3D<float> volumes[64];
 [[vk::binding(1, 0)]] Sampler1D<float4> tf;
 [[vk::binding(2, 0)]] RWTexture2D<float4> out_image;
 // per-8^3-block max, dilated 1 block (nearest sampler) — empty-space skipping
@@ -113,6 +113,54 @@ float sample_tile(float3 uvw, uint idx) {
   case 13: return volumes[13].SampleLevel(uvw, 0);
   case 14: return volumes[14].SampleLevel(uvw, 0);
   case 15: return volumes[15].SampleLevel(uvw, 0);
+  case 16: return volumes[16].SampleLevel(uvw, 0);
+  case 17: return volumes[17].SampleLevel(uvw, 0);
+  case 18: return volumes[18].SampleLevel(uvw, 0);
+  case 19: return volumes[19].SampleLevel(uvw, 0);
+  case 20: return volumes[20].SampleLevel(uvw, 0);
+  case 21: return volumes[21].SampleLevel(uvw, 0);
+  case 22: return volumes[22].SampleLevel(uvw, 0);
+  case 23: return volumes[23].SampleLevel(uvw, 0);
+  case 24: return volumes[24].SampleLevel(uvw, 0);
+  case 25: return volumes[25].SampleLevel(uvw, 0);
+  case 26: return volumes[26].SampleLevel(uvw, 0);
+  case 27: return volumes[27].SampleLevel(uvw, 0);
+  case 28: return volumes[28].SampleLevel(uvw, 0);
+  case 29: return volumes[29].SampleLevel(uvw, 0);
+  case 30: return volumes[30].SampleLevel(uvw, 0);
+  case 31: return volumes[31].SampleLevel(uvw, 0);
+  case 32: return volumes[32].SampleLevel(uvw, 0);
+  case 33: return volumes[33].SampleLevel(uvw, 0);
+  case 34: return volumes[34].SampleLevel(uvw, 0);
+  case 35: return volumes[35].SampleLevel(uvw, 0);
+  case 36: return volumes[36].SampleLevel(uvw, 0);
+  case 37: return volumes[37].SampleLevel(uvw, 0);
+  case 38: return volumes[38].SampleLevel(uvw, 0);
+  case 39: return volumes[39].SampleLevel(uvw, 0);
+  case 40: return volumes[40].SampleLevel(uvw, 0);
+  case 41: return volumes[41].SampleLevel(uvw, 0);
+  case 42: return volumes[42].SampleLevel(uvw, 0);
+  case 43: return volumes[43].SampleLevel(uvw, 0);
+  case 44: return volumes[44].SampleLevel(uvw, 0);
+  case 45: return volumes[45].SampleLevel(uvw, 0);
+  case 46: return volumes[46].SampleLevel(uvw, 0);
+  case 47: return volumes[47].SampleLevel(uvw, 0);
+  case 48: return volumes[48].SampleLevel(uvw, 0);
+  case 49: return volumes[49].SampleLevel(uvw, 0);
+  case 50: return volumes[50].SampleLevel(uvw, 0);
+  case 51: return volumes[51].SampleLevel(uvw, 0);
+  case 52: return volumes[52].SampleLevel(uvw, 0);
+  case 53: return volumes[53].SampleLevel(uvw, 0);
+  case 54: return volumes[54].SampleLevel(uvw, 0);
+  case 55: return volumes[55].SampleLevel(uvw, 0);
+  case 56: return volumes[56].SampleLevel(uvw, 0);
+  case 57: return volumes[57].SampleLevel(uvw, 0);
+  case 58: return volumes[58].SampleLevel(uvw, 0);
+  case 59: return volumes[59].SampleLevel(uvw, 0);
+  case 60: return volumes[60].SampleLevel(uvw, 0);
+  case 61: return volumes[61].SampleLevel(uvw, 0);
+  case 62: return volumes[62].SampleLevel(uvw, 0);
+  case 63: return volumes[63].SampleLevel(uvw, 0);
   default: return volumes[0].SampleLevel(uvw, 0);
   }
 }
@@ -169,19 +217,20 @@ float vol_sample(float3 p, float lod) {
   float wy = p.y * pc.slab_nx;
   float zc = pc.slab_z0 + 0.5 + p.z * pc.slab_nx; // ring z, seam-safe by box extent
   float w = frac(zc / float(pc.slab_wz)); // REPEAT sampler wraps the ring
-  if (lod >= 1.75) {
-    // far field: 1/4-res overview of the whole composite (binding 3 in slab
+  float ovs = float((pc.slab_grid >> 16) & 0xffu); // overview downscale (4 or 8)
+  if (lod >= log2(ovs) - 0.25) {
+    // far field: 1/ovs-res overview of the whole composite (binding 3 in slab
     // mode) — pre-filtered, so wide zoom-outs neither alias nor cost full res
-    float ox = ceil(pc.slab_nx * 0.25), oy = ceil(pc.slab_ny * 0.25);
-    return occ.SampleLevel(float3(wx / (4.0 * ox), wy / (4.0 * oy), w), 0);
+    float ox = ceil(pc.slab_nx / ovs), oy = ceil(pc.slab_ny / ovs);
+    return occ.SampleLevel(float3(wx / (ovs * ox), wy / (ovs * oy), w), 0);
   }
-  uint gx = pc.slab_grid & 0xffu, gy = pc.slab_grid >> 8;
+  uint gx = pc.slab_grid & 0xffu, gy = (pc.slab_grid >> 8) & 0xffu;
   uint ix = min(uint(max(wx, 0.0) / pc.slab_px), gx - 1);
   uint iy = min(uint(max(wy, 0.0) / pc.slab_py), gy - 1);
   float tw = pc.slab_px + 2.0, th = pc.slab_py + 2.0;
   float u = (wx - float(ix) * pc.slab_px + 1.0) / tw;
   float v = (wy - float(iy) * pc.slab_py + 1.0) / th;
-  return sample_tile(float3(u, v, w), iy * 4 + ix);
+  return sample_tile(float3(u, v, w), iy * 8 + ix);
 }
 
 float3 ray_dir(uint2 pix) {

@@ -13,14 +13,17 @@
 
 #include <stdint.h>
 
-#define R3D_SLAB_MAX_GRID 4u   /* up to 4x4 tiles = 8184^2 composite */
+#define R3D_SLAB_MAX_GRID 8u    /* up to 8x8 tiles = 16368^2 composite */
 #define R3D_SLAB_MAX_TILE 2048u /* maxImageDimension3D on target hardware */
+#define R3D_SLAB_TILES (R3D_SLAB_MAX_GRID * R3D_SLAB_MAX_GRID)
 
 typedef struct r3d_slab_layout {
   uint32_t nx, ny, nz; /* source volume dims (voxels) */
   uint32_t gx, gy;     /* tile grid, 1..2 per axis */
   uint32_t px, py;     /* uniform tile payload (voxels); last tile may cover less */
   uint32_t wz;         /* ring depth (z window, slices) */
+  uint32_t ovs;        /* overview downscale (4 while <=8184, 8 to 16368...):
+                          the whole-composite overview is ONE <=2048 texture */
 } r3d_slab_layout;
 
 /* Tile texture xy dims are payload + 2 apron texels. */
@@ -42,6 +45,8 @@ static inline int r3d_slab_layout_init(r3d_slab_layout *l, uint32_t nx, uint32_t
   if (l->gx > R3D_SLAB_MAX_GRID || l->gy > R3D_SLAB_MAX_GRID) return -1;
   l->px = (nx + l->gx - 1) / l->gx;
   l->py = (ny + l->gy - 1) / l->gy;
+  l->ovs = 4;
+  while ((nx + l->ovs - 1) / l->ovs > maxp || (ny + l->ovs - 1) / l->ovs > maxp) l->ovs <<= 1;
   return 0;
 }
 

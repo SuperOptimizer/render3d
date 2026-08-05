@@ -41,7 +41,7 @@ struct r3d_renderer {
   /* slab mode */
   bool slab_mode;
   r3d_slab_layout slab;
-  r3d_vkimage tiles[16]; /* gy-major (element j*4+i); unused stay null */
+  r3d_vkimage tiles[R3D_SLAB_TILES]; /* gy-major (element j*8+i); unused stay null */
   int64_t slab_z0;       /* current window start; -1 = nothing uploaded */
   uint8_t *slice_buf;    /* CPU assembly buffer, tile_w * tile_h bytes */
   r3d_vkimage overview;  /* whole composite at 1/4 res (anti-alias far field) */
@@ -163,9 +163,9 @@ static int create_offscreen(r3d_renderer *r) {
 
 static int create_pipeline(r3d_renderer *r) {
   VkDescriptorSetLayoutBinding bindings[] = {
-      {.binding = 0, /* volume: array of 16 (slab tiles; cube uses [0] x16) */
+      {.binding = 0, /* volume: array of 64 (slab tiles; cube uses [0] x64) */
        .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-       .descriptorCount = 16,
+       .descriptorCount = R3D_SLAB_TILES,
        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT},
       {.binding = 1,
        .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
@@ -245,7 +245,7 @@ static int create_pipeline(r3d_renderer *r) {
 
   VkDescriptorPoolSize sizes[] = {
       {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1},
-      {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 19},
+      {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, R3D_SLAB_TILES + 3}, /* vol[64]+tf+occ+atlas */
       {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1},
   };
   VkDescriptorPoolCreateInfo dpci = {
@@ -349,10 +349,11 @@ static uint64_t now_ns(void) {
   return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
-/* Write binding 0 (the vol[16] array) — views may repeat (cube: same view x16). */
-static void write_volume_dset(r3d_renderer *r, VkImageView views[16], VkSampler sampler) {
-  VkDescriptorImageInfo ii[16];
-  for (uint32_t i = 0; i < 16; i++)
+/* Write binding 0 (the vol[64] array) — views may repeat (cube: same view x64). */
+static void write_volume_dset(r3d_renderer *r, VkImageView views[R3D_SLAB_TILES],
+                              VkSampler sampler) {
+  VkDescriptorImageInfo ii[R3D_SLAB_TILES];
+  for (uint32_t i = 0; i < R3D_SLAB_TILES; i++)
     ii[i] = (VkDescriptorImageInfo){.sampler = sampler,
                                     .imageView = views[i],
                                     .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
@@ -360,7 +361,7 @@ static void write_volume_dset(r3d_renderer *r, VkImageView views[16], VkSampler 
       .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
       .dstSet = r->dset,
       .dstBinding = 0,
-      .descriptorCount = 16,
+      .descriptorCount = R3D_SLAB_TILES,
       .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
       .pImageInfo = ii,
   };
@@ -534,8 +535,8 @@ int r3d_create(SDL_Window *win, const r3d_config *cfg, r3d_renderer **out) {
                            &r->volume) != 0)
       goto fail;
     if (upload_small_image(r, &r->volume, zeros, sizeof zeros) != 0) goto fail;
-    VkImageView vv[16];
-    for (uint32_t e = 0; e < 16; e++) vv[e] = r->volume.view;
+    VkImageView vv[R3D_SLAB_TILES];
+    for (uint32_t e = 0; e < R3D_SLAB_TILES; e++) vv[e] = r->volume.view;
     write_volume_dset(r, vv, r->samp_vol);
     /* dummy occupancy: fully occupied so nothing is skipped before upload */
     uint8_t full[8];
@@ -651,7 +652,7 @@ void r3d_destroy(r3d_renderer *r) {
   if (r->samp_tf) vkDestroySampler(r->vk.dev, r->samp_tf, NULL);
   if (r->samp_near) vkDestroySampler(r->vk.dev, r->samp_near, NULL);
   if (r->samp_slab) vkDestroySampler(r->vk.dev, r->samp_slab, NULL);
-  for (uint32_t i = 0; i < 16; i++) r3d_vkimage_destroy(&r->vk, &r->tiles[i]);
+  for (uint32_t i = 0; i < R3D_SLAB_TILES; i++) r3d_vkimage_destroy(&r->vk, &r->tiles[i]);
   r3d_vkimage_destroy(&r->vk, &r->overview);
   free(r->slice_buf);
   free(r->ov_buf);
@@ -806,8 +807,8 @@ int r3d_upload_volume(r3d_renderer *r, const r3d_volume_desc *d, const uint8_t *
   r3d_vkimage_destroy(&r->vk, &r->occ);
   r->volume = im;
   r->occ = occ_im;
-  VkImageView vv[16];
-    for (uint32_t e = 0; e < 16; e++) vv[e] = r->volume.view;
+  VkImageView vv[R3D_SLAB_TILES];
+    for (uint32_t e = 0; e < R3D_SLAB_TILES; e++) vv[e] = r->volume.view;
   write_volume_dset(r, vv, r->samp_vol);
   write_image_dset(r, 3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, r->occ.view, r->samp_near,
                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
@@ -849,7 +850,7 @@ int r3d_slab_init(r3d_renderer *r, const r3d_slab_desc *d) {
 
   for (uint32_t j = 0; j < r->slab.gy; j++)
     for (uint32_t i = 0; i < r->slab.gx; i++) {
-      r3d_vkimage *t = &r->tiles[j * 4 + i];
+      r3d_vkimage *t = &r->tiles[j * R3D_SLAB_MAX_GRID + i];
       if (r3d_vkimage_create(&r->vk, VK_FORMAT_R8_UNORM, (VkExtent3D){tw, th, r->slab.wz}, 1,
                              VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT,
                              t) != 0)
@@ -865,28 +866,30 @@ int r3d_slab_init(r3d_renderer *r, const r3d_slab_desc *d) {
       if (r->fp_transition(r->vk.dev, 1, &tr) != VK_SUCCESS) return -1;
     }
 
-  VkImageView views[16];
-  for (uint32_t e = 0; e < 16; e++)
+  VkImageView views[R3D_SLAB_TILES];
+  for (uint32_t e = 0; e < R3D_SLAB_TILES; e++)
     views[e] = r->tiles[e].view ? r->tiles[e].view : r->tiles[0].view;
   /* NOTE: descriptors must use GENERAL for these images */
-  VkDescriptorImageInfo ii[16];
-  for (uint32_t e = 0; e < 16; e++)
+  VkDescriptorImageInfo ii[R3D_SLAB_TILES];
+  for (uint32_t e = 0; e < R3D_SLAB_TILES; e++)
     ii[e] = (VkDescriptorImageInfo){
         .sampler = r->samp_slab, .imageView = views[e], .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
   VkWriteDescriptorSet w = {
       .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
       .dstSet = r->dset,
       .dstBinding = 0,
-      .descriptorCount = 16,
+      .descriptorCount = R3D_SLAB_TILES,
       .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
       .pImageInfo = ii,
   };
   vkUpdateDescriptorSets(r->vk.dev, 1, &w, 0, NULL);
 
-  /* overview: the whole composite at 1/4 resolution in ONE texture (max
-   * 8184/4 = 2046), same ring z — sampled by the shader once the ray-cone
-   * footprint exceeds ~4 voxels, killing far-field aliasing without mips */
-  uint32_t ox = (d->nx + 3) / 4, oy = (d->ny + 3) / 4;
+  /* overview: the whole composite at 1/ovs resolution in ONE texture (<=2046
+   * per axis: ovs=4 up to 8184-wide, 8 up to 16368), same ring z — sampled by
+   * the shader once the ray-cone footprint exceeds ~ovs voxels, killing
+   * far-field aliasing without mips */
+  uint32_t ovs = r->slab.ovs;
+  uint32_t ox = (d->nx + ovs - 1) / ovs, oy = (d->ny + ovs - 1) / ovs;
   r->ov_buf = malloc((size_t)ox * oy);
   if (!r->ov_buf) return -1;
   if (r3d_vkimage_create(&r->vk, VK_FORMAT_R8_UNORM, (VkExtent3D){ox, oy, r->slab.wz}, 1,
@@ -959,7 +962,7 @@ int r3d_slab_window(r3d_renderer *r, const r3d_volume *src, uint32_t z0) {
         };
         VkCopyMemoryToImageInfoEXT ci = {
             .sType = VK_STRUCTURE_TYPE_COPY_MEMORY_TO_IMAGE_INFO_EXT,
-            .dstImage = r->tiles[j * 4 + i].img,
+            .dstImage = r->tiles[j * R3D_SLAB_MAX_GRID + i].img,
             .dstImageLayout = VK_IMAGE_LAYOUT_GENERAL,
             .regionCount = 1,
             .pRegions = &region,
@@ -967,14 +970,15 @@ int r3d_slab_window(r3d_renderer *r, const r3d_volume *src, uint32_t z0) {
         if (r->fp_copy_mem(r->vk.dev, &ci) != VK_SUCCESS) return -1;
       }
 
-    /* overview: 4x4 box-average of the source slice -> same ring layer */
-    uint32_t ox = (l->nx + 3) / 4, oyd = (l->ny + 3) / 4;
+    /* overview: ovs x ovs box-average of the source slice -> same ring layer */
+    uint32_t ovs = l->ovs;
+    uint32_t ox = (l->nx + ovs - 1) / ovs, oyd = (l->ny + ovs - 1) / ovs;
     const uint8_t *sbase = src->voxels + (size_t)s * src->ny * src->nx;
     for (uint32_t oy2 = 0; oy2 < oyd; oy2++) {
-      uint32_t y0 = oy2 * 4, y1 = y0 + 4 > l->ny ? l->ny : y0 + 4;
+      uint32_t y0 = oy2 * ovs, y1 = y0 + ovs > l->ny ? l->ny : y0 + ovs;
       uint8_t *orow = r->ov_buf + (size_t)oy2 * ox;
       for (uint32_t ox2 = 0; ox2 < ox; ox2++) {
-        uint32_t x0 = ox2 * 4, x1 = x0 + 4 > l->nx ? l->nx : x0 + 4;
+        uint32_t x0 = ox2 * ovs, x1 = x0 + ovs > l->nx ? l->nx : x0 + ovs;
         uint32_t sum = 0;
         for (uint32_t y = y0; y < y1; y++) {
           const uint8_t *sr = sbase + (size_t)y * src->nx;
@@ -1008,7 +1012,7 @@ int r3d_slab_window(r3d_renderer *r, const r3d_volume *src, uint32_t z0) {
 }
 
 void r3d_slab_params(const r3d_renderer *r, r3d_frame_params *p) {
-  p->slab_grid = r->slab.gx | (r->slab.gy << 8);
+  p->slab_grid = r->slab.gx | (r->slab.gy << 8) | (r->slab.ovs << 16);
   p->slab_wz = r->slab.wz;
   p->slab_z0 = (float)r->slab_z0;
   p->slab_nx = (float)r->slab.nx;
@@ -1568,8 +1572,8 @@ int r3d_clip_begin(r3d_renderer *r, const char *band_dir, const char *pyramid_di
                         pyramid_dir, band_z, depth_max, 21504, 21504, z0) != 0)
     return -1;
 
-  VkDescriptorImageInfo ii[16];
-  for (uint32_t e = 0; e < 16; e++) {
+  VkDescriptorImageInfo ii[R3D_SLAB_TILES];
+  for (uint32_t e = 0; e < R3D_SLAB_TILES; e++) {
     uint32_t l = e < R3D_CLIP_LEVELS ? e : R3D_CLIP_LEVELS - 1;
     ii[e] = (VkDescriptorImageInfo){.sampler = r->samp_slab,
                                     .imageView = r3d_vkclip_view(r->clipm, l),
@@ -1579,7 +1583,7 @@ int r3d_clip_begin(r3d_renderer *r, const char *band_dir, const char *pyramid_di
       .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
       .dstSet = r->dset,
       .dstBinding = 0,
-      .descriptorCount = 16,
+      .descriptorCount = R3D_SLAB_TILES,
       .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
       .pImageInfo = ii,
   };

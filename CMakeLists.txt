@@ -154,6 +154,8 @@ add_executable(c5dpack tools/c5dpack/main.c)
 target_link_libraries(c5dpack PRIVATE r3d_c5d r3d_shard r3d_warnings r3d_sanitize r3d_harden)
 add_executable(mkpyramid tools/mkpyramid/main.c)
 target_link_libraries(mkpyramid PRIVATE r3d_shard r3d_warnings r3d_sanitize r3d_harden)
+add_executable(bandcut tools/bandcut/main.c)
+target_link_libraries(bandcut PRIVATE r3d_shard r3d_warnings r3d_sanitize r3d_harden)
 add_executable(mkvol tools/mkvol/main.c)
 target_link_libraries(mkvol PRIVATE m r3d_warnings r3d_sanitize r3d_harden)
 

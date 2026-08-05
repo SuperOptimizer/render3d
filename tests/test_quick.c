@@ -134,8 +134,15 @@ static void test_slab(void) {
   CHECK(l.gx == 3 && l.gy == 1 && l.px == 1365);
   CHECK(r3d_slab_layout_init(&l, 8184, 8184, 48, 18) == 0);
   CHECK(l.gx == 4 && l.gy == 4 && l.px == 2046);
+  /* 8x8 grid + overview downscale bump (one <=2046 overview texture) */
+  CHECK(r3d_slab_layout_init(&l, 8184, 8184, 48, 18) == 0);
+  CHECK(l.ovs == 4);
+  CHECK(r3d_slab_layout_init(&l, 8185, 1024, 192, 32) == 0);
+  CHECK(l.gx == 5 && l.ovs == 8);
+  CHECK(r3d_slab_layout_init(&l, 16368, 16368, 48, 18) == 0);
+  CHECK(l.gx == 8 && l.gy == 8 && l.px == 2046 && l.ovs == 8);
   /* too wide */
-  CHECK(r3d_slab_layout_init(&l, 8185, 1024, 192, 32) == -1);
+  CHECK(r3d_slab_layout_init(&l, 16369, 1024, 192, 32) == -1);
   /* bad ring */
   CHECK(r3d_slab_layout_init(&l, 1024, 1024, 16, 32) == -1);
 
