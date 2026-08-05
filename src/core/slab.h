@@ -13,7 +13,7 @@
 
 #include <stdint.h>
 
-#define R3D_SLAB_MAX_GRID 8u    /* up to 8x8 tiles = 16368^2 composite */
+#define R3D_SLAB_MAX_GRID 16u   /* up to 16x16 tiles = 32736^2 composite */
 #define R3D_SLAB_MAX_TILE 2048u /* maxImageDimension3D on target hardware */
 #define R3D_SLAB_TILES (R3D_SLAB_MAX_GRID * R3D_SLAB_MAX_GRID)
 
@@ -22,7 +22,7 @@ typedef struct r3d_slab_layout {
   uint32_t gx, gy;     /* tile grid, 1..2 per axis */
   uint32_t px, py;     /* uniform tile payload (voxels); last tile may cover less */
   uint32_t wz;         /* ring depth (z window, slices) */
-  uint32_t ovs;        /* overview downscale (4 while <=8184, 8 to 16368...):
+  uint32_t ovs;        /* overview downscale (4 to 8184, 8 to 16368, 16 up):
                           the whole-composite overview is ONE <=2048 texture */
 } r3d_slab_layout;
 

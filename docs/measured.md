@@ -363,3 +363,15 @@ Measured (bigslab.u8 16368^2x32, --slab 16, 720p, tf 1, no-vsync):
   faster scrolling at 16k matters.
 - 8184 regression: unchanged (312 fps, fill 1.8 s); quick-test layout
   cases extended to 8x8 + ovs; all 4 suites green.
+
+## 2026-08-05 — slab mode: 16x16 grid (32736^2 — the whole scroll in one slab)
+
+Grid cap 8 -> 16 (256-tile array + 256-case literal switch; everything else
+was already R3D_SLAB_TILES-driven). ovs reaches 16 at 32k. Measured
+(bigslab32k.u8 = 32736^2 x 16 real band crop, 17.1 GB, --slab 8, 720p):
+window fill 10 slices in 17.9 s; whole-composite view 384 fps (1.6 ms —
+the ENTIRE PHercParis3 cross-section is visible in one view); GPU ~10.7 GB
+of 23 GiB. 32k x 16-deep (ring 18, ~19.3 GB) fits arithmetically but was
+deliberately not defaulted: it leaves ~3 GB for OS + source page cache.
+Scroll at 32k = ~1 GB/slice assembly (untested rate; threading the
+assembly is the known lever). Suites green; 8184/16368 layouts unchanged.

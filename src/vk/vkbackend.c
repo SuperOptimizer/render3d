@@ -41,7 +41,7 @@ struct r3d_renderer {
   /* slab mode */
   bool slab_mode;
   r3d_slab_layout slab;
-  r3d_vkimage tiles[R3D_SLAB_TILES]; /* gy-major (element j*8+i); unused stay null */
+  r3d_vkimage tiles[R3D_SLAB_TILES]; /* gy-major (element j*MAX_GRID+i); unused stay null */
   int64_t slab_z0;       /* current window start; -1 = nothing uploaded */
   uint8_t *slice_buf;    /* CPU assembly buffer, tile_w * tile_h bytes */
   r3d_vkimage overview;  /* whole composite at 1/4 res (anti-alias far field) */
@@ -163,7 +163,7 @@ static int create_offscreen(r3d_renderer *r) {
 
 static int create_pipeline(r3d_renderer *r) {
   VkDescriptorSetLayoutBinding bindings[] = {
-      {.binding = 0, /* volume: array of 64 (slab tiles; cube uses [0] x64) */
+      {.binding = 0, /* volume: array of 256 (slab tiles; cube uses [0] x256) */
        .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
        .descriptorCount = R3D_SLAB_TILES,
        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT},
@@ -245,7 +245,7 @@ static int create_pipeline(r3d_renderer *r) {
 
   VkDescriptorPoolSize sizes[] = {
       {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1},
-      {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, R3D_SLAB_TILES + 3}, /* vol[64]+tf+occ+atlas */
+      {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, R3D_SLAB_TILES + 3}, /* vol tiles+tf+occ+atlas */
       {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1},
   };
   VkDescriptorPoolCreateInfo dpci = {
@@ -349,7 +349,7 @@ static uint64_t now_ns(void) {
   return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
-/* Write binding 0 (the vol[64] array) — views may repeat (cube: same view x64). */
+/* Write binding 0 (the vol[] tile array) — views may repeat (cube: same view). */
 static void write_volume_dset(r3d_renderer *r, VkImageView views[R3D_SLAB_TILES],
                               VkSampler sampler) {
   VkDescriptorImageInfo ii[R3D_SLAB_TILES];
