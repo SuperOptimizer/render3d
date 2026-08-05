@@ -44,8 +44,11 @@ struct r3d_renderer {
   r3d_vkimage tiles[R3D_SLAB_TILES]; /* gy-major (element j*MAX_GRID+i); unused stay null */
   int64_t slab_z0;       /* current window start; -1 = nothing uploaded */
   uint8_t *slice_buf;    /* CPU assembly buffer, tile_w * tile_h bytes */
-  r3d_vkimage overview;  /* whole composite at 1/4 res (anti-alias far field) */
-  uint8_t *ov_buf;       /* downsampled slice, ov dims */
+  /* overview pyramid: prefiltered levels (scale 4<<lev, full ring z) living
+   * in tiles[] after the base grid — see r3d_slab_ov_layout */
+  r3d_slab_layout ovl[R3D_SLAB_OV_MAX];
+  uint32_t ov_nlev, ov_base[R3D_SLAB_OV_MAX];
+  uint8_t *ov_bufs[R3D_SLAB_OV_MAX]; /* downsampled composite slice per level */
 
   r3d_vkclip *clipm;     /* clipmap mode (NULL unless r3d_clip_begin) */
 
@@ -653,9 +656,8 @@ void r3d_destroy(r3d_renderer *r) {
   if (r->samp_near) vkDestroySampler(r->vk.dev, r->samp_near, NULL);
   if (r->samp_slab) vkDestroySampler(r->vk.dev, r->samp_slab, NULL);
   for (uint32_t i = 0; i < R3D_SLAB_TILES; i++) r3d_vkimage_destroy(&r->vk, &r->tiles[i]);
-  r3d_vkimage_destroy(&r->vk, &r->overview);
   free(r->slice_buf);
-  free(r->ov_buf);
+  for (uint32_t i = 0; i < R3D_SLAB_OV_MAX; i++) free(r->ov_bufs[i]);
   r3d_vkimage_destroy(&r->vk, &r->volume);
   r3d_vkimage_destroy(&r->vk, &r->tf);
   r3d_vkimage_destroy(&r->vk, &r->occ);
@@ -823,6 +825,59 @@ int r3d_set_transfer(r3d_renderer *r, const uint8_t rgba[256][4]) {
   return upload_small_image(r, &r->tf, rgba, 256 * 4);
 }
 
+/* NxN box-downsample of a flat slice (edge boxes clamp) */
+static void slab_downsample(const uint8_t *src, uint32_t nx, uint32_t ny, uint32_t n,
+                            uint8_t *dst) {
+  uint32_t ox = (nx + n - 1) / n, oy = (ny + n - 1) / n;
+  for (uint32_t y = 0; y < oy; y++) {
+    uint32_t y0 = y * n, y1 = y0 + n > ny ? ny : y0 + n;
+    uint8_t *drow = dst + (size_t)y * ox;
+    for (uint32_t x = 0; x < ox; x++) {
+      uint32_t x0 = x * n, x1 = x0 + n > nx ? nx : x0 + n;
+      uint32_t sum = 0;
+      for (uint32_t yy = y0; yy < y1; yy++) {
+        const uint8_t *sr = src + (size_t)yy * nx;
+        for (uint32_t xx = x0; xx < x1; xx++) sum += sr[xx];
+      }
+      drow[x] = (uint8_t)(sum / ((y1 - y0) * (x1 - x0)));
+    }
+  }
+}
+
+/* assemble one tile slice (payload + clamped 1-texel apron) from a flat
+ * composite slice (row stride l->nx) and host-copy it into ring `layer` */
+static int slab_upload_tile_slice(r3d_renderer *r, const r3d_slab_layout *l,
+                                  const uint8_t *sbase, uint32_t i, uint32_t j, uint32_t layer,
+                                  r3d_vkimage *img) {
+  uint32_t tw = r3d_slab_tile_w(l), th = r3d_slab_tile_h(l);
+  for (uint32_t dr = 0; dr < th; dr++) {
+    const uint8_t *srow = sbase + (size_t)r3d_slab_src_row(l, j, dr) * l->nx;
+    uint8_t *drow = r->slice_buf + (size_t)dr * tw;
+    int64_t w0 = (int64_t)i * l->px - 1; /* world col of dst col 0 */
+    uint32_t lo = w0 < 0 ? (uint32_t)(-w0) : 0;
+    int64_t hi64 = (int64_t)l->nx - 1 - w0; /* last dst col with src */
+    uint32_t hi = hi64 >= (int64_t)tw - 1 ? tw - 1 : (uint32_t)hi64;
+    memcpy(drow + lo, srow + (w0 + lo), hi - lo + 1);
+    for (uint32_t c = 0; c < lo; c++) drow[c] = srow[0];
+    for (uint32_t c = hi + 1; c < tw; c++) drow[c] = srow[l->nx - 1];
+  }
+  VkMemoryToImageCopyEXT region = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_TO_IMAGE_COPY_EXT,
+      .pHostPointer = r->slice_buf,
+      .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+      .imageOffset = {0, 0, (int32_t)layer},
+      .imageExtent = {tw, th, 1},
+  };
+  VkCopyMemoryToImageInfoEXT ci = {
+      .sType = VK_STRUCTURE_TYPE_COPY_MEMORY_TO_IMAGE_INFO_EXT,
+      .dstImage = img->img,
+      .dstImageLayout = VK_IMAGE_LAYOUT_GENERAL,
+      .regionCount = 1,
+      .pRegions = &region,
+  };
+  return r->fp_copy_mem(r->vk.dev, &ci) == VK_SUCCESS ? 0 : -1;
+}
+
 int r3d_slab_init(r3d_renderer *r, const r3d_slab_desc *d) {
   if (r3d_slab_layout_init(&r->slab, d->nx, d->ny, d->nz, d->wz) != 0) {
     fprintf(stderr, "slab: unsupported layout %ux%ux%u wz=%u (max %u per tiled axis)\n", d->nx,
@@ -850,7 +905,7 @@ int r3d_slab_init(r3d_renderer *r, const r3d_slab_desc *d) {
 
   for (uint32_t j = 0; j < r->slab.gy; j++)
     for (uint32_t i = 0; i < r->slab.gx; i++) {
-      r3d_vkimage *t = &r->tiles[j * R3D_SLAB_MAX_GRID + i];
+      r3d_vkimage *t = &r->tiles[j * r->slab.gx + i];
       if (r3d_vkimage_create(&r->vk, VK_FORMAT_R8_UNORM, (VkExtent3D){tw, th, r->slab.wz}, 1,
                              VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT,
                              t) != 0)
@@ -865,6 +920,43 @@ int r3d_slab_init(r3d_renderer *r, const r3d_slab_desc *d) {
       };
       if (r->fp_transition(r->vk.dev, 1, &tr) != VK_SUCCESS) return -1;
     }
+
+  /* overview pyramid: prefiltered levels at scale 4<<lev up to ovs, each a
+   * tiled virtual slab over the downsampled composite (full ring z). Appended
+   * to tiles[] right after the base grid; the shader picks the level whose
+   * prefilter matches the ray-cone footprint (mip-style). */
+  r->ov_nlev = r3d_slab_ov_levels(&r->slab);
+  uint32_t nt = r->slab.gx * r->slab.gy;
+  for (uint32_t lev = 0; lev < r->ov_nlev; lev++) {
+    r3d_slab_ov_layout(&r->slab, lev, &r->ovl[lev]);
+    const r3d_slab_layout *ol = &r->ovl[lev];
+    r->ov_base[lev] = nt;
+    nt += ol->gx * ol->gy;
+    if (nt > R3D_SLAB_TILES) {
+      fprintf(stderr, "slab: tile pool exhausted (%u)\n", nt);
+      return -1;
+    }
+    r->ov_bufs[lev] = malloc((size_t)ol->nx * ol->ny);
+    if (!r->ov_bufs[lev]) return -1;
+    uint32_t otw = r3d_slab_tile_w(ol), oth = r3d_slab_tile_h(ol);
+    for (uint32_t j = 0; j < ol->gy; j++)
+      for (uint32_t i = 0; i < ol->gx; i++) {
+        r3d_vkimage *t = &r->tiles[r->ov_base[lev] + j * ol->gx + i];
+        if (r3d_vkimage_create(&r->vk, VK_FORMAT_R8_UNORM, (VkExtent3D){otw, oth, r->slab.wz},
+                               1,
+                               VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT,
+                               t) != 0)
+          return -1;
+        VkHostImageLayoutTransitionInfoEXT tr = {
+            .sType = VK_STRUCTURE_TYPE_HOST_IMAGE_LAYOUT_TRANSITION_INFO_EXT,
+            .image = t->img,
+            .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+            .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+        };
+        if (r->fp_transition(r->vk.dev, 1, &tr) != VK_SUCCESS) return -1;
+      }
+  }
 
   VkImageView views[R3D_SLAB_TILES];
   for (uint32_t e = 0; e < R3D_SLAB_TILES; e++)
@@ -883,30 +975,6 @@ int r3d_slab_init(r3d_renderer *r, const r3d_slab_desc *d) {
       .pImageInfo = ii,
   };
   vkUpdateDescriptorSets(r->vk.dev, 1, &w, 0, NULL);
-
-  /* overview: the whole composite at 1/ovs resolution in ONE texture (<=2046
-   * per axis: ovs=4 up to 8184-wide, 8 up to 16368), same ring z — sampled by
-   * the shader once the ray-cone footprint exceeds ~ovs voxels, killing
-   * far-field aliasing without mips */
-  uint32_t ovs = r->slab.ovs;
-  uint32_t ox = (d->nx + ovs - 1) / ovs, oy = (d->ny + ovs - 1) / ovs;
-  r->ov_buf = malloc((size_t)ox * oy);
-  if (!r->ov_buf) return -1;
-  if (r3d_vkimage_create(&r->vk, VK_FORMAT_R8_UNORM, (VkExtent3D){ox, oy, r->slab.wz}, 1,
-                         VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT,
-                         &r->overview) != 0)
-    return -1;
-  VkHostImageLayoutTransitionInfoEXT otr = {
-      .sType = VK_STRUCTURE_TYPE_HOST_IMAGE_LAYOUT_TRANSITION_INFO_EXT,
-      .image = r->overview.img,
-      .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-      .newLayout = VK_IMAGE_LAYOUT_GENERAL,
-      .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
-  };
-  if (r->fp_transition(r->vk.dev, 1, &otr) != VK_SUCCESS) return -1;
-  /* binding 3 (occupancy slot, unused in slab mode) becomes the overview */
-  write_image_dset(r, 3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, r->overview.view,
-                   r->samp_slab, VK_IMAGE_LAYOUT_GENERAL);
 
   r->slab_mode = true;
   r->slab_z0 = -1;
@@ -934,74 +1002,30 @@ int r3d_slab_window(r3d_renderer *r, const r3d_volume *src, uint32_t z0) {
     if (vkWaitSemaphores(r->vk.dev, &wi, UINT64_MAX) != VK_SUCCESS) return -1;
   }
 
-  uint32_t tw = r3d_slab_tile_w(&r->slab), th = r3d_slab_tile_h(&r->slab);
   const r3d_slab_layout *l = &r->slab;
   for (uint32_t s = s0; s < s1; s++) {
     uint32_t layer = r3d_slab_ring_layer(l, s);
-    for (uint32_t j = 0; j < l->gy; j++)
-      for (uint32_t i = 0; i < l->gx; i++) {
-        /* assemble slice: payload run memcpy + clamped apron columns */
-        for (uint32_t dr = 0; dr < th; dr++) {
-          const uint8_t *srow =
-              src->voxels + ((size_t)s * src->ny + r3d_slab_src_row(l, j, dr)) * src->nx;
-          uint8_t *drow = r->slice_buf + (size_t)dr * tw;
-          int64_t w0 = (int64_t)i * l->px - 1; /* world col of dst col 0 */
-          uint32_t lo = w0 < 0 ? (uint32_t)(-w0) : 0;
-          int64_t hi64 = (int64_t)l->nx - 1 - w0; /* last dst col with src */
-          uint32_t hi = hi64 >= (int64_t)tw - 1 ? tw - 1 : (uint32_t)hi64;
-          memcpy(drow + lo, srow + (w0 + lo), hi - lo + 1);
-          for (uint32_t c = 0; c < lo; c++) drow[c] = srow[0];
-          for (uint32_t c = hi + 1; c < tw; c++) drow[c] = srow[l->nx - 1];
-        }
-        VkMemoryToImageCopyEXT region = {
-            .sType = VK_STRUCTURE_TYPE_MEMORY_TO_IMAGE_COPY_EXT,
-            .pHostPointer = r->slice_buf,
-            .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-            .imageOffset = {0, 0, (int32_t)layer},
-            .imageExtent = {tw, th, 1},
-        };
-        VkCopyMemoryToImageInfoEXT ci = {
-            .sType = VK_STRUCTURE_TYPE_COPY_MEMORY_TO_IMAGE_INFO_EXT,
-            .dstImage = r->tiles[j * R3D_SLAB_MAX_GRID + i].img,
-            .dstImageLayout = VK_IMAGE_LAYOUT_GENERAL,
-            .regionCount = 1,
-            .pRegions = &region,
-        };
-        if (r->fp_copy_mem(r->vk.dev, &ci) != VK_SUCCESS) return -1;
-      }
-
-    /* overview: ovs x ovs box-average of the source slice -> same ring layer */
-    uint32_t ovs = l->ovs;
-    uint32_t ox = (l->nx + ovs - 1) / ovs, oyd = (l->ny + ovs - 1) / ovs;
     const uint8_t *sbase = src->voxels + (size_t)s * src->ny * src->nx;
-    for (uint32_t oy2 = 0; oy2 < oyd; oy2++) {
-      uint32_t y0 = oy2 * ovs, y1 = y0 + ovs > l->ny ? l->ny : y0 + ovs;
-      uint8_t *orow = r->ov_buf + (size_t)oy2 * ox;
-      for (uint32_t ox2 = 0; ox2 < ox; ox2++) {
-        uint32_t x0 = ox2 * ovs, x1 = x0 + ovs > l->nx ? l->nx : x0 + ovs;
-        uint32_t sum = 0;
-        for (uint32_t y = y0; y < y1; y++) {
-          const uint8_t *sr = sbase + (size_t)y * src->nx;
-          for (uint32_t x = x0; x < x1; x++) sum += sr[x];
-        }
-        orow[ox2] = (uint8_t)(sum / ((y1 - y0) * (x1 - x0)));
-      }
+    for (uint32_t j = 0; j < l->gy; j++)
+      for (uint32_t i = 0; i < l->gx; i++)
+        if (slab_upload_tile_slice(r, l, sbase, i, j, layer, &r->tiles[j * l->gx + i]) != 0)
+          return -1;
+
+    /* overview pyramid: 4x box down from the source slice, then 2x chains;
+     * each level uploads through the same tile-assembly path */
+    for (uint32_t lev = 0; lev < r->ov_nlev; lev++) {
+      const r3d_slab_layout *ol = &r->ovl[lev];
+      if (lev == 0)
+        slab_downsample(sbase, l->nx, l->ny, 4, r->ov_bufs[0]);
+      else
+        slab_downsample(r->ov_bufs[lev - 1], r->ovl[lev - 1].nx, r->ovl[lev - 1].ny, 2,
+                        r->ov_bufs[lev]);
+      for (uint32_t j = 0; j < ol->gy; j++)
+        for (uint32_t i = 0; i < ol->gx; i++)
+          if (slab_upload_tile_slice(r, ol, r->ov_bufs[lev], i, j, layer,
+                                     &r->tiles[r->ov_base[lev] + j * ol->gx + i]) != 0)
+            return -1;
     }
-    VkMemoryToImageCopyEXT oregion = {
-        .sType = VK_STRUCTURE_TYPE_MEMORY_TO_IMAGE_COPY_EXT,
-        .pHostPointer = r->ov_buf,
-        .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-        .imageOffset = {0, 0, (int32_t)layer},
-        .imageExtent = {ox, oyd, 1},
-    };
-    VkCopyMemoryToImageInfoEXT oci = {
-        .sType = VK_STRUCTURE_TYPE_COPY_MEMORY_TO_IMAGE_INFO_EXT,
-        .dstImage = r->overview.img,
-        .dstImageLayout = VK_IMAGE_LAYOUT_GENERAL,
-        .regionCount = 1,
-        .pRegions = &oregion,
-    };
-    if (r->fp_copy_mem(r->vk.dev, &oci) != VK_SUCCESS) return -1;
   }
   double ms = (double)(now_ns() - t0) / 1e6;
   if (full || ms > 5.0)

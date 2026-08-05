@@ -359,6 +359,25 @@ int main(int argc, char **argv) {
         cam.pos = v3(0.25f + 0.5f * ph, 0.5f, -0.02f);
         cam.yaw = 0.0f;
         cam.pitch = 0.0f;
+      } else if (strcmp(bench, "zoomio") == 0) {
+        /* full zoom sweep: whole-composite view down to voxel scale and back
+         * (log-space triangle wave) — walks every LOD band the mode has */
+        float ey = slab_wz ? (float)slab_src.ny / (float)slab_src.nx : 1.0f;
+        float ez = slab_wz ? (float)slab_wz / (float)slab_src.nx : 1.0f;
+        float tri = ph < 0.5f ? ph * 2.0f : 2.0f - ph * 2.0f; /* 0->1->0 */
+        float d = 1.6f * powf(0.002f / 1.6f, tri);
+        cam.yaw = 0.0f;
+        cam.pitch = 0.0f;
+        r3d_camera_orbit_set(&cam, v3(0.5f, ey * 0.5f, ez * 0.5f), d);
+      } else if (strcmp(bench, "volrot") == 0) {
+        /* mid-zoom + model rotation: worst case for anisotropic footprints */
+        float ey = slab_wz ? (float)slab_src.ny / (float)slab_src.nx : 1.0f;
+        float ez = slab_wz ? (float)slab_wz / (float)slab_src.nx : 1.0f;
+        vol_rot[0] = 0.7f * sinf(ph * tau);
+        vol_rot[1] = 0.45f * sinf(ph * tau * 0.7f);
+        cam.yaw = 0.0f;
+        cam.pitch = 0.0f;
+        r3d_camera_orbit_set(&cam, v3(0.5f, ey * 0.5f, ez * 0.5f), 0.2f);
       } /* other bench names (zsweep) keep the default camera */
     }
     r3d_v3 right, up, fwd;

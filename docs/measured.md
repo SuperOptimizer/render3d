@@ -392,3 +392,35 @@ so wide views marched full-res tiles forever (24.6 ms). At ovs=16 (32k)
 the 3.75 threshold cleared it by luck. max_lod is now log2(ovs)+2.
 Lesson: thresholds derived from a scale knob must be checked against
 every clamp on the same quantity.
+
+## 2026-08-05 — slab optimization: overview pyramid + native descriptor indexing
+
+New benches: zoomio (whole-composite -> voxel scale -> back, log-space) and
+volrot (model rotation at mid-zoom). Baselines on the whole-scroll slab
+(35712x24000x8, 720p full-res): zoomio 96.2 ms avg, volrot 74.1 ms — the
+band between full-res tiles (lod 0) and the single 1/ovs overview had no
+prefiltered data, so mid-zoom samples thrashed the texture cache. Occlusion/
+viewport culling would not help: rays already exit on miss and terminate at
+0.98 alpha; the cost was unfiltered sampling.
+
+Fix 1 — tiled overview pyramid: prefiltered levels at scale 4<<lev up to
+ovs (full ring z, never downsampled in depth), each a virtual slab layout
+appended to the tiles[] pool; shader picks the level matching the ray-cone
+footprint (all-float geometry math — Adreno has no integer divide). Fill
+builds levels by 4x box + 2x chain per slice (~7% extra CPU, ~700 MB GPU
+at this size).
+
+Fix 2 — the real assassin: the "literal indices" sample_tile switch. Fine
+at 16 cases (M1), it silently became a ~20x per-sample tax as the pool
+grew (544 texture instructions in a branch tree; whole view 1.0 -> 21 ms
+just from routing through it). Turnip reports
+shaderSampledImageArrayNonUniformIndexingNative, so the switch is now one
+NonUniformResourceIndex sample and the 1.2/DI features are enabled at
+device create. Lesson: re-audit "no feature needed" workarounds when the
+constant that motivated them grows.
+
+Results (same bench, same data): zoomio 96.2 -> 2.83 ms (34x, worst frame
+7.5 ms), volrot 74.1 -> 2.17 ms (34x), whole view unchanged 1.0 ms,
+mid-zoom stills ~2.9 ms and visually clean (no seams/banding). Every zoom
+level of the whole scroll now renders at 60 fps with headroom. Suites
+green.

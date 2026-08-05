@@ -15,7 +15,8 @@
 
 #define R3D_SLAB_MAX_GRID 22u   /* up to 22x22 tiles = 45012^2 composite (whole 43k plane) */
 #define R3D_SLAB_MAX_TILE 2048u /* maxImageDimension3D on target hardware */
-#define R3D_SLAB_TILES (R3D_SLAB_MAX_GRID * R3D_SLAB_MAX_GRID)
+#define R3D_SLAB_TILES 544u /* descriptor slots: base grid + overview pyramid */
+#define R3D_SLAB_OV_MAX 6u
 
 typedef struct r3d_slab_layout {
   uint32_t nx, ny, nz; /* source volume dims (voxels) */
@@ -96,5 +97,24 @@ static inline void r3d_slab_scroll_range(const r3d_slab_layout *l, int64_t z0_ol
 
 /* Highest legal window start for a source of nz slices. */
 static inline uint32_t r3d_slab_z0_max(const r3d_slab_layout *l) { return l->nz - l->wz; }
+
+/* Overview pyramid: prefiltered whole-composite levels at scale s = 4<<lev
+ * (coarsest = ovs), each a virtual slab layout over the downsampled plane
+ * (same ring z, never downsampled). Kills the unfiltered mid-zoom band:
+ * without it, footprints between 1 and ovs voxels sample full-res tiles
+ * with zero texture-cache locality. */
+static inline uint32_t r3d_slab_ov_levels(const r3d_slab_layout *l) {
+  uint32_t n = 1, s = 4;
+  while (s < l->ovs) {
+    s <<= 1;
+    n++;
+  }
+  return n;
+}
+static inline void r3d_slab_ov_layout(const r3d_slab_layout *l, uint32_t lev,
+                                      r3d_slab_layout *out) {
+  uint32_t s = 4u << lev;
+  (void)r3d_slab_layout_init(out, (l->nx + s - 1) / s, (l->ny + s - 1) / s, l->nz, l->wz);
+}
 
 #endif /* R3D_SLAB_H */

@@ -208,6 +208,10 @@ int r3d_vkctx_create(r3d_vkctx *c, const char *const *inst_exts, uint32_t n_inst
       .pNext = &en13,
       .timelineSemaphore = VK_TRUE,
       .hostQueryReset = f12.hostQueryReset,
+      /* slab tiles are dynamically indexed (a 544-case literal switch costs
+       * ~20x per sample vs native non-uniform indexing on this hardware) */
+      .shaderSampledImageArrayNonUniformIndexing = f12.shaderSampledImageArrayNonUniformIndexing,
+      .runtimeDescriptorArray = f12.runtimeDescriptorArray,
   };
   float prio = 1.0f;
   VkDeviceQueueCreateInfo qci = {
