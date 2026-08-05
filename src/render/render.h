@@ -65,6 +65,16 @@ typedef struct r3d_bricks_stats {
   uint32_t inflight;            /* requests decoded this frame */
 } r3d_bricks_stats;
 void r3d_bricks_get_stats(const r3d_renderer *r, r3d_bricks_stats *st);
+/* Virtual slab: a W x H x D window positioned anywhere in the full export
+ * (43008^2 x 68608), streamed from the local shard cache in band_dir with
+ * remote fetch on miss (R3D_VSLAB_NOFETCH=1 disables). Call r3d_vslab_frame
+ * once per frame BEFORE r3d_frame: it recenters the window on the focus
+ * (world voxels), runs up to `budget` decode jobs, and fills the params. */
+int r3d_vslab_begin(r3d_renderer *r, const char *band_dir, uint32_t W, uint32_t H, uint32_t D);
+void r3d_vslab_frame(r3d_renderer *r, double fx, double fy, int64_t z0, uint32_t budget,
+                     r3d_frame_params *p);
+void r3d_vslab_get(const r3d_renderer *r, int64_t o[3], uint32_t *pending);
+
 int r3d_set_transfer(r3d_renderer *r, const uint8_t rgba[256][4]);
 
 /* Acquire -> raycast -> blit -> present. Fills st (may be zero). */

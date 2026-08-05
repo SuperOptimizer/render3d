@@ -74,6 +74,9 @@ int main(int argc, char **argv) {
   bool clip_mode = false;   /* clipmap over the shard band */
   const char *bricks_path = NULL; /* c5d shard for GPU-decoded bricks mode */
   int pool_bpa = 0, warm_mb = 0;  /* bricks hot-atlas slots/axis, warm-tier MB */
+  bool vslab_mode = false;        /* toroidal streaming window over the export */
+  int vsw = 12096, vsh = 12096, vsd = 16; /* window dims (voxels) */
+  long long vsz0 = 34288;         /* start z (world; default inside the local band) */
   for (int i = 1; i < argc; i++) {
     if (i < argc - 1 && strcmp(argv[i], "--frames") == 0) exit_frames = (uint32_t)atoi(argv[i + 1]);
     if (i < argc - 1 && strcmp(argv[i], "--shot") == 0) shot_path = argv[i + 1];
@@ -97,6 +100,13 @@ int main(int argc, char **argv) {
     if (i < argc - 1 && strcmp(argv[i], "--bricks") == 0) bricks_path = argv[i + 1];
     if (i < argc - 1 && strcmp(argv[i], "--pool") == 0) pool_bpa = atoi(argv[i + 1]);
     if (i < argc - 1 && strcmp(argv[i], "--warm") == 0) warm_mb = atoi(argv[i + 1]);
+    if (strcmp(argv[i], "--vslab") == 0) vslab_mode = true;
+    if (i < argc - 1 && strcmp(argv[i], "--vsz") == 0) vsz0 = atoll(argv[i + 1]);
+    if (i < argc - 3 && strcmp(argv[i], "--vswin") == 0) {
+      vsw = atoi(argv[i + 1]);
+      vsh = atoi(argv[i + 2]);
+      vsd = atoi(argv[i + 3]);
+    }
     if (strcmp(argv[i], "--slab") == 0) {
       slab_wz = 32;
       if (i < argc - 1 && argv[i + 1][0] >= '0' && argv[i + 1][0] <= '9')
@@ -164,6 +174,15 @@ int main(int argc, char **argv) {
     mode = R3D_MODE_FULL;
   }
 
+  int64_t vs_z0 = (int64_t)vsz0;
+  double vs_fx = 21504.0, vs_fy = 21504.0;
+  bool vs_follow = true;
+  if (vslab_mode) {
+    if (r3d_vslab_begin(renderer, "band", (uint32_t)vsw, (uint32_t)vsh, (uint32_t)vsd) != 0)
+      return EXIT_FAILURE;
+    mode = R3D_MODE_FULL;
+  }
+
   /* clipmap: 43k^2 cross sections from the shard band + pyramid */
   const uint32_t CLIP_NX = 43008, CLIP_BAND_Z = 33, CLIP_DEPTH_MAX = 32;
   uint64_t clip_z0 = 0, clip_z0_min = 0, clip_z0_max = 0;
@@ -200,6 +219,10 @@ int main(int argc, char **argv) {
     if (clip_mode) {
       float ez = (float)CLIP_DEPTH_MAX / (float)CLIP_NX;
       r3d_camera_orbit_set(&cam, v3(0.5f, 0.5f, ez * 0.5f), 1.3f);
+    } else if (vslab_mode) {
+      float ey = (float)vsh / (float)vsw;
+      float ez = (float)(vsd + 2) / (float)vsw;
+      r3d_camera_orbit_set(&cam, v3(0.5f, ey * 0.5f, ez * 0.5f), 1.4f);
     } else if (slab_wz) {
       /* orbit the thin slab: target its center, sit back along z */
       float ey = (float)slab_src.ny / (float)slab_src.nx;
@@ -381,6 +404,13 @@ int main(int argc, char **argv) {
         cam.pitch = 0.0f;
         r3d_camera_orbit_set(&cam, v3(0.5f, ey * 0.5f, ez * 0.5f), 0.2f);
       } /* other bench names (zsweep) keep the default camera */
+      if (vslab_mode && strcmp(bench, "zsweep") == 0) /* scroll z across the band */
+        vs_z0 = 33792 + (int64_t)(ph * (1024.0f - (float)(vsd + 2)));
+      if (vslab_mode && strcmp(bench, "clippan") == 0) { /* xy window churn */
+        vs_follow = false;
+        vs_fx = 12000.0 + (double)ph * 18000.0;
+        vs_fy = 21504.0;
+      }
     }
     r3d_v3 right, up, fwd;
     r3d_camera_basis(&cam, (float)w / (float)h, &right, &up, &fwd);
@@ -444,6 +474,17 @@ int main(int argc, char **argv) {
              (clip_valid_disp & 2) ? " L1" : "", (clip_valid_disp & 4) ? " L2" : "",
              (clip_valid_disp & 8) ? " L3" : "", (clip_valid_disp & 16) ? " L4" : "",
              (clip_valid_disp & 32) ? " L5" : "");
+    }
+    if (vslab_mode) {
+      int z0i = (int)vs_z0;
+      if (igSliderInt("z position (world)", &z0i, 0, 68608 - (vsd + 2), "%d", 0))
+        vs_z0 = z0i;
+      igCheckbox("follow camera (x/y)", &vs_follow);
+      int64_t vo_[3];
+      uint32_t pend;
+      r3d_vslab_get(renderer, vo_, &pend);
+      igText("window @ (%lld, %lld, %lld)%s", (long long)vo_[0], (long long)vo_[1],
+             (long long)vo_[2], pend ? "  streaming..." : "");
     }
     if (bricks_path) {
       r3d_bricks_stats bst;
@@ -519,6 +560,24 @@ int main(int argc, char **argv) {
     if (slab_wz) {
       r3d_slab_params(renderer, &p);
       p.slab_depth = (uint32_t)slab_depth;
+    }
+    if (vslab_mode) {
+      /* focus = view axis ^ window mid-plane, in WINDOW space -> world */
+      float vey = (float)vsh / (float)vsw, vez = (float)(vsd + 2) / (float)vsw;
+      r3d_v3 vc = v3(0.5f, vey * 0.5f, vez * 0.5f);
+      r3d_v3 vo = v3_add(m3_tmul(vm, v3_sub(v3_sub(cam.pos, vol_t), vc)), vc);
+      r3d_v3 vd = m3_tmul(vm, fwd);
+      float tt = vd.z != 0.0f ? (vez * 0.5f - vo.z) / vd.z : 0.0f;
+      if (tt < 0.0f) tt = 0.0f;
+      float fxn = fclampf(vo.x + vd.x * tt, 0.0f, 1.0f);
+      float fyn = fclampf((vo.y + vd.y * tt) / (vey > 0.0f ? vey : 1.0f), 0.0f, 1.0f);
+      int64_t vo3[3];
+      r3d_vslab_get(renderer, vo3, NULL);
+      if (vs_follow && vo3[0] >= 0) {
+        vs_fx = (double)vo3[0] + (double)fxn * vsw;
+        vs_fy = (double)vo3[1] + (double)fyn * vsh;
+      }
+      r3d_vslab_frame(renderer, vs_fx, vs_fy, vs_z0, moving ? 1u : 3u, &p);
     }
     if (bricks_path) {
       /* streaming pump: camera in VOLUME space (model transform inverted, like

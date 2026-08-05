@@ -36,6 +36,7 @@ static const float OCC_BLOCK = 8.0;
 bool is_slab() { return R3D_MODE == 1; }
 bool is_clip() { return R3D_MODE == 2; }
 bool is_bricks() { return R3D_MODE == 3; }
+bool is_vslab() { return R3D_MODE == 4; } /* virtual slab: toroidal window */
 
 /* bricks mode: one page-table resolve per sample position; the fetch (and
  * the 6 gradient taps reusing the context) are then plain atlas samples. */
@@ -91,7 +92,7 @@ float clip_wzl(uint l) {
 // World box the ray marches: cube = [0,1]^3; slab = thin box whose z spans the
 // wz-1 seam-safe slices, all in units of 1/nx.
 float3 vol_extent() {
-  if (!is_slab() && !is_clip()) return float3(1);
+  if (!is_slab() && !is_clip() && !is_vslab()) return float3(1);
   // box is exactly slab_depth voxels thick; the ring holds depth+2 slices so
   // filtering at the faces never crosses the ring seam
   return float3(1.0, pc.slab_ny / pc.slab_nx, float(pc.slab_depth) / pc.slab_nx);
@@ -102,6 +103,43 @@ float sample_tile(float3 uvw, uint idx) {
   // — replaces the old literal-index switch, whose branch tree cost ~20x per
   // sample once the tile pool grew past a few dozen entries
   return volumes[NonUniformResourceIndex(idx)].SampleLevel(uvw, 0);
+}
+
+/* --- virtual slab: world-anchored toroidal tile grids over the full export.
+ * World coords = window origin + p * W. Cell (cx,cy) of level l lives in
+ * physical tile (cx mod gx_l, cy mod gy_l); a validity table (binding 5,
+ * base-level granularity) gates sampling — pyramid content is written by the
+ * same fill as its base cell, so it inherits base validity. All geometry in
+ * floats: payload 2016, cells <= 22 per axis, exact in f32; no int divides. */
+float vs_sample(float3 p, float lod) {
+  float wx = pc.slab_x0 + p.x * pc.slab_nx;
+  float wy = pc.slab_y0 + p.y * pc.slab_nx; /* extent y = H/W: p.y*W = offset */
+  float zc = pc.slab_z0 + 0.5 + p.z * pc.slab_nx;
+  float w = frac(zc / float(pc.slab_wz)); /* world-anchored z ring */
+  float gx0 = float(pc.slab_grid & 63u), gy0 = float((pc.slab_grid >> 6) & 63u);
+  float cbx = floor(wx / 2016.0), cby = floor(wy / 2016.0);
+  float pbx = cbx - floor(cbx / gx0) * gx0, pby = cby - floor(cby / gy0) * gy0;
+  uint want = (uint(cbx) & 1023u) | ((uint(cby) & 1023u) << 10) | 0x80000000u;
+  if (page[uint(pby * gx0 + pbx)] != want) return 0.0; /* not resident (yet) */
+  int lev = int(floor(lod)) - 2; /* prefilter 4<<lev matches the footprint */
+  if (lev < 0) {
+    float lx = wx - cbx * 2016.0 + 1.0, ly = wy - cby * 2016.0 + 1.0;
+    return sample_tile(float3(lx / 2018.0, ly / 2018.0, w), uint(pby * gx0 + pbx));
+  }
+  lev = min(lev, 3);
+  float sc = float(4 << lev);
+  uint gp = pc.brick_mode >> (uint(lev) * 8u); /* packed pyramid grids */
+  float gxl = float(gp & 15u), gyl = float((gp >> 4) & 15u);
+  uint bse = uint(gx0) * uint(gy0);
+  for (int k = 0; k < lev; k++) {
+    uint gk = pc.brick_mode >> (uint(k) * 8u);
+    bse += (gk & 15u) * ((gk >> 4) & 15u);
+  }
+  float tx = wx / sc, ty = wy / sc; /* absolute level texel coords */
+  float cx = floor(tx / 2016.0), cy = floor(ty / 2016.0);
+  float px_ = cx - floor(cx / gxl) * gxl, py_ = cy - floor(cy / gyl) * gyl;
+  float lx = tx - cx * 2016.0 + 1.0, ly = ty - cy * 2016.0 + 1.0;
+  return sample_tile(float3(lx / 2018.0, ly / 2018.0, w), bse + uint(py_ * gxl + px_));
 }
 
 // --- clip mode: level pick is separated from sampling so the marcher picks
@@ -150,6 +188,7 @@ float vol_sample(float3 p, float lod) {
     return l < 0 ? 0.0 : sample_clip_level(uint(l), p);
   }
   if (is_bricks()) return bricks_sample(p);
+  if (is_vslab()) return vs_sample(p, lod);
   if (!is_slab()) return volumes[0].SampleLevel(p, lod);
   // voxel coords (units of 1/nx per axis)
   float wx = p.x * pc.slab_nx;
@@ -232,6 +271,9 @@ void main(uint3 tid: SV_DispatchThreadID) {
   } else if (is_bricks()) {
     voxel = 1.0 / float((pc.brick_mode & 0xffu) * 128u);
     max_lod = 3.0; // atlas has no mips; lod only widens far-field steps
+  } else if (is_vslab()) {
+    voxel = 1.0 / pc.slab_nx;
+    max_lod = 7.0; /* pyramid tops out at 1/32; extra lod widens far steps */
   } else if (is_slab()) {
     voxel = 1.0 / pc.slab_nx;
     // must exceed the overview switch (log2(ovs)-0.25) or wide views would be
@@ -291,7 +333,7 @@ void main(uint3 tid: SV_DispatchThreadID) {
     // step size scales with it so far-field marching is proportionally cheap.
     float lod = clamp(log2(max(t * cone / voxel, 1.0)) + pc.lod_bias, 0.0, max_lod);
     float lod_step = exp2(lod); /* continuous: fractional lod still widens dt */
-    if (is_slab() || is_clip()) // keep >=4 samples along THIS ray's box segment
+    if (is_slab() || is_clip() || is_vslab()) // >=4 samples along the box segment
       lod_step = min(lod_step, max(1.0, (tf_ - tn) / (4.0 * dt)));
     float3 p = ro + t * dir;
 

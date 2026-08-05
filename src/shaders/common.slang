@@ -29,6 +29,8 @@ struct FrameParams {
   // bricks mode (c5d GPU-decoded atlas): 0 = off; else bpa | atlas_bpa<<8
   uint brick_mode;
   float skip_gate; // voxels below this are invisible under the current TF
+  // virtual-slab mode (slab_grid bit 24): window world origin (z = slab_z0)
+  float slab_x0, slab_y0;
 };
 
 // world -> volume space (R^T rotate about the box center, minus translation)

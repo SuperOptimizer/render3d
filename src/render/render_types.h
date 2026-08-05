@@ -63,8 +63,11 @@ typedef struct r3d_frame_params {
    * transfer function + low-cut, so empty-space skipping may leap them.
    * Exact, not approximate: TF alpha is zero below it by construction. */
   float skip_gate;
+  /* virtual-slab mode (slab_grid bit 24): window world origin x/y (z is
+   * slab_z0); coords <= 43008 are exact in f32 */
+  float slab_x0, slab_y0;
 } r3d_frame_params;
-static_assert(sizeof(r3d_frame_params) == 224, "must mirror shader FrameParams");
+static_assert(sizeof(r3d_frame_params) == 232, "must mirror shader FrameParams");
 
 typedef struct r3d_frame_stats {
   /* GPU zones from timestamp queries (0 if unsupported); lag 2 frames */

@@ -10,6 +10,7 @@
 #include "core/clip.h"
 #include "core/mathx.h"
 #include "core/slab.h"
+#include "core/vslab.h"
 #include "core/transfer.h"
 #include "core/volume.h"
 
@@ -184,6 +185,24 @@ static void test_slab(void) {
   CHECK(full == 1 && s0 == 100 && s1 == 132);
 }
 
+static void test_vslab(void) {
+  r3d_vslab v;
+  CHECK(r3d_vslab_init(&v, 43008, 43008, 68608, 12096, 12096, 16) == 0);
+  CHECK(v.wz == 18 && v.lv[0].gx == 7 && v.lv[0].gy == 7); /* 6 cells + straddle */
+  CHECK(v.lv[1].gx == 3 && v.lv[4].gx == 2);               /* s=4, s=32 */
+  CHECK(v.ntiles == 49 + 9 + 4 + 4 + 4);
+  CHECK(r3d_vs_cell(&v, 0) == 2016 && r3d_vs_cell(&v, 4) == 2016 * 32);
+  int64_t c0, c1;
+  r3d_vs_range(&v, 0, 10000, 43008, 12096, &c0, &c1);
+  CHECK(c0 == 4 && c1 == 10); /* 10000/2016=4, 22095/2016=10 -> 7 cells */
+  r3d_vs_range(&v, 0, 43008 - 12096, 43008, 12096, &c0, &c1);
+  CHECK(c1 == 21); /* clamped at the last cell */
+  CHECK(r3d_vs_phys(10, 7) == 3);
+  CHECK(r3d_vs_key(3, 5) == (3u | (5u << 10) | 0x80000000u));
+  CHECK(r3d_vs_layer(&v, 34288) == 34288 % 18);
+  CHECK(r3d_vs_max0(68608, 18) == 68590);
+}
+
 static void test_clip(void) {
   r3d_clip c;
   r3d_clip_init(&c, 43008, 43008, 68608, 32, 21504, 21504);
@@ -218,6 +237,7 @@ int main(void) {
   test_slab();
   test_clip();
   test_volume();
+  test_vslab();
   test_camera();
   test_orbit();
   test_transfer();

@@ -440,3 +440,35 @@ Results: all suites green both legs; bricks render vs cube unchanged
 (mean 0.100); full-GPU atlas fill 144 -> 228 bricks/s (0.30 -> 0.48 GB/s)
 free from upstream's dq fast path. GPU-path encodes may now use tau
 (lossless still rejected); c5dpack stays tau=0 by default.
+
+## 2026-08-05 — virtual slab: 3-axis streaming window over the ENTIRE export
+
+New mode --vslab [--vswin W H D] [--vsz Z]: a W x H x D window positioned
+anywhere in the full 43008^2 x 68608 volume. World-anchored TOROIDAL tile
+grids per level (base + pyramid 4/8/16/32; payload 2016 = 63*32 so every
+pyramid texel's source box lies in ONE base cell): scrolling any axis only
+decodes ENTERING cells/strips — resident texels never move or re-upload.
+Pyramid content is a by-product of base fills (4x + 2x chain per layer,
+scattered into overlapped pyramid tiles with sub-rect host copies) and
+inherits base validity: a key table on binding 5 gates sampling per base
+cell, so unfilled regions render empty and refine as jobs land (R3D_MODE=4
+pipeline variant; slab_grid bit 24; window origin = new push floats
+slab_x0/y0, 224 -> 232 B). Sources: local shard cache (band/<Z>_<Y>_<X>)
+with REMOTE FETCH on miss from the dl.ash2txt.org export (curl per shard,
+404 -> .missing marker; R3D_VSLAB_NOFETCH=1 disables). Fills are
+synchronous, budgeted in slices (~1 full cell per frame; z strips chunk-16
+aligned since dct3d decodes whole chunks). Window follows the camera focus
+(GUI toggle) + world-z slider over all 68608 slices.
+
+Measured (12096^2 x 16 window = 70 tiles / 5.1 GB, 720p, band z=33):
+- initial fill ~4 s (49 cells x ~80 ms decode), then 0.6 ms whole-window.
+- xy pan bench (window slides 18k voxels): 51 fps avg, worst frame 104 ms
+  (synchronous fills — async worker is the known follow-up).
+- z sweep at 2.6 slices/frame (whole band in 7 s — far beyond real
+  scrubbing): ~11 fps, throttled by the slice budget; validity blanks
+  outrun cells until fills catch up.
+- remote: window dropped into never-fetched z-row 32 pulled 49 shards from
+  the export automatically and rendered fresh scroll data end to end.
+
+Follow-ups: async fill worker (+ prefetch margin), parallel shard fetch,
+multi-window z rings > 62, vslab zoomio-class benches.

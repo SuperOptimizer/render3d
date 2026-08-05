@@ -5,6 +5,7 @@
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
 #include <pthread.h>
+#include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,8 +13,10 @@
 
 #include "core/clip.h"
 #include "core/slab.h"
+#include "core/vslab.h"
 #include "render/render.h"
 #include "shard.h" /* c5d .c5s reader */
+#include "shard/shardio.h"
 #include "vk/vkc5d.h"
 #include "vk/vkclip.h"
 #include "vk/vkctx.h"
@@ -89,12 +92,24 @@ struct r3d_renderer {
     uint32_t nwf, cwf;
   } bs;
 
+  /* virtual slab: windowed toroidal streaming over the whole export */
+  struct {
+    bool active, fetch;
+    r3d_vslab v;
+    r3d_shard_store store;
+    struct vscell { int64_t cx, cy, za, zb; } *cells; /* base phys grid */
+    uint8_t *box;   /* decode staging: 2018^2 * wz */
+    uint8_t *ds[4]; /* per-level downsample strips (one layer) */
+    char band_dir[512];
+    uint32_t pending; /* jobs left after this frame's budget */
+  } vsl;
+
   PFN_vkTransitionImageLayoutEXT fp_transition;
   PFN_vkCopyMemoryToImageEXT fp_copy_mem;
 
   VkDescriptorSetLayout dsl;
   VkPipelineLayout pipe_layout;
-  VkPipeline raycast[4]; /* per-mode variants: cube, slab, clip, bricks */
+  VkPipeline raycast[5]; /* per-mode variants: cube, slab, clip, bricks, vslab */
   VkDescriptorPool dpool;
   VkDescriptorSet dset;
 
@@ -211,8 +226,8 @@ static int create_pipeline(r3d_renderer *r) {
 
   /* one pipeline per sampling mode; R3D_WG workgroup sweep applies to cube */
   const char *wg = getenv("R3D_WG");
-  const char *names[4] = {"raycast_cube.spv", "raycast_slab.spv", "raycast_clip.spv",
-                          "raycast_bricks.spv"};
+  const char *names[5] = {"raycast_cube.spv", "raycast_slab.spv", "raycast_clip.spv",
+                          "raycast_bricks.spv", "raycast_vslab.spv"};
   r->wg_x = 16;
   r->wg_y = 8;
   if (wg && strcmp(wg, "8x8") == 0) {
@@ -222,7 +237,7 @@ static int create_pipeline(r3d_renderer *r) {
     names[0] = "raycast_16x16.spv";
     r->wg_x = r->wg_y = 16;
   }
-  for (uint32_t m = 0; m < 4; m++) {
+  for (uint32_t m = 0; m < 5; m++) {
     uint32_t *spv = NULL;
     size_t spv_n = 0;
     if (load_spv(r->cfg.spv_dir, names[m], &spv, &spv_n) != 0) return -1;
@@ -621,7 +636,7 @@ void r3d_destroy(r3d_renderer *r) {
     if (r->acquire[i]) vkDestroySemaphore(r->vk.dev, r->acquire[i], NULL);
   if (r->pool) vkDestroyCommandPool(r->vk.dev, r->pool, NULL);
   if (r->dpool) vkDestroyDescriptorPool(r->vk.dev, r->dpool, NULL);
-  for (uint32_t m = 0; m < 4; m++)
+  for (uint32_t m = 0; m < 5; m++)
     if (r->raycast[m]) vkDestroyPipeline(r->vk.dev, r->raycast[m], NULL);
   if (r->pipe_layout) vkDestroyPipelineLayout(r->vk.dev, r->pipe_layout, NULL);
   if (r->dsl) vkDestroyDescriptorSetLayout(r->vk.dev, r->dsl, NULL);
@@ -658,6 +673,9 @@ void r3d_destroy(r3d_renderer *r) {
   for (uint32_t i = 0; i < R3D_SLAB_TILES; i++) r3d_vkimage_destroy(&r->vk, &r->tiles[i]);
   free(r->slice_buf);
   for (uint32_t i = 0; i < R3D_SLAB_OV_MAX; i++) free(r->ov_bufs[i]);
+  free(r->vsl.cells);
+  free(r->vsl.box);
+  for (uint32_t i = 0; i < 4; i++) free(r->vsl.ds[i]);
   r3d_vkimage_destroy(&r->vk, &r->volume);
   r3d_vkimage_destroy(&r->vk, &r->tf);
   r3d_vkimage_destroy(&r->vk, &r->occ);
@@ -1568,6 +1586,372 @@ void r3d_bricks_get_stats(const r3d_renderer *r, r3d_bricks_stats *st) {
   st->inflight = r->bs.last_inflight;
 }
 
+
+/* ---------- virtual slab: toroidal streaming window over the export ------- */
+
+#define VS_URL \
+  "https://dl.ash2txt.org/community-uploads/forrest/exports/PHercParis3/" \
+  "20260427095331-2.400um-0.2m-78keV-masked.zarr/0/c"
+
+/* strided NxN box downsample (w,h multiples of N) */
+static void vs_down(const uint8_t *src, uint32_t stride, uint32_t w, uint32_t h, uint32_t N,
+                    uint8_t *dst) {
+  uint32_t ow = w / N, oh = h / N;
+  for (uint32_t y = 0; y < oh; y++) {
+    uint8_t *drow = dst + (size_t)y * ow;
+    for (uint32_t x = 0; x < ow; x++) {
+      uint32_t sum = 0;
+      for (uint32_t yy = 0; yy < N; yy++) {
+        const uint8_t *sr = src + (size_t)(y * N + yy) * stride + (size_t)x * N;
+        for (uint32_t xx = 0; xx < N; xx++) sum += sr[xx];
+      }
+      drow[x] = (uint8_t)(sum / (N * N));
+    }
+  }
+}
+
+/* make sure the shards covering a world box exist locally (remote fetch on
+ * miss; 404 -> .missing marker so sparse regions are never re-tried) */
+static void vs_fetch(r3d_renderer *r, int64_t wx0, int64_t wy0, int64_t zs0, uint32_t nx,
+                     uint32_t ny, uint32_t nz) {
+  if (!r->vsl.fetch) return;
+  int64_t sx0 = wx0 / 1024, sx1 = (wx0 + nx - 1) / 1024;
+  int64_t sy0 = wy0 / 1024, sy1 = (wy0 + ny - 1) / 1024;
+  int64_t sz0 = zs0 / 1024, sz1 = (zs0 + nz - 1) / 1024;
+  for (int64_t sz = sz0; sz <= sz1; sz++)
+    for (int64_t sy = sy0; sy <= sy1; sy++)
+      for (int64_t sx = sx0; sx <= sx1; sx++) {
+        char path[1024], cmd[2048];
+        snprintf(path, sizeof path, "%s/%lld_%lld_%lld.shard", r->vsl.band_dir,
+                 (long long)sz, (long long)sy, (long long)sx);
+        if (access(path, F_OK) == 0) continue;
+        snprintf(cmd, sizeof cmd, "%s.missing", path);
+        if (access(cmd, F_OK) == 0) continue;
+        printf("vslab: fetching shard %lld_%lld_%lld...\n", (long long)sz, (long long)sy,
+               (long long)sx);
+        fflush(stdout);
+        snprintf(cmd, sizeof cmd,
+                 "curl -sf -o '%s.part' '" VS_URL "/%lld/%lld/%lld' && mv '%s.part' '%s'",
+                 path, (long long)sz, (long long)sy, (long long)sx, path, path);
+        int rc = system(cmd);
+        if (rc != 0) { /* 404 (sparse) or network failure: mark and move on */
+          snprintf(cmd, sizeof cmd, "%s.missing", path);
+          FILE *f = fopen(cmd, "w");
+          if (f) fclose(f);
+          printf("vslab: shard %lld_%lld_%lld absent (rc %d)\n", (long long)sz,
+                 (long long)sy, (long long)sx, rc);
+        }
+      }
+}
+
+/* host-copy a sub-rect of a strided staging buffer into one ring layer */
+static int vs_copy(r3d_renderer *r, const uint8_t *host, uint32_t stride, uint32_t dx,
+                   uint32_t dy, uint32_t layer, uint32_t w, uint32_t h, r3d_vkimage *img) {
+  VkMemoryToImageCopyEXT region = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_TO_IMAGE_COPY_EXT,
+      .pHostPointer = host,
+      .memoryRowLength = stride,
+      .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+      .imageOffset = {(int32_t)dx, (int32_t)dy, (int32_t)layer},
+      .imageExtent = {w, h, 1},
+  };
+  VkCopyMemoryToImageInfoEXT ci = {
+      .sType = VK_STRUCTURE_TYPE_COPY_MEMORY_TO_IMAGE_INFO_EXT,
+      .dstImage = img->img,
+      .dstImageLayout = VK_IMAGE_LAYOUT_GENERAL,
+      .regionCount = 1,
+      .pRegions = &region,
+  };
+  return r->fp_copy_mem(r->vk.dev, &ci) == VK_SUCCESS ? 0 : -1;
+}
+
+/* scatter one level strip (n x n texels at world texel origin t0) into the
+ * (up to 4) overlapped pyramid tiles, aprons included */
+static int vs_scatter(r3d_renderer *r, uint32_t l, int64_t cx, int64_t cy,
+                      const uint8_t *strip, uint32_t layer) {
+  const r3d_vs_level *lv = &r->vsl.v.lv[l];
+  uint32_t n = R3D_VS_PAY / lv->s;
+  int64_t t0x = cx * (int64_t)n, t0y = cy * (int64_t)n;
+  int64_t p0x = (t0x - 1) / (int64_t)R3D_VS_PAY, p1x = (t0x + n) / (int64_t)R3D_VS_PAY;
+  int64_t p0y = (t0y - 1) / (int64_t)R3D_VS_PAY, p1y = (t0y + n) / (int64_t)R3D_VS_PAY;
+  if (p0x < 0) p0x = 0;
+  if (p0y < 0) p0y = 0;
+  for (int64_t py = p0y; py <= p1y; py++)
+    for (int64_t px = p0x; px <= p1x; px++) {
+      int64_t ax = t0x > px * (int64_t)R3D_VS_PAY - 1 ? t0x : px * (int64_t)R3D_VS_PAY - 1;
+      int64_t bx = t0x + n < px * (int64_t)R3D_VS_PAY + 2017 ? t0x + n
+                                                             : px * (int64_t)R3D_VS_PAY + 2017;
+      int64_t ay = t0y > py * (int64_t)R3D_VS_PAY - 1 ? t0y : py * (int64_t)R3D_VS_PAY - 1;
+      int64_t by = t0y + n < py * (int64_t)R3D_VS_PAY + 2017 ? t0y + n
+                                                             : py * (int64_t)R3D_VS_PAY + 2017;
+      if (ax >= bx || ay >= by) continue;
+      uint32_t ti = lv->base + r3d_vs_phys(py, lv->gy) * lv->gx + r3d_vs_phys(px, lv->gx);
+      if (vs_copy(r, strip + (size_t)(ay - t0y) * n + (size_t)(ax - t0x), n,
+                  (uint32_t)(ax - px * (int64_t)R3D_VS_PAY + 1),
+                  (uint32_t)(ay - py * (int64_t)R3D_VS_PAY + 1), layer,
+                  (uint32_t)(bx - ax), (uint32_t)(by - ay), &r->tiles[ti]) != 0)
+        return -1;
+    }
+  return 0;
+}
+
+/* fill world z slices [zs0, zs0+nz) of base cell (cx,cy): decode (apron
+ * included, volume edges duplicated), upload the base tile layers, and
+ * derive + scatter every pyramid level */
+static int vs_fill(r3d_renderer *r, int64_t cx, int64_t cy, int64_t zs0, uint32_t nz) {
+  r3d_vslab *v = &r->vsl.v;
+  int64_t wx0 = cx * (int64_t)R3D_VS_PAY - 1, wy0 = cy * (int64_t)R3D_VS_PAY - 1;
+  int64_t ax = wx0 < 0 ? 0 : wx0, ay = wy0 < 0 ? 0 : wy0;
+  uint32_t lx = (uint32_t)(ax - wx0), ly = (uint32_t)(ay - wy0); /* leading dup */
+  vs_fetch(r, ax, ay, zs0, R3D_VS_TEX, R3D_VS_TEX, nz);
+  if (r3d_shard_decode_region(&r->vsl.store, (uint64_t)zs0, (uint64_t)ay, (uint64_t)ax, nz,
+                              R3D_VS_TEX - ly, R3D_VS_TEX - lx, r->vsl.box, 0) != 0)
+    return -1;
+  /* un-shift in place when the apron clamped at world 0 (edge cells): the
+   * decode produced packed (tex-lx)x(tex-ly) slices; expand descending so
+   * dst addresses stay >= src, duplicating the clamped border */
+  if (lx || ly) {
+    for (int64_t z = nz - 1; z >= 0; z--) {
+      const uint8_t *sp = r->vsl.box + (size_t)z * (R3D_VS_TEX - ly) * (R3D_VS_TEX - lx);
+      uint8_t *dp = r->vsl.box + (size_t)z * R3D_VS_TEX * R3D_VS_TEX;
+      for (int64_t y = R3D_VS_TEX - 1; y >= 0; y--) {
+        int64_t sy = y - ly < 0 ? 0 : y - ly;
+        memmove(dp + (size_t)y * R3D_VS_TEX + lx, sp + (size_t)sy * (R3D_VS_TEX - lx),
+                R3D_VS_TEX - lx);
+        if (lx) dp[(size_t)y * R3D_VS_TEX] = dp[(size_t)y * R3D_VS_TEX + 1];
+      }
+    }
+  }
+  uint32_t slot = r3d_vs_phys(cy, v->lv[0].gy) * v->lv[0].gx + r3d_vs_phys(cx, v->lv[0].gx);
+  for (uint32_t k = 0; k < nz; k++) {
+    int64_t zs = zs0 + k;
+    uint32_t layer = r3d_vs_layer(v, zs);
+    const uint8_t *slice = r->vsl.box + (size_t)k * R3D_VS_TEX * R3D_VS_TEX;
+    if (vs_copy(r, slice, R3D_VS_TEX, 0, 0, layer, R3D_VS_TEX, R3D_VS_TEX,
+                &r->tiles[v->lv[0].base + slot]) != 0)
+      return -1;
+    /* pyramid: 4x from the payload, then 2x chain; scatter each level */
+    vs_down(slice + R3D_VS_TEX + 1, R3D_VS_TEX, R3D_VS_PAY, R3D_VS_PAY, 4, r->vsl.ds[0]);
+    for (uint32_t l = 1; l < 4; l++)
+      vs_down(r->vsl.ds[l - 1], R3D_VS_PAY / r3d_vs_scale[l], R3D_VS_PAY / r3d_vs_scale[l],
+              R3D_VS_PAY / r3d_vs_scale[l], 2, r->vsl.ds[l]);
+    for (uint32_t l = 1; l < R3D_VS_LEVELS; l++)
+      if (vs_scatter(r, l, cx, cy, r->vsl.ds[l - 1], layer) != 0) return -1;
+  }
+  return 0;
+}
+
+int r3d_vslab_begin(r3d_renderer *r, const char *band_dir, uint32_t W, uint32_t H,
+                    uint32_t D) {
+  if (!r->vk.caps.host_image_copy || !r->fp_transition || !r->fp_copy_mem) {
+    fprintf(stderr, "vslab: needs VK_EXT_host_image_copy\n");
+    return -1;
+  }
+  if (r3d_vslab_init(&r->vsl.v, 43008, 43008, 68608, W, H, D) != 0) {
+    fprintf(stderr, "vslab: bad window %ux%ux%u\n", W, H, D);
+    return -1;
+  }
+  r3d_vslab *v = &r->vsl.v;
+  if (v->ntiles > R3D_SLAB_TILES) {
+    fprintf(stderr, "vslab: window needs %u tiles (> %u)\n", v->ntiles, R3D_SLAB_TILES);
+    return -1;
+  }
+  if (r3d_shard_store_init(&r->vsl.store, band_dir, 68608, 43008, 43008) != 0) return -1;
+  snprintf(r->vsl.band_dir, sizeof r->vsl.band_dir, "%s", band_dir);
+  if (!r->samp_slab) {
+    VkSamplerCreateInfo smci = {
+        .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+        .magFilter = VK_FILTER_LINEAR,
+        .minFilter = VK_FILTER_LINEAR,
+        .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+        .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT, /* ring z wraps */
+    };
+    if (vkCreateSampler(r->vk.dev, &smci, NULL, &r->samp_slab) != VK_SUCCESS) return -1;
+  }
+  for (uint32_t t = 0; t < v->ntiles; t++) {
+    if (r3d_vkimage_create(&r->vk, VK_FORMAT_R8_UNORM,
+                           (VkExtent3D){R3D_VS_TEX, R3D_VS_TEX, v->wz}, 1,
+                           VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT,
+                           &r->tiles[t]) != 0)
+      return -1;
+    VkHostImageLayoutTransitionInfoEXT tr = {
+        .sType = VK_STRUCTURE_TYPE_HOST_IMAGE_LAYOUT_TRANSITION_INFO_EXT,
+        .image = r->tiles[t].img,
+        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+    };
+    if (r->fp_transition(r->vk.dev, 1, &tr) != VK_SUCCESS) return -1;
+  }
+  VkImageView views[R3D_SLAB_TILES];
+  for (uint32_t e = 0; e < R3D_SLAB_TILES; e++)
+    views[e] = r->tiles[e].view ? r->tiles[e].view : r->tiles[0].view;
+  VkDescriptorImageInfo ii[R3D_SLAB_TILES];
+  for (uint32_t e = 0; e < R3D_SLAB_TILES; e++)
+    ii[e] = (VkDescriptorImageInfo){
+        .sampler = r->samp_slab, .imageView = views[e], .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
+  VkWriteDescriptorSet w = {
+      .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+      .dstSet = r->dset,
+      .dstBinding = 0,
+      .descriptorCount = R3D_SLAB_TILES,
+      .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+      .pImageInfo = ii,
+  };
+  vkUpdateDescriptorSets(r->vk.dev, 1, &w, 0, NULL);
+  /* validity table on binding 5 (page slot; bricks and vslab are exclusive) */
+  uint32_t nslot = v->lv[0].gx * v->lv[0].gy;
+  r3d_vkbuf_destroy(&r->vk, &r->page_buf);
+  if (r3d_vkbuf_create_host(&r->vk, (VkDeviceSize)nslot * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                            &r->page_buf) != 0)
+    return -1;
+  memset(r->page_buf.mapped, 0, (size_t)nslot * 4);
+  VkDescriptorBufferInfo pbi = {.buffer = r->page_buf.buf, .range = VK_WHOLE_SIZE};
+  VkWriteDescriptorSet pw = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                             .dstSet = r->dset,
+                             .dstBinding = 5,
+                             .descriptorCount = 1,
+                             .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                             .pBufferInfo = &pbi};
+  vkUpdateDescriptorSets(r->vk.dev, 1, &pw, 0, NULL);
+  r->vsl.cells = malloc((size_t)nslot * sizeof(struct vscell));
+  r->vsl.box = malloc((size_t)R3D_VS_TEX * R3D_VS_TEX * v->wz);
+  r->vsl.ds[0] = malloc((size_t)504 * 504);
+  r->vsl.ds[1] = malloc((size_t)252 * 252);
+  r->vsl.ds[2] = malloc((size_t)126 * 126);
+  r->vsl.ds[3] = malloc((size_t)63 * 63);
+  if (!r->vsl.cells || !r->vsl.box || !r->vsl.ds[3]) return -1;
+  for (uint32_t i = 0; i < nslot; i++)
+    r->vsl.cells[i] = (struct vscell){INT64_MIN, INT64_MIN, 0, 0};
+  r->vsl.fetch = !getenv("R3D_VSLAB_NOFETCH");
+  r->vsl.active = true;
+  v->x0 = v->y0 = -1; /* set by the first frame */
+  v->z0 = -1;
+  printf("vslab: %ux%ux%u window, %u tiles (%.1f GB), fetch %s\n", W, H, D, v->ntiles,
+         (double)v->ntiles * R3D_VS_TEX * R3D_VS_TEX * v->wz / 1e9,
+         r->vsl.fetch ? "on" : "off");
+  return 0;
+}
+
+void r3d_vslab_frame(r3d_renderer *r, double fx, double fy, int64_t z0, uint32_t budget,
+                     r3d_frame_params *p) {
+  r3d_vslab *v = &r->vsl.v;
+  if (!r->vsl.active) return;
+  /* window follows the focus (cell-anchored tiles: origin moves freely) */
+  int64_t x0 = (int64_t)fx - v->W / 2, y0 = (int64_t)fy - v->H / 2;
+  x0 = x0 < 0 ? 0 : x0 & ~15ll;
+  y0 = y0 < 0 ? 0 : y0 & ~15ll;
+  if (x0 > r3d_vs_max0(v->nx, v->W)) x0 = r3d_vs_max0(v->nx, v->W) & ~15ll;
+  if (y0 > r3d_vs_max0(v->ny, v->H)) y0 = r3d_vs_max0(v->ny, v->H) & ~15ll;
+  if (z0 < 0) z0 = 0;
+  if (z0 > r3d_vs_max0(v->nz, v->wz)) z0 = r3d_vs_max0(v->nz, v->wz);
+  v->x0 = x0;
+  v->y0 = y0;
+  v->z0 = z0;
+
+  /* enumerate needed base cells; run the nearest `budget` jobs synchronously */
+  int64_t cx0, cx1, cy0, cy1;
+  r3d_vs_range(v, 0, x0, v->nx, v->W, &cx0, &cx1);
+  r3d_vs_range(v, 0, y0, v->ny, v->H, &cy0, &cy1);
+  struct vjob { int64_t cx, cy, zs0; uint32_t nz; uint64_t d; } jobs[64];
+  uint32_t nj = 0;
+  uint32_t *page = r->page_buf.mapped;
+  int64_t ccx = (x0 + v->W / 2) / (int64_t)R3D_VS_PAY;
+  int64_t ccy = (y0 + v->H / 2) / (int64_t)R3D_VS_PAY;
+  for (int64_t cy = cy0; cy <= cy1 && nj < 64; cy++)
+    for (int64_t cx = cx0; cx <= cx1 && nj < 64; cx++) {
+      uint32_t slot = r3d_vs_phys(cy, v->lv[0].gy) * v->lv[0].gx + r3d_vs_phys(cx, v->lv[0].gx);
+      struct vscell *c = &r->vsl.cells[slot];
+      int64_t za = z0, zb = z0 + v->wz;
+      struct vjob j = {cx, cy, za, v->wz, 0};
+      if (c->cx == cx && c->cy == cy) {
+        if (c->za <= za && c->zb >= zb) continue; /* fully resident */
+        if (c->za < zb && c->zb > za && c->zb - c->za >= 1) { /* overlap: strip */
+          int64_t s0, s1;
+          if (za < c->za) { s0 = za; s1 = c->za; }
+          else { s0 = c->zb; s1 = zb; }
+          /* chunk-align (dct3d decodes whole 16-slice chunks anyway), clamped
+           * to the ring window so the expansion is never wasted */
+          s0 = (s0 / 16) * 16;
+          s1 = ((s1 + 15) / 16) * 16;
+          if (s0 < za) s0 = za;
+          if (s1 > zb) s1 = zb;
+          j.zs0 = s0;
+          j.nz = (uint32_t)(s1 - s0);
+        }
+      }
+      int64_t dx = cx - ccx, dy = cy - ccy;
+      j.d = (uint64_t)(dx * dx + dy * dy);
+      jobs[nj++] = j;
+    }
+  /* selection sort is fine at <= 64 entries */
+  for (uint32_t a = 0; a + 1 < nj; a++)
+    for (uint32_t b = a + 1; b < nj; b++)
+      if (jobs[b].d < jobs[a].d) { struct vjob t = jobs[a]; jobs[a] = jobs[b]; jobs[b] = t; }
+  /* budget is slice-weighted: one full cell fill costs wz, a z strip its
+   * height — so z scrolling touches many cells per frame while xy churn
+   * stays bounded by whole-cell decode cost */
+  int64_t slices = (int64_t)budget * 6; /* ~one full cell fill per 3 budget */
+  uint32_t run = 0;
+  while (run < nj && slices > 0) slices -= jobs[run++].nz;
+  if (run && r->timeline_value) { /* in-flight frames may sample these tiles */
+    VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
+                              .semaphoreCount = 1,
+                              .pSemaphores = &r->timeline,
+                              .pValues = &r->timeline_value};
+    vkWaitSemaphores(r->vk.dev, &wi, UINT64_MAX);
+  }
+  for (uint32_t k = 0; k < run; k++) {
+    struct vjob *j = &jobs[k];
+    uint32_t slot =
+        r3d_vs_phys(j->cy, v->lv[0].gy) * v->lv[0].gx + r3d_vs_phys(j->cx, v->lv[0].gx);
+    struct vscell *c = &r->vsl.cells[slot];
+    bool fresh = c->cx != j->cx || c->cy != j->cy;
+    if (fresh) page[slot] = 0; /* stale key would still mismatch, but be tidy */
+    if (vs_fill(r, j->cx, j->cy, j->zs0, j->nz) != 0) {
+      fprintf(stderr, "vslab: fill (%lld,%lld) failed\n", (long long)j->cx, (long long)j->cy);
+      continue;
+    }
+    if (fresh) { c->za = j->zs0; c->zb = j->zs0 + j->nz; }
+    else {
+      if (j->zs0 < c->za) c->za = j->zs0;
+      if (j->zs0 + j->nz > c->zb) c->zb = j->zs0 + j->nz;
+    }
+    c->cx = j->cx;
+    c->cy = j->cy;
+    /* clamp the tracked range to the ring capacity around the new window */
+    if (c->za < z0) c->za = z0;
+    if (c->zb > z0 + v->wz) c->zb = z0 + v->wz;
+    if (c->za <= z0 && c->zb >= z0 + v->wz) page[slot] = r3d_vs_key(j->cx, j->cy);
+  }
+  r->vsl.pending = nj > run ? nj - run : 0;
+
+  /* params */
+  p->slab_grid = v->lv[0].gx | (v->lv[0].gy << 6) | (1u << 24);
+  uint32_t bm = 0;
+  for (uint32_t l = 1; l < R3D_VS_LEVELS; l++)
+    bm |= (v->lv[l].gx | (v->lv[l].gy << 4)) << ((l - 1) * 8);
+  p->brick_mode = bm;
+  p->slab_wz = v->wz;
+  p->slab_z0 = (float)z0;
+  p->slab_nx = (float)v->W;
+  p->slab_ny = (float)v->H;
+  p->slab_px = (float)R3D_VS_PAY;
+  p->slab_py = (float)R3D_VS_PAY;
+  p->slab_depth = v->D;
+  p->slab_x0 = (float)x0;
+  p->slab_y0 = (float)y0;
+}
+
+void r3d_vslab_get(const r3d_renderer *r, int64_t o[3], uint32_t *pending) {
+  o[0] = r->vsl.v.x0;
+  o[1] = r->vsl.v.y0;
+  o[2] = r->vsl.v.z0;
+  if (pending) *pending = r->vsl.pending;
+}
+
 int r3d_clip_begin(r3d_renderer *r, const char *band_dir, const char *pyramid_dir,
                    uint32_t band_z, uint32_t depth_max) {
   if (!r->vk.caps.host_image_copy || !r->fp_transition || !r->fp_copy_mem) {
@@ -1689,7 +2073,9 @@ int r3d_frame(r3d_renderer *r, const r3d_frame_params *p, r3d_frame_stats *st) {
 
   if (r->query)
     vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, r->query, slot * 4);
-  uint32_t rmode = p->clip_valid ? 2u : (p->brick_mode ? 3u : (p->slab_grid ? 1u : 0u));
+  uint32_t rmode = p->slab_grid & (1u << 24)
+                       ? 4u
+                       : (p->clip_valid ? 2u : (p->brick_mode ? 3u : (p->slab_grid ? 1u : 0u)));
   uint32_t wgx = rmode == 0 ? r->wg_x : 16u, wgy = rmode == 0 ? r->wg_y : 8u;
   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r->raycast[rmode]);
   vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r->pipe_layout, 0, 1, &r->dset, 0,
