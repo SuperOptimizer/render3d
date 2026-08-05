@@ -300,3 +300,43 @@ cube mode; exterior 4.0 ms; diff vs cube improved 0.317 -> 0.196 and brick
 seams vanish (continuous sampling, no slot borders). The indirected-path
 costs return only when streaming remaps slots — at which point aprons
 (retry plan in round 3) become the relevant fix.
+
+## 2026-08-05 — streaming milestone: two-tier GPU cache (warm compressed / hot atlas)
+
+Bricks mode now runs volumes larger than the atlas. WARM tier: compressed
+c5d blobs cached in a host-visible device buffer (default 256 MB, --warm MB;
+offset-sorted first-fit allocator, 64 B granules, LRU eviction; blobs bigger
+than the tier or a thrashing tier fall back to the mmap'd shard). HOT tier:
+the R8 atlas as pool_bpa^3 LRU slots (--pool N, default 8; identity full
+residency + direct sampling whenever the volume fits). Per frame BEFORE
+r3d_frame, r3d_bricks_stream() computes the desired brick set (view cone
+widened 1.15x + brick radius, plus a near-camera sphere; camera transformed
+to volume space so model transforms are honored), stamps LRU on residents,
+sorts requests nearest-first, and decodes up to budget bricks (2 while the
+camera moves, 6 idle) warm->hot. Decoded-empty bricks (max < 5 LSB codec
+floor, or below the TF-aware gate) never occupy slots and are never
+re-requested. Post-fill per decoded slot: 3 slot-region mip blits +
+region-form occupancy (occmax slot->world, occdilate brick+1-block halo —
+neighbor borders self-heal as fill order interleaves). Occupancy images are
+world-indexed and persist across evictions (stale entries are safe: the
+page-table whole-brick skip short-circuits first). Atlas stays GENERAL for
+life in bricks mode (measured identical to READ_ONLY in round 3).
+
+Measured (volume.c5s 512 bricks, pool 5^3 = 125 slots, warm 16 MB < 44 MB
+shard, 720p, tf 1, no-vsync):
+- close-up fill: ~20 fps during the ~20-frame initial stream-in (budgeted
+  synchronous decode, ~6.4 ms/brick GPU), then 111 fps settled; screenshot
+  vs cube mode mean 2.16 LSB, 0.05% pixels > 32 — all of it the documented
+  non-identity brick-border seam cross + amplified codec noise; zero missing
+  or misplaced bricks. (Identity path after the refactor: mean 0.100.)
+- zoom bench (continuous residency churn): 72-110 fps throughout.
+- orbit with whole volume visible (working set 4x the pool): thrash guard
+  (never evict a slot wanted this same frame) stops decode cleanly; nearest
+  125 bricks render, 440 fps, no churn. Proper answer for this case is
+  LOD-fallback bricks (coarse-resolution residency for far bricks) — next.
+
+Decodes drain the queue (vkQueueWaitIdle) before overwriting slots/pages
+sampled by in-flight frames — pipelined handoff via the timeline semaphore
+is the known follow-up, as is zero-copy entropy reads straight from the warm
+buffer (needs c5d to expose the payload offset in he_gpu; today he_gpu_setup
+stages a CPU copy of the payload per decode, ~50 KB/brick, negligible).

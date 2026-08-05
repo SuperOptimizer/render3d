@@ -1,31 +1,28 @@
 #version 450
-/* Max-reduce the brick atlas into an 8^3-block occupancy texture indexed in
- * WORLD space (one thread per occupancy texel). Slot geometry: 132^3 slots
- * with a 2-voxel apron; identity world<->slot mapping (v1 full residency).
- * Runs once after the atlas fill. */
+/* Max-reduce one brick's atlas slot into the WORLD-indexed raw occupancy
+ * (8^3 voxels per occupancy texel, 16^3 texels per brick). Region form: one
+ * dispatch per brick with its slot/world origins pushed, so streaming mode
+ * can update occupancy incrementally as bricks decode; identity mode loops
+ * the same kernel over every brick. */
 layout(local_size_x = 64) in;
 
 layout(binding = 0) uniform sampler3D atlas;
 layout(binding = 1, r8) uniform writeonly image3D occ;
 
-layout(push_constant) uniform PC { uint odim; } pc; /* world blocks per axis */
-
-const int SLOT = 128;
-const int AP = 0;
+layout(push_constant) uniform PC {
+  uint sx, sy, sz; /* atlas texel origin of the slot payload */
+  uint wx, wy, wz; /* world 8^3-block origin of the brick (brick coord * 16) */
+} pc;
 
 void main() {
   uint id = gl_GlobalInvocationID.x;
-  uint n = pc.odim * pc.odim * pc.odim;
-  if (id >= n) return;
-  ivec3 ob = ivec3(int(id % pc.odim), int((id / pc.odim) % pc.odim),
-                   int(id / (pc.odim * pc.odim)));
-  ivec3 brick = ob >> 4;              /* 16 blocks per brick per axis */
-  ivec3 lb = (ob & 15) * 8;           /* block origin within the brick */
-  ivec3 base = brick * SLOT + AP + lb;
+  if (id >= 16u * 16u * 16u) return;
+  ivec3 lb = ivec3(int(id & 15u), int((id >> 4u) & 15u), int(id >> 8u));
+  ivec3 base = ivec3(int(pc.sx), int(pc.sy), int(pc.sz)) + lb * 8;
   float m = 0.0;
   for (int dz = 0; dz < 8; dz++)
     for (int dy = 0; dy < 8; dy++)
       for (int dx = 0; dx < 8; dx++)
         m = max(m, texelFetch(atlas, base + ivec3(dx, dy, dz), 0).r);
-  imageStore(occ, ob, vec4(m));
+  imageStore(occ, ivec3(int(pc.wx), int(pc.wy), int(pc.wz)) + lb, vec4(m));
 }

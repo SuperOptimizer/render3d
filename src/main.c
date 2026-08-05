@@ -73,6 +73,7 @@ int main(int argc, char **argv) {
   int depth0 = 0;           /* initial visible depth (default = max) */
   bool clip_mode = false;   /* clipmap over the shard band */
   const char *bricks_path = NULL; /* c5d shard for GPU-decoded bricks mode */
+  int pool_bpa = 0, warm_mb = 0;  /* bricks hot-atlas slots/axis, warm-tier MB */
   for (int i = 1; i < argc; i++) {
     if (i < argc - 1 && strcmp(argv[i], "--frames") == 0) exit_frames = (uint32_t)atoi(argv[i + 1]);
     if (i < argc - 1 && strcmp(argv[i], "--shot") == 0) shot_path = argv[i + 1];
@@ -94,6 +95,8 @@ int main(int argc, char **argv) {
     if (i < argc - 1 && strcmp(argv[i], "--depth") == 0) depth0 = atoi(argv[i + 1]);
     if (strcmp(argv[i], "--clipmap") == 0) clip_mode = true;
     if (i < argc - 1 && strcmp(argv[i], "--bricks") == 0) bricks_path = argv[i + 1];
+    if (i < argc - 1 && strcmp(argv[i], "--pool") == 0) pool_bpa = atoi(argv[i + 1]);
+    if (i < argc - 1 && strcmp(argv[i], "--warm") == 0) warm_mb = atoi(argv[i + 1]);
     if (strcmp(argv[i], "--slab") == 0) {
       slab_wz = 32;
       if (i < argc - 1 && argv[i + 1][0] >= '0' && argv[i + 1][0] <= '9')
@@ -156,7 +159,8 @@ int main(int argc, char **argv) {
   }
 
   if (bricks_path) {
-    if (r3d_bricks_begin(renderer, bricks_path) != 0) return EXIT_FAILURE;
+    if (r3d_bricks_begin(renderer, bricks_path, (uint32_t)pool_bpa, (uint32_t)warm_mb) != 0)
+      return EXIT_FAILURE;
     mode = R3D_MODE_FULL;
   }
 
@@ -420,6 +424,13 @@ int main(int argc, char **argv) {
              (clip_valid_disp & 8) ? " L3" : "", (clip_valid_disp & 16) ? " L4" : "",
              (clip_valid_disp & 32) ? " L5" : "");
     }
+    if (bricks_path) {
+      r3d_bricks_stats bst;
+      r3d_bricks_get_stats(renderer, &bst);
+      igText("bricks: hot %u/%u slots  warm %u (%.0f/%llu MB)%s", bst.hot, bst.hot_cap,
+             bst.warm_bricks, (double)bst.warm_bytes / 1048576.0,
+             (unsigned long long)(bst.warm_cap >> 20), bst.inflight ? "  streaming..." : "");
+    }
     igSliderFloat("lod bias", &lod_bias, -2.0f, 4.0f, "%.2f", 0);
     igCheckbox("half-res while moving", &adaptive_res);
     if (igCollapsingHeader_TreeNodeFlags("transform", 0)) {
@@ -488,7 +499,19 @@ int main(int argc, char **argv) {
       r3d_slab_params(renderer, &p);
       p.slab_depth = (uint32_t)slab_depth;
     }
-    if (bricks_path) r3d_bricks_params(renderer, &p);
+    if (bricks_path) {
+      /* streaming pump: camera in VOLUME space (model transform inverted, like
+       * the clip focus); smaller decode budget while moving so the pump's GPU
+       * time shares the frame with half-res rendering */
+      r3d_v3 vc = v3(0.5f, 0.5f, 0.5f);
+      r3d_v3 vo = v3_add(m3_tmul(vm, v3_sub(v3_sub(cam.pos, vol_t), vc)), vc);
+      r3d_v3 vd = m3_tmul(vm, fwd);
+      float be[3] = {vo.x, vo.y, vo.z}, bf[3] = {vd.x, vd.y, vd.z};
+      float asp = (float)w / (float)h;
+      float ht = tanf(cam.fov_y * 0.5f) * sqrtf(1.0f + asp * asp);
+      r3d_bricks_stream(renderer, be, bf, ht, p.skip_gate, moving ? 2u : 6u);
+      r3d_bricks_params(renderer, &p);
+    }
     if (clip_mode) {
       /* focus = where the view axis crosses the slab plane, computed in
        * VOLUME space so it tracks the model transform */

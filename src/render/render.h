@@ -42,9 +42,29 @@ int r3d_clip_frame(r3d_renderer *r, double fx, double fy, uint64_t z0, r3d_frame
 
 /* Bricks mode: a c5d .c5s shard decoded ON the GPU (entropy/IDCT/deblock
  * compute kernels) into an R8 atlas image — compressed bytes are all that
- * crosses to the GPU. v1: full static residency of one shard. */
-int r3d_bricks_begin(r3d_renderer *r, const char *c5s_path);
+ * crosses to the GPU. Two-tier GPU cache: a WARM buffer of compressed bricks
+ * (warm_mb MB, LRU) feeds budgeted decodes into the HOT atlas (pool_bpa slots
+ * per axis, LRU, page-table indirected). pool_bpa >= the volume's bricks per
+ * axis (or 0 when the volume fits the default pool) selects full identity
+ * residency up front — the streaming pump is then a no-op. */
+int r3d_bricks_begin(r3d_renderer *r, const char *c5s_path, uint32_t pool_bpa, uint32_t warm_mb);
 void r3d_bricks_params(const r3d_renderer *r, r3d_frame_params *p);
+
+/* Streaming pump: call once per frame BEFORE r3d_frame. eye/fwd = camera
+ * position/forward in VOLUME space (normalized [0,1] cube coords, model
+ * transform already inverted); half_tan = tan(fov_y/2) * frustum diagonal
+ * factor; gate = minimum visible voxel value [0,1] (TF-aware, empty bricks
+ * below it never occupy slots); budget = max bricks decoded this call. */
+void r3d_bricks_stream(r3d_renderer *r, const float eye[3], const float fwd[3], float half_tan,
+                       float gate, uint32_t budget);
+
+typedef struct r3d_bricks_stats {
+  uint32_t nb, hot, hot_cap;    /* volume bricks; resident slots; pool slots */
+  uint32_t warm_bricks;         /* compressed bricks in the warm cache */
+  uint64_t warm_bytes, warm_cap;
+  uint32_t inflight;            /* requests decoded this frame */
+} r3d_bricks_stats;
+void r3d_bricks_get_stats(const r3d_renderer *r, r3d_bricks_stats *st);
 int r3d_set_transfer(r3d_renderer *r, const uint8_t rgba[256][4]);
 
 /* Acquire -> raycast -> blit -> present. Fills st (may be zero). */
