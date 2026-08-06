@@ -177,6 +177,7 @@ int main(int argc, char **argv) {
   int64_t vs_z0 = (int64_t)vsz0;
   double vs_fx = 21504.0, vs_fy = 21504.0;
   bool vs_follow = true;
+  uint64_t vs_pend_acc = 0;
   if (vslab_mode) {
     if (r3d_vslab_begin(renderer, "band", (uint32_t)vsw, (uint32_t)vsh, (uint32_t)vsd) != 0)
       return EXIT_FAILURE;
@@ -389,6 +390,7 @@ int main(int argc, char **argv) {
          * (log-space triangle wave) — walks every LOD band the mode has */
         float ey = slab_wz ? (float)slab_src.ny / (float)slab_src.nx : 1.0f;
         float ez = slab_wz ? (float)slab_wz / (float)slab_src.nx : 1.0f;
+        if (vslab_mode) { ey = (float)vsh / (float)vsw; ez = (float)(vsd + 2) / (float)vsw; }
         float tri = ph < 0.5f ? ph * 2.0f : 2.0f - ph * 2.0f; /* 0->1->0 */
         float d = 1.6f * powf(0.002f / 1.6f, tri);
         cam.yaw = 0.0f;
@@ -398,6 +400,7 @@ int main(int argc, char **argv) {
         /* mid-zoom + model rotation: worst case for anisotropic footprints */
         float ey = slab_wz ? (float)slab_src.ny / (float)slab_src.nx : 1.0f;
         float ez = slab_wz ? (float)slab_wz / (float)slab_src.nx : 1.0f;
+        if (vslab_mode) { ey = (float)vsh / (float)vsw; ez = (float)(vsd + 2) / (float)vsw; }
         vol_rot[0] = 0.7f * sinf(ph * tau);
         vol_rot[1] = 0.45f * sinf(ph * tau * 0.7f);
         cam.yaw = 0.0f;
@@ -578,6 +581,14 @@ int main(int argc, char **argv) {
         vs_fy = (double)vo3[1] + (double)fyn * vsh;
       }
       r3d_vslab_frame(renderer, vs_fx, vs_fy, vs_z0, moving ? 1u : 3u, &p);
+      /* residency-lag metric: cells short of full residency, second half of
+       * the run only (the first half absorbs the initial window fill) */
+      if (bench && frame_index * 2 >= exit_frames) {
+        int64_t bo_[3];
+        uint32_t pd = 0;
+        r3d_vslab_get(renderer, bo_, &pd);
+        vs_pend_acc += pd;
+      }
     }
     if (bricks_path) {
       /* streaming pump: camera in VOLUME space (model transform inverted, like
@@ -659,6 +670,8 @@ int main(int argc, char **argv) {
            (double)prof_sum.cpu_wait_ns / n / 1e6, (double)prof_sum.cpu_acquire_ns / n / 1e6,
            (double)prof_sum.cpu_record_ns / n / 1e6, (double)prof_sum.cpu_submit_ns / n / 1e6);
   }
+  if (vslab_mode && bench)
+    printf("vslab bench: pending cell-frames %llu\n", (unsigned long long)vs_pend_acc);
   r3d_destroy(renderer);
   SDL_DestroyWindow(win);
   SDL_Quit();

@@ -57,10 +57,13 @@ static inline int r3d_vslab_init(r3d_vslab *v, uint64_t nx, uint64_t ny, uint64_
   for (uint32_t l = 0; l < R3D_VS_LEVELS; l++) {
     uint32_t s = r3d_vs_scale[l];
     uint64_t cs = (uint64_t)R3D_VS_PAY * s;
-    /* +1: a window of W voxels can straddle ceil(W/cs)+1 cells */
+    /* +1: a window of W voxels can straddle ceil(W/cs)+1 cells; the base
+     * level adds one more so a prefetch ring one cell beyond the window can
+     * be resident without evicting a wanted cell (pyramid levels never
+     * prefetch — their content arrives with base fills) */
     v->lv[l].s = s;
-    v->lv[l].gx = (uint32_t)((W + cs - 1) / cs) + 1;
-    v->lv[l].gy = (uint32_t)((H + cs - 1) / cs) + 1;
+    v->lv[l].gx = (uint32_t)((W + cs - 1) / cs) + 1 + (l == 0);
+    v->lv[l].gy = (uint32_t)((H + cs - 1) / cs) + 1 + (l == 0);
     v->lv[l].base = nt;
     nt += v->lv[l].gx * v->lv[l].gy;
   }

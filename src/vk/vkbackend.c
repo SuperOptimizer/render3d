@@ -1930,6 +1930,7 @@ void r3d_vslab_frame(r3d_renderer *r, double fx, double fy, int64_t z0, uint32_t
                      r3d_frame_params *p) {
   r3d_vslab *v = &r->vsl.v;
   if (!r->vsl.active) return;
+  int64_t px0 = v->x0, py0 = v->y0; /* last frame's origin -> motion direction */
   /* window follows the focus (cell-anchored tiles: origin moves freely) */
   int64_t x0 = (int64_t)fx - v->W / 2, y0 = (int64_t)fy - v->H / 2;
   x0 = x0 < 0 ? 0 : x0 & ~15ll;
@@ -2029,6 +2030,51 @@ void r3d_vslab_frame(r3d_renderer *r, double fx, double fy, int64_t z0, uint32_t
                                   .st = 1,
                                   .tl = r->timeline_value};
     enq++;
+  }
+  /* prefetch margin: with the window's own jobs all queued and capacity to
+   * spare, pull in the cell ring one step beyond the window edge in the
+   * direction of motion — pans then land on already-resident data. The
+   * straddle column (+1 in each grid axis) hosts it; a span check keeps the
+   * toroidal mapping from evicting a wanted in-window cell. */
+  if (px0 >= 0 && (x0 != px0 || y0 != py0) && !getenv("R3D_VSLAB_NOPREF")) {
+    struct { int64_t cx, cy; } pf[48];
+    uint32_t npf = 0;
+    int64_t mxc = ((int64_t)v->nx - 1) / R3D_VS_PAY, myc = ((int64_t)v->ny - 1) / R3D_VS_PAY;
+    if (x0 != px0) {
+      int64_t cxc = x0 > px0 ? cx1 + 1 : cx0 - 1;
+      if (cxc >= 0 && cxc <= mxc && cx1 - cx0 + 2 <= (int64_t)v->lv[0].gx)
+        for (int64_t cy = cy0; cy <= cy1 && npf < 48; cy++)
+          pf[npf++] = (typeof(pf[0])){cxc, cy};
+    }
+    if (y0 != py0) {
+      int64_t cyc = y0 > py0 ? cy1 + 1 : cy0 - 1;
+      if (cyc >= 0 && cyc <= myc && cy1 - cy0 + 2 <= (int64_t)v->lv[0].gy)
+        for (int64_t cx = cx0; cx <= cx1 && npf < 48; cx++)
+          pf[npf++] = (typeof(pf[0])){cx, cyc};
+    }
+    for (uint32_t k = 0; k < npf; k++) {
+      uint32_t slot =
+          r3d_vs_phys(pf[k].cy, v->lv[0].gy) * v->lv[0].gx + r3d_vs_phys(pf[k].cx, v->lv[0].gx);
+      struct vscell *c = &r->vsl.cells[slot];
+      if (c->cx == pf[k].cx && c->cy == pf[k].cy && c->za <= z0 && c->zb >= z0 + v->wz)
+        continue; /* already resident */
+      int fi = -1;
+      bool dup = false;
+      for (uint32_t i = 0; i < 4; i++) {
+        if (r->vsl.q[i].st == 0) { if (fi < 0) fi = (int)i; }
+        else if (r->vsl.q[i].cx == pf[k].cx && r->vsl.q[i].cy == pf[k].cy) dup = true;
+      }
+      if (dup) continue;
+      if (fi < 0) break;
+      if (c->cx != pf[k].cx || c->cy != pf[k].cy) page[slot * 4] = 0;
+      r->vsl.q[fi] = (struct vsjob){.cx = pf[k].cx,
+                                    .cy = pf[k].cy,
+                                    .zs0 = z0,
+                                    .nz = v->wz,
+                                    .st = 1,
+                                    .tl = r->timeline_value};
+      enq++;
+    }
   }
   if (enq) pthread_cond_broadcast(&r->vsl.cv);
   r->vsl.pending = nj;

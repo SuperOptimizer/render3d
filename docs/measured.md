@@ -499,3 +499,27 @@ Measured (12096^2 x 16 window, 720p, band z=33, same benches as 08-05):
 
 Follow-ups: prefetch margin (fill one cell ring beyond the window in the
 motion direction), multi-window z rings > 62, vslab zoomio-class benches.
+
+## 2026-08-06 — vslab prefetch ring + zoomio/volrot benches
+
+Prefetch margin: while the window origin is moving, the render thread also
+enqueues (lowest priority, only into idle queue slots) the cell ring ONE step
+beyond the window edge in the direction of motion, so pans arrive on
+already-resident data. The base grid grew a second spare column/row
+(ceil(W/cs)+2; 12096^2x16 window: 7x7 -> 8x8 base tiles, 70 -> 85 total,
+5.1 -> 6.2 GB) because the original +1 straddle column is consumed by any
+unaligned window — without it the toroidal span check (which stops a prefetch
+from evicting a wanted cell) could never pass. Pyramid grids stay +1 (their
+content rides along with base fills). R3D_VSLAB_NOPREF=1 disables.
+
+New metric: benches accumulate `pending` (cells short of full residency) over
+the SECOND half of the run — steady state, past the initial window fill.
+clippan 1200 frames: 475 pending cell-frames without prefetch -> 0 with.
+The sweep never touches a non-resident cell.
+
+zoomio/volrot now run in vslab mode (window extents instead of slab dims):
+both vsync-locked at 720p — zoomio gpu avg 9.1 ms, volrot 6.2 ms. The
+overview pyramid + validity gating hold through full zoom sweeps and model
+rotation over the streamed window.
+
+Follow-up remaining: windows deeper than D=62 (multi-ring z).

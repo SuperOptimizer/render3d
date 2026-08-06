@@ -188,9 +188,9 @@ static void test_slab(void) {
 static void test_vslab(void) {
   r3d_vslab v;
   CHECK(r3d_vslab_init(&v, 43008, 43008, 68608, 12096, 12096, 16) == 0);
-  CHECK(v.wz == 18 && v.lv[0].gx == 7 && v.lv[0].gy == 7); /* 6 cells + straddle */
+  CHECK(v.wz == 18 && v.lv[0].gx == 8 && v.lv[0].gy == 8); /* 6 + straddle + prefetch */
   CHECK(v.lv[1].gx == 3 && v.lv[4].gx == 2);               /* s=4, s=32 */
-  CHECK(v.ntiles == 49 + 9 + 4 + 4 + 4);
+  CHECK(v.ntiles == 64 + 9 + 4 + 4 + 4);
   CHECK(r3d_vs_cell(&v, 0) == 2016 && r3d_vs_cell(&v, 4) == 2016 * 32);
   int64_t c0, c1;
   r3d_vs_range(&v, 0, 10000, 43008, 12096, &c0, &c1);
