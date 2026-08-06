@@ -92,16 +92,31 @@ struct r3d_renderer {
     uint32_t nwf, cwf;
   } bs;
 
-  /* virtual slab: windowed toroidal streaming over the whole export */
+  /* virtual slab: windowed toroidal streaming over the whole export.
+   * Fills run on ONE worker thread (fetch + decode + host_image_copy); the
+   * render thread only enqueues jobs and applies completed ones to the cell
+   * ledger + validity table. Safety: a fresh cell's page key is cleared at
+   * enqueue and the worker drains then-in-flight frames (timeline) before
+   * writing, so the GPU never samples a tile mid-write; z-strip refills only
+   * touch layers outside the published [za,zb) validity range. */
   struct {
     bool active, fetch;
     r3d_vslab v;
     r3d_shard_store store;
     struct vscell { int64_t cx, cy, za, zb; } *cells; /* base phys grid */
-    uint8_t *box;   /* decode staging: 2018^2 * wz */
-    uint8_t *ds[4]; /* per-level downsample strips (one layer) */
+    uint8_t *box;   /* decode staging: 2018^2 * wz (worker-owned) */
+    uint8_t *ds[4]; /* per-level downsample strips (one layer, worker-owned) */
     char band_dir[512];
-    uint32_t pending; /* jobs left after this frame's budget */
+    uint32_t pending; /* cells not yet fully resident for this window */
+    pthread_t worker;
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    bool quit;
+    struct vsjob { /* st: 0 free, 1 ready, 2 running, 3 done */
+      int64_t cx, cy, zs0;
+      uint32_t nz, st;
+      uint64_t tl; /* timeline value to drain before writing tiles */
+    } q[4];
   } vsl;
 
   PFN_vkTransitionImageLayoutEXT fp_transition;
@@ -624,6 +639,15 @@ void r3d_gui_event(r3d_renderer *r, const SDL_Event *ev) {
 
 void r3d_destroy(r3d_renderer *r) {
   if (!r) return;
+  if (r->vsl.active) {
+    pthread_mutex_lock(&r->vsl.mu);
+    r->vsl.quit = true;
+    pthread_cond_broadcast(&r->vsl.cv);
+    pthread_mutex_unlock(&r->vsl.mu);
+    pthread_join(r->vsl.worker, NULL);
+    pthread_mutex_destroy(&r->vsl.mu);
+    pthread_cond_destroy(&r->vsl.cv);
+  }
   if (r->vk.dev) vkDeviceWaitIdle(r->vk.dev);
   if (r->gui_up) {
     if (r->gui_open) r3d_vkgui_discard();
@@ -1611,37 +1635,61 @@ static void vs_down(const uint8_t *src, uint32_t stride, uint32_t w, uint32_t h,
 }
 
 /* make sure the shards covering a world box exist locally (remote fetch on
- * miss; 404 -> .missing marker so sparse regions are never re-tried) */
+ * miss; 404 -> .missing marker so sparse regions are never re-tried). Missing
+ * shards download in batches of up to 6 concurrent curls. */
 static void vs_fetch(r3d_renderer *r, int64_t wx0, int64_t wy0, int64_t zs0, uint32_t nx,
                      uint32_t ny, uint32_t nz) {
   if (!r->vsl.fetch) return;
   int64_t sx0 = wx0 / 1024, sx1 = (wx0 + nx - 1) / 1024;
   int64_t sy0 = wy0 / 1024, sy1 = (wy0 + ny - 1) / 1024;
   int64_t sz0 = zs0 / 1024, sz1 = (zs0 + nz - 1) / 1024;
+  struct { int64_t z, y, x; } miss[64];
+  uint32_t nm = 0;
   for (int64_t sz = sz0; sz <= sz1; sz++)
     for (int64_t sy = sy0; sy <= sy1; sy++)
-      for (int64_t sx = sx0; sx <= sx1; sx++) {
-        char path[1024], cmd[2048];
+      for (int64_t sx = sx0; sx <= sx1 && nm < 64; sx++) {
+        char path[1024];
         snprintf(path, sizeof path, "%s/%lld_%lld_%lld.shard", r->vsl.band_dir,
                  (long long)sz, (long long)sy, (long long)sx);
         if (access(path, F_OK) == 0) continue;
-        snprintf(cmd, sizeof cmd, "%s.missing", path);
-        if (access(cmd, F_OK) == 0) continue;
-        printf("vslab: fetching shard %lld_%lld_%lld...\n", (long long)sz, (long long)sy,
-               (long long)sx);
-        fflush(stdout);
-        snprintf(cmd, sizeof cmd,
-                 "curl -sf -o '%s.part' '" VS_URL "/%lld/%lld/%lld' && mv '%s.part' '%s'",
-                 path, (long long)sz, (long long)sy, (long long)sx, path, path);
-        int rc = system(cmd);
-        if (rc != 0) { /* 404 (sparse) or network failure: mark and move on */
-          snprintf(cmd, sizeof cmd, "%s.missing", path);
-          FILE *f = fopen(cmd, "w");
-          if (f) fclose(f);
-          printf("vslab: shard %lld_%lld_%lld absent (rc %d)\n", (long long)sz,
-                 (long long)sy, (long long)sx, rc);
-        }
+        char mk[1088];
+        snprintf(mk, sizeof mk, "%s.missing", path);
+        if (access(mk, F_OK) == 0) continue;
+        miss[nm].z = sz;
+        miss[nm].y = sy;
+        miss[nm++].x = sx;
       }
+  for (uint32_t b = 0; b < nm; b += 6) {
+    uint32_t be = b + 6 < nm ? b + 6 : nm;
+    char cmd[4096];
+    size_t off = 0;
+    printf("vslab: fetching %u shard(s)...\n", be - b);
+    fflush(stdout);
+    for (uint32_t i = b; i < be; i++) {
+      char path[1024];
+      snprintf(path, sizeof path, "%s/%lld_%lld_%lld.shard", r->vsl.band_dir,
+               (long long)miss[i].z, (long long)miss[i].y, (long long)miss[i].x);
+      off += (size_t)snprintf(cmd + off, sizeof cmd - off,
+                              "( curl -sf -o '%s.part' '" VS_URL
+                              "/%lld/%lld/%lld' && mv '%s.part' '%s' ) & ",
+                              path, (long long)miss[i].z, (long long)miss[i].y,
+                              (long long)miss[i].x, path, path);
+      if (off >= sizeof cmd - 8) break;
+    }
+    snprintf(cmd + off, sizeof cmd - off, "wait");
+    (void)!system(cmd);
+    for (uint32_t i = b; i < be; i++) { /* 404 (sparse) or failure: mark */
+      char path[1088];
+      snprintf(path, sizeof path, "%s/%lld_%lld_%lld.shard", r->vsl.band_dir,
+               (long long)miss[i].z, (long long)miss[i].y, (long long)miss[i].x);
+      if (access(path, F_OK) == 0) continue;
+      strcat(path, ".missing");
+      FILE *f = fopen(path, "w");
+      if (f) fclose(f);
+      printf("vslab: shard %lld_%lld_%lld absent\n", (long long)miss[i].z,
+             (long long)miss[i].y, (long long)miss[i].x);
+    }
+  }
 }
 
 /* host-copy a sub-rect of a strided staging buffer into one ring layer */
@@ -1741,6 +1789,42 @@ static int vs_fill(r3d_renderer *r, int64_t cx, int64_t cy, int64_t zs0, uint32_
   return 0;
 }
 
+/* fill worker: drains ready jobs; each = drain in-flight frames from enqueue
+ * time, then fetch + decode + upload one cell (or z strip) */
+static void *vs_worker(void *arg) {
+  r3d_renderer *r = arg;
+  for (;;) {
+    pthread_mutex_lock(&r->vsl.mu);
+    int ji = -1;
+    for (;;) {
+      if (r->vsl.quit) {
+        pthread_mutex_unlock(&r->vsl.mu);
+        return NULL;
+      }
+      for (uint32_t i = 0; i < 4 && ji < 0; i++)
+        if (r->vsl.q[i].st == 1) ji = (int)i;
+      if (ji >= 0) break;
+      pthread_cond_wait(&r->vsl.cv, &r->vsl.mu);
+    }
+    struct vsjob j = r->vsl.q[ji];
+    r->vsl.q[ji].st = 2;
+    pthread_mutex_unlock(&r->vsl.mu);
+    if (j.tl) {
+      VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
+                                .semaphoreCount = 1,
+                                .pSemaphores = &r->timeline,
+                                .pValues = &j.tl};
+      vkWaitSemaphores(r->vk.dev, &wi, UINT64_MAX);
+    }
+    int rc = vs_fill(r, j.cx, j.cy, j.zs0, j.nz);
+    if (rc != 0)
+      fprintf(stderr, "vslab: fill (%lld,%lld) failed\n", (long long)j.cx, (long long)j.cy);
+    pthread_mutex_lock(&r->vsl.mu);
+    r->vsl.q[ji].st = rc == 0 ? 3 : 0;
+    pthread_mutex_unlock(&r->vsl.mu);
+  }
+}
+
 int r3d_vslab_begin(r3d_renderer *r, const char *band_dir, uint32_t W, uint32_t H,
                     uint32_t D) {
   if (!r->vk.caps.host_image_copy || !r->fp_transition || !r->fp_copy_mem) {
@@ -1801,13 +1885,15 @@ int r3d_vslab_begin(r3d_renderer *r, const char *band_dir, uint32_t W, uint32_t 
       .pImageInfo = ii,
   };
   vkUpdateDescriptorSets(r->vk.dev, 1, &w, 0, NULL);
-  /* validity table on binding 5 (page slot; bricks and vslab are exclusive) */
+  /* validity table on binding 5 (bricks and vslab are exclusive): 4 words per
+   * base slot = {key, za, zb, pad} — the z range lets partial fills render
+   * and gates in-progress strip writes out of the sampled set */
   uint32_t nslot = v->lv[0].gx * v->lv[0].gy;
   r3d_vkbuf_destroy(&r->vk, &r->page_buf);
-  if (r3d_vkbuf_create_host(&r->vk, (VkDeviceSize)nslot * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+  if (r3d_vkbuf_create_host(&r->vk, (VkDeviceSize)nslot * 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                             &r->page_buf) != 0)
     return -1;
-  memset(r->page_buf.mapped, 0, (size_t)nslot * 4);
+  memset(r->page_buf.mapped, 0, (size_t)nslot * 16);
   VkDescriptorBufferInfo pbi = {.buffer = r->page_buf.buf, .range = VK_WHOLE_SIZE};
   VkWriteDescriptorSet pw = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
                              .dstSet = r->dset,
@@ -1826,6 +1912,11 @@ int r3d_vslab_begin(r3d_renderer *r, const char *band_dir, uint32_t W, uint32_t 
   for (uint32_t i = 0; i < nslot; i++)
     r->vsl.cells[i] = (struct vscell){INT64_MIN, INT64_MIN, 0, 0};
   r->vsl.fetch = !getenv("R3D_VSLAB_NOFETCH");
+  pthread_mutex_init(&r->vsl.mu, NULL);
+  pthread_cond_init(&r->vsl.cv, NULL);
+  memset(r->vsl.q, 0, sizeof r->vsl.q);
+  r->vsl.quit = false;
+  if (pthread_create(&r->vsl.worker, NULL, vs_worker, r) != 0) return -1;
   r->vsl.active = true;
   v->x0 = v->y0 = -1; /* set by the first frame */
   v->z0 = -1;
@@ -1851,13 +1942,38 @@ void r3d_vslab_frame(r3d_renderer *r, double fx, double fy, int64_t z0, uint32_t
   v->y0 = y0;
   v->z0 = z0;
 
-  /* enumerate needed base cells; run the nearest `budget` jobs synchronously */
+  uint32_t *page = r->page_buf.mapped;
+  pthread_mutex_lock(&r->vsl.mu);
+  /* apply completed fills: fold into the cell ledger, publish validity (key +
+   * z range; partial z coverage renders immediately, the rest samples 0) */
+  for (uint32_t i = 0; i < 4; i++) {
+    struct vsjob *j = &r->vsl.q[i];
+    if (j->st != 3) continue;
+    uint32_t slot =
+        r3d_vs_phys(j->cy, v->lv[0].gy) * v->lv[0].gx + r3d_vs_phys(j->cx, v->lv[0].gx);
+    struct vscell *c = &r->vsl.cells[slot];
+    if (c->cx != j->cx || c->cy != j->cy) { c->za = j->zs0; c->zb = j->zs0 + j->nz; }
+    else {
+      if (j->zs0 < c->za) c->za = j->zs0;
+      if (j->zs0 + j->nz > c->zb) c->zb = j->zs0 + j->nz;
+    }
+    c->cx = j->cx;
+    c->cy = j->cy;
+    /* clamp the tracked range to the ring capacity around the current window */
+    if (c->za < z0) c->za = z0;
+    if (c->zb > z0 + v->wz) c->zb = z0 + v->wz;
+    if (c->zb < c->za) c->zb = c->za;
+    page[slot * 4 + 1] = (uint32_t)c->za;
+    page[slot * 4 + 2] = (uint32_t)c->zb;
+    page[slot * 4] = r3d_vs_key(j->cx, j->cy);
+    j->st = 0;
+  }
+  /* enumerate needed base cells, nearest-first */
   int64_t cx0, cx1, cy0, cy1;
   r3d_vs_range(v, 0, x0, v->nx, v->W, &cx0, &cx1);
   r3d_vs_range(v, 0, y0, v->ny, v->H, &cy0, &cy1);
   struct vjob { int64_t cx, cy, zs0; uint32_t nz; uint64_t d; } jobs[64];
   uint32_t nj = 0;
-  uint32_t *page = r->page_buf.mapped;
   int64_t ccx = (x0 + v->W / 2) / (int64_t)R3D_VS_PAY;
   int64_t ccy = (y0 + v->H / 2) / (int64_t)R3D_VS_PAY;
   for (int64_t cy = cy0; cy <= cy1 && nj < 64; cy++)
@@ -1890,43 +2006,33 @@ void r3d_vslab_frame(r3d_renderer *r, double fx, double fy, int64_t z0, uint32_t
   for (uint32_t a = 0; a + 1 < nj; a++)
     for (uint32_t b = a + 1; b < nj; b++)
       if (jobs[b].d < jobs[a].d) { struct vjob t = jobs[a]; jobs[a] = jobs[b]; jobs[b] = t; }
-  /* budget is slice-weighted: one full cell fill costs wz, a z strip its
-   * height — so z scrolling touches many cells per frame while xy churn
-   * stays bounded by whole-cell decode cost */
-  int64_t slices = (int64_t)budget * 6; /* ~one full cell fill per 3 budget */
-  uint32_t run = 0;
-  while (run < nj && slices > 0) slices -= jobs[run++].nz;
-  if (run && r->timeline_value) { /* in-flight frames may sample these tiles */
-    VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
-                              .semaphoreCount = 1,
-                              .pSemaphores = &r->timeline,
-                              .pValues = &r->timeline_value};
-    vkWaitSemaphores(r->vk.dev, &wi, UINT64_MAX);
-  }
-  for (uint32_t k = 0; k < run; k++) {
-    struct vjob *j = &jobs[k];
+  /* hand the nearest jobs to the worker (skip cells it already holds) */
+  uint32_t enq = 0;
+  for (uint32_t k = 0; k < nj && enq < budget; k++) {
+    int fi = -1;
+    bool dup = false;
+    for (uint32_t i = 0; i < 4; i++) {
+      if (r->vsl.q[i].st == 0) { if (fi < 0) fi = (int)i; }
+      else if (r->vsl.q[i].cx == jobs[k].cx && r->vsl.q[i].cy == jobs[k].cy) dup = true;
+    }
+    if (dup) continue;
+    if (fi < 0) break;
     uint32_t slot =
-        r3d_vs_phys(j->cy, v->lv[0].gy) * v->lv[0].gx + r3d_vs_phys(j->cx, v->lv[0].gx);
+        r3d_vs_phys(jobs[k].cy, v->lv[0].gy) * v->lv[0].gx + r3d_vs_phys(jobs[k].cx, v->lv[0].gx);
     struct vscell *c = &r->vsl.cells[slot];
-    bool fresh = c->cx != j->cx || c->cy != j->cy;
-    if (fresh) page[slot] = 0; /* stale key would still mismatch, but be tidy */
-    if (vs_fill(r, j->cx, j->cy, j->zs0, j->nz) != 0) {
-      fprintf(stderr, "vslab: fill (%lld,%lld) failed\n", (long long)j->cx, (long long)j->cy);
-      continue;
-    }
-    if (fresh) { c->za = j->zs0; c->zb = j->zs0 + j->nz; }
-    else {
-      if (j->zs0 < c->za) c->za = j->zs0;
-      if (j->zs0 + j->nz > c->zb) c->zb = j->zs0 + j->nz;
-    }
-    c->cx = j->cx;
-    c->cy = j->cy;
-    /* clamp the tracked range to the ring capacity around the new window */
-    if (c->za < z0) c->za = z0;
-    if (c->zb > z0 + v->wz) c->zb = z0 + v->wz;
-    if (c->za <= z0 && c->zb >= z0 + v->wz) page[slot] = r3d_vs_key(j->cx, j->cy);
+    if (c->cx != jobs[k].cx || c->cy != jobs[k].cy)
+      page[slot * 4] = 0; /* fresh tile: invalidate BEFORE the worker writes */
+    r->vsl.q[fi] = (struct vsjob){.cx = jobs[k].cx,
+                                  .cy = jobs[k].cy,
+                                  .zs0 = jobs[k].zs0,
+                                  .nz = jobs[k].nz,
+                                  .st = 1,
+                                  .tl = r->timeline_value};
+    enq++;
   }
-  r->vsl.pending = nj > run ? nj - run : 0;
+  if (enq) pthread_cond_broadcast(&r->vsl.cv);
+  r->vsl.pending = nj;
+  pthread_mutex_unlock(&r->vsl.mu);
 
   /* params */
   p->slab_grid = v->lv[0].gx | (v->lv[0].gy << 6) | (1u << 24);

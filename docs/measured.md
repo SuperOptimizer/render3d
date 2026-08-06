@@ -472,3 +472,30 @@ Measured (12096^2 x 16 window = 70 tiles / 5.1 GB, 720p, band z=33):
 
 Follow-ups: async fill worker (+ prefetch margin), parallel shard fetch,
 multi-window z rings > 62, vslab zoomio-class benches.
+
+## 2026-08-06 — vslab async fill worker + z-range validity + parallel fetch
+
+Fills (fetch + decode + downsample + host_image_copy) moved off the render
+thread onto ONE worker (pthread, vkclip pattern): the render thread now only
+enumerates needed cells nearest-first, hands up to `budget` jobs to a 4-slot
+queue, and folds completed jobs into the cell ledger. Write safety without
+render-thread waits: a fresh cell's page key is cleared at enqueue and the
+worker drains then-in-flight frames (timeline wait at the ENQUEUE value)
+before touching the tile, so later frames see key=0 and never sample it;
+z-strip refills only write layers outside the published validity range.
+Validity grew from 1 to 4 words per base slot {key, za, zb, pad}: the shader
+gates each sample's z taps against [za, zb), so PARTIAL z coverage renders
+immediately (z scrolling shows data as strips land instead of stale ring
+layers — also fixes the pre-existing stale-z artifact during fast sweeps).
+Missing shards now download in batches of up to 6 concurrent curls.
+
+Measured (12096^2 x 16 window, 720p, band z=33, same benches as 08-05):
+- z sweep: ~11 fps -> vsync-locked 60 fps (worst frame 566 -> 50 ms).
+- xy pan: 51 fps / worst 104 ms -> vsync-locked 60 fps / worst 38 ms.
+- remote: 9 never-fetched z-row-31 shards pulled in two concurrent batches
+  (6 + 3) mid-bench with zero frame stalls (gpu avg 1.05 ms throughout).
+- decode itself was already threaded (r3d_shard_decode_region nthreads=0 ->
+  all cores); the win is purely taking it off the frame loop.
+
+Follow-ups: prefetch margin (fill one cell ring beyond the window in the
+motion direction), multi-window z rings > 62, vslab zoomio-class benches.

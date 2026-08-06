@@ -120,7 +120,12 @@ float vs_sample(float3 p, float lod) {
   float cbx = floor(wx / 2016.0), cby = floor(wy / 2016.0);
   float pbx = cbx - floor(cbx / gx0) * gx0, pby = cby - floor(cby / gy0) * gy0;
   uint want = (uint(cbx) & 1023u) | ((uint(cby) & 1023u) << 10) | 0x80000000u;
-  if (page[uint(pby * gx0 + pbx)] != want) return 0.0; /* not resident (yet) */
+  /* validity = 4 words/slot {key, za, zb, pad}: the async fill worker
+   * publishes ranges as they land, so partially filled cells render their
+   * resident z span and in-progress writes are never sampled */
+  uint s4 = uint(pby * gx0 + pbx) * 4u;
+  if (page[s4] != want) return 0.0; /* not resident (yet) */
+  if (zc - 0.5 < float(page[s4 + 1]) || zc + 0.5 > float(page[s4 + 2])) return 0.0;
   int lev = int(floor(lod)) - 2; /* prefilter 4<<lev matches the footprint */
   if (lev < 0) {
     float lx = wx - cbx * 2016.0 + 1.0, ly = wy - cby * 2016.0 + 1.0;
