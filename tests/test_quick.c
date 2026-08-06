@@ -188,18 +188,31 @@ static void test_slab(void) {
 static void test_vslab(void) {
   r3d_vslab v;
   CHECK(r3d_vslab_init(&v, 43008, 43008, 68608, 12096, 12096, 16) == 0);
-  CHECK(v.wz == 18 && v.lv[0].gx == 8 && v.lv[0].gy == 8); /* 6 + straddle + prefetch */
-  CHECK(v.lv[1].gx == 3 && v.lv[4].gx == 2);               /* s=4, s=32 */
-  CHECK(v.ntiles == 64 + 9 + 4 + 4 + 4);
-  CHECK(r3d_vs_cell(&v, 0) == 2016 && r3d_vs_cell(&v, 4) == 2016 * 32);
+  /* payload adapts: 12096/8 rounded up to 32 -> 1536; + straddle + prefetch */
+  CHECK(v.wz == 18 && v.px == 1536 && v.lv[0].gx == 10 && v.lv[0].gy == 10);
+  /* pyramid present only while window/s >= 1024: L1, L2 yes; L3, L4 no */
+  CHECK(v.lv[1].gx == 4 && v.lv[2].gx == 3 && v.lv[3].gx == 0 && v.lv[4].gx == 0);
+  CHECK(v.ntiles == 100 + 16 + 9);
+  CHECK(r3d_vs_cell(&v, 0) == 1536 && r3d_vs_cell(&v, 2) == 1536 * 8);
   int64_t c0, c1;
   r3d_vs_range(&v, 0, 10000, 43008, 12096, &c0, &c1);
-  CHECK(c0 == 4 && c1 == 10); /* 10000/2016=4, 22095/2016=10 -> 7 cells */
+  CHECK(c0 == 6 && c1 == 14); /* 10000/1536=6, 22095/1536=14 */
   r3d_vs_range(&v, 0, 43008 - 12096, 43008, 12096, &c0, &c1);
-  CHECK(c1 == 21); /* clamped at the last cell */
+  CHECK(c1 == 27); /* clamped at the last cell: 43007/1536 */
   CHECK(r3d_vs_phys(10, 7) == 3);
+  /* deep cube window: single ring image (D <= 2044), no pyramid needed */
+  CHECK(r3d_vslab_init(&v, 43008, 43008, 68608, 2048, 2048, 2044) == 0);
+  CHECK(v.px == 256 && v.wz == 2046 && v.lv[0].gx == 10);
+  CHECK(v.lv[1].gx == 0 && v.ntiles == 100);
+  /* whole-xy thin plane: immovable axes drop straddle + prefetch entirely */
+  CHECK(r3d_vslab_init(&v, 43008, 43008, 68608, 43008, 43008, 4) == 0);
+  CHECK(v.px == 2016 && v.wz == 6 && v.lv[0].gx == 22 && v.lv[0].gy == 22);
+  CHECK(v.lv[1].gx == 6 && v.lv[4].gx == 1);
+  CHECK(v.ntiles == 484 + 36 + 9 + 4 + 1);
+  CHECK(r3d_vslab_init(&v, 43008, 43008, 68608, 12096, 12096, 2045) != 0); /* too deep */
+  CHECK(r3d_vslab_init(&v, 43008, 43008, 68608, 43009, 4096, 16) != 0);    /* > volume */
   CHECK(r3d_vs_key(3, 5) == (3u | (5u << 10) | 0x80000000u));
-  CHECK(r3d_vs_layer(&v, 34288) == 34288 % 18);
+  CHECK(r3d_vs_layer(&v, 34288) == 34288 % 6); /* v = whole-xy window, wz 6 */
   CHECK(r3d_vs_max0(68608, 18) == 68590);
 }
 

@@ -523,3 +523,36 @@ overview pyramid + validity gating hold through full zoom sweeps and model
 rotation over the streamed window.
 
 Follow-up remaining: windows deeper than D=62 (multi-ring z).
+
+## 2026-08-06 — vslab: arbitrary window shapes (adaptive payload + band fills)
+
+The window is now any W x H x D that fits in RAM: tile payload adapts at
+runtime (~extent/8, 32-aligned, capped 2016) instead of the compile-time
+2016^2, D lifted from 62 to 2044 (ring wz = D+2 <= maxImageDimension3D 2048;
+px auto-shrinks if a tile would pass the 4 GB allocation cap), straddle +
+prefetch margins are PER AXIS and vanish when an axis spans the whole volume
+(it cannot move), and pyramid levels exist only while window/scale >= 1024
+(the shader steps down to the finest present level; max_lod follows). Tile
+pool 544 -> 1024 descriptors (device limit is 16M); >20 GB tile totals are
+refused at begin.
+
+Deep windows exposed decode amplification: a fresh 258^2-cell fill re-decodes
+whole 1024^2 dct3d chunks — ~60x waste, minutes for a 2048^3 fill. Small-xy
+windows (exactly the no-pyramid case, max extent < 4096) therefore switch to
+BAND fills: per-cell jobs sharing a z range group into one window-wide
+16-slice decode scattered to every cell tile (~2x amplification, the chunk
+row is decoded exactly once).
+
+Measured (720p, band z=33 local):
+- 2048x2048x1024 (payload 256, 100 tiles, 6.8 GB): full fill = exactly 65
+  band jobs (= 1026/16 chunk rows, zero redundant decode) in ~13 s,
+  renders real scroll data, 60 fps.
+- 43008x43008x4 whole cross-section (payload 2016, 534 tiles, 13.0 GB):
+  streams the ENTIRE scroll plane, whole-view gpu 2.2 ms.
+- 12096^2x16 default regression: payload adapts to 1536 (125 tiles, 5.3 GB),
+  clippan steady-state pending still 0 with prefetch, zoomio 9.1 -> 7.8 ms.
+
+Note: camera-follow slides small windows continuously during orbits (the
+focus intersection swings); fills keep up asynchronously but a follow
+deadband for small windows is a possible refinement. R3D_VSLAB_DEBUG=1
+prints per-job traces.

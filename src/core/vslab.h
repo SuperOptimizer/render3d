@@ -16,21 +16,21 @@
 
 #include <stdint.h>
 
-#define R3D_VS_PAY 2016u /* payload voxels per tile axis (divisible by 32) */
-#define R3D_VS_TEX 2018u /* payload + 1-voxel apron each side */
+#define R3D_VS_PAY 2016u /* MAX payload voxels per tile axis (divisible by 32) */
 #define R3D_VS_LEVELS 5u
 
 static const uint32_t r3d_vs_scale[R3D_VS_LEVELS] = {1, 4, 8, 16, 32};
 
 typedef struct r3d_vs_level {
   uint32_t s;      /* voxel spacing */
-  uint32_t gx, gy; /* physical tiles per axis (>= resident cells) */
+  uint32_t gx, gy; /* physical tiles per axis (>= resident cells); 0 = level absent */
   uint32_t base;   /* first index in the shared tile pool */
 } r3d_vs_level;
 
 typedef struct r3d_vslab {
   uint64_t nx, ny, nz; /* full volume dims */
   uint32_t W, H, D;    /* window dims (world voxels) */
+  uint32_t px;         /* tile payload per xy axis (runtime, multiple of 32) */
   uint32_t wz;         /* z ring depth = D + 2 */
   int64_t x0, y0, z0;  /* window origin (world voxels) */
   r3d_vs_level lv[R3D_VS_LEVELS];
@@ -39,12 +39,18 @@ typedef struct r3d_vslab {
 
 /* Cell world size at level l. */
 static inline int64_t r3d_vs_cell(const r3d_vslab *v, uint32_t l) {
-  return (int64_t)R3D_VS_PAY * v->lv[l].s;
+  return (int64_t)v->px * v->lv[l].s;
 }
 
+/* Window shapes are arbitrary as long as they fit in RAM: the tile payload
+ * adapts to the extents (~8 cells across the larger xy extent) so overhead
+ * stays proportional, and the z ring is a single image depth (aprons + ring
+ * slack included), bounded by maxImageDimension3D = 2048 -> D <= 2044. An
+ * axis that spans the whole volume cannot move and drops its straddle +
+ * prefetch margin entirely. */
 static inline int r3d_vslab_init(r3d_vslab *v, uint64_t nx, uint64_t ny, uint64_t nz,
                                  uint32_t W, uint32_t H, uint32_t D) {
-  if (W < R3D_VS_PAY || H < R3D_VS_PAY || D < 2 || D > 62) return -1;
+  if (W < 64 || H < 64 || W > nx || H > ny || D < 2 || D > 2044 || D > nz) return -1;
   v->nx = nx;
   v->ny = ny;
   v->nz = nz;
@@ -53,17 +59,32 @@ static inline int r3d_vslab_init(r3d_vslab *v, uint64_t nx, uint64_t ny, uint64_
   v->D = D;
   v->wz = D + 2;
   v->x0 = v->y0 = v->z0 = 0;
+  uint32_t m = W > H ? W : H;
+  uint32_t px = (m / 8 + 31) & ~31u;
+  if (px < 64) px = 64;
+  if (px > R3D_VS_PAY) px = R3D_VS_PAY;
+  /* per-image cap: (px+2)^2 * wz must stay well under the 4 GB allocation
+   * limit (3 GB margin) — deep rings shrink the xy payload */
+  while (px > 64 && (uint64_t)(px + 2) * (px + 2) * v->wz > (3ull << 30)) px -= 32;
+  v->px = px;
+  /* +1 straddle (a window of W voxels can cover ceil(W/cs)+1 cells) and, at
+   * the base level, +1 more for the prefetch ring — per axis, only when the
+   * axis can move at all */
+  uint32_t ex = W < nx ? 2 : 0, ey = H < ny ? 2 : 0;
   uint32_t nt = 0;
   for (uint32_t l = 0; l < R3D_VS_LEVELS; l++) {
     uint32_t s = r3d_vs_scale[l];
-    uint64_t cs = (uint64_t)R3D_VS_PAY * s;
-    /* +1: a window of W voxels can straddle ceil(W/cs)+1 cells; the base
-     * level adds one more so a prefetch ring one cell beyond the window can
-     * be resident without evicting a wanted cell (pyramid levels never
-     * prefetch — their content arrives with base fills) */
+    uint64_t cs = (uint64_t)px * s;
     v->lv[l].s = s;
-    v->lv[l].gx = (uint32_t)((W + cs - 1) / cs) + 1 + (l == 0);
-    v->lv[l].gy = (uint32_t)((H + cs - 1) / cs) + 1 + (l == 0);
+    /* pyramid levels exist only while the window is large enough to need
+     * them (below ~1024 texels the base level serves zoomed-out sampling) */
+    if (l && m / s < 1024) {
+      v->lv[l].gx = v->lv[l].gy = 0;
+      v->lv[l].base = nt;
+      continue;
+    }
+    v->lv[l].gx = (uint32_t)((W + cs - 1) / cs) + ex;
+    v->lv[l].gy = (uint32_t)((H + cs - 1) / cs) + ey;
     v->lv[l].base = nt;
     nt += v->lv[l].gx * v->lv[l].gy;
   }

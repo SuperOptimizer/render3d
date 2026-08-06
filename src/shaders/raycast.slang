@@ -7,7 +7,7 @@ import common;
 
 // slab tiles: base grid (compact j*gx+i) then overview-pyramid levels;
 // cube mode binds the monolithic view in every slot
-[[vk::binding(0, 0)]] Sampler3D<float> volumes[544];
+[[vk::binding(0, 0)]] Sampler3D<float> volumes[1024];
 [[vk::binding(1, 0)]] Sampler1D<float4> tf;
 [[vk::binding(2, 0)]] RWTexture2D<float4> out_image;
 // per-8^3-block max, dilated 1 block (nearest sampler) — empty-space skipping
@@ -110,14 +110,17 @@ float sample_tile(float3 uvw, uint idx) {
  * physical tile (cx mod gx_l, cy mod gy_l); a validity table (binding 5,
  * base-level granularity) gates sampling — pyramid content is written by the
  * same fill as its base cell, so it inherits base validity. All geometry in
- * floats: payload 2016, cells <= 22 per axis, exact in f32; no int divides. */
+ * floats: payload pc.slab_px (runtime, <= 2016), cells exact in f32; no int
+ * divides. Pyramid levels are OPTIONAL (grid byte 0 = absent, small windows
+ * skip levels they don't need — sampling steps down to the finest present). */
 float vs_sample(float3 p, float lod) {
+  float P = pc.slab_px, T = P + 2.0;
   float wx = pc.slab_x0 + p.x * pc.slab_nx;
   float wy = pc.slab_y0 + p.y * pc.slab_nx; /* extent y = H/W: p.y*W = offset */
   float zc = pc.slab_z0 + 0.5 + p.z * pc.slab_nx;
   float w = frac(zc / float(pc.slab_wz)); /* world-anchored z ring */
   float gx0 = float(pc.slab_grid & 63u), gy0 = float((pc.slab_grid >> 6) & 63u);
-  float cbx = floor(wx / 2016.0), cby = floor(wy / 2016.0);
+  float cbx = floor(wx / P), cby = floor(wy / P);
   float pbx = cbx - floor(cbx / gx0) * gx0, pby = cby - floor(cby / gy0) * gy0;
   uint want = (uint(cbx) & 1023u) | ((uint(cby) & 1023u) << 10) | 0x80000000u;
   /* validity = 4 words/slot {key, za, zb, pad}: the async fill worker
@@ -126,12 +129,13 @@ float vs_sample(float3 p, float lod) {
   uint s4 = uint(pby * gx0 + pbx) * 4u;
   if (page[s4] != want) return 0.0; /* not resident (yet) */
   if (zc - 0.5 < float(page[s4 + 1]) || zc + 0.5 > float(page[s4 + 2])) return 0.0;
-  int lev = int(floor(lod)) - 2; /* prefilter 4<<lev matches the footprint */
+  int lev = min(int(floor(lod)) - 2, 3); /* prefilter 4<<lev matches footprint */
+  while (lev >= 0 && ((pc.brick_mode >> (uint(lev) * 8u)) & 0xffu) == 0u)
+    lev--; /* absent level: step down to the finest present */
   if (lev < 0) {
-    float lx = wx - cbx * 2016.0 + 1.0, ly = wy - cby * 2016.0 + 1.0;
-    return sample_tile(float3(lx / 2018.0, ly / 2018.0, w), uint(pby * gx0 + pbx));
+    float lx = wx - cbx * P + 1.0, ly = wy - cby * P + 1.0;
+    return sample_tile(float3(lx / T, ly / T, w), uint(pby * gx0 + pbx));
   }
-  lev = min(lev, 3);
   float sc = float(4 << lev);
   uint gp = pc.brick_mode >> (uint(lev) * 8u); /* packed pyramid grids */
   float gxl = float(gp & 15u), gyl = float((gp >> 4) & 15u);
@@ -141,10 +145,10 @@ float vs_sample(float3 p, float lod) {
     bse += (gk & 15u) * ((gk >> 4) & 15u);
   }
   float tx = wx / sc, ty = wy / sc; /* absolute level texel coords */
-  float cx = floor(tx / 2016.0), cy = floor(ty / 2016.0);
+  float cx = floor(tx / P), cy = floor(ty / P);
   float px_ = cx - floor(cx / gxl) * gxl, py_ = cy - floor(cy / gyl) * gyl;
-  float lx = tx - cx * 2016.0 + 1.0, ly = ty - cy * 2016.0 + 1.0;
-  return sample_tile(float3(lx / 2018.0, ly / 2018.0, w), bse + uint(py_ * gxl + px_));
+  float lx = tx - cx * P + 1.0, ly = ty - cy * P + 1.0;
+  return sample_tile(float3(lx / T, ly / T, w), bse + uint(py_ * gxl + px_));
 }
 
 // --- clip mode: level pick is separated from sampling so the marcher picks
@@ -278,7 +282,14 @@ void main(uint3 tid: SV_DispatchThreadID) {
     max_lod = 3.0; // atlas has no mips; lod only widens far-field steps
   } else if (is_vslab()) {
     voxel = 1.0 / pc.slab_nx;
-    max_lod = 7.0; /* pyramid tops out at 1/32; extra lod widens far steps */
+    /* +2 lod past the finest PRESENT pyramid level keeps far steps widening;
+     * small windows may carry no pyramid at all (base only -> 3.0) */
+    max_lod = 3.0;
+    for (int l = 3; l >= 0; l--)
+      if (((pc.brick_mode >> (uint(l) * 8u)) & 0xffu) != 0u) {
+        max_lod = float(l) + 4.0; /* scale 4<<l: log2 = l+2, +2 headroom */
+        break;
+      }
   } else if (is_slab()) {
     voxel = 1.0 / pc.slab_nx;
     // must exceed the overview switch (log2(ovs)-0.25) or wide views would be

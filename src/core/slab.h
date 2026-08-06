@@ -15,7 +15,7 @@
 
 #define R3D_SLAB_MAX_GRID 22u   /* up to 22x22 tiles = 45012^2 composite (whole 43k plane) */
 #define R3D_SLAB_MAX_TILE 2048u /* maxImageDimension3D on target hardware */
-#define R3D_SLAB_TILES 544u /* descriptor slots: base grid + overview pyramid */
+#define R3D_SLAB_TILES 1024u /* descriptor slots: base grid + overview pyramid */
 #define R3D_SLAB_OV_MAX 6u
 
 typedef struct r3d_slab_layout {

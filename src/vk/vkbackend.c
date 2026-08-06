@@ -101,10 +101,14 @@ struct r3d_renderer {
    * touch layers outside the published [za,zb) validity range. */
   struct {
     bool active, fetch;
+    bool band; /* small-xy window: fills are window-wide 16-slice z bands
+                * (per-cell decode would re-decode whole 1024^2 dct3d chunks
+                * per cell — up to 60x amplification on narrow cells) */
     r3d_vslab v;
     r3d_shard_store store;
     struct vscell { int64_t cx, cy, za, zb; } *cells; /* base phys grid */
-    uint8_t *box;   /* decode staging: 2018^2 * wz (worker-owned) */
+    uint8_t *box;   /* decode staging: tex^2 * wz (worker-owned) */
+    uint8_t *bbox;  /* band decode staging: window-wide * 16 (worker-owned) */
     uint8_t *ds[4]; /* per-level downsample strips (one layer, worker-owned) */
     char band_dir[512];
     uint32_t pending; /* cells not yet fully resident for this window */
@@ -113,7 +117,8 @@ struct r3d_renderer {
     pthread_cond_t cv;
     bool quit;
     struct vsjob { /* st: 0 free, 1 ready, 2 running, 3 done */
-      int64_t cx, cy, zs0;
+      int64_t cx, cy, cx1, cy1, zs0; /* cell box (cx..cx1, cy..cy1); per-cell
+                                        jobs have cx1 == cx, cy1 == cy */
       uint32_t nz, st;
       uint64_t tl; /* timeline value to drain before writing tiles */
     } q[4];
@@ -699,6 +704,7 @@ void r3d_destroy(r3d_renderer *r) {
   for (uint32_t i = 0; i < R3D_SLAB_OV_MAX; i++) free(r->ov_bufs[i]);
   free(r->vsl.cells);
   free(r->vsl.box);
+  free(r->vsl.bbox);
   for (uint32_t i = 0; i < 4; i++) free(r->vsl.ds[i]);
   r3d_vkimage_destroy(&r->vk, &r->volume);
   r3d_vkimage_destroy(&r->vk, &r->tf);
@@ -1718,25 +1724,23 @@ static int vs_copy(r3d_renderer *r, const uint8_t *host, uint32_t stride, uint32
 static int vs_scatter(r3d_renderer *r, uint32_t l, int64_t cx, int64_t cy,
                       const uint8_t *strip, uint32_t layer) {
   const r3d_vs_level *lv = &r->vsl.v.lv[l];
-  uint32_t n = R3D_VS_PAY / lv->s;
+  int64_t P = r->vsl.v.px;
+  uint32_t n = (uint32_t)P / lv->s;
   int64_t t0x = cx * (int64_t)n, t0y = cy * (int64_t)n;
-  int64_t p0x = (t0x - 1) / (int64_t)R3D_VS_PAY, p1x = (t0x + n) / (int64_t)R3D_VS_PAY;
-  int64_t p0y = (t0y - 1) / (int64_t)R3D_VS_PAY, p1y = (t0y + n) / (int64_t)R3D_VS_PAY;
+  int64_t p0x = (t0x - 1) / P, p1x = (t0x + n) / P;
+  int64_t p0y = (t0y - 1) / P, p1y = (t0y + n) / P;
   if (p0x < 0) p0x = 0;
   if (p0y < 0) p0y = 0;
   for (int64_t py = p0y; py <= p1y; py++)
     for (int64_t px = p0x; px <= p1x; px++) {
-      int64_t ax = t0x > px * (int64_t)R3D_VS_PAY - 1 ? t0x : px * (int64_t)R3D_VS_PAY - 1;
-      int64_t bx = t0x + n < px * (int64_t)R3D_VS_PAY + 2017 ? t0x + n
-                                                             : px * (int64_t)R3D_VS_PAY + 2017;
-      int64_t ay = t0y > py * (int64_t)R3D_VS_PAY - 1 ? t0y : py * (int64_t)R3D_VS_PAY - 1;
-      int64_t by = t0y + n < py * (int64_t)R3D_VS_PAY + 2017 ? t0y + n
-                                                             : py * (int64_t)R3D_VS_PAY + 2017;
+      int64_t ax = t0x > px * P - 1 ? t0x : px * P - 1;
+      int64_t bx = t0x + n < px * P + P + 1 ? t0x + n : px * P + P + 1;
+      int64_t ay = t0y > py * P - 1 ? t0y : py * P - 1;
+      int64_t by = t0y + n < py * P + P + 1 ? t0y + n : py * P + P + 1;
       if (ax >= bx || ay >= by) continue;
       uint32_t ti = lv->base + r3d_vs_phys(py, lv->gy) * lv->gx + r3d_vs_phys(px, lv->gx);
       if (vs_copy(r, strip + (size_t)(ay - t0y) * n + (size_t)(ax - t0x), n,
-                  (uint32_t)(ax - px * (int64_t)R3D_VS_PAY + 1),
-                  (uint32_t)(ay - py * (int64_t)R3D_VS_PAY + 1), layer,
+                  (uint32_t)(ax - px * P + 1), (uint32_t)(ay - py * P + 1), layer,
                   (uint32_t)(bx - ax), (uint32_t)(by - ay), &r->tiles[ti]) != 0)
         return -1;
     }
@@ -1748,49 +1752,89 @@ static int vs_scatter(r3d_renderer *r, uint32_t l, int64_t cx, int64_t cy,
  * derive + scatter every pyramid level */
 static int vs_fill(r3d_renderer *r, int64_t cx, int64_t cy, int64_t zs0, uint32_t nz) {
   r3d_vslab *v = &r->vsl.v;
-  int64_t wx0 = cx * (int64_t)R3D_VS_PAY - 1, wy0 = cy * (int64_t)R3D_VS_PAY - 1;
+  uint32_t P = v->px, tex = P + 2;
+  int64_t wx0 = cx * (int64_t)P - 1, wy0 = cy * (int64_t)P - 1;
   int64_t ax = wx0 < 0 ? 0 : wx0, ay = wy0 < 0 ? 0 : wy0;
   uint32_t lx = (uint32_t)(ax - wx0), ly = (uint32_t)(ay - wy0); /* leading dup */
-  vs_fetch(r, ax, ay, zs0, R3D_VS_TEX, R3D_VS_TEX, nz);
+  vs_fetch(r, ax, ay, zs0, tex, tex, nz);
   if (r3d_shard_decode_region(&r->vsl.store, (uint64_t)zs0, (uint64_t)ay, (uint64_t)ax, nz,
-                              R3D_VS_TEX - ly, R3D_VS_TEX - lx, r->vsl.box, 0) != 0)
+                              tex - ly, tex - lx, r->vsl.box, 0) != 0)
     return -1;
   /* un-shift in place when the apron clamped at world 0 (edge cells): the
    * decode produced packed (tex-lx)x(tex-ly) slices; expand descending so
    * dst addresses stay >= src, duplicating the clamped border */
   if (lx || ly) {
     for (int64_t z = nz - 1; z >= 0; z--) {
-      const uint8_t *sp = r->vsl.box + (size_t)z * (R3D_VS_TEX - ly) * (R3D_VS_TEX - lx);
-      uint8_t *dp = r->vsl.box + (size_t)z * R3D_VS_TEX * R3D_VS_TEX;
-      for (int64_t y = R3D_VS_TEX - 1; y >= 0; y--) {
+      const uint8_t *sp = r->vsl.box + (size_t)z * (tex - ly) * (tex - lx);
+      uint8_t *dp = r->vsl.box + (size_t)z * tex * tex;
+      for (int64_t y = tex - 1; y >= 0; y--) {
         int64_t sy = y - ly < 0 ? 0 : y - ly;
-        memmove(dp + (size_t)y * R3D_VS_TEX + lx, sp + (size_t)sy * (R3D_VS_TEX - lx),
-                R3D_VS_TEX - lx);
-        if (lx) dp[(size_t)y * R3D_VS_TEX] = dp[(size_t)y * R3D_VS_TEX + 1];
+        memmove(dp + (size_t)y * tex + lx, sp + (size_t)sy * (tex - lx), tex - lx);
+        if (lx) dp[(size_t)y * tex] = dp[(size_t)y * tex + 1];
       }
     }
   }
+  uint32_t lmax = 0; /* pyramid levels are a prefix of the table */
+  for (uint32_t l = 1; l < R3D_VS_LEVELS && v->lv[l].gx; l++) lmax = l;
   uint32_t slot = r3d_vs_phys(cy, v->lv[0].gy) * v->lv[0].gx + r3d_vs_phys(cx, v->lv[0].gx);
   for (uint32_t k = 0; k < nz; k++) {
     int64_t zs = zs0 + k;
     uint32_t layer = r3d_vs_layer(v, zs);
-    const uint8_t *slice = r->vsl.box + (size_t)k * R3D_VS_TEX * R3D_VS_TEX;
-    if (vs_copy(r, slice, R3D_VS_TEX, 0, 0, layer, R3D_VS_TEX, R3D_VS_TEX,
-                &r->tiles[v->lv[0].base + slot]) != 0)
+    const uint8_t *slice = r->vsl.box + (size_t)k * tex * tex;
+    if (vs_copy(r, slice, tex, 0, 0, layer, tex, tex, &r->tiles[v->lv[0].base + slot]) != 0)
       return -1;
-    /* pyramid: 4x from the payload, then 2x chain; scatter each level */
-    vs_down(slice + R3D_VS_TEX + 1, R3D_VS_TEX, R3D_VS_PAY, R3D_VS_PAY, 4, r->vsl.ds[0]);
-    for (uint32_t l = 1; l < 4; l++)
-      vs_down(r->vsl.ds[l - 1], R3D_VS_PAY / r3d_vs_scale[l], R3D_VS_PAY / r3d_vs_scale[l],
-              R3D_VS_PAY / r3d_vs_scale[l], 2, r->vsl.ds[l]);
-    for (uint32_t l = 1; l < R3D_VS_LEVELS; l++)
+    if (!lmax) continue;
+    /* pyramid: 4x from the payload, then 2x chain; scatter each present level */
+    vs_down(slice + tex + 1, tex, P, P, 4, r->vsl.ds[0]);
+    for (uint32_t l = 2; l <= lmax; l++)
+      vs_down(r->vsl.ds[l - 2], P / r3d_vs_scale[l - 1], P / r3d_vs_scale[l - 1],
+              P / r3d_vs_scale[l - 1], 2, r->vsl.ds[l - 1]);
+    for (uint32_t l = 1; l <= lmax; l++)
       if (vs_scatter(r, l, cx, cy, r->vsl.ds[l - 1], layer) != 0) return -1;
   }
   return 0;
 }
 
+/* window-wide band fill: decode ONE (cell-box x nz) slab and scatter it into
+ * every cell tile. Band mode (small xy windows — exactly the no-pyramid case)
+ * exists because per-cell decode re-decodes whole 1024^2 dct3d chunks per
+ * cell: up to ~60x amplification on narrow cells vs ~2x window-wide. Cells
+ * touching the volume boundary fall back to the per-cell path (apron dup). */
+static int vs_fill_band(r3d_renderer *r, int64_t cx0, int64_t cy0, int64_t cx1, int64_t cy1,
+                        int64_t zs0, uint32_t nz) {
+  r3d_vslab *v = &r->vsl.v;
+  uint32_t P = v->px, tex = P + 2;
+  int64_t ax = cx0 * (int64_t)P - 1, ay = cy0 * (int64_t)P - 1;
+  int64_t bx = (cx1 + 1) * (int64_t)P + 1, by = (cy1 + 1) * (int64_t)P + 1;
+  if (ax < 0 || ay < 0 || bx > (int64_t)v->nx || by > (int64_t)v->ny) {
+    for (int64_t cy = cy0; cy <= cy1; cy++)
+      for (int64_t cx = cx0; cx <= cx1; cx++)
+        if (vs_fill(r, cx, cy, zs0, nz) != 0) return -1;
+    return 0;
+  }
+  uint32_t bw = (uint32_t)(bx - ax), bh = (uint32_t)(by - ay);
+  vs_fetch(r, ax, ay, zs0, bw, bh, nz);
+  if (r3d_shard_decode_region(&r->vsl.store, (uint64_t)zs0, (uint64_t)ay, (uint64_t)ax, nz, bh,
+                              bw, r->vsl.bbox, 0) != 0)
+    return -1;
+  for (uint32_t k = 0; k < nz; k++) {
+    uint32_t layer = r3d_vs_layer(v, zs0 + k);
+    const uint8_t *slice = r->vsl.bbox + (size_t)k * bw * bh;
+    for (int64_t cy = cy0; cy <= cy1; cy++)
+      for (int64_t cx = cx0; cx <= cx1; cx++) {
+        uint32_t slot =
+            r3d_vs_phys(cy, v->lv[0].gy) * v->lv[0].gx + r3d_vs_phys(cx, v->lv[0].gx);
+        const uint8_t *src = slice + (size_t)(cy * (int64_t)P - 1 - ay) * bw +
+                             (size_t)(cx * (int64_t)P - 1 - ax);
+        if (vs_copy(r, src, bw, 0, 0, layer, tex, tex, &r->tiles[v->lv[0].base + slot]) != 0)
+          return -1;
+      }
+  }
+  return 0;
+}
+
 /* fill worker: drains ready jobs; each = drain in-flight frames from enqueue
- * time, then fetch + decode + upload one cell (or z strip) */
+ * time, then fetch + decode + upload one cell box (or z strip) */
 static void *vs_worker(void *arg) {
   r3d_renderer *r = arg;
   for (;;) {
@@ -1816,7 +1860,11 @@ static void *vs_worker(void *arg) {
                                 .pValues = &j.tl};
       vkWaitSemaphores(r->vk.dev, &wi, UINT64_MAX);
     }
-    int rc = vs_fill(r, j.cx, j.cy, j.zs0, j.nz);
+    int rc = r->vsl.band ? vs_fill_band(r, j.cx, j.cy, j.cx1, j.cy1, j.zs0, j.nz)
+                         : vs_fill(r, j.cx, j.cy, j.zs0, j.nz);
+    if (getenv("R3D_VSLAB_DEBUG"))
+      fprintf(stderr, "vsjob (%lld,%lld)-(%lld,%lld) z%lld+%u -> %d\n", (long long)j.cx,
+              (long long)j.cy, (long long)j.cx1, (long long)j.cy1, (long long)j.zs0, j.nz, rc);
     if (rc != 0)
       fprintf(stderr, "vslab: fill (%lld,%lld) failed\n", (long long)j.cx, (long long)j.cy);
     pthread_mutex_lock(&r->vsl.mu);
@@ -1840,6 +1888,13 @@ int r3d_vslab_begin(r3d_renderer *r, const char *band_dir, uint32_t W, uint32_t 
     fprintf(stderr, "vslab: window needs %u tiles (> %u)\n", v->ntiles, R3D_SLAB_TILES);
     return -1;
   }
+  uint32_t tex = v->px + 2;
+  double gb = (double)v->ntiles * tex * tex * v->wz / 1e9;
+  if (gb > 20.0) { /* leave headroom on the 22.5 GB budget for everything else */
+    fprintf(stderr, "vslab: %ux%ux%u needs %.1f GB of tiles (> 20 GB) — shrink the window\n",
+            W, H, D, gb);
+    return -1;
+  }
   if (r3d_shard_store_init(&r->vsl.store, band_dir, 68608, 43008, 43008) != 0) return -1;
   snprintf(r->vsl.band_dir, sizeof r->vsl.band_dir, "%s", band_dir);
   if (!r->samp_slab) {
@@ -1855,8 +1910,7 @@ int r3d_vslab_begin(r3d_renderer *r, const char *band_dir, uint32_t W, uint32_t 
     if (vkCreateSampler(r->vk.dev, &smci, NULL, &r->samp_slab) != VK_SUCCESS) return -1;
   }
   for (uint32_t t = 0; t < v->ntiles; t++) {
-    if (r3d_vkimage_create(&r->vk, VK_FORMAT_R8_UNORM,
-                           (VkExtent3D){R3D_VS_TEX, R3D_VS_TEX, v->wz}, 1,
+    if (r3d_vkimage_create(&r->vk, VK_FORMAT_R8_UNORM, (VkExtent3D){tex, tex, v->wz}, 1,
                            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT,
                            &r->tiles[t]) != 0)
       return -1;
@@ -1903,12 +1957,18 @@ int r3d_vslab_begin(r3d_renderer *r, const char *band_dir, uint32_t W, uint32_t 
                              .pBufferInfo = &pbi};
   vkUpdateDescriptorSets(r->vk.dev, 1, &pw, 0, NULL);
   r->vsl.cells = malloc((size_t)nslot * sizeof(struct vscell));
-  r->vsl.box = malloc((size_t)R3D_VS_TEX * R3D_VS_TEX * v->wz);
-  r->vsl.ds[0] = malloc((size_t)504 * 504);
-  r->vsl.ds[1] = malloc((size_t)252 * 252);
-  r->vsl.ds[2] = malloc((size_t)126 * 126);
-  r->vsl.ds[3] = malloc((size_t)63 * 63);
+  r->vsl.box = malloc((size_t)tex * tex * v->wz);
+  for (uint32_t l = 0; l < 4; l++) {
+    size_t n = (size_t)v->px / r3d_vs_scale[l + 1];
+    r->vsl.ds[l] = malloc(n * n);
+  }
   if (!r->vsl.cells || !r->vsl.box || !r->vsl.ds[3]) return -1;
+  r->vsl.band = (W > H ? W : H) < 4096; /* == the no-pyramid case */
+  if (r->vsl.band) {
+    size_t bw = (size_t)v->lv[0].gx * v->px + 2;
+    r->vsl.bbox = malloc(bw * bw * 16);
+    if (!r->vsl.bbox) return -1;
+  }
   for (uint32_t i = 0; i < nslot; i++)
     r->vsl.cells[i] = (struct vscell){INT64_MIN, INT64_MIN, 0, 0};
   r->vsl.fetch = !getenv("R3D_VSLAB_NOFETCH");
@@ -1920,9 +1980,8 @@ int r3d_vslab_begin(r3d_renderer *r, const char *band_dir, uint32_t W, uint32_t 
   r->vsl.active = true;
   v->x0 = v->y0 = -1; /* set by the first frame */
   v->z0 = -1;
-  printf("vslab: %ux%ux%u window, %u tiles (%.1f GB), fetch %s\n", W, H, D, v->ntiles,
-         (double)v->ntiles * R3D_VS_TEX * R3D_VS_TEX * v->wz / 1e9,
-         r->vsl.fetch ? "on" : "off");
+  printf("vslab: %ux%ux%u window, payload %u, %u tiles (%.1f GB), fetch %s\n", W, H, D,
+         v->px, v->ntiles, gb, r->vsl.fetch ? "on" : "off");
   return 0;
 }
 
@@ -1950,23 +2009,25 @@ void r3d_vslab_frame(r3d_renderer *r, double fx, double fy, int64_t z0, uint32_t
   for (uint32_t i = 0; i < 4; i++) {
     struct vsjob *j = &r->vsl.q[i];
     if (j->st != 3) continue;
-    uint32_t slot =
-        r3d_vs_phys(j->cy, v->lv[0].gy) * v->lv[0].gx + r3d_vs_phys(j->cx, v->lv[0].gx);
-    struct vscell *c = &r->vsl.cells[slot];
-    if (c->cx != j->cx || c->cy != j->cy) { c->za = j->zs0; c->zb = j->zs0 + j->nz; }
-    else {
-      if (j->zs0 < c->za) c->za = j->zs0;
-      if (j->zs0 + j->nz > c->zb) c->zb = j->zs0 + j->nz;
-    }
-    c->cx = j->cx;
-    c->cy = j->cy;
-    /* clamp the tracked range to the ring capacity around the current window */
-    if (c->za < z0) c->za = z0;
-    if (c->zb > z0 + v->wz) c->zb = z0 + v->wz;
-    if (c->zb < c->za) c->zb = c->za;
-    page[slot * 4 + 1] = (uint32_t)c->za;
-    page[slot * 4 + 2] = (uint32_t)c->zb;
-    page[slot * 4] = r3d_vs_key(j->cx, j->cy);
+    for (int64_t cy = j->cy; cy <= j->cy1; cy++)
+      for (int64_t cx = j->cx; cx <= j->cx1; cx++) {
+        uint32_t slot = r3d_vs_phys(cy, v->lv[0].gy) * v->lv[0].gx + r3d_vs_phys(cx, v->lv[0].gx);
+        struct vscell *c = &r->vsl.cells[slot];
+        if (c->cx != cx || c->cy != cy) { c->za = j->zs0; c->zb = j->zs0 + j->nz; }
+        else {
+          if (j->zs0 < c->za) c->za = j->zs0;
+          if (j->zs0 + j->nz > c->zb) c->zb = j->zs0 + j->nz;
+        }
+        c->cx = cx;
+        c->cy = cy;
+        /* clamp the tracked range to the ring capacity around the window */
+        if (c->za < z0) c->za = z0;
+        if (c->zb > z0 + v->wz) c->zb = z0 + v->wz;
+        if (c->zb < c->za) c->zb = c->za;
+        page[slot * 4 + 1] = (uint32_t)c->za;
+        page[slot * 4 + 2] = (uint32_t)c->zb;
+        page[slot * 4] = r3d_vs_key(cx, cy);
+      }
     j->st = 0;
   }
   /* enumerate needed base cells, nearest-first */
@@ -1975,8 +2036,8 @@ void r3d_vslab_frame(r3d_renderer *r, double fx, double fy, int64_t z0, uint32_t
   r3d_vs_range(v, 0, y0, v->ny, v->H, &cy0, &cy1);
   struct vjob { int64_t cx, cy, zs0; uint32_t nz; uint64_t d; } jobs[64];
   uint32_t nj = 0;
-  int64_t ccx = (x0 + v->W / 2) / (int64_t)R3D_VS_PAY;
-  int64_t ccy = (y0 + v->H / 2) / (int64_t)R3D_VS_PAY;
+  int64_t ccx = (x0 + v->W / 2) / (int64_t)v->px;
+  int64_t ccy = (y0 + v->H / 2) / (int64_t)v->px;
   for (int64_t cy = cy0; cy <= cy1 && nj < 64; cy++)
     for (int64_t cx = cx0; cx <= cx1 && nj < 64; cx++) {
       uint32_t slot = r3d_vs_phys(cy, v->lv[0].gy) * v->lv[0].gx + r3d_vs_phys(cx, v->lv[0].gx);
@@ -2009,6 +2070,49 @@ void r3d_vslab_frame(r3d_renderer *r, double fx, double fy, int64_t z0, uint32_t
       if (jobs[b].d < jobs[a].d) { struct vjob t = jobs[a]; jobs[a] = jobs[b]; jobs[b] = t; }
   /* hand the nearest jobs to the worker (skip cells it already holds) */
   uint32_t enq = 0;
+  if (r->vsl.band) {
+    /* group per-cell jobs sharing a z range into one window-wide band job,
+     * capped at 16 slices (one dct3d chunk row) so publishes stay frequent */
+    for (uint32_t k = 0; k < nj && enq < budget; k++) {
+      if (!jobs[k].nz) continue; /* consumed by an earlier group */
+      int64_t bx0 = jobs[k].cx, bx1 = jobs[k].cx, by0 = jobs[k].cy, by1 = jobs[k].cy;
+      for (uint32_t m = k + 1; m < nj; m++)
+        if (jobs[m].nz == jobs[k].nz && jobs[m].zs0 == jobs[k].zs0) {
+          if (jobs[m].cx < bx0) bx0 = jobs[m].cx;
+          if (jobs[m].cx > bx1) bx1 = jobs[m].cx;
+          if (jobs[m].cy < by0) by0 = jobs[m].cy;
+          if (jobs[m].cy > by1) by1 = jobs[m].cy;
+          jobs[m].nz = 0;
+        }
+      uint32_t nz = jobs[k].nz > 16 ? 16 : jobs[k].nz;
+      int fi = -1;
+      bool dup = false;
+      for (uint32_t i = 0; i < 4; i++) {
+        if (r->vsl.q[i].st == 0) { if (fi < 0) fi = (int)i; }
+        else if (r->vsl.q[i].zs0 == jobs[k].zs0 && r->vsl.q[i].cx <= bx1 &&
+                 r->vsl.q[i].cx1 >= bx0 && r->vsl.q[i].cy <= by1 && r->vsl.q[i].cy1 >= by0)
+          dup = true;
+      }
+      if (dup) continue;
+      if (fi < 0) break;
+      for (int64_t cy = by0; cy <= by1; cy++)
+        for (int64_t cx = bx0; cx <= bx1; cx++) {
+          uint32_t slot = r3d_vs_phys(cy, v->lv[0].gy) * v->lv[0].gx + r3d_vs_phys(cx, v->lv[0].gx);
+          struct vscell *c = &r->vsl.cells[slot];
+          if (c->cx != cx || c->cy != cy)
+            page[slot * 4] = 0; /* fresh tile: invalidate BEFORE the worker writes */
+        }
+      r->vsl.q[fi] = (struct vsjob){.cx = bx0,
+                                    .cy = by0,
+                                    .cx1 = bx1,
+                                    .cy1 = by1,
+                                    .zs0 = jobs[k].zs0,
+                                    .nz = nz,
+                                    .st = 1,
+                                    .tl = r->timeline_value};
+      enq++;
+    }
+  } else
   for (uint32_t k = 0; k < nj && enq < budget; k++) {
     int fi = -1;
     bool dup = false;
@@ -2025,6 +2129,8 @@ void r3d_vslab_frame(r3d_renderer *r, double fx, double fy, int64_t z0, uint32_t
       page[slot * 4] = 0; /* fresh tile: invalidate BEFORE the worker writes */
     r->vsl.q[fi] = (struct vsjob){.cx = jobs[k].cx,
                                   .cy = jobs[k].cy,
+                                  .cx1 = jobs[k].cx,
+                                  .cy1 = jobs[k].cy,
                                   .zs0 = jobs[k].zs0,
                                   .nz = jobs[k].nz,
                                   .st = 1,
@@ -2036,10 +2142,10 @@ void r3d_vslab_frame(r3d_renderer *r, double fx, double fy, int64_t z0, uint32_t
    * direction of motion — pans then land on already-resident data. The
    * straddle column (+1 in each grid axis) hosts it; a span check keeps the
    * toroidal mapping from evicting a wanted in-window cell. */
-  if (px0 >= 0 && (x0 != px0 || y0 != py0) && !getenv("R3D_VSLAB_NOPREF")) {
+  if (px0 >= 0 && (x0 != px0 || y0 != py0) && !r->vsl.band && !getenv("R3D_VSLAB_NOPREF")) {
     struct { int64_t cx, cy; } pf[48];
     uint32_t npf = 0;
-    int64_t mxc = ((int64_t)v->nx - 1) / R3D_VS_PAY, myc = ((int64_t)v->ny - 1) / R3D_VS_PAY;
+    int64_t mxc = ((int64_t)v->nx - 1) / v->px, myc = ((int64_t)v->ny - 1) / v->px;
     if (x0 != px0) {
       int64_t cxc = x0 > px0 ? cx1 + 1 : cx0 - 1;
       if (cxc >= 0 && cxc <= mxc && cx1 - cx0 + 2 <= (int64_t)v->lv[0].gx)
@@ -2069,6 +2175,8 @@ void r3d_vslab_frame(r3d_renderer *r, double fx, double fy, int64_t z0, uint32_t
       if (c->cx != pf[k].cx || c->cy != pf[k].cy) page[slot * 4] = 0;
       r->vsl.q[fi] = (struct vsjob){.cx = pf[k].cx,
                                     .cy = pf[k].cy,
+                                    .cx1 = pf[k].cx,
+                                    .cy1 = pf[k].cy,
                                     .zs0 = z0,
                                     .nz = v->wz,
                                     .st = 1,
@@ -2090,8 +2198,8 @@ void r3d_vslab_frame(r3d_renderer *r, double fx, double fy, int64_t z0, uint32_t
   p->slab_z0 = (float)z0;
   p->slab_nx = (float)v->W;
   p->slab_ny = (float)v->H;
-  p->slab_px = (float)R3D_VS_PAY;
-  p->slab_py = (float)R3D_VS_PAY;
+  p->slab_px = (float)v->px;
+  p->slab_py = (float)v->px;
   p->slab_depth = v->D;
   p->slab_x0 = (float)x0;
   p->slab_y0 = (float)y0;
