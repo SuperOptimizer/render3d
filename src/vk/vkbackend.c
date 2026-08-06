@@ -733,8 +733,15 @@ int r3d_upload_volume(r3d_renderer *r, const r3d_volume_desc *d, const uint8_t *
   uint32_t mips = 1;
   while ((maxdim >> mips) >= 1 && mips < 16) mips++;
 
-  bool use_hic = r->vk.caps.host_image_copy && r->fp_transition && r->fp_copy_mem &&
-                 !(getenv("R3D_STAGING") && *getenv("R3D_STAGING") == '1');
+  /* Staging beats host-image-copy for the bulk upload on every GPU measured so
+   * far (Turnip 251 vs 339 ms/GiB, RTX 4060 294 vs 547) — the transient cost is
+   * one reusable <=128 MiB buffer, so it is the default. R3D_STAGING=0 forces
+   * the host-image-copy path back on. Note this choice is confined to the
+   * monolithic upload: slab/vslab/clip scrolling still requires host image copy
+   * outright (no staging scroll path exists). */
+  const char *stg = getenv("R3D_STAGING");
+  bool use_hic = r->vk.caps.host_image_copy && r->fp_transition && r->fp_copy_mem && stg &&
+                 *stg == '0';
   VkImageUsageFlags usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                             VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                             (use_hic ? VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT : 0u);

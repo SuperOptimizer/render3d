@@ -556,3 +556,63 @@ Note: camera-follow slides small windows continuously during orbits (the
 focus intersection swings); fills keep up asynchronously but a follow
 deadband for small windows is a possible refinement. R3D_VSLAB_DEBUG=1
 prints per-job traces.
+
+## 2026-08-06 — x86_64 / RTX 4060 port: upload path + a benchmark-validity bug
+
+First run on a second GPU (RTX 4060 Laptop, NVIDIA 595.84, Ubuntu 26.04,
+clang 21, Wayland). Probe: maxImageDimension3D **16384** (vs 2048 on Turnip),
+subgroup **32** (vs 128), maxWorkgroupInvocations 1024, host_image_copy yes.
+
+**Benchmark validity first — the old perf.sh numbers were not measuring what
+they claimed.** This GPU idles at 210 MHz and settles ~2055 MHz under load. A
+cold 300-frame process spends its first frames ramping, and `profile avg`
+averages them in. The same scenario, same binary, three consecutive runs:
+1.90 / 4.70 / 5.98 ms. Repeatability was accidental, not real: 8 back-to-back
+runs agreed to 1.5% purely because they shared one clock state.
+perf.sh now does a 400-frame throwaway warmup then measures 1200 frames —
+spread drops under 1%. Any pre-2026-08-06 number in this file taken on a
+discrete GPU should be assumed inflated by the cold ramp; the Adreno figures
+are unaffected (no comparable idle/boost swing).
+
+**Upload: staging is the default now** (was host-image-copy). Interleaved, 4
+reps, 1 GiB volume: staging **294 ms** (3.6 GB/s) vs host-image-copy **547 ms**
+(1.9 GB/s) — 1.86x. Staging also won on Turnip (251 vs 339), so the old
+default was never the faster one; it was chosen to avoid a staging RAM spike,
+but the staging path reuses a bounded <=128 MiB buffer, so there is no spike
+to avoid. `R3D_STAGING=0` restores host-image-copy.
+Verified the choice is upload-only: dropping VK_IMAGE_USAGE_HOST_TRANSFER_BIT
+does **not** change sampling throughput (interior 5.97 vs 5.97, exterior 1.21
+vs 1.21 ms) — no texture-compression penalty from that usage bit here.
+Unaffected: slab/vslab/clip scrolling still requires host image copy outright.
+
+**Workgroup size is not a lever here — keep 16x8.** The 16x8 default was
+chosen as one 128-wide Adreno wave; this GPU's subgroup is 32, so the rationale
+does not carry, but the outcome does. Interleaved medians of 3 (raycast ms):
+
+| scenario | 8x8  | 16x8* | 16x16 |
+|----------|------|-------|-------|
+| exterior | 1.22 | 1.21  | 1.23  |
+| orbit    | 1.49 | 1.48  | 1.52  |
+| zoom     | 4.51 | 4.44  | 4.46  |
+| fly      | 3.26 | 3.19  | 3.18  |
+| interior | 6.02 | 5.97  | 5.98  |
+| mip      | 4.22 | 4.09  | 3.93  |
+
+16x16 wins MIP by 3.9% and loses orbit/exterior slightly; all six share one
+cube pipeline so only one choice exists. Not worth churning the default.
+
+Baseline after the upload change (warmed perf.sh, 1080p, 1024^3 gyroid —
+note: synthetic, NOT the real scroll region the pre-08-06 rows used, so these
+are not comparable to them):
+orbit 1.47 · zoom 4.43 · fly 3.19 · orbit lowcut 1.24 · fly lowcut 2.30 ·
+exterior 1.21 · interior dense 5.98 · MIP 4.14 · slab zsweep 1-tile 0.36 ·
+slab zsweep 2x2 3072^2 (real PHercParis4) 0.53 ms.
+
+Not done, sized but deferred: R3D_SLAB_MAX_TILE is hardcoded 2048 ("target
+hardware") and clip/vslab inherit 2046/2044 payload caps from it. This GPU
+allows 16384, which would cut a 3072^2 slab from 2x2 tiles to 1 and the whole
+43k plane from 22x22 to 3x3. Blocked on two things: the shader hardcodes
+2046.0 in the overview-pyramid level math (raycast.slang:222,225), so the cap
+must become a push constant; and tile edge cannot simply follow the device
+limit — one 16382^2 x 34 tile is 8.6 GB, so the bound is really VRAM, not
+maxImageDimension3D. Needs a min(device limit, memory budget) rule.

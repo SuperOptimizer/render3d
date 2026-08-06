@@ -56,5 +56,7 @@ libraries (fontconfig/wayland/vulkan loader); our own code must stay leak-free
 without suppressions.
 
 Shader workgroup variants for occupancy tuning: `R3D_WG=8x8|16x8|16x16`.
-Upload path override: `R3D_STAGING=1` (default is VK_EXT_host_image_copy).
+Upload path override: `R3D_STAGING=0` forces VK_EXT_host_image_copy (default
+is staging — 1.86× faster for the bulk upload, see docs/measured.md; slab/
+vslab/clip scrolling requires host image copy regardless).
 Vulkan validation: `R3D_VALIDATE=1` (needs vulkan-validationlayers installed).
