@@ -14,3 +14,10 @@ leak:libvulkan_freedreno
 leak:libEGL
 leak:libGLX
 leak:_mesa_
+# NVIDIA proprietary driver (595.84): one 128 B realloc from a pthread_once
+# initializer on a driver-spawned thread. LSAN reports the frames as
+# "<unknown module>" (the driver runs it from an anonymous/JIT mapping), so a
+# leak:libnvidia* rule cannot match it — the once-initializer is the only
+# named frame. Verified driver-side: the same tests under the lavapipe ICD
+# (VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json) report zero leaks.
+leak:__pthread_once_slow

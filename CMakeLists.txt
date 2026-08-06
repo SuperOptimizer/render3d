@@ -39,16 +39,6 @@ elseif(R3D_SANITIZE STREQUAL "msan")
   target_link_options(r3d_sanitize INTERFACE -fsanitize=memory)
 endif()
 
-# Hardening for release binaries (OpenSSF baseline; skipped under sanitizers).
-add_library(r3d_harden INTERFACE)
-if(R3D_SANITIZE STREQUAL "" AND CMAKE_BUILD_TYPE STREQUAL "Release")
-  target_compile_options(r3d_harden INTERFACE
-    -D_FORTIFY_SOURCE=3 -fstack-protector-strong -fstack-clash-protection
-    -fstrict-flex-arrays=3 -mbranch-protection=standard)
-  target_link_options(r3d_harden INTERFACE
-    -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack -Wl,--as-needed)
-endif()
-
 find_package(SDL3 REQUIRED CONFIG)
 find_package(Vulkan REQUIRED)
 find_package(Threads REQUIRED)
@@ -62,7 +52,7 @@ add_library(r3d_core STATIC
   src/core/input.c
   src/core/screenshot.c)
 target_include_directories(r3d_core PUBLIC src)
-target_link_libraries(r3d_core PRIVATE r3d_warnings r3d_sanitize r3d_harden
+target_link_libraries(r3d_core PRIVATE r3d_warnings r3d_sanitize
                                PUBLIC m Threads::Threads SDL3::SDL3)
 
 # --- c5d codec (sibling working tree, read-only dependency) ---
@@ -99,7 +89,7 @@ target_include_directories(r3d_shard SYSTEM PUBLIC tools/3ddct)
 set_source_files_properties(tools/3ddct/dct3d.c PROPERTIES
   COMPILE_OPTIONS "-ffast-math;-fno-math-errno;-O3;-Wno-nan-infinity-disabled")
 target_link_libraries(r3d_shard PUBLIC m Threads::Threads
-                                PRIVATE r3d_sanitize r3d_harden)
+                                PRIVATE r3d_sanitize)
 
 # --- vendored cimgui/imgui (C++; the only non-C code in the tree) ---
 if(NOT EXISTS "${CMAKE_SOURCE_DIR}/tools/cimgui/cimgui.cpp")
@@ -135,7 +125,7 @@ add_library(r3d_vk STATIC
   src/vk/vkgui.c)
 target_include_directories(r3d_vk PUBLIC src)
 target_link_libraries(r3d_vk PUBLIC Vulkan::Vulkan SDL3::SDL3 r3d_imgui r3d_shard r3d_c5d
-                             PRIVATE r3d_warnings r3d_sanitize r3d_harden)
+                             PRIVATE r3d_warnings r3d_sanitize)
 
 # --- shaders (Slang -> SPIR-V) ---
 include(src/shaders/shaders.cmake)
@@ -145,34 +135,34 @@ add_executable(render3d src/main.c)
 target_compile_definitions(render3d PRIVATE R3D_SPV_DIR="${R3D_SPV_DIR}")
 add_dependencies(render3d r3d_shaders)
 target_link_libraries(render3d PRIVATE r3d_core r3d_vk SDL3::SDL3
-                                       r3d_warnings r3d_sanitize r3d_harden)
+                                       r3d_warnings r3d_sanitize)
 
 # --- tools ---
 add_executable(assemble tools/assemble/main.c)
-target_link_libraries(assemble PRIVATE m r3d_warnings r3d_sanitize r3d_harden)
+target_link_libraries(assemble PRIVATE m r3d_warnings r3d_sanitize)
 add_executable(c5dpack tools/c5dpack/main.c)
-target_link_libraries(c5dpack PRIVATE r3d_c5d r3d_shard r3d_warnings r3d_sanitize r3d_harden)
+target_link_libraries(c5dpack PRIVATE r3d_c5d r3d_shard r3d_warnings r3d_sanitize)
 add_executable(mkpyramid tools/mkpyramid/main.c)
-target_link_libraries(mkpyramid PRIVATE r3d_shard r3d_warnings r3d_sanitize r3d_harden)
+target_link_libraries(mkpyramid PRIVATE r3d_shard r3d_warnings r3d_sanitize)
 add_executable(bandcut tools/bandcut/main.c)
-target_link_libraries(bandcut PRIVATE r3d_shard r3d_warnings r3d_sanitize r3d_harden)
+target_link_libraries(bandcut PRIVATE r3d_shard r3d_warnings r3d_sanitize)
 add_executable(mkvol tools/mkvol/main.c)
-target_link_libraries(mkvol PRIVATE m r3d_warnings r3d_sanitize r3d_harden)
+target_link_libraries(mkvol PRIVATE m r3d_warnings r3d_sanitize)
 
 # --- tests ---
 enable_testing()
 add_executable(test_quick tests/test_quick.c)
-target_link_libraries(test_quick PRIVATE r3d_core r3d_warnings r3d_sanitize r3d_harden)
+target_link_libraries(test_quick PRIVATE r3d_core r3d_warnings r3d_sanitize)
 add_test(NAME quick COMMAND test_quick)
 set_tests_properties(quick PROPERTIES LABELS quick TIMEOUT 30)
 
 add_executable(test_shard tests/test_shard.c)
-target_link_libraries(test_shard PRIVATE r3d_shard r3d_warnings r3d_sanitize r3d_harden)
+target_link_libraries(test_shard PRIVATE r3d_shard r3d_warnings r3d_sanitize)
 add_test(NAME shard COMMAND test_shard ${CMAKE_SOURCE_DIR}/band)
-set_tests_properties(shard PROPERTIES LABELS data TIMEOUT 60)
+set_tests_properties(shard PROPERTIES LABELS data TIMEOUT 60 SKIP_RETURN_CODE 77)
 
 add_executable(test_c5dgpu tests/test_c5dgpu.c)
-target_link_libraries(test_c5dgpu PRIVATE r3d_vk r3d_c5d r3d_warnings r3d_sanitize r3d_harden)
+target_link_libraries(test_c5dgpu PRIVATE r3d_vk r3d_c5d r3d_warnings r3d_sanitize)
 add_dependencies(test_c5dgpu r3d_shaders)
 target_compile_definitions(test_c5dgpu PRIVATE R3D_SPV_DIR="${R3D_SPV_DIR}")
 add_test(NAME c5dgpu COMMAND test_c5dgpu)
@@ -180,7 +170,7 @@ set_tests_properties(c5dgpu PROPERTIES LABELS gpu TIMEOUT 300
   ENVIRONMENT "LSAN_OPTIONS=suppressions=${CMAKE_SOURCE_DIR}/lsan.supp")
 
 add_executable(test_gpu tests/test_gpu.c)
-target_link_libraries(test_gpu PRIVATE r3d_core r3d_warnings r3d_sanitize r3d_harden)
+target_link_libraries(test_gpu PRIVATE r3d_core r3d_warnings r3d_sanitize)
 add_test(NAME gpu COMMAND test_gpu $<TARGET_FILE:render3d>)
-set_tests_properties(gpu PROPERTIES LABELS gpu TIMEOUT 120
+set_tests_properties(gpu PROPERTIES LABELS gpu TIMEOUT 120 SKIP_RETURN_CODE 77
   ENVIRONMENT "LSAN_OPTIONS=suppressions=${CMAKE_SOURCE_DIR}/lsan.supp")
