@@ -933,12 +933,33 @@ static int slab_upload_tile_slice(r3d_renderer *r, const r3d_slab_layout *l,
   return r->fp_copy_mem(r->vk.dev, &ci) == VK_SUCCESS ? 0 : -1;
 }
 
+/* Per-tile allocation budget. Total slab payload is nx*ny*wz no matter how it
+ * is tiled, so this does not bound memory — it bounds how much of it lands in
+ * ONE image. Concentrating 4.8 GB into a single allocation is what fails on an
+ * 8 GB card, not the total. */
+#define R3D_SLAB_TILE_BUDGET ((VkDeviceSize)1 << 30)
+
 int r3d_slab_init(r3d_renderer *r, const r3d_slab_desc *d) {
-  if (r3d_slab_layout_init(&r->slab, d->nx, d->ny, d->nz, d->wz) != 0) {
+  /* Base tiles may use the device's real 3D image limit (16384 on desktop
+   * parts) instead of the 2048 the original Adreno target allowed: fewer,
+   * larger tiles mean fewer descriptors, fewer per-tile fill loops and fewer
+   * duplicated aprons. Grow the edge from the old default so this can only
+   * ever match or improve on previous behaviour. */
+  VkDeviceSize budget = r->vk.caps.max_alloc_bytes;
+  if (budget > R3D_SLAB_TILE_BUDGET) budget = R3D_SLAB_TILE_BUDGET;
+  uint64_t max_texels = (uint64_t)budget / (d->wz ? d->wz : 1u);
+  uint32_t cap = r->vk.caps.max_dim_3d < R3D_SLAB_MAX_TILE ? r->vk.caps.max_dim_3d
+                                                           : R3D_SLAB_MAX_TILE;
+  while (cap < r->vk.caps.max_dim_3d && (uint64_t)(cap + 1) * (cap + 1) <= max_texels) cap++;
+  if (r3d_slab_layout_init_cap(&r->slab, d->nx, d->ny, d->nz, d->wz, cap) != 0) {
     fprintf(stderr, "slab: unsupported layout %ux%ux%u wz=%u (max %u per tiled axis)\n", d->nx,
-            d->ny, d->nz, d->wz, 2u * (R3D_SLAB_MAX_TILE - 2));
+            d->ny, d->nz, d->wz, R3D_SLAB_MAX_GRID * (cap - 2));
     return -1;
   }
+  printf("slab: tile cap %u (device %u) -> %ux%u grid, payload %ux%u, %.0f MiB/tile\n", cap,
+         r->vk.caps.max_dim_3d, r->slab.gx, r->slab.gy, r->slab.px, r->slab.py,
+         (double)((uint64_t)r3d_slab_tile_w(&r->slab) * r3d_slab_tile_h(&r->slab) * r->slab.wz) /
+             1048576.0);
   if (!r->vk.caps.host_image_copy || !r->fp_transition || !r->fp_copy_mem) {
     fprintf(stderr, "slab: needs VK_EXT_host_image_copy (staging scroll path not implemented)\n");
     return -1;

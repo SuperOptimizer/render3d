@@ -153,6 +153,28 @@ static void test_slab(void) {
   /* bad ring */
   CHECK(r3d_slab_layout_init(&l, 1024, 1024, 16, 32) == -1);
 
+  /* --- explicit base-tile cap (device maxImageDimension3D > 2048) --- */
+  /* 3072^2 needs a 2x2 grid at the 2048 cap but fits ONE tile at 16384 */
+  CHECK(r3d_slab_layout_init(&l, 3072, 3072, 96, 32) == 0);
+  CHECK(l.gx == 2 && l.gy == 2 && l.px == 1536);
+  CHECK(r3d_slab_layout_init_cap(&l, 3072, 3072, 96, 32, 16384) == 0);
+  CHECK(l.gx == 1 && l.gy == 1 && l.px == 3072 && r3d_slab_tile_w(&l) == 3074);
+  /* the overview scale is bound by R3D_SLAB_OV_TILE, NOT the base cap: the
+   * shader's pyramid math hardcodes the 2046 payload, so a wider base tile
+   * must not change ovs (16368/2046 = 8 either way) */
+  CHECK(r3d_slab_layout_init(&l, 16368, 16368, 48, 18) == 0);
+  uint32_t ovs_default = l.ovs;
+  CHECK(r3d_slab_layout_init_cap(&l, 16368, 16368, 48, 18, 16384) == 0);
+  CHECK(l.gx == 1 && l.gy == 1 && l.px == 16368);
+  CHECK(l.ovs == ovs_default);
+  /* a cap below 2048 still works (clamped-down device) */
+  CHECK(r3d_slab_layout_init_cap(&l, 3072, 3072, 96, 32, 1024) == 0);
+  CHECK(l.gx == 4 && l.gy == 4 && l.px == 768);
+  /* degenerate caps rejected, not divided by zero */
+  CHECK(r3d_slab_layout_init_cap(&l, 1024, 1024, 96, 32, 4) == -1);
+  /* the 22-tile grid limit is still enforced against the supplied cap */
+  CHECK(r3d_slab_layout_init_cap(&l, 43008, 1024, 192, 32, 1024) == -1);
+
   /* apron source mapping: tile 0 col 0 clamps to world 0; col 1 = world 0;
    * tile 1 col 0 duplicates world px-1 (tile 0's last payload col) */
   CHECK(r3d_slab_layout_init(&l, 4092, 4092, 192, 32) == 0);

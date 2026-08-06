@@ -14,7 +14,12 @@
 #include <stdint.h>
 
 #define R3D_SLAB_MAX_GRID 22u   /* up to 22x22 tiles = 45012^2 composite (whole 43k plane) */
-#define R3D_SLAB_MAX_TILE 2048u /* maxImageDimension3D on target hardware */
+#define R3D_SLAB_MAX_TILE 2048u /* default base-tile cap when no device cap is supplied */
+/* Overview levels are capped separately and must stay at 2048: the shader's
+ * pyramid math hardcodes the 2046 payload (raycast.slang, "ceil(... / 2046.0)").
+ * Raising the BASE cap needs no shader change — the base grid reads slab_px/py
+ * and slab_grid from push constants — so the two caps are deliberately split. */
+#define R3D_SLAB_OV_TILE 2048u
 #define R3D_SLAB_TILES 1024u /* descriptor slots: base grid + overview pyramid */
 #define R3D_SLAB_OV_MAX 6u
 
@@ -31,24 +36,42 @@ typedef struct r3d_slab_layout {
 static inline uint32_t r3d_slab_tile_w(const r3d_slab_layout *l) { return l->px + 2; }
 static inline uint32_t r3d_slab_tile_h(const r3d_slab_layout *l) { return l->py + 2; }
 
-/* Computes grid + payload. Returns 0, or -1 if the volume needs >2 tiles per
- * axis or the ring depth is unusable. */
-static inline int r3d_slab_layout_init(r3d_slab_layout *l, uint32_t nx, uint32_t ny, uint32_t nz,
-                                       uint32_t wz) {
+/* Computes grid + payload, with an explicit base-tile edge cap (texels incl.
+ * apron; pass the device maxImageDimension3D bounded by an allocation budget).
+ * Returns 0, or -1 if the volume needs more than R3D_SLAB_MAX_GRID tiles per
+ * axis or the ring depth is unusable.
+ *
+ * Total payload is nx*ny*wz however it is tiled, so a larger cap does not cost
+ * memory — it duplicates fewer aprons. What it does change is allocation
+ * shape: many small tile images become few large ones, which is why callers
+ * bound the edge by a per-allocation budget rather than by the raw limit. */
+static inline int r3d_slab_layout_init_cap(r3d_slab_layout *l, uint32_t nx, uint32_t ny,
+                                           uint32_t nz, uint32_t wz, uint32_t max_tile) {
   if (nx == 0 || ny == 0 || nz == 0 || wz < 4 || wz > nz) return -1;
+  if (max_tile < 6) return -1; /* need at least the 2 apron texels + payload */
   l->nx = nx;
   l->ny = ny;
   l->nz = nz;
   l->wz = wz;
-  uint32_t maxp = R3D_SLAB_MAX_TILE - 2;
+  uint32_t maxp = max_tile - 2;
   l->gx = (nx + maxp - 1) / maxp;
   l->gy = (ny + maxp - 1) / maxp;
   if (l->gx > R3D_SLAB_MAX_GRID || l->gy > R3D_SLAB_MAX_GRID) return -1;
   l->px = (nx + l->gx - 1) / l->gx;
   l->py = (ny + l->gy - 1) / l->gy;
+  /* overview scale is bounded by the OVERVIEW cap, not the base one: those
+   * levels must keep matching the shader's hardcoded 2046 payload */
+  uint32_t ovp = R3D_SLAB_OV_TILE - 2;
   l->ovs = 4;
-  while ((nx + l->ovs - 1) / l->ovs > maxp || (ny + l->ovs - 1) / l->ovs > maxp) l->ovs <<= 1;
+  while ((nx + l->ovs - 1) / l->ovs > ovp || (ny + l->ovs - 1) / l->ovs > ovp) l->ovs <<= 1;
   return 0;
+}
+
+/* Default cap (2048) — used by the overview levels and by callers with no
+ * device information. */
+static inline int r3d_slab_layout_init(r3d_slab_layout *l, uint32_t nx, uint32_t ny, uint32_t nz,
+                                       uint32_t wz) {
+  return r3d_slab_layout_init_cap(l, nx, ny, nz, wz, R3D_SLAB_MAX_TILE);
 }
 
 /* Ring layer holding world slice s (s need not be < nz here). */

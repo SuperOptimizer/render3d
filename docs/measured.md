@@ -660,3 +660,42 @@ received ONE junk argument, silently ignored it, and rendered at default
 size/TF — which reads as a 6x speedup. Scripts that build flag lists in
 variables must run under sh/dash, or write the flags literally. Verify A/B
 shots differ by md5 before trusting any image diff.
+
+## 2026-08-06 — slab base-tile cap from the device, not a hardcoded 2048
+
+R3D_SLAB_MAX_TILE was 2048 with the comment "maxImageDimension3D on target
+hardware". That is an Adreno fact, not a portable one: this GPU reports 16384.
+r3d_slab_layout_init_cap() now takes the cap explicitly and the backend derives
+it as min(device maxImageDimension3D, edge that fits a 1 GiB per-tile
+allocation), growing from the old 2048 so it can never do worse.
+
+The bound is per-ALLOCATION, not total. Slab payload is nx*ny*wz however it is
+tiled, so a wider cap costs no memory (it duplicates marginally fewer aprons —
+measured 0.1%, not the several percent guessed before checking). What changes
+is that the same bytes land in fewer, larger images, and one 4.8 GB image can
+fail where 64 small ones succeed.
+
+Overview levels keep a SEPARATE fixed cap (R3D_SLAB_OV_TILE = 2048): the
+shader's pyramid math hardcodes the 2046 payload (raycast.slang "ceil(../
+2046.0)"), while the base grid already reads slab_px/py and slab_grid from
+push constants. Splitting the two caps is what keeps this a pure CPU-side
+change — no shader edit, no push-constant growth (the block is ~232 B of the
+256 this device allows, and the file still claims a 128 B budget).
+
+Measured on the real 3072^2 PHercParis4 slab: 2x2 grid -> 1x1, one 306 MiB
+tile. A/B against the old binary (medians of 3, warmed): raycast 0.53 vs 0.53
+ms, full window fill 336.4 vs 336.9 ms, 1-slice scroll 10.2 vs 10.0 ms —
+**no measurable speedup**, and output is byte-identical (md5 match at the
+default view and at --lod-bias -2 where former tile seams would show). It is
+kept as a correctness/portability fix, not a perf win: the payoff is fewer
+descriptors and tiles at large grids (the 22x22 whole-plane case drops well
+under the 1024-slot pool), and one less wrong hardware assumption.
+
+Note on the c5d coupling: render3d compiles ${R3D_C5D_DIR}/src directly, i.e.
+against that checkout's WORKING TREE, not a pinned commit. In-progress edits
+there change the host/kernel contract under render3d with no version signal —
+an uncommitted 6->7 widening of the entropy subinfo stride made test_c5dgpu
+fail intermittently, then hang, then decode garbage, all with render3d
+unchanged. Verified by extracting c5d HEAD to a scratch dir (git archive, no
+mutation of the checkout) and rebuilding: 4/4 pass, exact 16777189 voxels. If
+c5dgpu misbehaves, diff the c5d worktree before suspecting render3d.
