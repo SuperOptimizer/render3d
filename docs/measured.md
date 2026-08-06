@@ -616,3 +616,47 @@ allows 16384, which would cut a 3072^2 slab from 2x2 tiles to 1 and the whole
 must become a push constant; and tile edge cannot simply follow the device
 limit — one 16382^2 x 34 tile is 8.6 GB, so the bound is really VRAM, not
 maxImageDimension3D. Needs a min(device limit, memory budget) rule.
+
+## 2026-08-06 — gradient shading: one failed idea, one real-but-unadopted 11%
+
+Shaded compositing costs ~30% of frame time on the RTX 4060 (mode 0 vs mode 5,
+warmed harness): interior 5.96 -> 4.24, fly 3.19 -> 2.09, exterior 1.21 -> 0.84
+ms. That is the 6 central-difference taps per contributing sample.
+
+**FAILED — skip shading on low-contribution samples.** Gate the taps on the
+sample's front-to-back weight (1-acc.a)*a instead of just `a > 0.003`, on the
+theory that a dense ray's tail cannot move the pixel. At a visually lossless
+threshold (0.004) it bought **nothing** (interior 5.96 vs 5.98); at 0.02 it was
+*slower* (6.49) AND wrecked the image (mean 71 LSB, 99.8% of subpixels). The
+lesson is SIMT, not thresholds: a warp executes the taps if ANY lane needs
+them, so a per-sample divergent skip saves no work and adds a branch. Only
+whole-warp-coherent skips (like the occupancy gate) pay off. Reverted.
+
+**REAL but NOT adopted — 4-tap tetrahedral gradient, -11%.** Replace the 6
+central differences with 4 taps at the tetrahedron corners; cost is uniform so
+SIMT divergence is not an issue. Offsets scaled by 1/sqrt(3) to keep tap radius
+equal to the central differences (sampling further out over-smooths noisy
+scroll data) and renormalised by sqrt(3)/2 so |g| still matches — gm drives
+saturate(gm*6.0), so magnitude matters, not just direction.
+
+True A/B (same binary, only raycast_cube.spv swapped, medians of 4):
+interior 5.97 -> 5.42 (-9.2%) · exterior 1.22 -> 1.09 (-10.7%) ·
+fly 3.19 -> 2.82 (-11.6%) · zoom 4.45 -> 3.95 (-11.2%).
+
+Not adopted because it changes the look on REAL data more than this project
+has previously accepted. Synthetic gyroid is nearly free (interior p99.9 = 2
+LSB, nothing over 4 LSB) but real PHercParis4 slab: mean 3.5 LSB, 14.4% of
+pixels >4 LSB, 8.4% >16 LSB, 0.9% >64 LSB. Structure is visually preserved —
+layers, fibres and boundaries read identically, the delta is fine surface
+speckle — but prior accepted image diffs here are 0.13-0.16 LSB mean. The two
+estimators only agree on smooth fields, and papyrus is not smooth. It is also
+not a GPU-specific change: it would alter Adreno output identically. Patch
+kept out of tree; flip is one block in the shader's gradient `else` branch.
+
+**Harness note for whoever automates this next.** Two separate measurements in
+this session were invalidated by writing `C="--size 1920 1080 ..."` and passing
+`$C` unquoted: zsh does not word-split parameter expansions, so render3d
+received ONE junk argument, silently ignored it, and rendered at default
+size/TF — which reads as a 6x speedup. Scripts that build flag lists in
+variables must run under sh/dash, or write the flags literally. Verify A/B
+shots differ by md5 before trusting any image diff.
