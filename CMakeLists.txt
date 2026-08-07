@@ -42,6 +42,7 @@ endif()
 find_package(SDL3 REQUIRED CONFIG)
 find_package(Vulkan REQUIRED)
 find_package(Threads REQUIRED)
+find_package(CURL REQUIRED)
 
 # --- core (backend-agnostic: math, camera, volume, transfer, stats) ---
 add_library(r3d_core STATIC
@@ -55,13 +56,48 @@ target_include_directories(r3d_core PUBLIC src)
 target_link_libraries(r3d_core PRIVATE r3d_warnings r3d_sanitize
                                PUBLIC m Threads::Threads SDL3::SDL3)
 
-# --- c5d codec (sibling working tree, read-only dependency) ---
-# Sources compiled directly (not add_subdirectory) to keep test/target
-# namespaces separate; list mirrors the c5d lib in ${R3D_C5D_DIR}/CMakeLists.
-set(R3D_C5D_DIR "$ENV{HOME}/compressor" CACHE PATH "c5d compressor checkout")
+# --- c5d codec (pinned source dependency) ---
+# The GPU host/kernel contract is not a stable c5d public ABI.  Compiling a
+# random sibling working tree previously produced hangs and quiet corruption,
+# so normal builds fetch one audited revision.  R3D_C5D_DIR remains available
+# for c5d development, but is revision-checked unless explicitly overridden.
+set(R3D_C5D_PIN "d09400711b5bc10dfd1075404e96edeb64c58893")
+set(R3D_C5D_DIR "" CACHE PATH "Override the pinned c5d checkout")
+option(R3D_ALLOW_UNPINNED_C5D "Allow an R3D_C5D_DIR revision other than R3D_C5D_PIN" OFF)
+if(NOT R3D_C5D_DIR)
+  include(FetchContent)
+  FetchContent_Declare(r3d_c5d_source
+    GIT_REPOSITORY https://github.com/SuperOptimizer/c5d.git
+    GIT_TAG ${R3D_C5D_PIN}
+    GIT_SHALLOW FALSE
+    SOURCE_SUBDIR __render3d_dependency_sources_only)
+  FetchContent_MakeAvailable(r3d_c5d_source)
+  set(R3D_C5D_DIR "${r3d_c5d_source_SOURCE_DIR}")
+endif()
 if(NOT EXISTS "${R3D_C5D_DIR}/src/brick.h")
   message(FATAL_ERROR "c5d not found at ${R3D_C5D_DIR} (set R3D_C5D_DIR)")
 endif()
+find_package(Git QUIET)
+set(R3D_C5D_REV "unknown")
+if(Git_FOUND)
+  execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${R3D_C5D_DIR}" rev-parse HEAD
+                  OUTPUT_VARIABLE R3D_C5D_REV OUTPUT_STRIP_TRAILING_WHITESPACE
+                  ERROR_QUIET)
+  execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${R3D_C5D_DIR}" status --porcelain
+                          --untracked-files=no
+                  OUTPUT_VARIABLE R3D_C5D_DIRTY OUTPUT_STRIP_TRAILING_WHITESPACE
+                  ERROR_QUIET)
+endif()
+if(NOT R3D_ALLOW_UNPINNED_C5D AND
+   (NOT R3D_C5D_REV STREQUAL R3D_C5D_PIN OR R3D_C5D_DIRTY))
+  message(FATAL_ERROR
+    "c5d source is not the clean audited revision ${R3D_C5D_PIN} "
+    "(HEAD=${R3D_C5D_REV}, dirty=${R3D_C5D_DIRTY}); "
+    "use the default pinned fetch or set R3D_ALLOW_UNPINNED_C5D=ON for development")
+endif()
+message(STATUS "render3d c5d revision: ${R3D_C5D_REV}")
+# Sources are compiled directly (not add_subdirectory) to keep target/test
+# namespaces separate; this list mirrors the c5d library at R3D_C5D_PIN.
 add_library(r3d_c5d STATIC
   ${R3D_C5D_DIR}/src/common/c5d_core.c
   ${R3D_C5D_DIR}/src/common/pool.c
@@ -74,6 +110,9 @@ add_library(r3d_c5d STATIC
   ${R3D_C5D_DIR}/src/cache.c)
 target_include_directories(r3d_c5d SYSTEM PUBLIC ${R3D_C5D_DIR}/src)
 target_compile_options(r3d_c5d PRIVATE -ffast-math -fno-math-errno -O3)
+target_compile_definitions(r3d_c5d PUBLIC
+  R3D_C5D_REV="${R3D_C5D_REV}"
+  R3D_C5D_GPU_ABI=20260806)
 target_link_libraries(r3d_c5d PUBLIC m Threads::Threads PRIVATE r3d_sanitize)
 
 # --- shard store: vendored dct3d codec + zarr-v3 shard reader ---
@@ -124,7 +163,7 @@ add_library(r3d_vk STATIC
   src/vk/vkc5d.c
   src/vk/vkgui.c)
 target_include_directories(r3d_vk PUBLIC src)
-target_link_libraries(r3d_vk PUBLIC Vulkan::Vulkan SDL3::SDL3 r3d_imgui r3d_shard r3d_c5d
+target_link_libraries(r3d_vk PUBLIC Vulkan::Vulkan SDL3::SDL3 CURL::libcurl r3d_imgui r3d_shard r3d_c5d
                              PRIVATE r3d_warnings r3d_sanitize)
 
 # --- shaders (Slang -> SPIR-V) ---
@@ -155,6 +194,11 @@ add_executable(test_quick tests/test_quick.c)
 target_link_libraries(test_quick PRIVATE r3d_core r3d_warnings r3d_sanitize)
 add_test(NAME quick COMMAND test_quick)
 set_tests_properties(quick PROPERTIES LABELS quick TIMEOUT 30)
+
+add_executable(test_shard_safety tests/test_shard_safety.c)
+target_link_libraries(test_shard_safety PRIVATE r3d_shard r3d_warnings r3d_sanitize)
+add_test(NAME shard_safety COMMAND test_shard_safety)
+set_tests_properties(shard_safety PROPERTIES LABELS quick TIMEOUT 30)
 
 add_executable(test_shard tests/test_shard.c)
 target_link_libraries(test_shard PRIVATE r3d_shard r3d_warnings r3d_sanitize)

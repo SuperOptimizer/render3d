@@ -35,6 +35,8 @@ struct r3d_vkclip {
   r3d_vkctx *vk;
   PFN_vkTransitionImageLayoutEXT fp_transition;
   PFN_vkCopyMemoryToImageEXT fp_copy_mem;
+  VkCommandPool upload_pool; /* portable staged-upload fallback */
+  r3d_vkbuf upload_stage;     /* worker-independent reusable fallback buffer */
 
   r3d_clip clip;
   r3d_vkimage tex[R3D_CLIP_LEVELS];
@@ -87,16 +89,17 @@ static void produce_from_pyramid(r3d_vkclip *cl, uint32_t l, uint64_t ls, uint8_
   }
 }
 
-static void produce_slice(r3d_vkclip *cl, uint32_t l, uint64_t ls, uint8_t *dst) {
+static int produce_slice(r3d_vkclip *cl, uint32_t l, uint64_t ls, uint8_t *dst) {
   const r3d_clip_level *lv = &cl->clip.lv[l];
   if (l == 0) {
-    r3d_shard_decode_region(&cl->store, ls, (uint64_t)(lv->oy - 1), (uint64_t)(lv->ox - 1), 1,
-                            TEX, TEX, dst, 0);
+    return r3d_shard_decode_region(&cl->store, ls, (uint64_t)(lv->oy - 1),
+                                   (uint64_t)(lv->ox - 1), 1, TEX, TEX, dst, 0);
   } else if (l == 1) {
     /* 2^3 box from full-res decode of the covered region */
     uint32_t W = 2 * TEX;
-    r3d_shard_decode_region(&cl->store, ls * 2, (uint64_t)(lv->oy - 2), (uint64_t)(lv->ox - 2),
-                            2, W, W, cl->scratch, 0);
+    if (r3d_shard_decode_region(&cl->store, ls * 2, (uint64_t)(lv->oy - 2),
+                                (uint64_t)(lv->ox - 2), 2, W, W, cl->scratch, 0) != 0)
+      return -1;
     for (uint32_t y = 0; y < TEX; y++) {
       const uint8_t *r0 = cl->scratch + (size_t)(2 * y) * W;
       const uint8_t *r1 = r0 + W;
@@ -112,6 +115,7 @@ static void produce_slice(r3d_vkclip *cl, uint32_t l, uint64_t ls, uint8_t *dst)
   } else {
     produce_from_pyramid(cl, l, ls, dst);
   }
+  return 0;
 }
 
 static void *clip_worker(void *arg) {
@@ -130,8 +134,11 @@ static void *clip_worker(void *arg) {
     clip_level_state *st = &cl->st[j.level];
     if (atomic_load(&st->gen) != j.gen) continue; /* recentered since enqueue */
     uint32_t slot = r3d_clip_ring_layer(&cl->clip, j.level, j.ls);
-    produce_slice(cl, j.level, j.ls, st->stage + (size_t)slot * TEX * TEX);
-    if (atomic_load(&st->gen) == j.gen)
+    int rc = produce_slice(cl, j.level, j.ls, st->stage + (size_t)slot * TEX * TEX);
+    if (rc != 0)
+      fprintf(stderr, "clip: corrupt shard data while filling L%u slice %llu\n", j.level,
+              (unsigned long long)j.ls);
+    if (rc == 0 && atomic_load(&st->gen) == j.gen)
       atomic_store(&st->slot_done[slot], (int64_t)j.ls);
     if (getenv("R3D_CLIP_TRACE"))
       fprintf(stderr, "clip-fill L%u ls=%llu slot=%u\n", j.level, (unsigned long long)j.ls,
@@ -199,21 +206,29 @@ int r3d_vkclip_pump(r3d_vkclip *cl, VkSemaphore timeline, uint64_t tv) {
         if (vkWaitSemaphores(cl->vk->dev, &wi, UINT64_MAX) != VK_SUCCESS) return -1;
         waited = true;
       }
-      VkMemoryToImageCopyEXT region = {
-          .sType = VK_STRUCTURE_TYPE_MEMORY_TO_IMAGE_COPY_EXT,
-          .pHostPointer = st->stage + (size_t)slot * TEX * TEX,
-          .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-          .imageOffset = {0, 0, (int32_t)slot},
-          .imageExtent = {TEX, TEX, 1},
-      };
-      VkCopyMemoryToImageInfoEXT ci = {
-          .sType = VK_STRUCTURE_TYPE_COPY_MEMORY_TO_IMAGE_INFO_EXT,
-          .dstImage = cl->tex[l].img,
-          .dstImageLayout = VK_IMAGE_LAYOUT_GENERAL,
-          .regionCount = 1,
-          .pRegions = &region,
-      };
-      if (cl->fp_copy_mem(cl->vk->dev, &ci) != VK_SUCCESS) return -1;
+      const uint8_t *src = st->stage + (size_t)slot * TEX * TEX;
+      if (cl->fp_copy_mem) {
+        VkMemoryToImageCopyEXT region = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_TO_IMAGE_COPY_EXT,
+            .pHostPointer = src,
+            .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+            .imageOffset = {0, 0, (int32_t)slot},
+            .imageExtent = {TEX, TEX, 1},
+        };
+        VkCopyMemoryToImageInfoEXT ci = {
+            .sType = VK_STRUCTURE_TYPE_COPY_MEMORY_TO_IMAGE_INFO_EXT,
+            .dstImage = cl->tex[l].img,
+            .dstImageLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .regionCount = 1,
+            .pRegions = &region,
+        };
+        if (cl->fp_copy_mem(cl->vk->dev, &ci) != VK_SUCCESS) return -1;
+      } else if (r3d_vk_upload_image_staged_buf(cl->vk, cl->upload_pool, &cl->upload_stage,
+                                                &cl->tex[l], src, TEX,
+                                                (VkOffset3D){0, 0, (int32_t)slot},
+                                                (VkExtent3D){TEX, TEX, 1}) != 0) {
+        return -1;
+      }
       st->slot_gpu[slot] = done;
       budget--;
     }
@@ -268,6 +283,13 @@ int r3d_vkclip_create(r3d_vkclip **out, r3d_vkctx *c,
   r3d_clip_init(&cl->clip, 43008, 43008, 68608, depth_max, fx, fy);
   if (r3d_shard_store_init(&cl->store, band_dir, 68608, 43008, 43008) != 0) goto fail;
 
+  VkCommandPoolCreateInfo upci = {
+      .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+      .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,
+      .queueFamilyIndex = c->qfam,
+  };
+  if (vkCreateCommandPool(c->dev, &upci, NULL, &cl->upload_pool) != VK_SUCCESS) goto fail;
+
   for (uint32_t l = 2; l < R3D_CLIP_LEVELS; l++) {
     char path[600];
     snprintf(path, sizeof path, "%s/L%u.u8", pyramid_dir, l);
@@ -298,18 +320,23 @@ int r3d_vkclip_create(r3d_vkclip **out, r3d_vkctx *c,
       cl->st[l].slot_gpu[s] = -1;
       atomic_store(&cl->st[l].slot_done[s], -1);
     }
-    if (r3d_vkimage_create(c, VK_FORMAT_R8_UNORM, (VkExtent3D){TEX, TEX, wzl}, 1,
-                           VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT,
+    VkImageUsageFlags usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    if (cl->fp_transition && cl->fp_copy_mem) usage |= VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT;
+    if (r3d_vkimage_create(c, VK_FORMAT_R8_UNORM, (VkExtent3D){TEX, TEX, wzl}, 1, usage,
                            &cl->tex[l]) != 0)
       goto fail;
-    VkHostImageLayoutTransitionInfoEXT tr = {
-        .sType = VK_STRUCTURE_TYPE_HOST_IMAGE_LAYOUT_TRANSITION_INFO_EXT,
-        .image = cl->tex[l].img,
-        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-        .newLayout = VK_IMAGE_LAYOUT_GENERAL,
-        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
-    };
-    if (cl->fp_transition(c->dev, 1, &tr) != VK_SUCCESS) goto fail;
+    if (cl->fp_transition && cl->fp_copy_mem) {
+      VkHostImageLayoutTransitionInfoEXT tr = {
+          .sType = VK_STRUCTURE_TYPE_HOST_IMAGE_LAYOUT_TRANSITION_INFO_EXT,
+          .image = cl->tex[l].img,
+          .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+          .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+          .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+      };
+      if (cl->fp_transition(c->dev, 1, &tr) != VK_SUCCESS) goto fail;
+    } else if (r3d_vk_image_to_general(c, cl->upload_pool, &cl->tex[l]) != 0) {
+      goto fail;
+    }
   }
 
   pthread_mutex_init(&cl->mu, NULL);
@@ -336,6 +363,8 @@ void r3d_vkclip_destroy(r3d_vkclip *cl) {
     free(cl->st[l].stage);
     if (cl->pyr[l].map) munmap(cl->pyr[l].map, cl->pyr[l].n);
   }
+  if (cl->upload_pool) vkDestroyCommandPool(cl->vk->dev, cl->upload_pool, NULL);
+  r3d_vkbuf_destroy(cl->vk, &cl->upload_stage);
   free(cl->scratch);
   free(cl);
 }

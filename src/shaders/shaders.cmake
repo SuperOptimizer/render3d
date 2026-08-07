@@ -20,6 +20,11 @@ set(_variants
   "raycast_clip:raycast:-DR3D_MODE=2 -DWG_X=16 -DWG_Y=8"
   "raycast_bricks:raycast:-DR3D_MODE=3 -DWG_X=16 -DWG_Y=8"
   "raycast_vslab:raycast:-DR3D_MODE=4 -DWG_X=16 -DWG_Y=8"
+  "raycast_fast_cube:raycast:-DR3D_MODE=0 -DR3D_FAST_GRADIENT=1 -DWG_X=16 -DWG_Y=8"
+  "raycast_fast_slab:raycast:-DR3D_MODE=1 -DR3D_FAST_GRADIENT=1 -DWG_X=16 -DWG_Y=8"
+  "raycast_fast_clip:raycast:-DR3D_MODE=2 -DR3D_FAST_GRADIENT=1 -DWG_X=16 -DWG_Y=8"
+  "raycast_fast_bricks:raycast:-DR3D_MODE=3 -DR3D_FAST_GRADIENT=1 -DWG_X=16 -DWG_Y=8"
+  "raycast_fast_vslab:raycast:-DR3D_MODE=4 -DR3D_FAST_GRADIENT=1 -DWG_X=16 -DWG_Y=8"
   "raycast_8x8:raycast:-DR3D_MODE=0 -DWG_X=8 -DWG_Y=8"
   "raycast_16x16:raycast:-DR3D_MODE=0 -DWG_X=16 -DWG_Y=16")
 foreach(_v ${_variants})
@@ -33,6 +38,7 @@ foreach(_v ${_variants})
   add_custom_command(
     OUTPUT "${_out}"
     COMMAND "${R3D_SLANGC}" "${_src}" -target spirv -profile spirv_1_5 -O2
+            -fvk-use-c-layout
             -entry main ${_defs} -o "${_out}"
     DEPENDS "${_src}" "${_shader_dir}/common.slang"
     COMMENT "slangc ${_shader}.slang -> ${_name}.spv"

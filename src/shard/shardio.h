@@ -27,12 +27,22 @@ typedef struct r3d_shard {
   const uint8_t *index; /* R3D_SHARD_INDEX_BYTES at tail */
 } r3d_shard;
 
+enum {
+  R3D_SHARD_OK = 0,
+  R3D_SHARD_ABSENT = -1,
+  R3D_SHARD_CORRUPT = -2,
+};
+
 int r3d_shard_store_init(r3d_shard_store *s, const char *dir, uint64_t nz, uint64_t ny,
                          uint64_t nx);
 
-/* Open/close one shard by shard coords; open fails (-1) if absent. */
+/* Open/close one shard by shard coords. Open returns R3D_SHARD_ABSENT when the
+ * file does not exist and R3D_SHARD_CORRUPT for I/O, size, or index-CRC errors. */
 int r3d_shard_open(const r3d_shard_store *s, uint32_t sz, uint32_t sy, uint32_t sx,
                    r3d_shard *sh);
+/* Validate and mmap an explicitly named shard (used before atomically
+ * publishing a remote download). Same return codes as r3d_shard_open. */
+int r3d_shard_open_path(const char *path, r3d_shard *sh);
 void r3d_shard_close(r3d_shard *sh);
 
 /* Blob location of inner chunk (cz,cy,cx) in shard-local 16^3-grid coords.
@@ -40,7 +50,8 @@ void r3d_shard_close(r3d_shard *sh);
 const uint8_t *r3d_shard_chunk_blob(const r3d_shard *sh, uint32_t cz, uint32_t cy, uint32_t cx,
                                     size_t *nbytes);
 
-/* Decode one inner chunk into out[4096] (z-major 16^3). 0 on success. */
+/* Decode one inner chunk into out[4096] (z-major 16^3). Missing chunks decode
+ * as zero. Corrupt index entries or compressed payloads return -1. */
 int r3d_shard_chunk_decode(const r3d_shard *sh, uint32_t cz, uint32_t cy, uint32_t cx,
                            uint8_t out[R3D_SHARD_CHUNK * R3D_SHARD_CHUNK * R3D_SHARD_CHUNK]);
 

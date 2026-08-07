@@ -152,6 +152,16 @@ int r3d_vkctx_create(r3d_vkctx *c, const char *const *inst_exts, uint32_t n_inst
   c->caps.max_dim_3d = p2.properties.limits.maxImageDimension3D;
   c->caps.max_push_bytes = p2.properties.limits.maxPushConstantsSize;
   c->caps.max_wg_invocations = p2.properties.limits.maxComputeWorkGroupInvocations;
+  c->caps.min_ubo_alignment = p2.properties.limits.minUniformBufferOffsetAlignment;
+  c->caps.max_allocations = p2.properties.limits.maxMemoryAllocationCount;
+  c->caps.max_sampled_images = p2.properties.limits.maxDescriptorSetSampledImages;
+  if (c->caps.max_sampled_images > p2.properties.limits.maxPerStageDescriptorSampledImages)
+    c->caps.max_sampled_images = p2.properties.limits.maxPerStageDescriptorSampledImages;
+  if (c->caps.max_sampled_images > p2.properties.limits.maxDescriptorSetSamplers)
+    c->caps.max_sampled_images = p2.properties.limits.maxDescriptorSetSamplers;
+  if (c->caps.max_sampled_images > p2.properties.limits.maxPerStageDescriptorSamplers)
+    c->caps.max_sampled_images = p2.properties.limits.maxPerStageDescriptorSamplers;
+  c->caps.max_stage_resources = p2.properties.limits.maxPerStageResources;
   c->caps.subgroup_size = sg.subgroupSize;
   c->caps.max_alloc_bytes = m3.maxMemoryAllocationSize;
   c->caps.ts_period_ns = (double)p2.properties.limits.timestampPeriod;
@@ -185,6 +195,26 @@ int r3d_vkctx_create(r3d_vkctx *c, const char *const *inst_exts, uint32_t n_inst
     return -1;
   }
   c->caps.host_image_copy = want_hic && hicf.hostImageCopy;
+  if (getenv("R3D_NO_HOST_COPY") && *getenv("R3D_NO_HOST_COPY") == '1')
+    c->caps.host_image_copy = false; /* conformance-test the staged fallback */
+  c->caps.descriptor_indexing = f12.shaderSampledImageArrayNonUniformIndexing;
+  c->caps.runtime_descriptor_array = f12.runtimeDescriptorArray;
+  c->caps.memory_budget = dev_has_ext(c->phys, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+
+  VkPhysicalDeviceMemoryBudgetPropertiesEXT mb = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+  VkPhysicalDeviceMemoryProperties2 mp2 = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2,
+      .pNext = c->caps.memory_budget ? &mb : NULL};
+  vkGetPhysicalDeviceMemoryProperties2(c->phys, &mp2);
+  for (uint32_t i = 0; i < mp2.memoryProperties.memoryHeapCount; i++) {
+    if (!(mp2.memoryProperties.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)) continue;
+    VkDeviceSize hs = mp2.memoryProperties.memoryHeaps[i].size;
+    if (hs <= c->caps.device_heap_bytes) continue;
+    c->caps.device_heap_bytes = hs;
+    c->caps.heap_budget_bytes = c->caps.memory_budget ? mb.heapBudget[i] : hs;
+    c->caps.heap_usage_bytes = c->caps.memory_budget ? mb.heapUsage[i] : 0;
+  }
 
   /* --- device --- */
   const char *dev_exts[4];
@@ -192,6 +222,7 @@ int r3d_vkctx_create(r3d_vkctx *c, const char *const *inst_exts, uint32_t n_inst
   if (dev_has_ext(c->phys, VK_KHR_SWAPCHAIN_EXTENSION_NAME))
     dev_exts[ndev_exts++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
   if (c->caps.host_image_copy) dev_exts[ndev_exts++] = VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME;
+  if (c->caps.memory_budget) dev_exts[ndev_exts++] = VK_EXT_MEMORY_BUDGET_EXTENSION_NAME;
 
   VkPhysicalDeviceHostImageCopyFeaturesEXT en_hic = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES_EXT,
@@ -230,11 +261,29 @@ int r3d_vkctx_create(r3d_vkctx *c, const char *const *inst_exts, uint32_t n_inst
   };
   VK_TRY(vkCreateDevice(c->phys, &dci, NULL, &c->dev));
   vkGetDeviceQueue(c->dev, c->qfam, 0, &c->queue);
+  if (pthread_mutex_init(&c->queue_mu, NULL) != 0) return -1;
+  c->queue_mu_up = true;
+  r3d_vkctx_set_budget(c, 0);
   return 0;
+}
+
+void r3d_vkctx_set_budget(r3d_vkctx *c, VkDeviceSize requested) {
+  VkDeviceSize reported = c->caps.heap_budget_bytes;
+  VkDeviceSize reserve = reported / 10;
+  if (reserve < ((VkDeviceSize)1 << 30)) reserve = (VkDeviceSize)1 << 30;
+  VkDeviceSize derived = reported > reserve ? reported - reserve : reported * 7 / 10;
+  if (!c->caps.memory_budget) derived = c->caps.device_heap_bytes * 7 / 10;
+  c->budget_bytes = requested && requested < derived ? requested : derived;
+}
+
+VkDeviceSize r3d_vkctx_budget_available(const r3d_vkctx *c) {
+  VkDeviceSize used = atomic_load(&c->allocated_bytes);
+  return used < c->budget_bytes ? c->budget_bytes - used : 0;
 }
 
 void r3d_vkctx_destroy(r3d_vkctx *c) {
   if (c->dev) vkDestroyDevice(c->dev, NULL);
+  if (c->queue_mu_up) pthread_mutex_destroy(&c->queue_mu);
   if (c->messenger) {
     PFN_vkDestroyDebugUtilsMessengerEXT destroy_messenger =
         (PFN_vkDestroyDebugUtilsMessengerEXT)(void (*)(void))vkGetInstanceProcAddr(
@@ -245,6 +294,48 @@ void r3d_vkctx_destroy(r3d_vkctx *c) {
   memset(c, 0, sizeof *c);
 }
 
+VkResult r3d_vkctx_queue_submit(r3d_vkctx *c, uint32_t n, const VkSubmitInfo *info,
+                                VkFence fence) {
+  if (!c->queue_mu_up) return vkQueueSubmit(c->queue, n, info, fence);
+  pthread_mutex_lock(&c->queue_mu);
+  VkResult rc = vkQueueSubmit(c->queue, n, info, fence);
+  pthread_mutex_unlock(&c->queue_mu);
+  return rc;
+}
+
+VkResult r3d_vkctx_queue_submit2(r3d_vkctx *c, uint32_t n, const VkSubmitInfo2 *info,
+                                 VkFence fence) {
+  if (!c->queue_mu_up) return vkQueueSubmit2(c->queue, n, info, fence);
+  pthread_mutex_lock(&c->queue_mu);
+  VkResult rc = vkQueueSubmit2(c->queue, n, info, fence);
+  pthread_mutex_unlock(&c->queue_mu);
+  return rc;
+}
+
+VkResult r3d_vkctx_queue_present(r3d_vkctx *c, const VkPresentInfoKHR *info) {
+  if (!c->queue_mu_up) return vkQueuePresentKHR(c->queue, info);
+  pthread_mutex_lock(&c->queue_mu);
+  VkResult rc = vkQueuePresentKHR(c->queue, info);
+  pthread_mutex_unlock(&c->queue_mu);
+  return rc;
+}
+
+VkResult r3d_vkctx_queue_wait_idle(r3d_vkctx *c) {
+  if (!c->queue_mu_up) return vkQueueWaitIdle(c->queue);
+  pthread_mutex_lock(&c->queue_mu);
+  VkResult rc = vkQueueWaitIdle(c->queue);
+  pthread_mutex_unlock(&c->queue_mu);
+  return rc;
+}
+
+VkResult r3d_vkctx_device_wait_idle(r3d_vkctx *c) {
+  if (!c->queue_mu_up) return vkDeviceWaitIdle(c->dev);
+  pthread_mutex_lock(&c->queue_mu);
+  VkResult rc = vkDeviceWaitIdle(c->dev);
+  pthread_mutex_unlock(&c->queue_mu);
+  return rc;
+}
+
 void r3d_vkctx_print_caps(const r3d_vkctx *c) {
   const r3d_vkcaps *k = &c->caps;
   printf("device            : %s (Vulkan %u.%u.%u)\n", k->dev_name,
@@ -253,9 +344,27 @@ void r3d_vkctx_print_caps(const r3d_vkctx *c) {
   printf("queue family      : %u (graphics+compute, timestamps=%s, period %.2f ns)\n", c->qfam,
          k->timestamps ? "yes" : "no", k->ts_period_ns);
   printf("maxImageDimension3D    : %u\n", k->max_dim_3d);
-  printf("maxMemoryAllocation    : %.2f GiB\n", (double)k->max_alloc_bytes / (1u << 30));
+  if (k->max_alloc_bytes == UINT64_MAX)
+    printf("maxMemoryAllocation    : unbounded (driver sentinel)\n");
+  else
+    printf("maxMemoryAllocation    : %.2f GiB\n", (double)k->max_alloc_bytes / (1ull << 30));
+  printf("device-local heap      : %.2f GiB\n", (double)k->device_heap_bytes / (1ull << 30));
+  printf("heap budget/usage      : %.2f / %.2f GiB%s\n",
+         (double)k->heap_budget_bytes / (1ull << 30),
+         (double)k->heap_usage_bytes / (1ull << 30), k->memory_budget ? "" : " (estimated)");
+  printf("renderer budget        : %.2f GiB\n", (double)c->budget_bytes / (1ull << 30));
+  printf("descriptor indexing    : nonuniform=%s runtime-array=%s, "
+         "max combined images %u, stage resources %u\n",
+         k->descriptor_indexing ? "yes" : "no", k->runtime_descriptor_array ? "yes" : "no",
+         k->max_sampled_images, k->max_stage_resources);
+  if (k->max_allocations == UINT32_MAX)
+    printf("max memory allocations : unbounded (driver sentinel)\n");
+  else
+    printf("max memory allocations : %u\n", k->max_allocations);
   printf("maxPushConstants       : %u B\n", k->max_push_bytes);
   printf("maxWorkgroupInvocations: %u (subgroup %u)\n", k->max_wg_invocations, k->subgroup_size);
+  printf("uniformBufferAlignment : %llu B\n",
+         (unsigned long long)k->min_ubo_alignment);
   printf("host_image_copy        : %s\n", k->host_image_copy ? "yes" : "no");
   VkFormatFeatureFlags r8 = k->r8_optimal;
   printf("R8_UNORM optimal       :%s%s%s%s%s\n",
@@ -265,6 +374,9 @@ void r3d_vkctx_print_caps(const r3d_vkctx *c) {
          (r8 & VK_FORMAT_FEATURE_BLIT_SRC_BIT) ? " blit-src" : "",
          (r8 & VK_FORMAT_FEATURE_BLIT_DST_BIT) ? " blit-dst" : "");
   uint32_t vol = 1024;
-  printf("verdict: 1024^3 R8 + mips %s (dim %u <= %u, ~1.14 GiB <= alloc max)\n",
-         (vol <= k->max_dim_3d) ? "OK" : "TOO BIG", vol, k->max_dim_3d);
+  VkDeviceSize need = (VkDeviceSize)1228 << 20; /* R8 mip chain + conservative alignment */
+  bool ok = vol <= k->max_dim_3d && need <= k->max_alloc_bytes && need <= c->budget_bytes;
+  printf("verdict: 1024^3 R8 + mips %s (dim %u/%u, estimate %.2f GiB, budget %.2f GiB)\n",
+         ok ? "OK" : "UNSUPPORTED", vol, k->max_dim_3d, (double)need / (1ull << 30),
+         (double)c->budget_bytes / (1ull << 30));
 }

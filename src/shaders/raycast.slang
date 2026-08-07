@@ -33,6 +33,9 @@ static const float OCC_BLOCK = 8.0;
 #ifndef R3D_MODE
 #define R3D_MODE 0
 #endif
+#ifndef R3D_FAST_GRADIENT
+#define R3D_FAST_GRADIENT 0
+#endif
 bool is_slab() { return R3D_MODE == 1; }
 bool is_clip() { return R3D_MODE == 2; }
 bool is_bricks() { return R3D_MODE == 3; }
@@ -433,6 +436,44 @@ void main(uint3 tid: SV_DispatchThreadID) {
           // gradient-modulated Blinn-Phong; homogeneous regions stay unshaded
           float e = voxel * lod_step;
           float3 g;
+#if R3D_FAST_GRADIENT
+          /* Four tetrahedron-corner taps instead of six central differences.
+           * The radius is unchanged (e), and sqrt(3)/2 restores the response
+           * of a linear field to the same 2*e magnitude. This is an explicit
+           * quality/performance mode: real papyrus retains structure but its
+           * fine surface speckle differs measurably from central differences. */
+          const float ir3 = 0.57735026919;
+          const float renorm = 0.86602540378;
+          float q0, q1, q2, q3;
+          if (is_bricks() && (pc.brick_mode & 0x10000u) != 0) {
+            float ee = e * ir3;
+            q0 = brick_atlas.SampleLevel(p + float3( ee, -ee, -ee), blod);
+            q1 = brick_atlas.SampleLevel(p + float3(-ee, -ee,  ee), blod);
+            q2 = brick_atlas.SampleLevel(p + float3(-ee,  ee, -ee), blod);
+            q3 = brick_atlas.SampleLevel(p + float3( ee,  ee,  ee), blod);
+          } else if (is_bricks()) {
+            float ev = lod_step * ir3;
+            q0 = bricks_fetch(b_slot, b_bl + float3( ev, -ev, -ev), blod, b_inv);
+            q1 = bricks_fetch(b_slot, b_bl + float3(-ev, -ev,  ev), blod, b_inv);
+            q2 = bricks_fetch(b_slot, b_bl + float3(-ev,  ev, -ev), blod, b_inv);
+            q3 = bricks_fetch(b_slot, b_bl + float3( ev,  ev,  ev), blod, b_inv);
+          } else if (cl_lvl >= 0) {
+            uint gl = uint(cl_lvl);
+            float ee = e * ir3;
+            q0 = sample_clip_level(gl, p + float3( ee, -ee, -ee));
+            q1 = sample_clip_level(gl, p + float3(-ee, -ee,  ee));
+            q2 = sample_clip_level(gl, p + float3(-ee,  ee, -ee));
+            q3 = sample_clip_level(gl, p + float3( ee,  ee,  ee));
+          } else {
+            float ee = e * ir3;
+            q0 = vol_sample(p + float3( ee, -ee, -ee), lod);
+            q1 = vol_sample(p + float3(-ee, -ee,  ee), lod);
+            q2 = vol_sample(p + float3(-ee,  ee, -ee), lod);
+            q3 = vol_sample(p + float3( ee,  ee,  ee), lod);
+          }
+          g = float3(q0 - q1 - q2 + q3, -q0 - q1 + q2 + q3,
+                     -q0 + q1 - q2 + q3) * renorm;
+#else
           if (is_bricks() && (pc.brick_mode & 0x10000u) != 0) {
             g = float3(brick_atlas.SampleLevel(p + float3(e, 0, 0), blod) -
                            brick_atlas.SampleLevel(p - float3(e, 0, 0), blod),
@@ -463,6 +504,7 @@ void main(uint3 tid: SV_DispatchThreadID) {
                 vol_sample(p + float3(0, e, 0), lod) - vol_sample(p - float3(0, e, 0), lod),
                 vol_sample(p + float3(0, 0, e), lod) - vol_sample(p - float3(0, 0, e), lod));
           }
+#endif
           float gm = length(g);
           if (gm > 1e-4) {
             float3 n = g / gm;

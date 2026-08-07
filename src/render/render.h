@@ -63,8 +63,12 @@ typedef struct r3d_bricks_stats {
   uint32_t warm_bricks;         /* compressed bricks in the warm cache */
   uint64_t warm_bytes, warm_cap;
   uint32_t inflight;            /* requests decoded this frame */
+  uint64_t decoded, jobs, stream_ns; /* cumulative worker throughput/latency */
+  uint32_t failures;
 } r3d_bricks_stats;
-void r3d_bricks_get_stats(const r3d_renderer *r, r3d_bricks_stats *st);
+void r3d_bricks_get_stats(r3d_renderer *r, r3d_bricks_stats *st);
+/* Wait for the currently queued streaming batch (benchmark/shutdown boundary). */
+void r3d_bricks_flush(r3d_renderer *r);
 /* Virtual slab: a W x H x D window positioned anywhere in the full export
  * (43008^2 x 68608), streamed from the local shard cache in band_dir with
  * remote fetch on miss (R3D_VSLAB_NOFETCH=1 disables). Call r3d_vslab_frame
@@ -76,6 +80,8 @@ void r3d_vslab_frame(r3d_renderer *r, double fx, double fy, int64_t z0, uint32_t
 void r3d_vslab_get(const r3d_renderer *r, int64_t o[3], uint32_t *pending);
 
 int r3d_set_transfer(r3d_renderer *r, const uint8_t rgba[256][4]);
+/* Select the full six-tap or fast four-tap shading pipeline. */
+void r3d_set_quality(r3d_renderer *r, uint32_t quality);
 
 /* Acquire -> raycast -> blit -> present. Fills st (may be zero). */
 int r3d_frame(r3d_renderer *r, const r3d_frame_params *p, r3d_frame_stats *st);

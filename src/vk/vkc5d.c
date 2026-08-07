@@ -15,9 +15,8 @@
 #define LVS (512u * 4096u) /* levels ints per brick */
 #define NCHUNK 512u /* 16^3 chunks in a 128^3 brick */
 /* Layout constants of the c5d GPU decode contract. These MUST match the
- * ${R3D_C5D_DIR} checkout render3d is COMPILED AGAINST -- CMake pulls that
- * tree's src/gpu directly, so it is the working tree, not a pinned commit,
- * and an in-flight edit there silently changes this ABI. SUBW is the uints
+ * audited c5d revision pinned by CMake (local overrides are rejected when
+ * dirty or at a different commit unless explicitly opted out). SUBW is the uints
  * per substream in he_gpu.subinfo (host_entropy.c fills subinfo[s*SUBW+..],
  * entropy.comp reads the same); PairInfo is offset+count per chunk. */
 #define SUBW 7u
@@ -466,7 +465,7 @@ int r3d_vkc5d_decode(r3d_vkc5d *d, const r3d_c5d_src *src, uint32_t n, VkImageVi
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
                        .commandBufferCount = 1,
                        .pCommandBuffers = &d->cmd};
-    if (vkQueueSubmit(c->queue, 1, &si, d->fence) != VK_SUCCESS) goto batch_fail;
+    if (r3d_vkctx_queue_submit(c, 1, &si, d->fence) != VK_SUCCESS) goto batch_fail;
     if (vkWaitForFences(c->dev, 1, &d->fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) goto batch_fail;
     vkResetFences(c->dev, 1, &d->fence);
     d->last_gpu_ms += (double)(now_ns() - t0) / 1e6;

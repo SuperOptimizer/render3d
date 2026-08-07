@@ -99,7 +99,11 @@ int main(int argc, char **argv) {
   memset(wide, 0xAA, sizeof wide);
   CHECK(r3d_shard_decode_region(&store, gz, gy, gx, 8, 8, 32, wide, 2) == 0);
   CHECK(wide[0] == direct[0]);
-  CHECK(wide[16] == direct[16] || 1); /* col 16 comes from the next chunk; presence-dependent */
+  if (cx + 1 < R3D_SHARD_GRID) {
+    uint8_t next[16 * 16 * 16];
+    CHECK(r3d_shard_chunk_decode(&sh, cz, cy, cx + 1, next) == 0);
+    CHECK(wide[16] == next[0]);
+  }
   CHECK(wide[(0 * 8 + 1) * 32 + 0] == direct[(0 * 16 + 1) * 16 + 0]); /* row stride */
 
   r3d_shard_close(&sh);

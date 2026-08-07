@@ -732,3 +732,25 @@ through three stages as the mismatch narrowed — hang (rANS looping on garbage
 counts), then "truncated substream" (structurally invalid), then clean decode
 with wrong values (valid but mis-dequantised). Only the last is quiet; treat
 a c5dgpu hang as an ABI mismatch, not a driver bug.
+
+## 2026-08-06 — performance-plan implementation and warmed final matrix
+
+The full implementation record, percentile matrix, portability decisions,
+quality A/B, validation scope, and prioritized residual work are in
+`docs/performance-review-20260806.md`. This entry supersedes the historical
+notes above which say that c5d uses an unpinned sibling working tree, streaming
+requires host image copy, four-tap shading was not available, or one-shot work
+uses queue-wide idle.
+
+Headline results on the RTX 4060 at 1080p (400 warm-up + 1,200 measured):
+raycast mean/p99 is orbit 1.455/1.846 ms, zoom 4.464/7.540, fly
+3.295/7.252, exterior 1.198/1.400, dense interior 6.147/6.245, MIP
+4.033/4.832, and real 3072^2 slab 0.531/0.534. Default image quality is
+unchanged. The opt-in four-tap `fast` policy reduces the dense mean from 6.141
+to 5.539 ms (-9.8%).
+
+The principal latency result is c5d streaming: on a 384^3, 27-brick fixture
+through a 2^3 hot atlas, GPU decode jobs average 89.43 ms while render-loop CPU
+frames stay at or below 4.42 ms. Page-table publication is timeline-drained and
+image access is explicitly synchronized; the decode no longer blocks the
+render thread.

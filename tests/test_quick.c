@@ -10,6 +10,7 @@
 #include "core/clip.h"
 #include "core/mathx.h"
 #include "core/slab.h"
+#include "core/stats.h"
 #include "core/vslab.h"
 #include "core/transfer.h"
 #include "core/volume.h"
@@ -24,6 +25,18 @@ static int failures = 0;
   } while (0)
 
 static int feq(float a, float b) { return fabsf(a - b) < 1e-6f; }
+
+static void test_stats(void) {
+  uint64_t values[100];
+  for (uint32_t i = 0; i < 100; i++) values[i] = 100u - i; /* intentionally unsorted */
+  r3d_stats_summary s;
+  r3d_stats_summarize_values(values, 100, &s);
+  CHECK(fabs(s.mean_ns - 50.5) < 1e-12);
+  CHECK(s.p50_ns == 50 && s.p95_ns == 95 && s.p99_ns == 99 && s.max_ns == 100);
+  s.max_ns = 123;
+  r3d_stats_summarize_values(NULL, 0, &s);
+  CHECK(s.mean_ns == 0.0 && s.max_ns == 0);
+}
 
 static void test_mathx(void) {
   r3d_v3 a = v3(1, 2, 3), b = v3(4, 5, 6);
@@ -269,6 +282,7 @@ static void test_clip(void) {
 
 int main(void) {
   test_mathx();
+  test_stats();
   test_slab();
   test_clip();
   test_volume();

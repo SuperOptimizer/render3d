@@ -1,7 +1,7 @@
 /* Tiled-slab layout math (pure, header-only — unit-tested in test_quick).
  *
  * A wide, thin window of the source volume is rendered from a grid of up to
- * 2x2 tile textures. Each tile stores `payload+2` texels per XY axis: its
+ * 22x22 tile textures. Each tile stores `payload+2` texels per XY axis: its
  * payload plus a 1-voxel apron duplicated from the neighboring tile (or edge-
  * clamped at volume borders) so hardware trilinear filtering never shows a
  * seam. Z is a ring buffer of `wz` layers: world slice s lives in layer
@@ -18,7 +18,7 @@
 /* Overview levels are capped separately and must stay at 2048: the shader's
  * pyramid math hardcodes the 2046 payload (raycast.slang, "ceil(... / 2046.0)").
  * Raising the BASE cap needs no shader change — the base grid reads slab_px/py
- * and slab_grid from push constants — so the two caps are deliberately split. */
+ * and slab_grid from the frame UBO — so the two caps are deliberately split. */
 #define R3D_SLAB_OV_TILE 2048u
 #define R3D_SLAB_TILES 1024u /* descriptor slots: base grid + overview pyramid */
 #define R3D_SLAB_OV_MAX 6u

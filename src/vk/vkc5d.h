@@ -1,8 +1,8 @@
 /* c5d GPU decode engine: compressed brick blobs -> (entropy -> dequant/IDCT ->
  * deblock) on the GPU -> pack (R8) into the brick-atlas 3D image. Batched:
  * up to `max_batch` bricks per submit through shared mega-buffers, mirroring
- * the batched design in ~/compressor/src/gpu (kernels are compiled from that
- * working tree; push structs here must match them — test_c5dgpu is the gate).
+ * c5d's batched design (kernels are compiled from the clean revision pinned
+ * by CMake; push structs here must match them — test_c5dgpu is the gate).
  * CPU side per brick is only he_gpu_setup (header parse + rANS tables), or
  * he_decode when R3D_C5D_HYBRID=1 (entropy on CPU, rest on GPU). */
 #ifndef R3D_VKC5D_H

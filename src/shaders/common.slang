@@ -1,6 +1,6 @@
-// Shared shader definitions. FrameParams must mirror r3d_frame_params in
-// src/render/render_types.h byte-for-byte (guarded by _Static_assert there).
-// Push-constant budget: 128 bytes (Vulkan guaranteed minimum).
+// Shared shader definitions. FrameParams mirrors r3d_frame_params in
+// src/render/render_types.h.  It lives in a dynamic uniform-buffer ring;
+// Vulkan only guarantees 128 bytes of push constants and this block is larger.
 
 struct FrameParams {
   float3 cam_origin;   float step_voxels;   // ray origin (volume-normalized)
@@ -43,7 +43,7 @@ float3 to_volume_point(float3 p, float3 center) {
   return to_volume_dir(p - float3(pc.vol_tx, pc.vol_ty, pc.vol_tz) - center) + center;
 }
 
-[[vk::push_constant]] FrameParams pc;
+[[vk::binding(6, 0)]] ConstantBuffer<FrameParams> pc;
 
 // Cheap per-pixel hash for jitter (PCG-ish); stable across drivers.
 float hash12(uint2 p, uint frame) {

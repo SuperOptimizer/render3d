@@ -9,6 +9,7 @@ typedef struct r3d_vkbuf {
   VkDeviceMemory mem;
   void *mapped; /* persistently mapped iff host-visible */
   VkDeviceSize size;
+  VkDeviceSize alloc_size;
 } r3d_vkbuf;
 
 typedef struct r3d_vkimage {
@@ -18,7 +19,21 @@ typedef struct r3d_vkimage {
   VkFormat format;
   VkExtent3D extent;
   uint32_t mips;
+  VkDeviceSize alloc_size;
+  bool owns_mem;
 } r3d_vkimage;
+
+typedef struct r3d_vkarena_block {
+  VkDeviceMemory mem;
+  VkDeviceSize size, used;
+  uint32_t memory_type;
+} r3d_vkarena_block;
+
+typedef struct r3d_vkarena {
+  r3d_vkarena_block *blocks;
+  uint32_t count, capacity;
+  VkDeviceSize block_size;
+} r3d_vkarena;
 
 uint32_t r3d_vk_find_mem(const r3d_vkctx *c, uint32_t type_bits, VkMemoryPropertyFlags flags);
 
@@ -30,11 +45,27 @@ void r3d_vkbuf_destroy(r3d_vkctx *c, r3d_vkbuf *b);
 /* Device-local image + view (2D if extent.depth==1, else 3D). Dedicated allocation. */
 int r3d_vkimage_create(r3d_vkctx *c, VkFormat format, VkExtent3D extent, uint32_t mips,
                        VkImageUsageFlags usage, r3d_vkimage *im);
+void r3d_vkarena_init(r3d_vkarena *a, VkDeviceSize block_size);
+void r3d_vkarena_destroy(r3d_vkctx *c, r3d_vkarena *a);
+int r3d_vkimage_create_arena(r3d_vkctx *c, r3d_vkarena *a, VkFormat format,
+                             VkExtent3D extent, uint32_t mips, VkImageUsageFlags usage,
+                             r3d_vkimage *im);
 void r3d_vkimage_destroy(r3d_vkctx *c, r3d_vkimage *im);
 
 /* One-shot command buffer helpers (submit + wait idle; init/upload paths only). */
 VkCommandBuffer r3d_vk_oneshot_begin(r3d_vkctx *c, VkCommandPool pool);
 int r3d_vk_oneshot_end(r3d_vkctx *c, VkCommandPool pool, VkCommandBuffer cmd);
+
+/* Portable fallback for streaming uploads when VK_EXT_host_image_copy is not
+ * available. `host` contains h rows with `row_length` bytes between rows. */
+int r3d_vk_upload_image_staged(r3d_vkctx *c, VkCommandPool pool, r3d_vkimage *img,
+                               const void *host, uint32_t row_length, VkOffset3D offset,
+                               VkExtent3D extent);
+/* Same upload using a caller-owned reusable staging buffer (worker-local). */
+int r3d_vk_upload_image_staged_buf(r3d_vkctx *c, VkCommandPool pool, r3d_vkbuf *stage,
+                                   r3d_vkimage *img, const void *host, uint32_t row_length,
+                                   VkOffset3D offset, VkExtent3D extent);
+int r3d_vk_image_to_general(r3d_vkctx *c, VkCommandPool pool, r3d_vkimage *img);
 
 /* Small generic compute pipeline (descriptor types given per binding). */
 typedef struct r3d_vkcomp {

@@ -1,6 +1,6 @@
-/* POD types crossing the core <-> backend boundary. r3d_frame_params is the
- * push-constant block and must mirror FrameParams in src/shaders/common.slang
- * byte-for-byte (std430 rules: float3 aligns to 16). */
+/* POD types crossing the core <-> backend boundary. r3d_frame_params is copied
+ * to the per-frame uniform-buffer ring and must mirror FrameParams in
+ * src/shaders/common.slang byte-for-byte (float3 aligns to 16). */
 #ifndef R3D_RENDER_TYPES_H
 #define R3D_RENDER_TYPES_H
 
@@ -12,6 +12,7 @@ typedef struct r3d_config {
   bool validate;       /* Vulkan validation layer + debug messenger */
   bool vsync;          /* FIFO (true) vs MAILBOX/IMMEDIATE if available */
   const char *spv_dir; /* directory holding compiled .spv shaders */
+  uint64_t gpu_budget_bytes; /* 0 = derive conservatively from the device heap */
 } r3d_config;
 
 /* Debug/render modes (mirrors shader `pc.mode`). */
@@ -23,6 +24,12 @@ enum {
   R3D_MODE_RAYDIR = 4,  /* ray-direction color (wiring check) */
   R3D_MODE_FLAT = 5,    /* full compositing, shading off (perf A/B + tests) */
   R3D_MODE_COUNT = 6,
+};
+
+enum {
+  R3D_QUALITY_FULL = 0, /* six-tap central-difference gradient */
+  R3D_QUALITY_FAST = 1, /* four-tap tetrahedral gradient */
+  R3D_QUALITY_COUNT = 2,
 };
 
 typedef struct r3d_volume_desc {

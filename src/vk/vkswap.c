@@ -123,7 +123,7 @@ int r3d_vkswap_create(r3d_vkctx *c, SDL_Window *win, bool vsync, r3d_vkswap *s) 
 }
 
 int r3d_vkswap_recreate(r3d_vkctx *c, SDL_Window *win, bool vsync, r3d_vkswap *s) {
-  vkDeviceWaitIdle(c->dev);
+  r3d_vkctx_device_wait_idle(c);
   return create_swapchain(c, win, vsync, s, s->swapchain);
 }
 

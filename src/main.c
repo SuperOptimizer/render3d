@@ -18,6 +18,9 @@
 #ifndef R3D_SPV_DIR
 #define R3D_SPV_DIR "spv" /* release fallback: exe-relative */
 #endif
+#ifndef R3D_C5D_REV
+#define R3D_C5D_REV "unknown"
+#endif
 
 #define MOUSE_SENS 0.0025f
 #define ORBIT_SENS 0.006f
@@ -50,35 +53,112 @@ static void take_screenshot(r3d_renderer *renderer, uint64_t frame) {
   free(rgba);
 }
 
+static void profile_summary(const r3d_frame_stats *samples, uint64_t n, size_t field,
+                            r3d_stats_summary *out) {
+  memset(out, 0, sizeof *out);
+  if (!samples || n == 0 || n > UINT32_MAX) return;
+  uint64_t *v = malloc((size_t)n * sizeof *v);
+  if (!v) return;
+  for (uint64_t i = 0; i < n; i++) v[i] = ((const uint64_t *)&samples[i])[field];
+  r3d_stats_summarize_values(v, (uint32_t)n, out);
+  free(v);
+}
+
+static void json_string(FILE *f, const char *s) {
+  fputc('"', f);
+  for (; s && *s; s++) {
+    unsigned char c = (unsigned char)*s;
+    if (c == '"' || c == '\\') fprintf(f, "\\%c", c);
+    else if (c == '\n') fputs("\\n", f);
+    else if (c >= 0x20) fputc(c, f);
+  }
+  fputc('"', f);
+}
+
+static void json_timing(FILE *f, const char *name, const r3d_stats_summary *s, bool comma) {
+  fprintf(f, "    \"%s\": {\"mean_ms\": %.6f, \"p50_ms\": %.6f, "
+             "\"p95_ms\": %.6f, \"p99_ms\": %.6f, \"max_ms\": %.6f}%s\n",
+          name, s->mean_ns / 1e6, (double)s->p50_ns / 1e6, (double)s->p95_ns / 1e6,
+          (double)s->p99_ns / 1e6, (double)s->max_ns / 1e6, comma ? "," : "");
+}
+
+static int write_bench_json(const char *path, const char *scenario, int width, int height,
+                            const char *quality, uint32_t warmup, const r3d_stats *stats,
+                            const r3d_frame_stats *samples, uint64_t nsamples,
+                            uint64_t pending_cell_frames, const r3d_bricks_stats *bricks) {
+  FILE *f = fopen(path, "w");
+  if (!f) {
+    fprintf(stderr, "benchmark: cannot write %s\n", path);
+    return -1;
+  }
+  r3d_stats_summary timing[10];
+  r3d_stats_summarize(stats, &timing[0], &timing[1]);
+  for (size_t i = 0; i < 8; i++) profile_summary(samples, nsamples, i, &timing[i + 2]);
+  fputs("{\n  \"schema\": \"render3d-benchmark-v1\",\n  \"scenario\": ", f);
+  json_string(f, scenario ? scenario : "static");
+  fputs(",\n  \"quality\": ", f);
+  json_string(f, quality);
+  fprintf(f, ",\n  \"width\": %d,\n  \"height\": %d,\n  \"warmup_frames\": %u,\n"
+             "  \"measured_frames\": %llu,\n  \"retained_frame_samples\": %u,\n"
+             "  \"c5d_revision\": ",
+          width, height, warmup, (unsigned long long)nsamples, stats->count);
+  json_string(f, R3D_C5D_REV);
+  fprintf(f, ",\n  \"pending_cell_frames\": %llu,\n"
+             "  \"brick_stream\": {\"decoded\": %llu, \"jobs\": %llu, "
+             "\"failures\": %u, \"mean_job_ms\": %.6f},\n  \"timings\": {\n",
+          (unsigned long long)pending_cell_frames,
+          (unsigned long long)(bricks ? bricks->decoded : 0),
+          (unsigned long long)(bricks ? bricks->jobs : 0), bricks ? bricks->failures : 0,
+          bricks && bricks->jobs ? (double)bricks->stream_ns / (double)bricks->jobs / 1e6 : 0.0);
+  static const char *names[10] = {"cpu_frame", "gpu_frame", "gpu_total", "gpu_raycast",
+                                  "gpu_blit", "gpu_gui", "cpu_wait", "cpu_acquire",
+                                  "cpu_record", "cpu_submit"};
+  for (size_t i = 0; i < 10; i++) json_timing(f, names[i], &timing[i], i + 1 < 10);
+  fputs("  }\n}\n", f);
+  int rc = ferror(f) || fclose(f) != 0 ? -1 : 0;
+  if (rc == 0) printf("benchmark json: %s\n", path);
+  return rc;
+}
+
 int main(int argc, char **argv) {
   if (argc > 1 && strcmp(argv[1], "--probe") == 0) {
     r3d_vkctx vk;
     if (r3d_vkctx_create(&vk, NULL, 0, false) != 0) return EXIT_FAILURE;
     r3d_vkctx_print_caps(&vk);
+    printf("c5d revision       : %s (GPU ABI %u)\n", R3D_C5D_REV,
+           (unsigned)R3D_C5D_GPU_ABI);
     r3d_vkctx_destroy(&vk);
     return EXIT_SUCCESS;
   }
 
   /* automation flags (tests/CI): exit after N frames, dump a screenshot */
   uint32_t exit_frames = 0;
+  uint32_t warmup_frames = 0;
   const char *shot_path = NULL;
+  const char *bench_json = NULL;
   int force_mode = -1, tf_preset = -1;
   int win_w = 1280, win_h = 720;
   float cam0[5] = {0.5f, 0.5f, -1.5f, 0.0f, 0.0f}; /* pos, yaw, pitch */
   bool no_vsync = false;
   float lowcut0 = 0.0f;
   const char *bench = NULL; /* scripted camera path: orbit | zoom | fly */
+  const char *bench_name = NULL;
+  const char *quality_arg = "interactive";
   float volpos0[3] = {0, 0, 0}, volrot0[3] = {0, 0, 0};
   uint32_t slab_wz = 0;     /* nonzero = slab mode, max visible depth */
   int depth0 = 0;           /* initial visible depth (default = max) */
   bool clip_mode = false;   /* clipmap over the shard band */
   const char *bricks_path = NULL; /* c5d shard for GPU-decoded bricks mode */
   int pool_bpa = 0, warm_mb = 0;  /* bricks hot-atlas slots/axis, warm-tier MB */
+  uint64_t gpu_budget_bytes = 0;
   bool vslab_mode = false;        /* toroidal streaming window over the export */
   int vsw = 12096, vsh = 12096, vsd = 16; /* window dims (voxels) */
   long long vsz0 = 34288;         /* start z (world; default inside the local band) */
   for (int i = 1; i < argc; i++) {
     if (i < argc - 1 && strcmp(argv[i], "--frames") == 0) exit_frames = (uint32_t)atoi(argv[i + 1]);
+    if (i < argc - 1 && strcmp(argv[i], "--warmup") == 0)
+      warmup_frames = (uint32_t)atoi(argv[i + 1]);
+    if (i < argc - 1 && strcmp(argv[i], "--bench-json") == 0) bench_json = argv[i + 1];
     if (i < argc - 1 && strcmp(argv[i], "--shot") == 0) shot_path = argv[i + 1];
     if (i < argc - 1 && strcmp(argv[i], "--mode") == 0) force_mode = atoi(argv[i + 1]);
     if (i < argc - 1 && strcmp(argv[i], "--tf") == 0) tf_preset = atoi(argv[i + 1]);
@@ -91,6 +171,8 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "--no-vsync") == 0) no_vsync = true;
     if (i < argc - 1 && strcmp(argv[i], "--lowcut") == 0) lowcut0 = (float)atof(argv[i + 1]);
     if (i < argc - 1 && strcmp(argv[i], "--bench") == 0) bench = argv[i + 1];
+    if (i < argc - 1 && strcmp(argv[i], "--bench-name") == 0) bench_name = argv[i + 1];
+    if (i < argc - 1 && strcmp(argv[i], "--quality") == 0) quality_arg = argv[i + 1];
     if (i < argc - 3 && strcmp(argv[i], "--volpos") == 0)
       for (int k = 0; k < 3; k++) volpos0[k] = (float)atof(argv[i + 1 + k]);
     if (i < argc - 3 && strcmp(argv[i], "--volrot") == 0)
@@ -100,6 +182,8 @@ int main(int argc, char **argv) {
     if (i < argc - 1 && strcmp(argv[i], "--bricks") == 0) bricks_path = argv[i + 1];
     if (i < argc - 1 && strcmp(argv[i], "--pool") == 0) pool_bpa = atoi(argv[i + 1]);
     if (i < argc - 1 && strcmp(argv[i], "--warm") == 0) warm_mb = atoi(argv[i + 1]);
+    if (i < argc - 1 && strcmp(argv[i], "--gpu-mem") == 0)
+      gpu_budget_bytes = (uint64_t)strtoull(argv[i + 1], NULL, 10) << 20;
     if (strcmp(argv[i], "--vslab") == 0) vslab_mode = true;
     if (i < argc - 1 && strcmp(argv[i], "--vsz") == 0) vsz0 = atoll(argv[i + 1]);
     if (i < argc - 3 && strcmp(argv[i], "--vswin") == 0) {
@@ -114,6 +198,20 @@ int main(int argc, char **argv) {
     }
   }
   if (bench && exit_frames == 0) exit_frames = 300;
+  if (!exit_frames) warmup_frames = 0;
+  if (exit_frames > UINT32_MAX - warmup_frames) {
+    fprintf(stderr, "--frames + --warmup is too large\n");
+    return EXIT_FAILURE;
+  }
+  uint32_t total_frames = exit_frames + warmup_frames;
+  int quality_policy = 1; /* full=0, interactive=1, fast=2 */
+  if (strcmp(quality_arg, "full") == 0) quality_policy = 0;
+  else if (strcmp(quality_arg, "interactive") == 0) quality_policy = 1;
+  else if (strcmp(quality_arg, "fast") == 0) quality_policy = 2;
+  else {
+    fprintf(stderr, "--quality must be full, interactive, or fast\n");
+    return EXIT_FAILURE;
+  }
 
   if (!SDL_Init(SDL_INIT_VIDEO)) {
     fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
@@ -127,7 +225,10 @@ int main(int argc, char **argv) {
     return EXIT_FAILURE;
   }
 
-  r3d_config cfg = {.validate = false, .vsync = !no_vsync, .spv_dir = R3D_SPV_DIR};
+  r3d_config cfg = {.validate = false,
+                    .vsync = !no_vsync,
+                    .spv_dir = R3D_SPV_DIR,
+                    .gpu_budget_bytes = gpu_budget_bytes};
   r3d_renderer *renderer = NULL;
   if (r3d_create(win, &cfg, &renderer) != 0) {
     fprintf(stderr, "renderer init failed\n");
@@ -135,6 +236,7 @@ int main(int argc, char **argv) {
     SDL_Quit();
     return EXIT_FAILURE;
   }
+  r3d_set_quality(renderer, quality_policy == 2 ? R3D_QUALITY_FAST : R3D_QUALITY_FULL);
 
   /* positional args: <volume.u8> <nx> <ny> <nz> */
   uint32_t mode = R3D_MODE_RAYDIR;
@@ -253,17 +355,25 @@ int main(int argc, char **argv) {
   uint32_t tf_idx = tf_preset > 0 ? (uint32_t)tf_preset : 0;
   uint32_t frame_index = 0;
   float fps_smooth = 60.0f;
-  bool adaptive_res = true; /* half-res rendering while the camera moves */
+  bool adaptive_res = quality_policy != 0; /* interactive/fast halve resolution while moving */
   int settle = 0;
   uint64_t last_gpu_ns = 0;
   r3d_frame_stats prof = {0};   /* EMA-smoothed for display */
   r3d_frame_stats prof_sum = {0}; /* running sums for the exit report */
   uint64_t prof_frames = 0;
+  r3d_frame_stats *prof_samples = exit_frames ? calloc(exit_frames, sizeof *prof_samples) : NULL;
+  if (exit_frames && !prof_samples) return EXIT_FAILURE;
   uint64_t prev_ns = r3d_now_ns();
 
   bool running = true;
   while (running) {
     uint64_t t0 = r3d_now_ns();
+    if (exit_frames && frame_index == warmup_frames) {
+      r3d_stats_init(&stats);
+      memset(&prof_sum, 0, sizeof prof_sum);
+      prof_frames = 0;
+      vs_pend_acc = 0;
+    }
     float dt = (float)((double)(t0 - prev_ns) / 1e9);
     prev_ns = t0;
     if (dt > 0.1f) dt = 0.1f;
@@ -288,7 +398,11 @@ int main(int argc, char **argv) {
     if (slab_wz) {
       int64_t nz0 = (int64_t)slab_z0 + in.zdelta + (int64_t)in.zpage * (int64_t)slab_depth;
       if (bench && strcmp(bench, "zsweep") == 0) /* scripted scroll for perf/tests */
-        nz0 = (int64_t)((float)slab_z0_max * (float)frame_index / (float)exit_frames);
+        nz0 = (int64_t)((float)slab_z0_max *
+                        (float)(frame_index < warmup_frames ? frame_index
+                                                           : frame_index - warmup_frames) /
+                        (float)(frame_index < warmup_frames && warmup_frames ? warmup_frames
+                                                                            : exit_frames));
       if (auto_scroll) {
         auto_accum += auto_speed * dt;
         float whole = floorf(auto_accum);
@@ -365,7 +479,11 @@ int main(int argc, char **argv) {
 
     /* scripted camera paths for reproducible perf runs (override user input) */
     if (bench) {
-      float ph = (float)frame_index / (float)exit_frames; /* 0..1 over the run */
+      uint32_t phase_frame = frame_index < warmup_frames ? frame_index
+                                                         : frame_index - warmup_frames;
+      uint32_t phase_count = frame_index < warmup_frames && warmup_frames ? warmup_frames
+                                                                          : exit_frames;
+      float ph = phase_count ? (float)phase_frame / (float)phase_count : 0.0f;
       float tau = 6.2831853f;
       if (strcmp(bench, "orbit") == 0) {
         cam.yaw = ph * tau;
@@ -426,7 +544,7 @@ int main(int argc, char **argv) {
     settle = moving ? 15 : (settle > 0 ? settle - 1 : 0);
     bool half_res = adaptive_res && settle > 0;
     if (getenv("R3D_FORCE_HALF")) half_res = true; /* testing/benching the path */
-    else if (in.screenshot || (exit_frames && shot_path && frame_index + 1 >= exit_frames))
+    else if (in.screenshot || (total_frames && shot_path && frame_index + 1 >= total_frames))
       half_res = false; /* captures always full res */
     uint32_t rvw = half_res ? (uint32_t)w / 2 : (uint32_t)w;
     uint32_t rvh = half_res ? (uint32_t)h / 2 : (uint32_t)h;
@@ -497,6 +615,12 @@ int main(int argc, char **argv) {
              (unsigned long long)(bst.warm_cap >> 20), bst.inflight ? "  streaming..." : "");
     }
     igSliderFloat("lod bias", &lod_bias, -2.0f, 4.0f, "%.2f", 0);
+    int qp = quality_policy;
+    if (igCombo_Str("quality", &qp, "full\0interactive\0fast\0\0", 3)) {
+      quality_policy = qp;
+      adaptive_res = quality_policy != 0;
+      r3d_set_quality(renderer, quality_policy == 2 ? R3D_QUALITY_FAST : R3D_QUALITY_FULL);
+    }
     igCheckbox("half-res while moving", &adaptive_res);
     if (igCollapsingHeader_TreeNodeFlags("transform", 0)) {
       float vt[3] = {vol_t.x, vol_t.y, vol_t.z};
@@ -583,7 +707,8 @@ int main(int argc, char **argv) {
       r3d_vslab_frame(renderer, vs_fx, vs_fy, vs_z0, moving ? 1u : 3u, &p);
       /* residency-lag metric: cells short of full residency, second half of
        * the run only (the first half absorbs the initial window fill) */
-      if (bench && frame_index * 2 >= exit_frames) {
+      if (bench && frame_index > warmup_frames &&
+          (frame_index - warmup_frames) * 2 >= exit_frames) {
         int64_t bo_[3];
         uint32_t pd = 0;
         r3d_vslab_get(renderer, bo_, &pd);
@@ -627,7 +752,8 @@ int main(int argc, char **argv) {
     }
     r3d_frame_stats st = {0};
     int frc = r3d_frame(renderer, &p, &st);
-    if (frc == 0) {
+    bool measuring = !exit_frames || frame_index > warmup_frames;
+    if (frc == 0 && measuring) {
       last_gpu_ns = st.gpu_ns;
       const uint64_t *sv = (const uint64_t *)&st;
       uint64_t *pv = (uint64_t *)&prof, *qv = (uint64_t *)&prof_sum;
@@ -635,6 +761,7 @@ int main(int argc, char **argv) {
         pv[k] = (uint64_t)((double)pv[k] * 0.95 + (double)sv[k] * 0.05);
         qv[k] += sv[k];
       }
+      if (prof_samples && prof_frames < exit_frames) prof_samples[prof_frames] = st;
       prof_frames++;
     }
     if (frc < 0) {
@@ -642,7 +769,7 @@ int main(int argc, char **argv) {
       running = false;
     }
     if (in.screenshot) take_screenshot(renderer, stats.frame_index);
-    if (exit_frames && frame_index >= exit_frames) {
+    if (total_frames && frame_index >= total_frames) {
       if (shot_path) {
         uint32_t sw = 0, sh = 0;
         r3d_read_frame(renderer, NULL, &sw, &sh);
@@ -654,8 +781,10 @@ int main(int argc, char **argv) {
       running = false;
     }
 
-    r3d_stats_push(&stats, r3d_now_ns() - t0, st.gpu_ns);
-    r3d_stats_report(&stats);
+    if (measuring) {
+      r3d_stats_push(&stats, r3d_now_ns() - t0, st.gpu_ns);
+      r3d_stats_report(&stats);
+    }
   }
 
   r3d_stats_report_now(&stats);
@@ -672,6 +801,19 @@ int main(int argc, char **argv) {
   }
   if (vslab_mode && bench)
     printf("vslab bench: pending cell-frames %llu\n", (unsigned long long)vs_pend_acc);
+  r3d_bricks_stats final_bst = {0};
+  if (bricks_path) {
+    r3d_bricks_flush(renderer);
+    r3d_bricks_get_stats(renderer, &final_bst);
+    printf("bricks bench: decoded %llu in %llu jobs, %.2f ms/job, %u failure(s), hot %u/%u\n",
+           (unsigned long long)final_bst.decoded, (unsigned long long)final_bst.jobs,
+           final_bst.jobs ? (double)final_bst.stream_ns / (double)final_bst.jobs / 1e6 : 0.0,
+           final_bst.failures, final_bst.hot, final_bst.hot_cap);
+  }
+  if (bench_json)
+    write_bench_json(bench_json, bench_name ? bench_name : bench, win_w, win_h, quality_arg,
+                     warmup_frames, &stats, prof_samples, prof_frames, vs_pend_acc, &final_bst);
+  free(prof_samples);
   r3d_destroy(renderer);
   SDL_DestroyWindow(win);
   SDL_Quit();
