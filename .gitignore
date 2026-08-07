@@ -5,6 +5,7 @@ tools/slang/
 .cache/
 compile_commands.json
 band/
+cache/
 *.shard
 pyramid/
 *.c5s

@@ -1,6 +1,7 @@
 /* render3d — volumetric renderer for Vesuvius Challenge micro-CT volumes.
  * M1: SDL3 window + Vulkan compute raycaster (see spec/ and docs/measured.md). */
 #include <SDL3/SDL.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,6 +13,7 @@
 #include "core/input.h"
 #include "core/screenshot.h"
 #include "core/stats.h"
+#include "core/umbilicus.h"
 #include "render/render.h"
 #include "vk/vkctx.h"
 
@@ -27,6 +29,78 @@
 #define BASE_SPEED 0.4f /* volume units per second */
 
 enum { CAM_ORBIT = 0, CAM_FLY = 1 };
+
+static const char PHERC1218_SOURCE[] =
+    "https://dl.ash2txt.org/community-uploads/forrest/exports/PHerc1218/"
+    "20250521120456-8.640um-1.2m-116keV-masked.zarr";
+static const char PHERC1218_SHARDS[] =
+    "https://dl.ash2txt.org/community-uploads/forrest/exports/PHerc1218/"
+    "20250521120456-8.640um-1.2m-116keV-masked.zarr/0/c";
+enum { PHERC1218_NX = 8192, PHERC1218_NY = 8192, PHERC1218_NZ = 23552 };
+
+static int annotation_z0(int z, uint32_t nz, uint32_t depth) {
+  int64_t z0 = (int64_t)z - (int64_t)depth / 2;
+  int64_t max = (int64_t)nz - depth;
+  if (max < 0) max = 0;
+  if (z0 < 0) z0 = 0;
+  if (z0 > max) z0 = max;
+  return (int)z0;
+}
+
+static bool annotation_pick(const r3d_camera *cam, r3d_v3 right, r3d_v3 up, r3d_v3 fwd,
+                            r3d_m3 model, r3d_v3 vol_t, float sx, float sy, int view_w,
+                            int view_h, uint32_t W, uint32_t H, uint32_t D, int64_t x0,
+                            int64_t y0, int64_t z0, int z, double *x, double *y) {
+  if (view_w <= 0 || view_h <= 0 || !W || !H || !D || !x || !y) return false;
+  float ndcx = 2.0f * (sx + 0.5f) / (float)view_w - 1.0f;
+  float ndcy = 1.0f - 2.0f * (sy + 0.5f) / (float)view_h;
+  r3d_v3 dir = v3_norm(v3_add(fwd, v3_add(v3_scale(right, ndcx), v3_scale(up, ndcy))));
+  float ey = (float)H / (float)W, ez = (float)D / (float)W;
+  r3d_v3 center = v3(0.5f, ey * 0.5f, ez * 0.5f);
+  r3d_v3 ro = v3_add(m3_tmul(model, v3_sub(v3_sub(cam->pos, vol_t), center)), center);
+  r3d_v3 rd = m3_tmul(model, dir);
+  if (fabsf(rd.z) < 1e-8f) return false;
+  float plane = (float)((int64_t)z - z0) / (float)W;
+  float t = (plane - ro.z) / rd.z;
+  if (t < 0.0f) return false;
+  r3d_v3 p = v3_add(ro, v3_scale(rd, t));
+  if (p.x < 0.0f || p.x >= 1.0f || p.y < 0.0f || p.y >= ey) return false;
+  *x = (double)x0 + (double)p.x * W;
+  *y = (double)y0 + (double)p.y * W;
+  return *x >= 0.0 && *x < (double)W && *y >= 0.0 && *y < (double)H;
+}
+
+static bool annotation_project(const r3d_umbilicus_point *point, const r3d_camera *cam,
+                               r3d_v3 right, r3d_v3 up, r3d_v3 fwd, r3d_m3 model,
+                               r3d_v3 vol_t, int view_w, int view_h, uint32_t W, uint32_t H,
+                               uint32_t D, int64_t x0, int64_t y0, int64_t z0, ImVec2 *screen) {
+  if (!point || !screen || view_w <= 0 || view_h <= 0) return false;
+  float ey = (float)H / (float)W, ez = (float)D / (float)W;
+  r3d_v3 center = v3(0.5f, ey * 0.5f, ez * 0.5f);
+  r3d_v3 p = v3((float)(point->x - (double)x0) / (float)W,
+                (float)(point->y - (double)y0) / (float)W,
+                (float)(point->z - (double)z0) / (float)W);
+  r3d_v3 world = v3_add(v3_add(m3_mul(model, v3_sub(p, center)), center), vol_t);
+  r3d_v3 d = v3_sub(world, cam->pos);
+  float rz = v3_dot(d, fwd), rl = v3_len(right), ul = v3_len(up);
+  if (rz <= 0.0f || rl <= 0.0f || ul <= 0.0f) return false;
+  float nx = v3_dot(d, v3_scale(right, 1.0f / rl)) / (rz * rl);
+  float ny = v3_dot(d, v3_scale(up, 1.0f / ul)) / (rz * ul);
+  screen->x = (nx + 1.0f) * 0.5f * (float)view_w;
+  screen->y = (1.0f - ny) * 0.5f * (float)view_h;
+  return screen->x >= 0.0f && screen->x < (float)view_w && screen->y >= 0.0f &&
+         screen->y < (float)view_h;
+}
+
+static int save_umbilicus(r3d_umbilicus *u, const char *path, char status[256]) {
+  if (r3d_umbilicus_save(u, path, PHERC1218_SOURCE, PHERC1218_NZ, PHERC1218_NY,
+                         PHERC1218_NX) != 0) {
+    snprintf(status, 256, "save failed: %s", strerror(errno));
+    return -1;
+  }
+  snprintf(status, 256, "saved %zu point%s", u->count, u->count == 1 ? "" : "s");
+  return 0;
+}
 
 /* first voxel value with nonzero TF alpha: below it, samples are invisible */
 static float tf_min_visible(const uint8_t lut[256][4]) {
@@ -105,11 +179,28 @@ static int write_bench_json(const char *path, const char *scenario, int width, i
   json_string(f, R3D_C5D_REV);
   fprintf(f, ",\n  \"pending_cell_frames\": %llu,\n"
              "  \"brick_stream\": {\"decoded\": %llu, \"jobs\": %llu, "
-             "\"failures\": %u, \"mean_job_ms\": %.6f},\n  \"timings\": {\n",
+             "\"failures\": %u, \"mean_job_ms\": %.6f,\n"
+             "    \"levels\": %u,\n"
+             "    \"lod_wanted\": [%u, %u, %u, %u, %u, %u, %u, %u],\n"
+             "    \"lod_requests\": [%llu, %llu, %llu, %llu, %llu, %llu, %llu, %llu]\n"
+             "  },\n  \"timings\": {\n",
           (unsigned long long)pending_cell_frames,
           (unsigned long long)(bricks ? bricks->decoded : 0),
           (unsigned long long)(bricks ? bricks->jobs : 0), bricks ? bricks->failures : 0,
-          bricks && bricks->jobs ? (double)bricks->stream_ns / (double)bricks->jobs / 1e6 : 0.0);
+          bricks && bricks->jobs ? (double)bricks->stream_ns / (double)bricks->jobs / 1e6 : 0.0,
+          bricks ? bricks->nlevels : 0, bricks ? bricks->lod_wanted[0] : 0,
+          bricks ? bricks->lod_wanted[1] : 0, bricks ? bricks->lod_wanted[2] : 0,
+          bricks ? bricks->lod_wanted[3] : 0, bricks ? bricks->lod_wanted[4] : 0,
+          bricks ? bricks->lod_wanted[5] : 0, bricks ? bricks->lod_wanted[6] : 0,
+          bricks ? bricks->lod_wanted[7] : 0,
+          (unsigned long long)(bricks ? bricks->lod_requests[0] : 0),
+          (unsigned long long)(bricks ? bricks->lod_requests[1] : 0),
+          (unsigned long long)(bricks ? bricks->lod_requests[2] : 0),
+          (unsigned long long)(bricks ? bricks->lod_requests[3] : 0),
+          (unsigned long long)(bricks ? bricks->lod_requests[4] : 0),
+          (unsigned long long)(bricks ? bricks->lod_requests[5] : 0),
+          (unsigned long long)(bricks ? bricks->lod_requests[6] : 0),
+          (unsigned long long)(bricks ? bricks->lod_requests[7] : 0));
   static const char *names[10] = {"cpu_frame", "gpu_frame", "gpu_total", "gpu_raycast",
                                   "gpu_blit", "gpu_gui", "cpu_wait", "cpu_acquire",
                                   "cpu_record", "cpu_submit"};
@@ -146,14 +237,24 @@ int main(int argc, char **argv) {
   const char *quality_arg = "interactive";
   float volpos0[3] = {0, 0, 0}, volrot0[3] = {0, 0, 0};
   uint32_t slab_wz = 0;     /* nonzero = slab mode, max visible depth */
-  int depth0 = 0;           /* initial visible depth (default = max) */
+  int depth0 = 0;           /* initial visible depth; explicit 0 = full volume */
+  bool depth_given = false;
   bool clip_mode = false;   /* clipmap over the shard band */
   const char *bricks_path = NULL; /* c5d shard for GPU-decoded bricks mode */
   int pool_bpa = 0, warm_mb = 0;  /* bricks hot-atlas slots/axis, warm-tier MB */
+  int brick_z = -1, brick_depth = 0; /* global manifest XY slice; depth 0 = full volume */
+  uint32_t brick_shape[3] = {0, 0, 0};
+  bool brick_is_lod = false;
   uint64_t gpu_budget_bytes = 0;
   bool vslab_mode = false;        /* toroidal streaming window over the export */
   int vsw = 12096, vsh = 12096, vsd = 16; /* window dims (voxels) */
   long long vsz0 = 34288;         /* start z (world; default inside the local band) */
+  uint32_t vsnx = 43008, vsny = 43008, vsnz = 68608;
+  const char *vscache = "band", *vsurl = NULL;
+  const char *umbilicus_path = NULL;
+  int annotation_prefetch = 5; /* annotation steps ahead; one slot is kept behind */
+  int annotation_z_prefetch = 32; /* contiguous GPU-resident fine-scroll margin */
+  bool vsz_given = false;
   for (int i = 1; i < argc; i++) {
     if (i < argc - 1 && strcmp(argv[i], "--frames") == 0) exit_frames = (uint32_t)atoi(argv[i + 1]);
     if (i < argc - 1 && strcmp(argv[i], "--warmup") == 0)
@@ -177,25 +278,58 @@ int main(int argc, char **argv) {
       for (int k = 0; k < 3; k++) volpos0[k] = (float)atof(argv[i + 1 + k]);
     if (i < argc - 3 && strcmp(argv[i], "--volrot") == 0)
       for (int k = 0; k < 3; k++) volrot0[k] = (float)atof(argv[i + 1 + k]) / 57.29578f;
-    if (i < argc - 1 && strcmp(argv[i], "--depth") == 0) depth0 = atoi(argv[i + 1]);
+    if (i < argc - 1 && strcmp(argv[i], "--depth") == 0) {
+      depth0 = atoi(argv[i + 1]);
+      depth_given = true;
+    }
     if (strcmp(argv[i], "--clipmap") == 0) clip_mode = true;
     if (i < argc - 1 && strcmp(argv[i], "--bricks") == 0) bricks_path = argv[i + 1];
+    if (i < argc - 1 && strcmp(argv[i], "--brick-z") == 0) brick_z = atoi(argv[i + 1]);
     if (i < argc - 1 && strcmp(argv[i], "--pool") == 0) pool_bpa = atoi(argv[i + 1]);
     if (i < argc - 1 && strcmp(argv[i], "--warm") == 0) warm_mb = atoi(argv[i + 1]);
     if (i < argc - 1 && strcmp(argv[i], "--gpu-mem") == 0)
       gpu_budget_bytes = (uint64_t)strtoull(argv[i + 1], NULL, 10) << 20;
     if (strcmp(argv[i], "--vslab") == 0) vslab_mode = true;
-    if (i < argc - 1 && strcmp(argv[i], "--vsz") == 0) vsz0 = atoll(argv[i + 1]);
+    if (i < argc - 1 && strcmp(argv[i], "--vsz") == 0) {
+      vsz0 = atoll(argv[i + 1]);
+      vsz_given = true;
+    }
     if (i < argc - 3 && strcmp(argv[i], "--vswin") == 0) {
       vsw = atoi(argv[i + 1]);
       vsh = atoi(argv[i + 2]);
       vsd = atoi(argv[i + 3]);
     }
+    if (i < argc - 1 && strcmp(argv[i], "--umbilicus") == 0) umbilicus_path = argv[i + 1];
+    if (i < argc - 1 && strcmp(argv[i], "--ann-prefetch") == 0)
+      annotation_prefetch = atoi(argv[i + 1]);
+    if (i < argc - 1 && strcmp(argv[i], "--ann-z-prefetch") == 0)
+      annotation_z_prefetch = atoi(argv[i + 1]);
     if (strcmp(argv[i], "--slab") == 0) {
       slab_wz = 32;
       if (i < argc - 1 && argv[i + 1][0] >= '0' && argv[i + 1][0] <= '9')
         slab_wz = (uint32_t)atoi(argv[i + 1]);
     }
+  }
+  if (umbilicus_path) {
+    vslab_mode = true;
+    vsnx = PHERC1218_NX;
+    vsny = PHERC1218_NY;
+    vsnz = PHERC1218_NZ;
+    vsw = PHERC1218_NX;
+    vsh = PHERC1218_NY;
+    vsd = 8;
+    vscache = "cache/PHerc1218";
+    vsurl = PHERC1218_SHARDS;
+    if (!vsz_given) vsz0 = 0;
+  }
+  if (annotation_prefetch < 0 || annotation_prefetch >= R3D_VSLAB_PREFETCH_MAX) {
+    fprintf(stderr, "--ann-prefetch must be between 0 and %u\n",
+            R3D_VSLAB_PREFETCH_MAX - 1);
+    return EXIT_FAILURE;
+  }
+  if (annotation_z_prefetch < 0 || annotation_z_prefetch > 128) {
+    fprintf(stderr, "--ann-z-prefetch must be between 0 and 128\n");
+    return EXIT_FAILURE;
   }
   if (bench && exit_frames == 0) exit_frames = 300;
   if (!exit_frames) warmup_frames = 0;
@@ -212,6 +346,36 @@ int main(int argc, char **argv) {
     fprintf(stderr, "--quality must be full, interactive, or fast\n");
     return EXIT_FAILURE;
   }
+
+  r3d_umbilicus umbilicus;
+  r3d_umbilicus_init(&umbilicus);
+  int annotation_step = 100;
+  int annotation_z = (int)vsz0;
+  int annotation_last_z = annotation_z, annotation_bench_z = annotation_z, annotation_dir = 1;
+  char annotation_status[256] = "";
+  if (umbilicus_path) {
+    int urc = r3d_umbilicus_load(&umbilicus, umbilicus_path);
+    if (urc < 0) {
+      fprintf(stderr, "umbilicus: cannot load %s (expected Villa-compatible JSON)\n",
+              umbilicus_path);
+      r3d_umbilicus_free(&umbilicus);
+      return EXIT_FAILURE;
+    }
+    if (urc == 0) {
+      snprintf(annotation_status, sizeof annotation_status, "loaded %zu point%s",
+               umbilicus.count, umbilicus.count == 1 ? "" : "s");
+      if (!vsz_given && umbilicus.count) {
+        double next = umbilicus.points[umbilicus.count - 1].z + annotation_step;
+        annotation_z = (int)llround(next);
+      }
+    } else {
+      snprintf(annotation_status, sizeof annotation_status, "new annotation");
+    }
+    if (annotation_z < 0) annotation_z = 0;
+    if (annotation_z >= (int)vsnz) annotation_z = (int)vsnz - 1;
+  }
+  annotation_last_z = annotation_z;
+  annotation_bench_z = annotation_z;
 
   if (!SDL_Init(SDL_INIT_VIDEO)) {
     fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
@@ -273,17 +437,43 @@ int main(int argc, char **argv) {
   if (bricks_path) {
     if (r3d_bricks_begin(renderer, bricks_path, (uint32_t)pool_bpa, (uint32_t)warm_mb) != 0)
       return EXIT_FAILURE;
+    r3d_bricks_shape(renderer, brick_shape);
+    r3d_bricks_stats initial_bst;
+    r3d_bricks_get_stats(renderer, &initial_bst);
+    brick_is_lod = initial_bst.nlevels > 1u;
+    brick_depth = depth_given ? depth0 : (brick_is_lod ? 8 : 0);
+    if (brick_depth < 0) brick_depth = 0;
+    if (brick_depth > (int)brick_shape[2]) brick_depth = (int)brick_shape[2];
+    if (brick_z < 0) brick_z = brick_depth ? ((int)brick_shape[2] - brick_depth) / 2 : 0;
+    if (brick_z < 0) brick_z = 0;
+    if (brick_z > (int)brick_shape[2] - brick_depth)
+      brick_z = (int)brick_shape[2] - brick_depth;
     mode = R3D_MODE_FULL;
   }
 
-  int64_t vs_z0 = (int64_t)vsz0;
-  double vs_fx = 21504.0, vs_fy = 21504.0;
+  int64_t vs_z0 = umbilicus_path ? annotation_z0(annotation_z, vsnz, (uint32_t)vsd)
+                                  : (int64_t)vsz0;
+  double vs_fx = (double)vsnx * 0.5, vs_fy = (double)vsny * 0.5;
   bool vs_follow = true;
   uint64_t vs_pend_acc = 0;
   if (vslab_mode) {
-    if (r3d_vslab_begin(renderer, "band", (uint32_t)vsw, (uint32_t)vsh, (uint32_t)vsd) != 0)
+    r3d_vslab_desc vd = {.nx = vsnx,
+                         .ny = vsny,
+                         .nz = vsnz,
+                         .W = (uint32_t)vsw,
+                         .H = (uint32_t)vsh,
+                         .D = (uint32_t)vsd,
+                         .cache_dir = vscache,
+                         .shard_url = vsurl,
+                         .z_prefetch = umbilicus_path ? (uint32_t)annotation_z_prefetch : 0u,
+                         .prefetch_slots = umbilicus_path && annotation_prefetch
+                                               ? (uint32_t)annotation_prefetch + 1u
+                                               : 0u,
+                         .prefetch_threads = umbilicus_path ? 6u : 0u};
+    if (r3d_vslab_begin(renderer, &vd) != 0)
       return EXIT_FAILURE;
     mode = R3D_MODE_FULL;
+    if (umbilicus_path) vs_follow = false; /* full XY plane is fixed at origin */
   }
 
   /* clipmap: 43k^2 cross sections from the shard band + pyramid */
@@ -331,6 +521,17 @@ int main(int argc, char **argv) {
       float ey = (float)slab_src.ny / (float)slab_src.nx;
       float ez = (float)slab_wz / (float)slab_src.nx;
       r3d_camera_orbit_set(&cam, v3(0.5f, ey * 0.5f, ez * 0.5f), 1.4f);
+    } else if (bricks_path) {
+      float e[3];
+      r3d_bricks_extent(renderer, e);
+      float tz = e[2] * 0.5f;
+      if (brick_depth > 0) {
+        uint32_t md = brick_shape[0] > brick_shape[1] ? brick_shape[0] : brick_shape[1];
+        if (brick_shape[2] > md) md = brick_shape[2];
+        tz = ((float)brick_z + 0.5f * (float)brick_depth) / (float)md;
+      }
+      r3d_camera_orbit_set(&cam, v3(e[0] * 0.5f, e[1] * 0.5f, tz),
+                           brick_depth > 0 ? 0.42f : 2.0f);
     } else {
       r3d_camera_orbit_set(&cam, v3(0.5f, 0.5f, 0.5f), 2.0f);
     }
@@ -380,7 +581,7 @@ int main(int argc, char **argv) {
 
     ImGuiIO *io = igGetIO_Nil(); /* Want* flags reflect last frame — fine */
     r3d_input_poll(&in, win, gui_event_hook, renderer, !io->WantCaptureMouse,
-                   cam_mode == CAM_FLY);
+                   cam_mode == CAM_FLY, umbilicus_path != NULL);
     if (io->WantCaptureKeyboard && !in.captured)
       in.move[0] = in.move[1] = in.move[2] = 0.0f;
     if (in.quit) running = false;
@@ -388,6 +589,47 @@ int main(int argc, char **argv) {
     if (in.mode_delta) {
       mode = (mode + (uint32_t)in.mode_delta) % R3D_MODE_COUNT;
       printf("mode: %u\n", mode);
+    }
+    bool z_navigated = false;
+    if (umbilicus_path) {
+      int old_annotation_z = annotation_z;
+      int64_t nz = annotation_z;
+      nz += in.zdelta;
+      nz += (int64_t)in.zpage * annotation_step;
+      /* In annotation mode the ordinary wheel traverses z. Shift+wheel is
+       * retained as camera zoom for inspecting a difficult center. Wheel is
+       * deliberately fine-grained; buttons/pages retain annotation_step. */
+      if (!in.fast && in.wheel != 0.0f && !io->WantCaptureMouse) {
+        nz += in.wheel > 0.0f ? 1 : -1;
+        in.wheel = 0.0f;
+      }
+      if (nz < 0) nz = 0;
+      if (nz >= vsnz) nz = (int64_t)vsnz - 1;
+      annotation_z = (int)nz;
+      z_navigated = annotation_z != old_annotation_z;
+      vs_z0 = annotation_z0(annotation_z, vsnz, (uint32_t)vsd);
+    }
+    if (bricks_path && brick_depth > 0 && !umbilicus_path) {
+      int old_brick_z = brick_z;
+      int64_t nz = (int64_t)brick_z + in.zdelta + (int64_t)in.zpage * brick_depth;
+      /* Global LOD slices use the same fine wheel semantics as annotation:
+       * wheel changes one z slice, Shift+wheel retains camera zoom. */
+      if (!in.fast && in.wheel != 0.0f && !io->WantCaptureMouse) {
+        nz += in.wheel > 0.0f ? 1 : -1;
+        in.wheel = 0.0f;
+      }
+      int64_t zmax = (int64_t)brick_shape[2] - brick_depth;
+      if (nz < 0) nz = 0;
+      if (nz > zmax) nz = zmax;
+      brick_z = (int)nz;
+      z_navigated = z_navigated || brick_z != old_brick_z;
+      if (cam_mode == CAM_ORBIT && brick_z != old_brick_z) {
+        uint32_t md = brick_shape[0] > brick_shape[1] ? brick_shape[0] : brick_shape[1];
+        if (brick_shape[2] > md) md = brick_shape[2];
+        float dz = (float)(brick_z - old_brick_z) / (float)md;
+        cam.target.z += dz;
+        cam.pos.z += dz;
+      }
     }
     if (clip_mode) {
       int64_t nz0 = (int64_t)clip_z0 + in.zdelta + (int64_t)in.zpage * (int64_t)clip_depth;
@@ -488,12 +730,33 @@ int main(int argc, char **argv) {
       if (strcmp(bench, "orbit") == 0) {
         cam.yaw = ph * tau;
         cam.pitch = 0.5f * sinf(ph * tau * 2.0f);
-        r3d_camera_orbit_set(&cam, v3(0.5f, 0.5f, 0.5f), 2.0f);
+        r3d_v3 target = v3(0.5f, 0.5f, 0.5f);
+        if (bricks_path) {
+          float e[3];
+          r3d_bricks_extent(renderer, e);
+          target = v3(e[0] * 0.5f, e[1] * 0.5f, e[2] * 0.5f);
+          if (brick_depth > 0) {
+            uint32_t md = brick_shape[0] > brick_shape[1] ? brick_shape[0] : brick_shape[1];
+            if (brick_shape[2] > md) md = brick_shape[2];
+            target.z = ((float)brick_z + 0.5f * (float)brick_depth) / (float)md;
+          }
+        }
+        r3d_camera_orbit_set(&cam, target, 2.0f);
       } else if (strcmp(bench, "zoom") == 0) {
         cam.yaw = ph * tau * 0.5f;
         cam.pitch = 0.2f;
-        r3d_camera_orbit_set(&cam, v3(0.5f, 0.5f, 0.5f),
-                             1.75f - 1.55f * sinf(ph * 3.14159265f));
+        r3d_v3 target = v3(0.5f, 0.5f, 0.5f);
+        if (bricks_path) {
+          float e[3];
+          r3d_bricks_extent(renderer, e);
+          target = v3(e[0] * 0.5f, e[1] * 0.5f, e[2] * 0.5f);
+          if (brick_depth > 0) {
+            uint32_t md = brick_shape[0] > brick_shape[1] ? brick_shape[0] : brick_shape[1];
+            if (brick_shape[2] > md) md = brick_shape[2];
+            target.z = ((float)brick_z + 0.5f * (float)brick_depth) / (float)md;
+          }
+        }
+        r3d_camera_orbit_set(&cam, target, 1.75f - 1.55f * sinf(ph * 3.14159265f));
       } else if (strcmp(bench, "fly") == 0) { /* weaving pass through the volume */
         cam.pos = v3(0.5f + 0.15f * sinf(ph * tau * 1.5f), 0.5f + 0.1f * sinf(ph * tau),
                      -0.3f + 1.6f * ph);
@@ -506,14 +769,26 @@ int main(int argc, char **argv) {
       } else if (strcmp(bench, "zoomio") == 0) {
         /* full zoom sweep: whole-composite view down to voxel scale and back
          * (log-space triangle wave) — walks every LOD band the mode has */
+        float tx = 0.5f;
         float ey = slab_wz ? (float)slab_src.ny / (float)slab_src.nx : 1.0f;
         float ez = slab_wz ? (float)slab_wz / (float)slab_src.nx : 1.0f;
         if (vslab_mode) { ey = (float)vsh / (float)vsw; ez = (float)(vsd + 2) / (float)vsw; }
+        if (bricks_path) {
+          float e[3];
+          r3d_bricks_extent(renderer, e);
+          tx = e[0] * 0.5f; ey = e[1]; ez = e[2];
+        }
         float tri = ph < 0.5f ? ph * 2.0f : 2.0f - ph * 2.0f; /* 0->1->0 */
         float d = 1.6f * powf(0.002f / 1.6f, tri);
         cam.yaw = 0.0f;
         cam.pitch = 0.0f;
-        r3d_camera_orbit_set(&cam, v3(0.5f, ey * 0.5f, ez * 0.5f), d);
+        float tz = ez * 0.5f;
+        if (bricks_path && brick_depth > 0) {
+          uint32_t md = brick_shape[0] > brick_shape[1] ? brick_shape[0] : brick_shape[1];
+          if (brick_shape[2] > md) md = brick_shape[2];
+          tz = ((float)brick_z + 0.5f * (float)brick_depth) / (float)md;
+        }
+        r3d_camera_orbit_set(&cam, v3(tx, ey * 0.5f, tz), d);
       } else if (strcmp(bench, "volrot") == 0) {
         /* mid-zoom + model rotation: worst case for anisotropic footprints */
         float ey = slab_wz ? (float)slab_src.ny / (float)slab_src.nx : 1.0f;
@@ -524,9 +799,39 @@ int main(int argc, char **argv) {
         cam.yaw = 0.0f;
         cam.pitch = 0.0f;
         r3d_camera_orbit_set(&cam, v3(0.5f, ey * 0.5f, ez * 0.5f), 0.2f);
+      } else if (umbilicus_path && strcmp(bench, "annstep") == 0) {
+        int64_t bz = annotation_bench_z;
+        if (ph >= 0.6f) bz += annotation_step;
+        if (bz >= vsnz) bz = (int64_t)vsnz - 1;
+        annotation_z = (int)bz;
+      } else if (umbilicus_path && strcmp(bench, "annscroll") == 0) {
+        /* Hold long enough to fill look-ahead, then make six consecutive
+         * annotation-step moves 0.6 s apart in a 600-frame vsynced run. */
+        int64_t n = ph < 0.6f ? 0 : 1 + (int64_t)((ph - 0.6f) / 0.06f);
+        if (n > 6) n = 6;
+        int64_t bz = (int64_t)annotation_bench_z + n * annotation_step;
+        if (bz >= vsnz) bz = (int64_t)vsnz - 1;
+        annotation_z = (int)bz;
+      } else if (umbilicus_path && strcmp(bench, "annwheel") == 0) {
+        /* Fine-scroll stress: after residency warmup, traverse 20 adjacent
+         * slices at ten detents/second in a 600-frame vsynced run. */
+        int64_t n = ph < 0.7f ? 0 : 1 + (int64_t)((ph - 0.7f) / 0.01f);
+        if (n > 20) n = 20;
+        int64_t bz = (int64_t)annotation_bench_z + n;
+        if (bz >= vsnz) bz = (int64_t)vsnz - 1;
+        annotation_z = (int)bz;
       } /* other bench names (zsweep) keep the default camera */
       if (vslab_mode && strcmp(bench, "zsweep") == 0) /* scroll z across the band */
         vs_z0 = 33792 + (int64_t)(ph * (1024.0f - (float)(vsd + 2)));
+      if (bricks_path && brick_depth > 0 && strcmp(bench, "zsweep") == 0) {
+        int bz = (int)(ph * (float)((int)brick_shape[2] - brick_depth));
+        uint32_t md = brick_shape[0] > brick_shape[1] ? brick_shape[0] : brick_shape[1];
+        if (brick_shape[2] > md) md = brick_shape[2];
+        float dz = (float)(bz - brick_z) / (float)md;
+        brick_z = bz;
+        cam.target.z += dz;
+        cam.pos.z += dz;
+      }
       if (vslab_mode && strcmp(bench, "clippan") == 0) { /* xy window churn */
         vs_follow = false;
         vs_fx = 12000.0 + (double)ph * 18000.0;
@@ -535,11 +840,34 @@ int main(int argc, char **argv) {
     }
     r3d_v3 right, up, fwd;
     r3d_camera_basis(&cam, (float)w / (float)h, &right, &up, &fwd);
+    r3d_m3 vm = m3_ypr(vol_rot[0], vol_rot[1], vol_rot[2]);
+
+    if (umbilicus_path && in.annotate_click) {
+      int64_t origin[3] = {0, 0, vs_z0};
+      r3d_vslab_get(renderer, origin, NULL);
+      if (origin[0] < 0) origin[0] = 0;
+      if (origin[1] < 0) origin[1] = 0;
+      double ax = 0.0, ay = 0.0;
+      if (annotation_pick(&cam, right, up, fwd, vm, vol_t, in.click_xy[0], in.click_xy[1],
+                          w, h, (uint32_t)vsw, (uint32_t)vsh, (uint32_t)vsd, origin[0],
+                          origin[1], vs_z0, annotation_z, &ax, &ay) &&
+          r3d_umbilicus_set(&umbilicus, ax, ay, annotation_z) == 0) {
+        save_umbilicus(&umbilicus, umbilicus_path, annotation_status);
+        if (in.click_ctrl) {
+          int64_t next = (int64_t)annotation_z + annotation_step;
+          annotation_z = (int)(next < vsnz ? next : (int64_t)vsnz - 1);
+          vs_z0 = annotation_z0(annotation_z, vsnz, (uint32_t)vsd);
+        }
+      } else {
+        snprintf(annotation_status, sizeof annotation_status,
+                 "click missed the displayed XY plane");
+      }
+    }
 
     /* adaptive resolution: drop to half res while interacting (4x fewer
      * rays), snap back to full once the camera settles */
     bool moving = in.dragging || in.captured || in.wheel != 0.0f || in.zdelta || in.zpage ||
-                  auto_scroll ||
+                  z_navigated || auto_scroll ||
                   in.move[0] != 0.0f || in.move[1] != 0.0f || in.move[2] != 0.0f;
     settle = moving ? 15 : (settle > 0 ? settle - 1 : 0);
     bool half_res = adaptive_res && settle > 0;
@@ -597,22 +925,107 @@ int main(int argc, char **argv) {
              (clip_valid_disp & 32) ? " L5" : "");
     }
     if (vslab_mode) {
-      int z0i = (int)vs_z0;
-      if (igSliderInt("z position (world)", &z0i, 0, 68608 - (vsd + 2), "%d", 0))
-        vs_z0 = z0i;
-      igCheckbox("follow camera (x/y)", &vs_follow);
+      if (umbilicus_path) {
+        igSeparator();
+        igText("umbilicus annotation   %zu point%s", umbilicus.count,
+               umbilicus.count == 1 ? "" : "s");
+        int zi = annotation_z;
+        if (igSliderInt("slice z", &zi, 0, (int)vsnz - 1, "%d", 0)) annotation_z = zi;
+        if (igInputInt("slice step", &annotation_step, 1, 100, 0)) {
+          if (annotation_step < 1) annotation_step = 1;
+          if (annotation_step > (int)vsnz - 1) annotation_step = (int)vsnz - 1;
+        }
+        if (igButton("< previous", (ImVec2){0, 0})) {
+          annotation_z -= annotation_step;
+          if (annotation_z < 0) annotation_z = 0;
+        }
+        igSameLine(0, 8);
+        if (igButton("next >", (ImVec2){0, 0})) {
+          annotation_z += annotation_step;
+          if (annotation_z >= (int)vsnz) annotation_z = (int)vsnz - 1;
+        }
+        if (igButton("< annotated", (ImVec2){0, 0})) {
+          for (size_t i = umbilicus.count; i > 0; i--)
+            if (umbilicus.points[i - 1].z < annotation_z) {
+              annotation_z = (int)llround(umbilicus.points[i - 1].z);
+              break;
+            }
+        }
+        igSameLine(0, 8);
+        if (igButton("annotated >", (ImVec2){0, 0})) {
+          for (size_t i = 0; i < umbilicus.count; i++)
+            if (umbilicus.points[i].z > annotation_z) {
+              annotation_z = (int)llround(umbilicus.points[i].z);
+              break;
+            }
+        }
+        const r3d_umbilicus_point *here = r3d_umbilicus_find(&umbilicus, annotation_z);
+        if (here) {
+          igText("current point: x %.1f   y %.1f", here->x, here->y);
+          if (igButton("delete current", (ImVec2){0, 0}) &&
+              r3d_umbilicus_remove(&umbilicus, annotation_z))
+            save_umbilicus(&umbilicus, umbilicus_path, annotation_status);
+          igSameLine(0, 8);
+        } else {
+          igTextDisabled("current slice is not annotated");
+        }
+        if (igButton("save now", (ImVec2){0, 0}))
+          save_umbilicus(&umbilicus, umbilicus_path, annotation_status);
+        const char *annotation_name = strrchr(umbilicus_path, '/');
+        igTextDisabled("%s | %s", annotation_name ? annotation_name + 1 : umbilicus_path,
+                       annotation_status);
+        r3d_vslab_prefetch_stats pcs;
+        r3d_vslab_prefetch_get(renderer, &pcs);
+        igText("decoded cache: %u/%u ready%s  hits %llu  last %.2f s", pcs.ready,
+               pcs.capacity,
+               pcs.filling ? " + filling" : "", (unsigned long long)pcs.hits,
+               pcs.last_decode_ms / 1000.0);
+        igTextDisabled("GPU fine-scroll neighborhood: +/- %d slices", annotation_z_prefetch);
+      } else {
+        int z0i = (int)vs_z0;
+        int zmax = (int)vsnz - vsd;
+        if (igSliderInt("z position (world)", &z0i, 0, zmax > 0 ? zmax : 0, "%d", 0))
+          vs_z0 = z0i;
+        igCheckbox("follow camera (x/y)", &vs_follow);
+      }
       int64_t vo_[3];
       uint32_t pend;
       r3d_vslab_get(renderer, vo_, &pend);
+      uint32_t rpend = r3d_vslab_resident_pending(renderer);
       igText("window @ (%lld, %lld, %lld)%s", (long long)vo_[0], (long long)vo_[1],
-             (long long)vo_[2], pend ? "  streaming..." : "");
+             (long long)vo_[2], pend ? "  streaming..." : (rpend ? "  prefetching..." : ""));
     }
     if (bricks_path) {
       r3d_bricks_stats bst;
       r3d_bricks_get_stats(renderer, &bst);
+      if (brick_is_lod && brick_depth > 0) {
+        int bz = brick_z;
+        int zmax = (int)brick_shape[2] - brick_depth;
+        if (igSliderInt("slice z", &bz, 0, zmax > 0 ? zmax : 0, "%d", 0) && bz != brick_z) {
+          uint32_t md = brick_shape[0] > brick_shape[1] ? brick_shape[0] : brick_shape[1];
+          if (brick_shape[2] > md) md = brick_shape[2];
+          float dz = (float)(bz - brick_z) / (float)md;
+          brick_z = bz;
+          if (cam_mode == CAM_ORBIT) {
+            cam.target.z += dz;
+            cam.pos.z += dz;
+          }
+        }
+        int bd = brick_depth;
+        int dmax = brick_shape[2] < 256u ? (int)brick_shape[2] : 256;
+        if (igSliderInt("slice depth", &bd, 1, dmax, "%d", 0)) {
+          brick_depth = bd;
+          if (brick_z > (int)brick_shape[2] - brick_depth)
+            brick_z = (int)brick_shape[2] - brick_depth;
+        }
+      }
       igText("bricks: hot %u/%u slots  warm %u (%.0f/%llu MB)%s", bst.hot, bst.hot_cap,
              bst.warm_bricks, (double)bst.warm_bytes / 1048576.0,
              (unsigned long long)(bst.warm_cap >> 20), bst.inflight ? "  streaming..." : "");
+      if (bst.nlevels > 1)
+        igText("wanted L0..L%u: %u %u %u %u %u %u %u %u", bst.nlevels - 1u,
+               bst.lod_wanted[0], bst.lod_wanted[1], bst.lod_wanted[2], bst.lod_wanted[3],
+               bst.lod_wanted[4], bst.lod_wanted[5], bst.lod_wanted[6], bst.lod_wanted[7]);
     }
     igSliderFloat("lod bias", &lod_bias, -2.0f, 4.0f, "%.2f", 0);
     int qp = quality_policy;
@@ -655,12 +1068,39 @@ int main(int argc, char **argv) {
       igText("cpu record  %6.2f ms", (double)prof.cpu_record_ns / 1e6);
       igText("cpu submit  %6.2f ms", (double)prof.cpu_submit_ns / 1e6);
     }
-    if (cam_mode == CAM_ORBIT)
+    if (umbilicus_path)
+      igTextDisabled("click: set point | wheel, R/F: 1 slice\n"
+                     "PgUp/PgDn: z step | Ctrl+click: set + advance\n"
+                     "Shift+drag: pan | Shift+wheel: zoom | F12: shot");
+    else if (cam_mode == CAM_ORBIT)
       igTextDisabled("drag orbit | shift+drag pan cam | ctrl+drag move vol\n"
                      "ctrl+shift+drag rot vol | wheel zoom | WASD pan | F12 shot");
     else
       igTextDisabled("click: fly (Esc releases)   WASD+QE: move   F12: shot");
     igEnd();
+
+    if (umbilicus_path) {
+      if (annotation_z < 0) annotation_z = 0;
+      if (annotation_z >= (int)vsnz) annotation_z = (int)vsnz - 1;
+      vs_z0 = annotation_z0(annotation_z, vsnz, (uint32_t)vsd);
+      const r3d_umbilicus_point *here = r3d_umbilicus_find(&umbilicus, annotation_z);
+      ImVec2 marker;
+      if (annotation_project(here, &cam, right, up, fwd, vm, vol_t, w, h, (uint32_t)vsw,
+                             (uint32_t)vsh, (uint32_t)vsd, 0, 0, vs_z0, &marker)) {
+        ImDrawList *draw = igGetBackgroundDrawList_Nil();
+        const ImU32 black = 0xff000000u, yellow = 0xff00ffffu;
+        ImDrawList_AddCircle(draw, marker, 12.0f, black, 32, 5.0f);
+        ImDrawList_AddCircle(draw, marker, 12.0f, yellow, 32, 2.0f);
+        ImDrawList_AddLine(draw, (ImVec2){marker.x - 18.0f, marker.y},
+                           (ImVec2){marker.x + 18.0f, marker.y}, black, 5.0f);
+        ImDrawList_AddLine(draw, (ImVec2){marker.x, marker.y - 18.0f},
+                           (ImVec2){marker.x, marker.y + 18.0f}, black, 5.0f);
+        ImDrawList_AddLine(draw, (ImVec2){marker.x - 18.0f, marker.y},
+                           (ImVec2){marker.x + 18.0f, marker.y}, yellow, 2.0f);
+        ImDrawList_AddLine(draw, (ImVec2){marker.x, marker.y - 18.0f},
+                           (ImVec2){marker.x, marker.y + 18.0f}, yellow, 2.0f);
+      }
+    }
 
     r3d_frame_params p = {
         .cam_origin = {cam.pos.x, cam.pos.y, cam.pos.z},
@@ -677,7 +1117,6 @@ int main(int argc, char **argv) {
         .threshold = low_cut / 255.0f,
         .skip_gate = fmaxf(low_cut, tf_min_v - 0.5f) / 255.0f,
     };
-    r3d_m3 vm = m3_ypr(vol_rot[0], vol_rot[1], vol_rot[2]);
     memcpy(p.vol_r0, &vm.r0, 12);
     memcpy(p.vol_r1, &vm.r1, 12);
     memcpy(p.vol_r2, &vm.r2, 12);
@@ -705,6 +1144,36 @@ int main(int argc, char **argv) {
         vs_fy = (double)vo3[1] + (double)fyn * vsh;
       }
       r3d_vslab_frame(renderer, vs_fx, vs_fy, vs_z0, moving ? 1u : 3u, &p);
+      if (umbilicus_path) {
+        int64_t co[3];
+        r3d_vslab_get(renderer, co, NULL);
+        uint32_t cpending = r3d_vslab_resident_pending(renderer);
+        if (annotation_z > annotation_last_z) annotation_dir = 1;
+        else if (annotation_z < annotation_last_z) annotation_dir = -1;
+        annotation_last_z = annotation_z;
+        if (cpending == 0 && co[2] == vs_z0) {
+          int64_t targets[R3D_VSLAB_PREFETCH_MAX];
+          uint32_t ntargets = 0;
+          for (int k = 1; k <= annotation_prefetch; k++) {
+            int64_t az = (int64_t)annotation_z +
+                         (int64_t)annotation_dir * annotation_step * k;
+            if (az < 0) az = 0;
+            if (az >= vsnz) az = (int64_t)vsnz - 1;
+            int64_t pz = annotation_z0((int)az, vsnz, (uint32_t)vsd);
+            if (pz != vs_z0) targets[ntargets++] = pz;
+          }
+          int64_t back = (int64_t)annotation_z -
+                         (int64_t)annotation_dir * annotation_step;
+          if (back < 0) back = 0;
+          if (back >= vsnz) back = (int64_t)vsnz - 1;
+          int64_t back_z0 = annotation_z0((int)back, vsnz, (uint32_t)vsd);
+          if (back_z0 != vs_z0 && ntargets < R3D_VSLAB_PREFETCH_MAX)
+            targets[ntargets++] = back_z0;
+          r3d_vslab_prefetch(renderer, targets, ntargets);
+        } else {
+          r3d_vslab_prefetch(renderer, NULL, 0);
+        }
+      }
       /* residency-lag metric: cells short of full residency, second half of
        * the run only (the first half absorbs the initial window fill) */
       if (bench && frame_index > warmup_frames &&
@@ -716,16 +1185,22 @@ int main(int argc, char **argv) {
       }
     }
     if (bricks_path) {
+      p.slab_z0 = (float)brick_z;
+      p.slab_depth = (uint32_t)brick_depth;
       /* streaming pump: camera in VOLUME space (model transform inverted, like
        * the clip focus); smaller decode budget while moving so the pump's GPU
        * time shares the frame with half-res rendering */
-      r3d_v3 vc = v3(0.5f, 0.5f, 0.5f);
+      float bext[3];
+      r3d_bricks_extent(renderer, bext);
+      r3d_v3 vc = v3(bext[0] * 0.5f, bext[1] * 0.5f, bext[2] * 0.5f);
       r3d_v3 vo = v3_add(m3_tmul(vm, v3_sub(v3_sub(cam.pos, vol_t), vc)), vc);
       r3d_v3 vd = m3_tmul(vm, fwd);
       float be[3] = {vo.x, vo.y, vo.z}, bf[3] = {vd.x, vd.y, vd.z};
       float asp = (float)w / (float)h;
       float ht = tanf(cam.fov_y * 0.5f) * sqrtf(1.0f + asp * asp);
-      r3d_bricks_stream(renderer, be, bf, ht, p.skip_gate, moving ? 2u : 6u);
+      float pixel_cone = 2.0f * tanf(cam.fov_y * 0.5f) / (float)(rvh ? rvh : 1) * exp2f(lod_bias);
+      r3d_bricks_stream(renderer, be, bf, ht, pixel_cone, (uint32_t)brick_z,
+                        (uint32_t)brick_depth, p.skip_gate, moving ? 2u : 6u);
       r3d_bricks_params(renderer, &p);
     }
     if (clip_mode) {
@@ -799,8 +1274,20 @@ int main(int argc, char **argv) {
            (double)prof_sum.cpu_wait_ns / n / 1e6, (double)prof_sum.cpu_acquire_ns / n / 1e6,
            (double)prof_sum.cpu_record_ns / n / 1e6, (double)prof_sum.cpu_submit_ns / n / 1e6);
   }
-  if (vslab_mode && bench)
-    printf("vslab bench: pending cell-frames %llu\n", (unsigned long long)vs_pend_acc);
+  if (vslab_mode && bench) {
+    int64_t final_o[3];
+    uint32_t final_visible = 0;
+    r3d_vslab_get(renderer, final_o, &final_visible);
+    printf("vslab bench: pending cell-frames %llu, final visible %u resident %u\n",
+           (unsigned long long)vs_pend_acc, final_visible,
+           r3d_vslab_resident_pending(renderer));
+  }
+  if (umbilicus_path) {
+    r3d_vslab_prefetch_stats pcs;
+    r3d_vslab_prefetch_get(renderer, &pcs);
+    printf("vslab decoded cache: %u ready, %llu hits, %llu misses, last %.0f ms\n", pcs.ready,
+           (unsigned long long)pcs.hits, (unsigned long long)pcs.misses, pcs.last_decode_ms);
+  }
   r3d_bricks_stats final_bst = {0};
   if (bricks_path) {
     r3d_bricks_flush(renderer);
@@ -809,10 +1296,28 @@ int main(int argc, char **argv) {
            (unsigned long long)final_bst.decoded, (unsigned long long)final_bst.jobs,
            final_bst.jobs ? (double)final_bst.stream_ns / (double)final_bst.jobs / 1e6 : 0.0,
            final_bst.failures, final_bst.hot, final_bst.hot_cap);
+    if (final_bst.nlevels > 1)
+      printf("bricks LOD wanted: [%u,%u,%u,%u,%u,%u,%u,%u]\n", final_bst.lod_wanted[0],
+             final_bst.lod_wanted[1], final_bst.lod_wanted[2], final_bst.lod_wanted[3],
+             final_bst.lod_wanted[4], final_bst.lod_wanted[5], final_bst.lod_wanted[6],
+             final_bst.lod_wanted[7]);
+    if (final_bst.nlevels > 1)
+      printf("bricks LOD requests: [%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu]\n",
+             (unsigned long long)final_bst.lod_requests[0],
+             (unsigned long long)final_bst.lod_requests[1],
+             (unsigned long long)final_bst.lod_requests[2],
+             (unsigned long long)final_bst.lod_requests[3],
+             (unsigned long long)final_bst.lod_requests[4],
+             (unsigned long long)final_bst.lod_requests[5],
+             (unsigned long long)final_bst.lod_requests[6],
+             (unsigned long long)final_bst.lod_requests[7]);
   }
   if (bench_json)
     write_bench_json(bench_json, bench_name ? bench_name : bench, win_w, win_h, quality_arg,
                      warmup_frames, &stats, prof_samples, prof_frames, vs_pend_acc, &final_bst);
+  if (umbilicus_path && umbilicus.dirty)
+    save_umbilicus(&umbilicus, umbilicus_path, annotation_status);
+  r3d_umbilicus_free(&umbilicus);
   free(prof_samples);
   r3d_destroy(renderer);
   SDL_DestroyWindow(win);

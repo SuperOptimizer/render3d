@@ -2,7 +2,7 @@
 
 void r3d_input_poll(r3d_input *in, SDL_Window *win,
                     void (*hook)(void *ud, const SDL_Event *ev), void *ud, bool allow_capture,
-                    bool fly_mode) {
+                    bool fly_mode, bool annotation_mode) {
   in->quit = false;
   in->screenshot = false;
   in->resized = false;
@@ -15,6 +15,8 @@ void r3d_input_poll(r3d_input *in, SDL_Window *win,
   in->wheel = 0.0f;
   in->zdelta = 0;
   in->zpage = 0;
+  in->annotate_click = false;
+  in->click_ctrl = false;
 
   SDL_Event ev;
   while (SDL_PollEvent(&ev)) {
@@ -28,6 +30,13 @@ void r3d_input_poll(r3d_input *in, SDL_Window *win,
       break;
     case SDL_EVENT_MOUSE_BUTTON_DOWN:
       if (ev.button.button != SDL_BUTTON_LEFT || !allow_capture) break;
+      if (annotation_mode && !(SDL_GetModState() & SDL_KMOD_SHIFT)) {
+        in->annotate_click = true;
+        in->click_ctrl = (SDL_GetModState() & SDL_KMOD_CTRL) != 0;
+        in->click_xy[0] = ev.button.x;
+        in->click_xy[1] = ev.button.y;
+        break;
+      }
       if (fly_mode && !in->captured) {
         SDL_SetWindowRelativeMouseMode(win, true);
         in->captured = true;

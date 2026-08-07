@@ -8,9 +8,11 @@
 
 #include "core/camera.h"
 #include "core/clip.h"
+#include "core/lod.h"
 #include "core/mathx.h"
 #include "core/slab.h"
 #include "core/stats.h"
+#include "core/umbilicus.h"
 #include "core/vslab.h"
 #include "core/transfer.h"
 #include "core/volume.h"
@@ -51,6 +53,15 @@ static void test_mathx(void) {
   CHECK(feq(flerpf(2, 4, 0.5f), 3.0f));
   r3d_v3 s = v3_add(v3_scale(a, 2.0f), v3_sub(b, a));
   CHECK(feq(s.x, 5) && feq(s.y, 7) && feq(s.z, 9));
+}
+
+static void test_lod(void) {
+  CHECK(r3d_lod_pick(0.0f, 0.001f, 8192.0f, 8) == 0);
+  CHECK(r3d_lod_pick(1.0f, 0.001f, 8192.0f, 8) == 3); /* 8.2 voxels/pixel */
+  CHECK(r3d_lod_pick(100.0f, 0.01f, 8192.0f, 8) == 7); /* clamp coarsest */
+  const uint32_t want[5] = {2, 3, 4, 1, 0};
+  for (uint32_t i = 0; i < 5; i++) CHECK(r3d_lod_fallback(2, i, 5) == want[i]);
+  CHECK(r3d_lod_fallback(2, 5, 5) == UINT32_MAX);
 }
 
 static void test_volume(void) {
@@ -131,6 +142,42 @@ static void test_transfer(void) {
   CHECK(lut[255][3] == 255);
   /* monotone alpha between declared points */
   CHECK(lut[100][3] >= lut[60][3]);
+}
+
+static void test_umbilicus(void) {
+  r3d_umbilicus u;
+  r3d_umbilicus_init(&u);
+  CHECK(r3d_umbilicus_set(&u, 20.25, 30.5, 100) == 0);
+  CHECK(r3d_umbilicus_set(&u, 5, 6, 50) == 0);
+  CHECK(r3d_umbilicus_set(&u, 21.25, 31.5, 100) == 0); /* replace */
+  CHECK(u.count == 2 && u.points[0].z == 50 && u.points[1].z == 100);
+  const r3d_umbilicus_point *p = r3d_umbilicus_find(&u, 100);
+  CHECK(p && fabs(p->x - 21.25) < 1e-12 && fabs(p->y - 31.5) < 1e-12);
+  CHECK(!r3d_umbilicus_remove(&u, 75));
+
+  char path[] = "/tmp/r3d_test_umbilicus_XXXXXX";
+  int fd = mkstemp(path);
+  CHECK(fd >= 0);
+  close(fd);
+  unlink(path); /* save creates the final file by atomic rename */
+  CHECK(r3d_umbilicus_save(&u, path, "test-source", 300, 200, 100) == 0);
+  CHECK(!u.dirty);
+  r3d_umbilicus v;
+  r3d_umbilicus_init(&v);
+  CHECK(r3d_umbilicus_load(&v, path) == 0);
+  CHECK(v.count == 2 && v.points[0].z == 50 && v.points[1].z == 100);
+  CHECK(r3d_umbilicus_remove(&v, 50) && v.count == 1 && v.dirty);
+  FILE *f = fopen(path, "w");
+  CHECK(f != NULL);
+  if (f) {
+    fputs("[[7, 8, 9], {\"x\": 12, \"y\": 11, \"z\": 10}]\n", f);
+    CHECK(fclose(f) == 0);
+  }
+  CHECK(r3d_umbilicus_load(&v, path) == 0);
+  CHECK(v.count == 2 && v.points[0].x == 9 && v.points[0].y == 8 && v.points[0].z == 7);
+  unlink(path);
+  r3d_umbilicus_free(&v);
+  r3d_umbilicus_free(&u);
 }
 
 static void test_slab(void) {
@@ -249,6 +296,18 @@ static void test_vslab(void) {
   CHECK(r3d_vs_key(3, 5) == (3u | (5u << 10) | 0x80000000u));
   CHECK(r3d_vs_layer(&v, 34288) == 34288 % 6); /* v = whole-xy window, wz 6 */
   CHECK(r3d_vs_max0(68608, 18) == 68590);
+  /* Visible depth stays 8 while a symmetric 16-slice GPU margin expands the
+   * ring to 42; near a volume face the unavailable margin shifts across. */
+  CHECK(r3d_vslab_init_margin(&v, 8192, 8192, 23552, 8192, 8192, 8, 16) == 0);
+  CHECK(v.D == 8 && v.z_margin == 16 && v.wz == 42);
+  int64_t za, zb;
+  r3d_vs_zrange(&v, 100, &za, &zb);
+  CHECK(za == 84 && zb == 126);
+  r3d_vs_zrange(&v, 0, &za, &zb);
+  CHECK(za == 0 && zb == 42);
+  r3d_vs_zrange(&v, 23544, &za, &zb);
+  CHECK(za == 23510 && zb == 23552);
+  CHECK(r3d_vslab_init_margin(&v, 8192, 8192, 23552, 8192, 8192, 8, 1020) != 0);
 }
 
 static void test_clip(void) {
@@ -282,6 +341,7 @@ static void test_clip(void) {
 
 int main(void) {
   test_mathx();
+  test_lod();
   test_stats();
   test_slab();
   test_clip();
@@ -290,6 +350,7 @@ int main(void) {
   test_camera();
   test_orbit();
   test_transfer();
+  test_umbilicus();
   if (failures) {
     fprintf(stderr, "%d failure(s)\n", failures);
     return EXIT_FAILURE;

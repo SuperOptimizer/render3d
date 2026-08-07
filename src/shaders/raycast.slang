@@ -48,12 +48,19 @@ struct BrickCtx {
   float maxv;     /* brick max (page high byte) for empty skip */
   float3 bl;      /* voxel coords local to the brick */
   float3 slot_org; /* atlas mip0 texel origin of the slot */
+  float atlas_lod; /* residual filtering after choosing an on-disk LOD */
+  float grad_vox;  /* one base-space gradient radius in chosen-level voxels */
+  float world_brick; /* chosen brick edge in renderer/world units */
 };
 
 // slot geometry: 132^3 = 128 payload + 2-voxel apron per side (seamless
 // trilinear across bricks; clamp only guards coarse mips)
 static const float BR_SLOT = 128.0;
 static const float BR_AP = 0.0;
+static const uint BR_LOD_FLAG = 0x20000u;
+static const uint BR_PAGE_HEADER = 64u;
+
+bool bricks_is_lod() { return (pc.brick_mode & BR_LOD_FLAG) != 0u; }
 
 BrickCtx bricks_locate(float3 p) {
   uint bpa = pc.brick_mode & 0xffu;
@@ -68,6 +75,57 @@ BrickCtx bricks_locate(float3 p) {
   uint3 sc = uint3(slot % abpa, (slot / abpa) % abpa, slot / (abpa * abpa));
   c.slot_org = float3(sc) * BR_SLOT + BR_AP; /* payload texel origin */
   c.bl = vp - float3(bc << 7u);
+  c.atlas_lod = 0.0;
+  c.grad_vox = 1.0;
+  c.world_brick = 1.0 / float(bpa);
+  return c;
+}
+
+/* Resolve the level whose voxel pitch matches this sample's projected
+ * footprint.  The streamer keeps the immediate parent warm, so desired,
+ * parent, grandparent, and the pinned coarsest level cover both steady-state
+ * and cold-start sampling with at most four page probes. */
+BrickCtx bricks_lod_locate(float3 p, float lod) {
+  BrickCtx c;
+  c.ok = false;
+  c.maxv = 0.0;
+  c.bl = float3(0);
+  c.slot_org = float3(0);
+  c.atlas_lod = 0.0;
+  c.grad_vox = 1.0;
+  c.world_brick = 1.0;
+  uint nlev = page[0];
+  float3 base_shape = float3(page[1], page[2], page[3]);
+  float maxdim = max(base_shape.x, max(base_shape.y, base_shape.z));
+  float3 base_v = clamp(p * maxdim, float3(0), max(base_shape - 0.001, float3(0)));
+  int desired = int(clamp(floor(lod), 0.0, float(nlev - 1u)));
+  uint abpa = pc.brick_mode & 0xffu;
+  int last = int(nlev) - 1;
+  for (uint step = 0; step < 4u; step++) {
+      int li = step < 3u ? desired + int(step) : last;
+      if (li < 0 || li > last || (step == 3u && li <= desired + 2)) continue;
+      uint h = 4u + uint(li) * 4u;
+      uint off = page[h], packed = page[h + 1u], scale = page[h + 2u];
+      uint3 bd = uint3(packed & 1023u, (packed >> 10u) & 1023u, packed >> 20u);
+      float3 lv = base_v / float(scale);
+      uint3 bc = min(uint3(lv) >> 7u, bd - 1u);
+      uint bi = off + (bc.z * bd.y + bc.y) * bd.x + bc.x;
+      uint e = page[bi];
+      if (e == 0xFFFFFFFFu) continue;
+      uint slot = e & 0xFFFFFFu;
+      uint3 sc = uint3(slot % abpa, (slot / abpa) % abpa, slot / (abpa * abpa));
+      c.ok = true;
+      c.maxv = float(e >> 24u) / 255.0;
+      c.slot_org = float3(sc) * BR_SLOT + BR_AP;
+      c.bl = lv - float3(bc << 7u);
+      /* The disk pyramid is the LOD hierarchy.  Per-slot atlas mips are
+       * intentionally disabled: independently replaced slots cannot form a
+       * globally continuous mip image. */
+      c.atlas_lod = 0.0;
+      c.grad_vox = exp2(lod) / float(scale);
+      c.world_brick = BR_SLOT * float(scale) / maxdim;
+      return c;
+  }
   return c;
 }
 
@@ -81,9 +139,10 @@ float bricks_fetch(float3 slot_org, float3 bl_off, float lod, float inv_adim) {
 }
 
 float bricks_sample(float3 p) { /* generic path (non-marcher callers) */
-  BrickCtx c = bricks_locate(p);
-  float inv = 1.0 / (float((pc.brick_mode >> 8) & 0xffu) * BR_SLOT);
-  return c.ok ? bricks_fetch(c.slot_org, c.bl, 0.0, inv) : 0.0;
+  BrickCtx c = bricks_is_lod() ? bricks_lod_locate(p, 0.0) : bricks_locate(p);
+  uint abpa = bricks_is_lod() ? (pc.brick_mode & 0xffu) : ((pc.brick_mode >> 8) & 0xffu);
+  float inv = 1.0 / (float(abpa) * BR_SLOT);
+  return c.ok ? bricks_fetch(c.slot_org, c.bl, c.atlas_lod, inv) : 0.0;
 }
 
 // mirror of core/clip.h ring sizing: depth_max/2^l + 3, min 4
@@ -95,6 +154,10 @@ float clip_wzl(uint l) {
 // World box the ray marches: cube = [0,1]^3; slab = thin box whose z spans the
 // wz-1 seam-safe slices, all in units of 1/nx.
 float3 vol_extent() {
+  if (is_bricks() && bricks_is_lod()) {
+    float3 shape = float3(page[1], page[2], page[3]);
+    return shape / max(shape.x, max(shape.y, shape.z));
+  }
   if (!is_slab() && !is_clip() && !is_vslab()) return float3(1);
   // box is exactly slab_depth voxels thick; the ring holds depth+2 slices so
   // filtering at the faces never crosses the ring seam
@@ -248,11 +311,11 @@ float3 ray_dir(uint2 pix) {
   return normalize(pc.cam_forward + ndc.x * pc.cam_right + ndc.y * pc.cam_up);
 }
 
-// slab test against [0, ext]; returns (tnear, tfar), tnear<=tfar means hit
-float2 box_hit(float3 o, float3 d, float3 ext) {
+// slab test against [lo, hi]; returns (tnear, tfar), tnear<=tfar means hit
+float2 box_hit(float3 o, float3 d, float3 lo, float3 hi) {
   float3 inv = 1.0 / d;
-  float3 t0 = (float3(0) - o) * inv;
-  float3 t1 = (ext - o) * inv;
+  float3 t0 = (lo - o) * inv;
+  float3 t1 = (hi - o) * inv;
   float3 tmin = min(t0, t1), tmax = max(t0, t1);
   return float2(max(max(tmin.x, tmin.y), tmin.z), min(min(tmax.x, tmax.y), tmax.z));
 }
@@ -281,8 +344,14 @@ void main(uint3 tid: SV_DispatchThreadID) {
     voxel = 1.0 / pc.slab_nx;
     max_lod = 7.0; // levels end at 5; extra lod keeps widening far-field steps
   } else if (is_bricks()) {
-    voxel = 1.0 / float((pc.brick_mode & 0xffu) * 128u);
-    max_lod = 3.0; // atlas has no mips; lod only widens far-field steps
+    if (bricks_is_lod()) {
+      float md = float(max(page[1], max(page[2], page[3])));
+      voxel = 1.0 / md;
+      max_lod = float(page[0] - 1u); // complete on-disk hierarchy
+    } else {
+      voxel = 1.0 / float((pc.brick_mode & 0xffu) * 128u);
+      max_lod = 3.0;
+    }
   } else if (is_vslab()) {
     voxel = 1.0 / pc.slab_nx;
     /* +2 lod past the finest PRESENT pyramid level keeps far steps widening;
@@ -312,7 +381,13 @@ void main(uint3 tid: SV_DispatchThreadID) {
   float3 ro = to_volume_point(pc.cam_origin, ext * 0.5);
   dir = to_volume_dir(dir);
 
-  float2 hit = box_hit(ro, dir, ext);
+  float3 box_lo = float3(0), box_hi = ext;
+  if (is_bricks() && bricks_is_lod() && pc.slab_depth > 0u) {
+    float md = float(max(page[1], max(page[2], page[3])));
+    box_lo.z = clamp(pc.slab_z0 / md, 0.0, ext.z);
+    box_hi.z = clamp((pc.slab_z0 + float(pc.slab_depth)) / md, box_lo.z, ext.z);
+  }
+  float2 hit = box_hit(ro, dir, box_lo, box_hi);
   float tn = max(hit.x, 0.0), tf_ = hit.y;
   if (tn >= tf_) {
     out_image[tid.xy] = float4(0.02, 0.02, 0.03, 1); // background
@@ -332,6 +407,11 @@ void main(uint3 tid: SV_DispatchThreadID) {
   uint steps = 0;
   bool composite = pc.mode == MODE_FULL || pc.mode == MODE_FLAT;
   bool shaded = pc.mode == MODE_FULL;
+  /* A deep rectangular volume can contain tens of thousands of voxels along
+   * one ray.  Bound and fully cover that interval; without this depth-step
+   * floor close views truncated at MAX_STEPS and still took hundreds of ms. */
+  uint ray_budget = is_bricks() && bricks_is_lod() ? (shaded ? 192u : 256u) : MAX_STEPS;
+  float span_step = max((tf_ - tn) / (float(ray_budget) * dt), 1.0);
 
   float bs = OCC_BLOCK * voxel; // skip-block edge, volume units
   // block max below this contributes nothing: low-cut OR zero TF alpha
@@ -340,18 +420,24 @@ void main(uint3 tid: SV_DispatchThreadID) {
   // bricks mode: page entry cached across steps (rays cross bricks rarely)
   uint b_bpa = pc.brick_mode & 0xffu;
   float b_N = float(b_bpa * 128u);
-  float b_inv = 1.0 / (float((pc.brick_mode >> 8) & 0xffu) * BR_SLOT);
+  uint b_abpa = bricks_is_lod() ? (pc.brick_mode & 0xffu) : ((pc.brick_mode >> 8) & 0xffu);
+  float b_inv = 1.0 / (float(b_abpa) * BR_SLOT);
   uint b_last = 0xFFFFFFFFu;
   bool b_ok = false;
   float b_max = 0.0;
   float3 b_slot = float3(0);
+  float b_grad_vox = 1.0;
+  float b_world_brick = 128.0 * voxel;
 
-  while (t < tf_ && steps < MAX_STEPS) {
+  while (t < tf_ && steps < ray_budget) {
     steps++;
     // LOD-on-distance: mip where the ray cone's width matches the voxel pitch;
     // step size scales with it so far-field marching is proportionally cheap.
     float lod = clamp(log2(max(t * cone / voxel, 1.0)) + pc.lod_bias, 0.0, max_lod);
-    float lod_step = exp2(lod); /* continuous: fractional lod still widens dt */
+    /* Spatial filtering follows projected magnification.  The independent
+     * depth step floor guarantees traversal of the whole ray without forcing
+     * an isotropic coarse LOD (which visibly destroyed close-up XY detail). */
+    float lod_step = max(exp2(lod), span_step);
     if (is_slab() || is_clip() || is_vslab()) // >=4 samples along the box segment
       lod_step = min(lod_step, max(1.0, (tf_ - tn) / (4.0 * dt)));
     float3 p = ro + t * dir;
@@ -364,12 +450,23 @@ void main(uint3 tid: SV_DispatchThreadID) {
       cl_lvl = pick_clip_level(p, lod);
       v = cl_lvl < 0 ? 0.0 : sample_clip_level(uint(cl_lvl), p);
     } else if (is_bricks()) {
-      blod = clamp(lod, 0.0, 3.0); /* atlas has 4 mips */
-      if ((pc.brick_mode & 0x10000u) != 0) {
+      if (bricks_is_lod()) {
+        BrickCtx bc = bricks_lod_locate(p, lod);
+        b_ok = bc.ok;
+        b_max = bc.maxv;
+        b_slot = bc.slot_org;
+        b_bl = bc.bl;
+        blod = bc.atlas_lod;
+        b_grad_vox = bc.grad_vox;
+        b_world_brick = bc.world_brick;
+        v = b_ok ? bricks_fetch(b_slot, b_bl, blod, b_inv) : 0.0;
+      } else if ((pc.brick_mode & 0x10000u) != 0) {
+        blod = clamp(lod, 0.0, 3.0); /* atlas has 4 mips */
         /* identity residency (v1 full shard): atlas layout == world layout,
          * so the page indirection is a no-op — sample like cube mode */
         v = brick_atlas.SampleLevel(p, blod);
       } else {
+        blod = clamp(lod, 0.0, 3.0);
         float3 vp = saturate(p) * b_N;
         uint3 bc = min(uint3(vp) >> 7u, uint3(b_bpa - 1u));
         uint bi = (bc.z * b_bpa + bc.y) * b_bpa + bc.x;
@@ -403,7 +500,12 @@ void main(uint3 tid: SV_DispatchThreadID) {
        * skipped block (invisible) and restores cube-grade skipping */
       float bgate = max(occ_gate, 4.5 / 255.0);
       if (v < bgate) {
-        if ((pc.brick_mode & 0x10000u) != 0) { /* identity: 8^3 occ only */
+        if (bricks_is_lod()) {
+          if (b_max < bgate) {
+            void_blk = true;
+            bsz = b_world_brick;
+          }
+        } else if ((pc.brick_mode & 0x10000u) != 0) { /* identity: 8^3 occ only */
           if (occ.SampleLevel(p, 0) < bgate) void_blk = true;
         } else if (b_max < bgate) { /* whole brick void (cached page entry) */
           void_blk = true;
@@ -445,14 +547,14 @@ void main(uint3 tid: SV_DispatchThreadID) {
           const float ir3 = 0.57735026919;
           const float renorm = 0.86602540378;
           float q0, q1, q2, q3;
-          if (is_bricks() && (pc.brick_mode & 0x10000u) != 0) {
+          if (is_bricks() && !bricks_is_lod() && (pc.brick_mode & 0x10000u) != 0) {
             float ee = e * ir3;
             q0 = brick_atlas.SampleLevel(p + float3( ee, -ee, -ee), blod);
             q1 = brick_atlas.SampleLevel(p + float3(-ee, -ee,  ee), blod);
             q2 = brick_atlas.SampleLevel(p + float3(-ee,  ee, -ee), blod);
             q3 = brick_atlas.SampleLevel(p + float3( ee,  ee,  ee), blod);
           } else if (is_bricks()) {
-            float ev = lod_step * ir3;
+            float ev = (bricks_is_lod() ? b_grad_vox : lod_step) * ir3;
             q0 = bricks_fetch(b_slot, b_bl + float3( ev, -ev, -ev), blod, b_inv);
             q1 = bricks_fetch(b_slot, b_bl + float3(-ev, -ev,  ev), blod, b_inv);
             q2 = bricks_fetch(b_slot, b_bl + float3(-ev,  ev, -ev), blod, b_inv);
@@ -474,7 +576,7 @@ void main(uint3 tid: SV_DispatchThreadID) {
           g = float3(q0 - q1 - q2 + q3, -q0 - q1 + q2 + q3,
                      -q0 + q1 - q2 + q3) * renorm;
 #else
-          if (is_bricks() && (pc.brick_mode & 0x10000u) != 0) {
+          if (is_bricks() && !bricks_is_lod() && (pc.brick_mode & 0x10000u) != 0) {
             g = float3(brick_atlas.SampleLevel(p + float3(e, 0, 0), blod) -
                            brick_atlas.SampleLevel(p - float3(e, 0, 0), blod),
                        brick_atlas.SampleLevel(p + float3(0, e, 0), blod) -
@@ -483,7 +585,7 @@ void main(uint3 tid: SV_DispatchThreadID) {
                            brick_atlas.SampleLevel(p - float3(0, 0, e), blod));
           } else if (is_bricks()) {
             /* taps reuse the cached brick (offsets in voxels) */
-            float ev = lod_step;
+            float ev = bricks_is_lod() ? b_grad_vox : lod_step;
             g = float3(bricks_fetch(b_slot, b_bl + float3(ev, 0, 0), blod, b_inv) -
                            bricks_fetch(b_slot, b_bl + float3(-ev, 0, 0), blod, b_inv),
                        bricks_fetch(b_slot, b_bl + float3(0, ev, 0), blod, b_inv) -

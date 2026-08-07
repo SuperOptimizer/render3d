@@ -65,6 +65,12 @@ int r3d_vk_upload_image_staged(r3d_vkctx *c, VkCommandPool pool, r3d_vkimage *im
 int r3d_vk_upload_image_staged_buf(r3d_vkctx *c, VkCommandPool pool, r3d_vkbuf *stage,
                                    r3d_vkimage *img, const void *host, uint32_t row_length,
                                    VkOffset3D offset, VkExtent3D extent);
+/* Depth-capable variant: image_height is the source slice pitch in rows and
+ * may exceed extent.height for a sub-rectangle of a strided 3-D host box. */
+int r3d_vk_upload_image_staged_buf_pitch(r3d_vkctx *c, VkCommandPool pool, r3d_vkbuf *stage,
+                                         r3d_vkimage *img, const void *host,
+                                         uint32_t row_length, uint32_t image_height,
+                                         VkOffset3D offset, VkExtent3D extent);
 int r3d_vk_image_to_general(r3d_vkctx *c, VkCommandPool pool, r3d_vkimage *img);
 
 /* Small generic compute pipeline (descriptor types given per binding). */

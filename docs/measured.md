@@ -557,6 +557,78 @@ focus intersection swings); fills keep up asynchronously but a follow
 deadband for small windows is a possible refinement. R3D_VSLAB_DEBUG=1
 prints per-job traces.
 
+## 2026-08-07 — PHerc1218 annotation z-prefetch
+
+The umbilicus workflow jumps between thin, complete 8192x8192 planes, usually
+100 slices apart. Before this change each jump waited for the 3ddct shards to
+be decoded and then uploaded. A separate CPU worker now prepares ordered nearby
+z windows after the current GPU window becomes resident: five annotation steps
+in the last navigation direction, then one behind it. Six LRU slots retain the
+decoded 10-slice windows (the visible 8 plus filtering apron), 640 MiB each /
+3.75 GiB maximum. The foreground upload worker copies a cache hit directly into
+its cell staging box. Fetch publication remains serialized between the workers;
+decoding runs with six threads. `--ann-prefetch N` selects 0-5 forward steps;
+`R3D_VSLAB_NOPC=1` is the comparison/low-memory escape hatch.
+
+Measured on the complete local PHerc1218 mirror, 420-frame `annstep` benchmark,
+z=1600 to z=1700:
+
+- no decoded cache: 2053 pending cell-frames;
+- decoded cache: 1357 pending cell-frames (33.9% fewer), 64/64 destination
+  cells served by cache;
+- cached and uncached final renders were byte-identical (matching SHA-256);
+- nearby 10-slice full-plane decodes usually completed in 200-500 ms, with a
+  2.0 s cold outlier in this run;
+- a cold standalone 8192x8192x16 decode took 2.07 s and about 1.0 GiB RSS.
+
+The automated `tools/bench_ann_prefetch.sh` stress test holds the initial plane
+until look-ahead is ready, then makes six +100 moves 0.6 seconds apart. Identical
+600-frame runs on this machine:
+
+| planes ahead | pending cell-frames | cache hits | cache misses |
+|-------------:|--------------------:|-----------:|-------------:|
+| 0 | 12609 | 0 | 0 |
+| 1 | 12300 | 56 | 193 |
+| 3 | 11326 | 169 | 128 |
+| 5 | 8938 | 273 | 127 |
+
+Five-ahead reduces pending work 27.3% relative to one-ahead and 29.1% relative
+to no decoded cache. It is therefore the default on this 30 GiB machine.
+
+Fine one-slice wheel movement exposed a separate issue: the original GPU ring
+contained only the visible 8 slices plus 2 filtering layers. Even when 3ddct
+data was cached elsewhere, each detent had to upload a new layer to all 64 base
+cells and their overview tiles. Annotation mode now keeps a symmetric
+contiguous GPU z margin and distinguishes visible residency from background
+margin completion. Visible jobs always win; travel-side margin jobs fill in
+16-slice breadth-first rounds, followed by the opposite side. Base and pyramid
+z stacks are submitted as 3-D batches instead of one Vulkan submission per
+slice.
+
+`annwheel` holds the initial view, then traverses 20 adjacent slices at ten
+detents/second. With the CPU jump cache disabled to isolate GPU residency,
+identical 600-frame runs measured:
+
+| GPU margin per side | ring depth | tile memory | visible pending cell-frames |
+|--------------------:|-----------:|------------:|----------------------------:|
+| 0 | 10 | 0.7 GB | 8577 |
+| 32 | 74 | 5.4 GB | 0 |
+
+The fully resident static outputs are visually equivalent (SSIM 0.9965). Their
+non-identical bytes come from normalized 3-D sampling with different ring
+periods, not missing cells: both runs ended with visible=0 and resident=0.
+`--ann-z-prefetch N` controls the margin (default 32, 0-128); the six decoded
+jump windows plus this ring use at most about 9.2 GB here.
+
+c5d is not the right first-stage cache for this view. Its GPU path works in
+128-cubed bricks, so an 8-10-slice plane would decode 13-16x the requested z
+depth. The current c5d renderer also addresses one 1024-cubed `.c5s` shard at
+a time, while PHerc1218 contains 1472 shards; using it here requires a global
+multi-shard GPU page table/atlas rather than only a transcode. The benchmark
+shows the remaining cache-hit delay is GPU upload and pyramid construction.
+Batching those uploads, or adding disjoint GPU-resident z windows, is the next
+useful optimization if navigation still needs to become instantaneous.
+
 ## 2026-08-06 — x86_64 / RTX 4060 port: upload path + a benchmark-validity bug
 
 First run on a second GPU (RTX 4060 Laptop, NVIDIA 595.84, Ubuntu 26.04,
@@ -754,3 +826,83 @@ through a 2^3 hot atlas, GPU decode jobs average 89.43 ms while render-loop CPU
 frames stay at or below 4.42 ms. Page-table publication is timeline-drained and
 image access is explicitly synchronized; the decode no longer blocks the
 render thread.
+
+## 2026-08-07 — Snapdragon X Elite / Adreno X1-85 local tuning
+
+Requalified the RTX-focused 2026-08-06 changes on the development laptop
+(12-core Qualcomm Oryon, Adreno X1-85, Turnip 26.0.3). Release CPU, shard,
+GPU-reference, and c5d-GPU conformance tests all pass. Bulk staging remains the
+right upload default here: cached 1024^3 startup was 0.80-0.90 s versus 1.00 s
+with `R3D_STAGING=0` host image copy.
+
+The global workgroup sweep exposed a view-dependent split. At 1080p full
+quality, 8x8 is poor for the dense static view (22.75 ms versus 19.05 ms for
+16x8), but markedly better on the divergent orbit path. Under the default
+half-resolution interaction policy, two 250-warmup/750-measured passes gave
+raycast means of 2.303/2.307 ms for 8x8 versus 2.839/2.835 ms for 16x8: an
+18.7% reduction. The backend therefore keeps both pipelines only on the exact
+X1-85 device and selects 8x8 when the render viewport is reduced; full
+resolution remains 16x8. `R3D_WG` still forces a fixed variant and disables
+the automatic choice.
+
+The portable release preset compiled generic AArch64 host code. A separate
+`native` preset adds `-mcpu=native` without making release binaries
+machine-specific. Across three cached 1024^3 starts, occupancy construction
+and upload averaged 122 ms with portable release and 95 ms native (-22%);
+steady-state GPU time was unchanged, as expected.
+
+## 2026-08-07 — PHerc1218 global Zarr/c5d LOD pyramid
+
+The 23552x8192x8192 mirror is now processed directly from its 1472 dct3d Zarr
+shards. `lodpack` combines eight decoded parent 16³ chunks into each 2x-reduced
+child chunk, writes standard Zarr v3 `sharding_indexed` objects, decodes each
+new chunk closed-loop, and assembles c5d 128³ bricks. The level shapes are
+23552x8192x8192, 11776x4096x4096, 5888x2048x2048, 2944x1024x1024,
+1472x512x512, 736x256x256, 368x128x128, and 184x64x64. The resulting shard
+counts are 1472, 192, 24, 3, 2, 1, 1, and 1.
+
+The first implementation used c5d's target-ratio search. Those streams passed
+CPU decode and a full 1.07-billion-voxel Zarr comparison but exposed a sparse
+substream failure in the current GPU entropy kernel. Production therefore
+uses the already-conformant fixed-quality path with an inverted q ladder
+(2, 1, 0.5, then 0.25). This is an important distinction: valid CPU c5d is
+not sufficient evidence for the renderer; the GPU conformance path is part of
+the format gate.
+
+`lodcheck` compared all 512 bricks in representative production shards against
+decoded Zarr (1,073,741,824 voxels each): L0 measured MAE 0.721, PSNR 44.35 dB,
+max error 57; L1 measured MAE 1.814, PSNR 40.17 dB, max error 45. Container
+CRCs, zero sentinels, and global brick/chunk coordinates were all exercised.
+All generated levels have matching Zarr/c5d shard counts and no partial output
+files. The production path also passes `test_c5dgpu` in native and sanitizer
+builds.
+
+The renderer manifest creates one logical page table over every true brick at
+all eight levels (861,341 entries for PHerc1218). The complete coarsest level
+is decoded synchronously and pinned as the no-hole fallback. The CPU streamer
+chooses a desired level from `distance * pixel_cone * base_max_dimension`,
+while the ray shader repeats the choice at sample depth. Lookup is bounded to
+the desired level, two immediate parents, and the pinned fallback. Atlas slots
+can therefore contain bricks from any level, and adjacent regions compose even
+when their requests complete on different frames without scanning unrelated
+finer levels.
+
+The original whole-depth MIP path exposed two correctness and scheduling
+problems: it produced visible nested brick rectangles while a 5^3 atlas
+thrashed, and asynchronous c5d compute shared the Adreno X1-85's only graphics
+and compute queue with raycasting. A close 640x480 view measured about 149 ms
+GPU. Manifests now default to the actual annotation workload: a shallow
+8-slice XY slab, with z-range-pruned requests and a 8^3 hot atlas. Manifest
+c5d is decoded on four CPU threads into a persistently mapped staging batch;
+the GPU only performs the final atlas copy. Disk Zarr/c5d levels are the only
+LOD hierarchy, so the atlas no longer allocates or filters a second per-slot
+mip chain.
+
+On the same machine, a settled 960x720 midpoint slice measured 1.59 ms GPU,
+with 12 streamed bricks and no failures; the captured image has no brick-grid
+discontinuities. A 600-frame 640x480 no-vsync `zoomio` sweep averaged 0.81 ms
+GPU / 0.88 ms CPU, exercised four requested LODs, and completed with zero
+failures. A 600-frame full-z `zsweep` averaged 0.90 ms GPU, decoded 144 bricks
+in 28 batches, and also recorded zero failures. Benchmark JSON records the
+desired-level set and cumulative per-level request counts so the LOD walk is
+machine-checkable.

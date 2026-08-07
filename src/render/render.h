@@ -53,10 +53,19 @@ void r3d_bricks_params(const r3d_renderer *r, r3d_frame_params *p);
 /* Streaming pump: call once per frame BEFORE r3d_frame. eye/fwd = camera
  * position/forward in VOLUME space (normalized [0,1] cube coords, model
  * transform already inverted); half_tan = tan(fov_y/2) * frustum diagonal
- * factor; gate = minimum visible voxel value [0,1] (TF-aware, empty bricks
- * below it never occupy slots); budget = max bricks decoded this call. */
+ * factor; pixel_cone = world-space ray-cone growth per unit distance (two
+ * adjacent vertical pixel rays), used to choose the c5d resolution whose
+ * voxel pitch matches apparent magnification; gate = minimum visible voxel
+ * value [0,1] (TF-aware, empty bricks below it never occupy slots); budget =
+ * max bricks decoded this call. */
 void r3d_bricks_stream(r3d_renderer *r, const float eye[3], const float fwd[3], float half_tan,
-                       float gate, uint32_t budget);
+                       float pixel_cone, uint32_t slice_z0, uint32_t slice_depth, float gate,
+                       uint32_t budget);
+/* Volume box in renderer coordinates. Legacy cubic shards return 1,1,1;
+ * manifests preserve rectangular physical proportions using max(shape). */
+void r3d_bricks_extent(const r3d_renderer *r, float extent[3]);
+/* True base-level voxel shape in renderer x,y,z order. */
+void r3d_bricks_shape(const r3d_renderer *r, uint32_t shape[3]);
 
 typedef struct r3d_bricks_stats {
   uint32_t nb, hot, hot_cap;    /* volume bricks; resident slots; pool slots */
@@ -65,19 +74,43 @@ typedef struct r3d_bricks_stats {
   uint32_t inflight;            /* requests decoded this frame */
   uint64_t decoded, jobs, stream_ns; /* cumulative worker throughput/latency */
   uint32_t failures;
+  uint32_t nlevels, lod_wanted[8]; /* latest projected-footprint desired set */
+  uint64_t lod_requests[8];        /* cumulative visible desired bricks */
 } r3d_bricks_stats;
 void r3d_bricks_get_stats(r3d_renderer *r, r3d_bricks_stats *st);
 /* Wait for the currently queued streaming batch (benchmark/shutdown boundary). */
 void r3d_bricks_flush(r3d_renderer *r);
-/* Virtual slab: a W x H x D window positioned anywhere in the full export
- * (43008^2 x 68608), streamed from the local shard cache in band_dir with
- * remote fetch on miss (R3D_VSLAB_NOFETCH=1 disables). Call r3d_vslab_frame
- * once per frame BEFORE r3d_frame: it recenters the window on the focus
- * (world voxels), runs up to `budget` decode jobs, and fills the params. */
-int r3d_vslab_begin(r3d_renderer *r, const char *band_dir, uint32_t W, uint32_t H, uint32_t D);
+/* Virtual slab: a W x H x D window positioned anywhere in a sharded Zarr
+ * export, streamed from a local cache with remote fetch on miss
+ * (R3D_VSLAB_NOFETCH=1 disables). shard_url is the array's `/c` URL; NULL
+ * retains the PHercParis3 default. The cache directory is created as needed. */
+typedef struct r3d_vslab_desc {
+  uint32_t nx, ny, nz; /* full export dimensions */
+  uint32_t W, H, D;    /* visible window dimensions */
+  const char *cache_dir;
+  const char *shard_url;
+  uint32_t z_prefetch; /* GPU-resident slices before/after visible D */
+  /* Optional CPU-decoded full-XY window cache. Intended for thin whole-plane
+   * annotation views; threads bounds background decode CPU use. */
+  uint32_t prefetch_slots;
+  uint32_t prefetch_threads;
+} r3d_vslab_desc;
+#define R3D_VSLAB_PREFETCH_MAX 6
+int r3d_vslab_begin(r3d_renderer *r, const r3d_vslab_desc *d);
 void r3d_vslab_frame(r3d_renderer *r, double fx, double fy, int64_t z0, uint32_t budget,
                      r3d_frame_params *p);
 void r3d_vslab_get(const r3d_renderer *r, int64_t o[3], uint32_t *pending);
+uint32_t r3d_vslab_resident_pending(const r3d_renderer *r);
+/* Replace the ordered nearby-z prefetch targets. Earlier entries have higher
+ * fill priority; invalid and duplicate entries are ignored. */
+void r3d_vslab_prefetch(r3d_renderer *r, const int64_t *z0, uint32_t count);
+typedef struct r3d_vslab_prefetch_stats {
+  uint32_t ready, filling, capacity;
+  uint64_t hits, misses;
+  int64_t wanted[R3D_VSLAB_PREFETCH_MAX];
+  double last_decode_ms;
+} r3d_vslab_prefetch_stats;
+void r3d_vslab_prefetch_get(r3d_renderer *r, r3d_vslab_prefetch_stats *st);
 
 int r3d_set_transfer(r3d_renderer *r, const uint8_t rgba[256][4]);
 /* Select the full six-tap or fast four-tap shading pipeline. */

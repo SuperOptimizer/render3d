@@ -50,6 +50,7 @@ add_library(r3d_core STATIC
   src/core/volume.c
   src/core/camera.c
   src/core/transfer.c
+  src/core/umbilicus.c
   src/core/input.c
   src/core/screenshot.c)
 target_include_directories(r3d_core PUBLIC src)
@@ -181,6 +182,10 @@ add_executable(assemble tools/assemble/main.c)
 target_link_libraries(assemble PRIVATE m r3d_warnings r3d_sanitize)
 add_executable(c5dpack tools/c5dpack/main.c)
 target_link_libraries(c5dpack PRIVATE r3d_c5d r3d_shard r3d_warnings r3d_sanitize)
+add_executable(lodpack tools/lodpack/main.c)
+target_link_libraries(lodpack PRIVATE r3d_c5d r3d_shard r3d_warnings r3d_sanitize)
+add_executable(lodcheck tools/lodcheck/main.c)
+target_link_libraries(lodcheck PRIVATE r3d_c5d r3d_shard r3d_warnings r3d_sanitize)
 add_executable(mkpyramid tools/mkpyramid/main.c)
 target_link_libraries(mkpyramid PRIVATE r3d_shard r3d_warnings r3d_sanitize)
 add_executable(bandcut tools/bandcut/main.c)

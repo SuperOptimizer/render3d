@@ -12,6 +12,8 @@
 
 typedef struct r3d_vkcaps {
   uint32_t api_version;
+  uint32_t vendor_id;
+  uint32_t device_id;
   uint32_t max_dim_3d;
   uint32_t max_push_bytes;
   uint32_t max_wg_invocations;

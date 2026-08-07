@@ -1,6 +1,6 @@
 /* Virtual-slab layout math (pure, header-only — unit-tested in test_quick).
  *
- * A W x H x D window positioned ANYWHERE in the full export (43008^2 x 68608),
+ * A W x H x D window positioned ANYWHERE in a sharded export,
  * rendered from world-anchored toroidal tile grids: each level's plane is cut
  * into fixed world-space cells of R3D_VS_PAY * scale voxels, and cell (cx,cy)
  * always lives in physical tile (cx mod gx, cy mod gy). Scrolling any axis
@@ -10,7 +10,9 @@
  * slab pyramid). Payload 2016 = 63*32, so every pyramid texel's s x s source
  * box lies entirely inside ONE base cell: pyramid content is a pure by-product
  * of base-cell fills and inherits base validity (1-texel aprons excepted).
- * Z is the slab ring: world slice s lives in layer s mod wz, wz = D + 2. */
+ * Z is the slab ring: world slice s lives in layer s mod wz. The visible D
+ * slices require D+2 filtering layers; an optional symmetric z margin makes
+ * nearby scroll positions GPU-resident without changing visible thickness. */
 #ifndef R3D_VSLAB_H
 #define R3D_VSLAB_H
 
@@ -31,7 +33,8 @@ typedef struct r3d_vslab {
   uint64_t nx, ny, nz; /* full volume dims */
   uint32_t W, H, D;    /* window dims (world voxels) */
   uint32_t px;         /* tile payload per xy axis (runtime, multiple of 32) */
-  uint32_t wz;         /* z ring depth = D + 2 */
+  uint32_t wz;         /* z ring depth = D + 2 + 2*z_margin */
+  uint32_t z_margin;   /* resident slices before/after the visible window */
   int64_t x0, y0, z0;  /* window origin (world voxels) */
   r3d_vs_level lv[R3D_VS_LEVELS];
   uint32_t ntiles;     /* total physical tiles across levels */
@@ -47,17 +50,23 @@ static inline int64_t r3d_vs_cell(const r3d_vslab *v, uint32_t l) {
  * stays proportional, and the z ring is a single image depth (aprons + ring
  * slack included), bounded by maxImageDimension3D = 2048 -> D <= 2044. An
  * axis that spans the whole volume cannot move and drops its straddle +
- * prefetch margin entirely. */
-static inline int r3d_vslab_init(r3d_vslab *v, uint64_t nx, uint64_t ny, uint64_t nz,
-                                 uint32_t W, uint32_t H, uint32_t D) {
-  if (W < 64 || H < 64 || W > nx || H > ny || D < 2 || D > 2044 || D > nz) return -1;
+ * prefetch margin entirely. Visible D plus filtering and z margins must fit
+ * that same 2046-layer ring limit. */
+static inline int r3d_vslab_init_margin(r3d_vslab *v, uint64_t nx, uint64_t ny, uint64_t nz,
+                                        uint32_t W, uint32_t H, uint32_t D,
+                                        uint32_t z_margin) {
+  uint64_t ring = (uint64_t)D + 2 + 2ull * z_margin;
+  if (W < 64 || H < 64 || W > nx || H > ny || D < 2 || D > 2044 || D > nz ||
+      ring > 2046 || ring > nz)
+    return -1;
   v->nx = nx;
   v->ny = ny;
   v->nz = nz;
   v->W = W;
   v->H = H;
   v->D = D;
-  v->wz = D + 2;
+  v->wz = (uint32_t)ring;
+  v->z_margin = z_margin;
   v->x0 = v->y0 = v->z0 = 0;
   uint32_t m = W > H ? W : H;
   uint32_t px = (m / 8 + 31) & ~31u;
@@ -90,6 +99,26 @@ static inline int r3d_vslab_init(r3d_vslab *v, uint64_t nx, uint64_t ny, uint64_
   }
   v->ntiles = nt;
   return 0;
+}
+
+static inline int r3d_vslab_init(r3d_vslab *v, uint64_t nx, uint64_t ny, uint64_t nz,
+                                 uint32_t W, uint32_t H, uint32_t D) {
+  return r3d_vslab_init_margin(v, nx, ny, nz, W, H, D, 0);
+}
+
+/* GPU-resident z range [a,b) for a visible window at z0. Keep a full ring
+ * near volume faces by shifting the margin to the available side. */
+static inline void r3d_vs_zrange(const r3d_vslab *v, int64_t z0, int64_t *a, int64_t *b) {
+  int64_t za = z0 - (int64_t)v->z_margin;
+  if (za < 0) za = 0;
+  int64_t zb = za + (int64_t)v->wz;
+  if (zb > (int64_t)v->nz) {
+    zb = (int64_t)v->nz;
+    za = zb - (int64_t)v->wz;
+    if (za < 0) za = 0;
+  }
+  *a = za;
+  *b = zb;
 }
 
 /* Resident cell range [c0, c1] at level l for the current origin (x axis;

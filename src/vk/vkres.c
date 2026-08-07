@@ -435,11 +435,14 @@ int r3d_vk_image_to_general(r3d_vkctx *c, VkCommandPool pool, r3d_vkimage *img) 
   return r3d_vk_oneshot_end(c, pool, cmd);
 }
 
-int r3d_vk_upload_image_staged_buf(r3d_vkctx *c, VkCommandPool pool, r3d_vkbuf *stage,
-                                   r3d_vkimage *img, const void *host, uint32_t row_length,
-                                   VkOffset3D offset, VkExtent3D extent) {
-  if (!host || !row_length || !extent.width || !extent.height || !extent.depth) return -1;
-  VkDeviceSize plane = (VkDeviceSize)row_length * extent.height;
+int r3d_vk_upload_image_staged_buf_pitch(r3d_vkctx *c, VkCommandPool pool, r3d_vkbuf *stage,
+                                         r3d_vkimage *img, const void *host,
+                                         uint32_t row_length, uint32_t image_height,
+                                         VkOffset3D offset, VkExtent3D extent) {
+  if (!host || !row_length || image_height < extent.height || !extent.width ||
+      !extent.height || !extent.depth)
+    return -1;
+  VkDeviceSize plane = (VkDeviceSize)row_length * image_height;
   VkDeviceSize bytes = plane * (extent.depth - 1) +
                        (VkDeviceSize)row_length * (extent.height - 1) + extent.width;
   if (stage->size < bytes) {
@@ -463,7 +466,7 @@ int r3d_vk_upload_image_staged_buf(r3d_vkctx *c, VkCommandPool pool, r3d_vkbuf *
                        VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, 0, 1);
   VkBufferImageCopy reg = {
       .bufferRowLength = row_length,
-      .bufferImageHeight = extent.height,
+      .bufferImageHeight = image_height,
       .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
       .imageOffset = offset,
       .imageExtent = extent,
@@ -475,6 +478,13 @@ int r3d_vk_upload_image_staged_buf(r3d_vkctx *c, VkCommandPool pool, r3d_vkbuf *
                        VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                        VK_ACCESS_2_SHADER_SAMPLED_READ_BIT, 0, 1);
   return r3d_vk_oneshot_end(c, pool, cmd);
+}
+
+int r3d_vk_upload_image_staged_buf(r3d_vkctx *c, VkCommandPool pool, r3d_vkbuf *stage,
+                                   r3d_vkimage *img, const void *host, uint32_t row_length,
+                                   VkOffset3D offset, VkExtent3D extent) {
+  return r3d_vk_upload_image_staged_buf_pitch(c, pool, stage, img, host, row_length,
+                                               extent.height, offset, extent);
 }
 
 int r3d_vk_upload_image_staged(r3d_vkctx *c, VkCommandPool pool, r3d_vkimage *img,

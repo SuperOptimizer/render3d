@@ -31,6 +31,15 @@
       }
     },
     {
+      "name": "native",
+      "inherits": "release",
+      "binaryDir": "${sourceDir}/build/native",
+      "cacheVariables": {
+        "CMAKE_C_FLAGS_RELEASE": "-O3 -DNDEBUG -mcpu=native",
+        "CMAKE_CXX_FLAGS_RELEASE": "-O3 -DNDEBUG -mcpu=native"
+      }
+    },
+    {
       "name": "tsan",
       "inherits": "base",
       "binaryDir": "${sourceDir}/build/tsan",
@@ -43,10 +52,12 @@
   "buildPresets": [
     { "name": "dev", "configurePreset": "dev" },
     { "name": "release", "configurePreset": "release" },
+    { "name": "native", "configurePreset": "native" },
     { "name": "tsan", "configurePreset": "tsan" }
   ],
   "testPresets": [
     { "name": "dev", "configurePreset": "dev", "output": { "outputOnFailure": true } },
+    { "name": "native", "configurePreset": "native", "output": { "outputOnFailure": true } },
     {
       "name": "quick",
       "configurePreset": "dev",

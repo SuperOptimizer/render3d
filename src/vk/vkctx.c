@@ -149,6 +149,8 @@ int r3d_vkctx_create(r3d_vkctx *c, const char *const *inst_exts, uint32_t n_inst
                                     .pNext = &sg};
   vkGetPhysicalDeviceProperties2(c->phys, &p2);
   c->caps.api_version = p2.properties.apiVersion;
+  c->caps.vendor_id = p2.properties.vendorID;
+  c->caps.device_id = p2.properties.deviceID;
   c->caps.max_dim_3d = p2.properties.limits.maxImageDimension3D;
   c->caps.max_push_bytes = p2.properties.limits.maxPushConstantsSize;
   c->caps.max_wg_invocations = p2.properties.limits.maxComputeWorkGroupInvocations;
@@ -338,9 +340,9 @@ VkResult r3d_vkctx_device_wait_idle(r3d_vkctx *c) {
 
 void r3d_vkctx_print_caps(const r3d_vkctx *c) {
   const r3d_vkcaps *k = &c->caps;
-  printf("device            : %s (Vulkan %u.%u.%u)\n", k->dev_name,
+  printf("device            : %s (Vulkan %u.%u.%u, %04x:%08x)\n", k->dev_name,
          VK_API_VERSION_MAJOR(k->api_version), VK_API_VERSION_MINOR(k->api_version),
-         VK_API_VERSION_PATCH(k->api_version));
+         VK_API_VERSION_PATCH(k->api_version), k->vendor_id, k->device_id);
   printf("queue family      : %u (graphics+compute, timestamps=%s, period %.2f ns)\n", c->qfam,
          k->timestamps ? "yes" : "no", k->ts_period_ns);
   printf("maxImageDimension3D    : %u\n", k->max_dim_3d);
