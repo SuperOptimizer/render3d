@@ -13,16 +13,28 @@
 #define BD 128u
 #define NVOX (BD * BD * BD)
 #define LVS (512u * 4096u) /* levels ints per brick */
+#define NCHUNK 512u /* 16^3 chunks in a 128^3 brick */
+/* Layout constants of the c5d GPU decode contract. These MUST match the
+ * ${R3D_C5D_DIR} checkout render3d is COMPILED AGAINST -- CMake pulls that
+ * tree's src/gpu directly, so it is the working tree, not a pinned commit,
+ * and an in-flight edit there silently changes this ABI. SUBW is the uints
+ * per substream in he_gpu.subinfo (host_entropy.c fills subinfo[s*SUBW+..],
+ * entropy.comp reads the same); PairInfo is offset+count per chunk. */
+#define SUBW 7u
 
 /* push structs must match the kernels in ${R3D_C5D_DIR}/src/gpu/kernels */
 typedef struct pc_ent {
   uint32_t chunks_per_sub, nchunk, nsub, nway, ctx2;
-  uint32_t nbrick, brick0, lv_stride, tb_stride, sub_stride, st_stride;
+  uint32_t nbrick, brick0, lv_stride, tb_stride, sub_stride, st_stride, pairinfo_stride;
 } pc_ent;
 typedef struct pc_dq {
   float q, hf_exp, dc_fine, dz_dq;
   uint32_t dim, bpa, levels_base, vol_base;
   uint32_t sparse; /* 1: Levels holds (pos<<20|val) pairs + Counts */
+  uint32_t qweights;      /* Q2.6 wz|wy<<8|wx<<16; 0 = isotropic */
+  uint32_t pairinfo_base; /* this brick's offset/count pairs */
+  uint32_t qmap;          /* nonzero when a per-chunk scale map is bound */
+  uint32_t qmap_base;
 } pc_dq;
 typedef struct pc_db {
   uint32_t dim, axis;
@@ -48,7 +60,7 @@ struct r3d_vkc5d {
   r3d_vkctx *vk;
   uint32_t max_batch;
   pipe ent, dq, db, pk, cr;
-  r3d_vkbuf lv, vol, pay, freq, cum, slot, sub, stat, scan, counts, corr;
+  r3d_vkbuf lv, vol, pay, freq, cum, slot, sub, stat, scan, counts, corr, qmap;
   VkCommandPool pool;
   VkCommandBuffer cmd;
   VkFence fence;
@@ -196,7 +208,7 @@ int r3d_vkc5d_create(r3d_vkc5d **out, r3d_vkctx *c, const char *spv_dir, uint32_
   uint32_t K = d->max_batch;
 
   if (pipe_create(c, spv_dir, "c5d_entropy.spv", 9, false, sizeof(pc_ent), &d->ent) != 0 ||
-      pipe_create(c, spv_dir, "c5d_dequant_idct.spv", 3, false, sizeof(pc_dq), &d->dq) != 0 ||
+      pipe_create(c, spv_dir, "c5d_dequant_idct.spv", 4, false, sizeof(pc_dq), &d->dq) != 0 ||
       pipe_create(c, spv_dir, "c5d_deblock.spv", 1, false, sizeof(pc_db), &d->db) != 0 ||
       pipe_create(c, spv_dir, "pack.spv", 1, true, sizeof(pc_pack), &d->pk) != 0 ||
       pipe_create(c, spv_dir, "c5d_corrections.spv", 2, false, sizeof(pc_corr), &d->cr) != 0)
@@ -210,10 +222,11 @@ int r3d_vkc5d_create(r3d_vkc5d **out, r3d_vkctx *c, const char *spv_dir, uint32_
       r3d_vkbuf_create_host(c, (VkDeviceSize)K * HE_NMODELS * (HE_NTOK + 1) * 4, u, &d->cum) !=
           0 ||
       r3d_vkbuf_create_host(c, (VkDeviceSize)K * HE_NMODELS * 4096 * 4, u, &d->slot) != 0 ||
-      r3d_vkbuf_create_host(c, (VkDeviceSize)K * 128 * 6 * 4, u, &d->sub) != 0 ||
+      r3d_vkbuf_create_host(c, (VkDeviceSize)K * 128 * SUBW * 4, u, &d->sub) != 0 ||
       r3d_vkbuf_create_host(c, (VkDeviceSize)K * 128 * 4, u, &d->stat) != 0 ||
       r3d_vkbuf_create_host(c, 4096 * 4, u, &d->scan) != 0 ||
-      r3d_vkbuf_create_host(c, (VkDeviceSize)K * 512 * 4, u, &d->counts) != 0 ||
+      r3d_vkbuf_create_host(c, (VkDeviceSize)K * NCHUNK * 2 * 4, u, &d->counts) != 0 ||
+      r3d_vkbuf_create_host(c, (VkDeviceSize)K * NCHUNK * 4, u, &d->qmap) != 0 ||
       /* tau pairs, post-deblock scatter (upstream worst case ~5.6 MB/brick) */
       r3d_vkbuf_create_host(c, (VkDeviceSize)K * (6u << 20), u, &d->corr) != 0)
     goto fail;
@@ -222,8 +235,8 @@ int r3d_vkc5d_create(r3d_vkc5d **out, r3d_vkctx *c, const char *spv_dir, uint32_
   r3d_vkbuf ent_bufs[9] = {d->lv, d->pay, d->freq, d->cum, d->slot,
                            d->sub, d->scan, d->stat, d->counts};
   bind_buffers(c, &d->ent, ent_bufs, 9);
-  r3d_vkbuf dq_bufs[3] = {d->lv, d->vol, d->counts};
-  bind_buffers(c, &d->dq, dq_bufs, 3);
+  r3d_vkbuf dq_bufs[4] = {d->lv, d->vol, d->counts, d->qmap};
+  bind_buffers(c, &d->dq, dq_bufs, 4);
   bind_buffers(c, &d->db, &d->vol, 1);
   bind_buffers(c, &d->pk, &d->vol, 1); /* image binding written per decode */
   r3d_vkbuf cr_bufs[2] = {d->vol, d->corr};
@@ -254,7 +267,8 @@ void r3d_vkc5d_destroy(r3d_vkc5d *d) {
   if (d->fence) vkDestroyFence(c->dev, d->fence, NULL);
   if (d->pool) vkDestroyCommandPool(c->dev, d->pool, NULL);
   r3d_vkbuf *bufs[] = {&d->lv,   &d->vol, &d->pay,  &d->freq,   &d->cum,  &d->slot,
-                       &d->sub,  &d->stat, &d->scan, &d->counts, &d->corr};
+                       &d->sub,  &d->stat, &d->scan, &d->counts, &d->corr,
+                       &d->qmap};
   for (size_t i = 0; i < sizeof bufs / sizeof *bufs; i++) r3d_vkbuf_destroy(c, bufs[i]);
   pipe_destroy(c, &d->cr);
   pipe_destroy(c, &d->ent);
@@ -297,6 +311,11 @@ int r3d_vkc5d_decode(r3d_vkc5d *d, const r3d_c5d_src *src, uint32_t n, VkImageVi
     uint32_t corr_base[64], corr_n[64];
     for (uint32_t i = 0; i < nb; i++) {
       const r3d_c5d_src *s = &src[i0 + i];
+      /* per-chunk Q2.6 scales; 64 == 1.0, i.e. the isotropic default the
+       * kernel assumes when pc.qmap is 0. Written for every brick so a stale
+       * neighbour's map can never leak into one that carries none. */
+      uint32_t *qm = (uint32_t *)d->qmap.mapped + (size_t)i * NCHUNK;
+      for (uint32_t ci = 0; ci < NCHUNK; ci++) qm[ci] = 64u;
       if (d->hybrid) {
         if (he_decode(s->blob, s->n, BD, &hds[i]) != 0) goto brick_fail;
         memcpy((int32_t *)d->lv.mapped + (size_t)i * LVS, hds[i].levels,
@@ -312,16 +331,18 @@ int r3d_vkc5d_decode(r3d_vkc5d *d, const r3d_c5d_src *src, uint32_t n, VkImageVi
         gpus[i].nchunk = hds[i].nchunk;
         gpus[i].nsub = hds[i].nsub;
         gpus[i].chunks_per_sub = hds[i].chunks_per_sub;
+        gpus[i].qweights = hds[i].qweights;
+        gpus[i].qmap = hds[i].qmap;
       } else {
         if (he_gpu_setup(s->blob, s->n, BD, &gpus[i]) != 0) goto brick_fail;
         he_gpu *g = &gpus[i];
         if (pay_off + g->payload_n > (size_t)d->max_batch * (4u << 20)) goto brick_fail;
         memcpy((uint8_t *)d->pay.mapped + pay_off, g->payload, g->payload_n);
-        uint32_t *si = (uint32_t *)d->sub.mapped + (size_t)i * 128 * 6;
-        memcpy(si, g->subinfo, (size_t)g->nsub * 6 * 4);
+        uint32_t *si = (uint32_t *)d->sub.mapped + (size_t)i * 128 * SUBW;
+        memcpy(si, g->subinfo, (size_t)g->nsub * SUBW * 4);
         for (uint32_t ss = 0; ss < g->nsub; ss++) {
-          si[ss * 6 + 0] += (uint32_t)pay_off;
-          si[ss * 6 + 2] += (uint32_t)pay_off;
+          si[ss * SUBW + 0] += (uint32_t)pay_off;
+          si[ss * SUBW + 2] += (uint32_t)pay_off;
         }
         memcpy((uint32_t *)d->freq.mapped + (size_t)i * HE_NMODELS * HE_NTOK, g->freq,
                (size_t)HE_NMODELS * HE_NTOK * 4);
@@ -331,6 +352,10 @@ int r3d_vkc5d_decode(r3d_vkc5d *d, const r3d_c5d_src *src, uint32_t n, VkImageVi
           memcpy((uint32_t *)d->slot.mapped + (size_t)i * HE_NMODELS * 4096, g->slot2sym,
                  (size_t)HE_NMODELS * 4096 * 4);
         pay_off += (g->payload_n + 3) & ~(size_t)3;
+      }
+      if (gpus[i].qmap) {
+        uint32_t nc = gpus[i].nchunk < NCHUNK ? gpus[i].nchunk : NCHUNK;
+        for (uint32_t ci = 0; ci < nc; ci++) qm[ci] = gpus[i].qmap[ci];
       }
     }
 
@@ -375,7 +400,8 @@ int r3d_vkc5d_decode(r3d_vkc5d *d, const r3d_c5d_src *src, uint32_t n, VkImageVi
                    .brick0 = 0,
                    .lv_stride = LVS,
                    .tb_stride = HE_NMODELS,
-                   .sub_stride = 128 * 6,
+                   .sub_stride = 128 * SUBW,
+                   .pairinfo_stride = NCHUNK * 2,
                    .st_stride = 128};
       dispatch(d->cmd, &d->ent, &pe, sizeof pe, (nb * g0->nsub + 63) / 64);
       barrier_compute(d->cmd);
@@ -384,7 +410,11 @@ int r3d_vkc5d_decode(r3d_vkc5d *d, const r3d_c5d_src *src, uint32_t n, VkImageVi
       const he_gpu *g = &gpus[i];
       pc_dq pd = {.q = g->q, .hf_exp = g->hf_exp, .dc_fine = g->dc_fine, .dz_dq = g->dz_dq,
                   .dim = g->dim, .bpa = g->bpa, .levels_base = i * LVS, .vol_base = i * NVOX,
-                  .sparse = d->hybrid ? 0u : 1u};
+                  .sparse = d->hybrid ? 0u : 1u,
+                  .qweights = g->qweights,
+                  .pairinfo_base = i * NCHUNK * 2,
+                  .qmap = g->qmap != NULL,
+                  .qmap_base = i * NCHUNK};
       dispatch(d->cmd, &d->dq, &pd, sizeof pd, g->nchunk);
     }
     barrier_compute(d->cmd);

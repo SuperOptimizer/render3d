@@ -692,10 +692,43 @@ descriptors and tiles at large grids (the 22x22 whole-plane case drops well
 under the 1024-slot pool), and one less wrong hardware assumption.
 
 Note on the c5d coupling: render3d compiles ${R3D_C5D_DIR}/src directly, i.e.
-against that checkout's WORKING TREE, not a pinned commit. In-progress edits
-there change the host/kernel contract under render3d with no version signal —
-an uncommitted 6->7 widening of the entropy subinfo stride made test_c5dgpu
-fail intermittently, then hang, then decode garbage, all with render3d
-unchanged. Verified by extracting c5d HEAD to a scratch dir (git archive, no
-mutation of the checkout) and rebuilding: 4/4 pass, exact 16777189 voxels. If
-c5dgpu misbehaves, diff the c5d worktree before suspecting render3d.
+against that checkout's WORKING TREE, not a pinned commit. Edits there change
+the host/kernel contract under render3d with no version signal — a 6->7
+widening of the entropy subinfo stride (in the worktree while this was
+written, since committed as c5d d094007) made test_c5dgpu fail
+intermittently, then hang, then decode garbage, all with render3d unchanged.
+Isolated by extracting c5d HEAD to a scratch dir (git archive, no mutation of
+the checkout) and rebuilding: 4/4 pass, exact 16777189 voxels, proving
+render3d was not at fault. If c5dgpu misbehaves, diff the c5d checkout before
+suspecting render3d. Resync in the next entry.
+
+## 2026-08-06 — resync vkc5d.c to the c5d GPU decode contract (d094007)
+
+c5d d094007 ("Optimize Vesuvius codec performance and quality") changes the
+GPU decode ABI; render3d's own glue in src/vk/vkc5d.c was still on the
+6bd75e4-era contract, so full-GPU decode produced garbage while the hybrid
+path (CPU entropy) stayed correct. The delta, taken from c5d's own driver
+(src/gpu/codec.c) rather than guessed:
+
+- subinfo widens 6 -> 7 uints/substream (adds pair_base). Now SUBW, used for
+  the buffer size, the per-brick base, the memcpy and the pay_off patch —
+  previously five independent literal 6s, which is how it drifted.
+- entropy PC gains pairinfo_stride; PairInfo is now offset+count PER CHUNK,
+  so that buffer doubles (NCHUNK*2 uints/brick, was NCHUNK).
+- dequant_idct gains a 4th binding (QMap, Q2.6 per-chunk scales) and four PC
+  fields: qweights (packed Q2.6 z|y|x, 0 = isotropic), pairinfo_base, qmap,
+  qmap_base. Missing qweights was what silently mis-dequantised everything:
+  the stride fix alone made the decode structurally valid but numerically
+  wrong (16.4M voxels off by >1).
+- qmap is written for EVERY brick (default 64 = 1.0) before the per-brick
+  fill, so a previous brick's map cannot leak into one that carries none.
+
+Result: full-GPU 5/5 exact 16777185 voxels, 31 at 1 LSB, 0 worse — identical
+to hybrid, and deterministic where the mismatched build hung or varied run to
+run. ctest --preset dev is 4/4 again (shard skipped: no local band data).
+
+Worth noting for the next time this drifts: the failure signature moved
+through three stages as the mismatch narrowed — hang (rANS looping on garbage
+counts), then "truncated substream" (structurally invalid), then clean decode
+with wrong values (valid but mis-dequantised). Only the last is quiet; treat
+a c5dgpu hang as an ABI mismatch, not a driver bug.
