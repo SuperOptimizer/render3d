@@ -22,8 +22,21 @@ import common;
 [[vk::binding(7, 0)]] Texture2D<float4> surf_coords;
 [[vk::binding(8, 0)]] Texture2D<float4> surf_normals;
 // flattened surface volume window (u, v, layer) — resampled from the bricks
-// cache by surfvol.comp; the surf view raycasts THIS like a real volume
-[[vk::binding(9, 0)]] Sampler3D<float> flat_vol;
+// cache by surfvol.comp; the surf view raycasts THIS like a real volume.
+// RG: R = CT value, G = overlay (ink) value
+[[vk::binding(9, 0)]] Sampler3D<float4> flat_vol;
+// overlay (ink) atlas: slot-parallel to brick_atlas — the SAME page-table
+// resolve and slot coords fetch the overlay value
+[[vk::binding(10, 0)]] Sampler3D<float> ink_atlas;
+
+bool overlay_on() { return (pc.overlay_flags & 1u) != 0u; }
+static const float3 INK_COLOR = float3(0.25, 1.0, 0.55); /* readable on sepia */
+
+float bricks_fetch_ink(float3 slot_org, float3 bl_off, float lod, float inv_adim) {
+  float inset = max(0.5 * exp2(lod), 0.5);
+  float3 l = clamp(bl_off, float3(inset), float3(128.0 - inset));
+  return ink_atlas.SampleLevel((slot_org + l) * inv_adim, lod);
+}
 
 static const uint MODE_FULL = 0;
 static const uint MODE_MIP = 1;
@@ -388,12 +401,14 @@ void main(uint3 tid: SV_DispatchThreadID) {
     float dt = max(pc.step_voxels, 0.25); /* layers per step (1 layer = 1 texel) */
     float t = lo + hash12(tid.xy, pc.frame_index) * dt;
     float3 inv_dim = 1.0 / float3(pc.slab_nx, pc.slab_ny, L);
-    float mip_max = 0.0;
+    float mip_max = 0.0, ink_max = 0.0;
     float4 acc = float4(0);
     bool composite = pc.mode != MODE_MIP;
     for (uint k = 0; k < 512u && t < hi; k++, t += dt) {
       float3 uvw = float3(txy, t) * inv_dim;
-      float v = flat_vol.SampleLevel(uvw, 0);
+      float2 vk = flat_vol.SampleLevel(uvw, 0).rg; /* R = CT, G = overlay */
+      float v = vk.r;
+      if (overlay_on() && vk.g > ink_max) ink_max = vk.g;
       if (v < pc.threshold) continue;
       if (v > mip_max) mip_max = v;
       if (!composite) continue;
@@ -403,12 +418,12 @@ void main(uint3 tid: SV_DispatchThreadID) {
       float3 col = s.rgb;
       if (pc.mode == MODE_FULL) { /* gradients in flattened space (1-texel taps) */
         float3 e = inv_dim;
-        float3 gr = float3(flat_vol.SampleLevel(uvw + float3(e.x, 0, 0), 0) -
-                               flat_vol.SampleLevel(uvw - float3(e.x, 0, 0), 0),
-                           flat_vol.SampleLevel(uvw + float3(0, e.y, 0), 0) -
-                               flat_vol.SampleLevel(uvw - float3(0, e.y, 0), 0),
-                           flat_vol.SampleLevel(uvw + float3(0, 0, e.z), 0) -
-                               flat_vol.SampleLevel(uvw - float3(0, 0, e.z), 0));
+        float3 gr = float3(flat_vol.SampleLevel(uvw + float3(e.x, 0, 0), 0).r -
+                               flat_vol.SampleLevel(uvw - float3(e.x, 0, 0), 0).r,
+                           flat_vol.SampleLevel(uvw + float3(0, e.y, 0), 0).r -
+                               flat_vol.SampleLevel(uvw - float3(0, e.y, 0), 0).r,
+                           flat_vol.SampleLevel(uvw + float3(0, 0, e.z), 0).r -
+                               flat_vol.SampleLevel(uvw - float3(0, 0, e.z), 0).r);
         float gm = length(gr);
         if (gm > 1e-4) {
           float3 nn = gr / gm;
@@ -417,12 +432,16 @@ void main(uint3 tid: SV_DispatchThreadID) {
           col = col * lerp(1.0, lit, saturate(gm * 6.0));
         }
       }
+      if (overlay_on())
+        col = lerp(col, INK_COLOR, saturate(vk.g * pc.overlay_gain));
       acc.rgb += (1.0 - acc.a) * a * col;
       acc.a += (1.0 - acc.a) * a;
       if (acc.a >= ALPHA_CUTOFF) break;
     }
     float3 color = composite ? acc.rgb + (1.0 - acc.a) * bg.rgb
                              : float3(mip_max * pc.density);
+    if (!composite && overlay_on())
+      color = lerp(color, INK_COLOR, saturate(ink_max * pc.overlay_gain));
     out_image[opix] = float4(color, 1);
     return;
   }
@@ -501,6 +520,7 @@ void main(uint3 tid: SV_DispatchThreadID) {
   float t = tn + jitter * dt;
 
   float mip_max = 0.0;   // MODE_MIP accumulator
+  float ink_max = 0.0;   // overlay MIP accumulator
   float first_hit = -1.0;
   float4 acc = float4(0); // MODE_FULL front-to-back accumulator
   uint steps = 0;
@@ -626,7 +646,11 @@ void main(uint3 tid: SV_DispatchThreadID) {
     }
 
     if (v > mip_max) mip_max = v;
-    if (pc.mode == MODE_MIP && mip_max >= 0.999) break; // saturated: nothing to gain
+    if (is_bricks() && bricks_is_lod() && overlay_on() && b_ok && pc.mode == MODE_MIP) {
+      float k = bricks_fetch_ink(b_slot, b_bl, blod, b_inv);
+      if (k > ink_max) ink_max = k;
+    }
+    if (pc.mode == MODE_MIP && mip_max >= 0.999 && !overlay_on()) break; // saturated
     if (first_hit < 0.0 && v > 0.05) first_hit = t;
 
     if (composite && !cut) {
@@ -720,6 +744,11 @@ void main(uint3 tid: SV_DispatchThreadID) {
             col = col * lerp(1.0, lit, w) + spec * w;
           }
         }
+        if (is_bricks() && bricks_is_lod() && overlay_on() && b_ok) {
+          /* ink tint AFTER shading so predictions stay vivid over the paper */
+          float k = bricks_fetch_ink(b_slot, b_bl, blod, b_inv) * pc.overlay_gain;
+          col = lerp(col, INK_COLOR, saturate(k));
+        }
         acc.rgb += (1.0 - acc.a) * a * col;
         acc.a += (1.0 - acc.a) * a;
         if (acc.a >= ALPHA_CUTOFF) break;
@@ -738,6 +767,7 @@ void main(uint3 tid: SV_DispatchThreadID) {
     color = acc.rgb + (1.0 - acc.a) * float3(0.02, 0.02, 0.03);
   } else { // MODE_MIP
     color = float3(mip_max * pc.density);
+    if (overlay_on()) color = lerp(color, INK_COLOR, saturate(ink_max * pc.overlay_gain));
   }
   out_image[opix] = float4(color, 1);
 }

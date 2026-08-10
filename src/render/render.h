@@ -48,6 +48,12 @@ int r3d_clip_frame(r3d_renderer *r, double fx, double fy, uint64_t z0, r3d_frame
  * axis (or 0 when the volume fits the default pool) selects full identity
  * residency up front — the streaming pump is then a no-op. */
 int r3d_bricks_begin(r3d_renderer *r, const char *c5s_path, uint32_t pool_bpa, uint32_t warm_mb);
+/* Overlay volume (e.g. 3D ink predictions): a second c5d LOD tree with the
+ * SAME shape/levels as the primary manifest. Its bricks share the page table
+ * and slot assignment — whenever a CT brick is decoded, the matching overlay
+ * brick lands in the same slot of a parallel atlas (absent = 0). Call after
+ * r3d_bricks_begin (CPU-decode LOD mode only); pass the LOD root directory. */
+int r3d_bricks_overlay(r3d_renderer *r, const char *lod_root);
 void r3d_bricks_params(const r3d_renderer *r, r3d_frame_params *p);
 
 /* Streaming pump: call once per frame BEFORE r3d_frame. eye/fwd = camera

@@ -333,6 +333,7 @@ int main(int argc, char **argv) {
   const char *vscache = "band", *vsurl = NULL;
   const char *umbilicus_path = NULL;
   const char *multiview_path = NULL; /* tifxyz dir: vc3d-style 2x2 viewer */
+  const char *overlay_path = NULL;   /* second c5d LOD root (ink predictions) */
   int annotation_prefetch = 5; /* annotation steps ahead; one slot is kept behind */
   int annotation_z_prefetch = 32; /* contiguous GPU-resident fine-scroll margin */
   bool vsz_given = false;
@@ -382,6 +383,7 @@ int main(int argc, char **argv) {
     }
     if (i < argc - 1 && strcmp(argv[i], "--umbilicus") == 0) umbilicus_path = argv[i + 1];
     if (i < argc - 1 && strcmp(argv[i], "--multiview") == 0) multiview_path = argv[i + 1];
+    if (i < argc - 1 && strcmp(argv[i], "--overlay") == 0) overlay_path = argv[i + 1];
     if (i < argc - 1 && strcmp(argv[i], "--ann-prefetch") == 0)
       annotation_prefetch = atoi(argv[i + 1]);
     if (i < argc - 1 && strcmp(argv[i], "--ann-z-prefetch") == 0)
@@ -531,7 +533,11 @@ int main(int argc, char **argv) {
     if (brick_z > (int)brick_shape[2] - brick_depth)
       brick_z = (int)brick_shape[2] - brick_depth;
     mode = R3D_MODE_FULL;
+    if (overlay_path && r3d_bricks_overlay(renderer, overlay_path) != 0)
+      return EXIT_FAILURE;
   }
+  bool overlay_show = overlay_path != NULL;
+  float overlay_gain = 1.5f;
 
   /* vc3d-style 2x2 multi-view: flattened segment (TL, milestone C — an XY
    * overview until then) + XY/XZ/YZ ortho plane views, shared focus POI */
@@ -1337,6 +1343,13 @@ int main(int argc, char **argv) {
         igTextDisabled("segment %ux%u  %llu valid points", mv_seg.w, mv_seg.h,
                        (unsigned long long)mv_seg.nvalid);
       }
+      if (overlay_path) {
+        igCheckbox("ink overlay", &overlay_show);
+        igSameLine(0, 10);
+        igSetNextItemWidth(140);
+        igSliderFloat("gain", &overlay_gain, 0.25f, 8.0f, "%.2f",
+                      ImGuiSliderFlags_Logarithmic);
+      }
       igText("bricks: hot %u/%u slots  warm %u (%.0f/%llu MB)%s", bst.hot, bst.hot_cap,
              bst.warm_bricks, (double)bst.warm_bytes / 1048576.0,
              (unsigned long long)(bst.warm_cap >> 20), bst.inflight ? "  streaming..." : "");
@@ -1525,6 +1538,8 @@ int main(int argc, char **argv) {
         .frame_index = frame_index++,
         .threshold = low_cut / 255.0f,
         .skip_gate = fmaxf(low_cut, tf_min_v - 0.5f) / 255.0f,
+        .overlay_gain = overlay_gain,
+        .overlay_flags = overlay_path && overlay_show ? 1u : 0u,
     };
     memcpy(p.vol_r0, &vm.r0, 12);
     memcpy(p.vol_r1, &vm.r1, 12);

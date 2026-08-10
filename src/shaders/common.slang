@@ -36,6 +36,9 @@ struct FrameParams {
   // bit 0: orthographic rays (cam_right/up = half-extents, forward unit);
   // bits 8..9: bricks slab-clip axis 0=z 1=x 2=y
   uint view_flags;
+  // overlay volume (ink): bit 0 of flags enables, gain scales the value
+  float overlay_gain;
+  uint overlay_flags;
 };
 
 // world -> volume space (R^T rotate about the box center, minus translation)

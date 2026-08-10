@@ -52,7 +52,8 @@ typedef struct level_info {
   dims3 shards;   /* 1024^3 shard grid */
   uint8_t *want;  /* shard selection bitmap (1 byte per shard), NULL = all */
   uint8_t *cwant; /* chunk selection bitmap; unwanted chunks transcode as zero */
-  bool raw;       /* "compressor": null — chunks are plain 128^3 u8 */
+  bool raw;       /* "compressor": null — chunks are plain u8 payloads */
+  uint32_t chsz;  /* zarr chunk edge (128 or 256; a chunk is (chsz/128)^3 bricks) */
 } level_info;
 
 typedef struct blob {
@@ -225,15 +226,16 @@ static bool chunk_wanted(const level_info *lv, uint64_t cz, uint64_t cy, uint64_
 
 static int decode_chunk_mem(const level_info *lv, const uint8_t *comp, size_t n,
                             uint8_t *dst) {
+  size_t want = (size_t)lv->chsz * lv->chsz * lv->chsz;
   if (lv->raw) {
-    if (n != BRICK_BYTES) return -1;
-    memcpy(dst, comp, BRICK_BYTES);
+    if (n != want) return -1;
+    memcpy(dst, comp, want);
     return 1;
   }
   size_t nbytes = 0, cbytes = 0, blocksize = 0;
   blosc_cbuffer_sizes(comp, &nbytes, &cbytes, &blocksize);
-  if (nbytes != BRICK_BYTES || cbytes > n ||
-      blosc_decompress_ctx(comp, dst, BRICK_BYTES, 1) != (int)BRICK_BYTES)
+  if (nbytes != want || cbytes > n ||
+      blosc_decompress_ctx(comp, dst, want, 1) != (int)want)
     return -1;
   return 1;
 }
@@ -268,14 +270,15 @@ static int load_chunk(uint32_t level, uint64_t cz, uint64_t cy, uint64_t cx, uin
   fseek(f, 0, SEEK_END);
   long fn = ftell(f);
   fseek(f, 0, SEEK_SET);
-  if (fn <= 0 || fn > (long)(BRICK_BYTES + (16u << 20))) {
+  size_t want = (size_t)lv->chsz * lv->chsz * lv->chsz;
+  if (fn <= 0 || fn > (long)(want + (16u << 20))) {
     fclose(f);
     return -1;
   }
-  if (lv->raw) { /* "compressor": null — the file IS the 128^3 payload */
-    size_t got = fread(dst, 1, BRICK_BYTES, f);
+  if (lv->raw) { /* "compressor": null — the file IS the chunk payload */
+    size_t got = fread(dst, 1, want, f);
     fclose(f);
-    if (got != BRICK_BYTES) {
+    if (got != want) {
       fprintf(stderr, "zarr2c5d: raw chunk %s is %zu bytes\n", path, got);
       return -1;
     }
@@ -290,8 +293,8 @@ static int load_chunk(uint32_t level, uint64_t cz, uint64_t cy, uint64_t cx, uin
   fclose(f);
   size_t nbytes = 0, cbytes = 0, blocksize = 0;
   blosc_cbuffer_sizes(comp, &nbytes, &cbytes, &blocksize);
-  if (nbytes != BRICK_BYTES || (long)cbytes > fn ||
-      blosc_decompress_ctx(comp, dst, BRICK_BYTES, 1) != (int)BRICK_BYTES) {
+  if (nbytes != want || (long)cbytes > fn ||
+      blosc_decompress_ctx(comp, dst, want, 1) != (int)want) {
     fprintf(stderr, "zarr2c5d: bad chunk %s (nbytes %zu)\n", path, nbytes);
     free(comp);
     return -1;
@@ -312,23 +315,31 @@ typedef struct shard_job {
   _Atomic uint64_t missing; /* chunks not yet downloaded */
 } shard_job;
 
+/* chunk-major: decode each zarr chunk once and cut it into its (chsz/128)^3
+ * bricks — with 256^3 chunks a brick-major loop would decompress the same
+ * 16 MB chunk eight times */
 static void *brick_worker(void *arg) {
   shard_job *j = arg;
+  const level_info *lv = &g_lv[j->level];
+  uint32_t chsz = lv->chsz, cpa = SHARD / chsz, bpc = chsz / BRICK;
+  size_t chunk_bytes = (size_t)chsz * chsz * chsz;
+  uint8_t *chunk = malloc(chunk_bytes);
   uint8_t *raw = malloc(BRICK_BYTES);
   uint8_t *rec = g_verify ? malloc(BRICK_BYTES) : NULL;
-  if (!raw || (g_verify && !rec)) {
+  if (!chunk || !raw || (g_verify && !rec)) {
+    free(chunk);
     free(raw);
     free(rec);
     atomic_store(&j->failed, 1);
     return NULL;
   }
+  uint32_t ncells = cpa * cpa * cpa;
   for (;;) {
-    uint32_t b = atomic_fetch_add(&j->next, 1);
-    if (b >= NBRICKS || atomic_load(&j->failed)) break;
-    uint32_t bz = b / (SHARD_BPA * SHARD_BPA), by = (b / SHARD_BPA) % SHARD_BPA,
-             bx = b % SHARD_BPA;
-    int rc = load_chunk(j->level, j->oz * SHARD_BPA + bz, j->oy * SHARD_BPA + by,
-                        j->ox * SHARD_BPA + bx, raw);
+    uint32_t cell = atomic_fetch_add(&j->next, 1);
+    if (cell >= ncells || atomic_load(&j->failed)) break;
+    uint32_t lz = cell / (cpa * cpa), ly = (cell / cpa) % cpa, lx = cell % cpa;
+    int rc = load_chunk(j->level, j->oz * cpa + lz, j->oy * cpa + ly, j->ox * cpa + lx,
+                        chunk);
     if (rc == -2) {
       atomic_fetch_add(&j->missing, 1);
       continue;
@@ -337,37 +348,55 @@ static void *brick_worker(void *arg) {
       atomic_store(&j->failed, 1);
       break;
     }
-    if (rc == 0 || all_zero(raw, BRICK_BYTES)) {
-      j->zero[b] = 1;
-      continue;
-    }
-    float q = g_quality / (float)(1u << (j->level < 3u ? j->level : 3u));
-    if (q < 0.25f) q = 0.25f;
-    c5d_brick_params p = c5d_brick_defaults(1.0f);
-    p.q = q;
-    size_t n = 0;
-    if (c5d_brick_encode(&p, raw, BRICK, &j->bricks[b].p, &n) != 0 || n > UINT32_MAX) {
-      atomic_store(&j->failed, 1);
-      break;
-    }
-    j->bricks[b].n = (uint32_t)n;
-    if (g_verify && atomic_fetch_add(&g_psnr_bricks, 1) < g_verify) {
-      if (c5d_brick_decode(j->bricks[b].p, n, rec, BRICK) != 0) {
-        atomic_store(&j->failed, 1);
-        break;
-      }
-      double sse = 0;
-      for (size_t i = 0; i < BRICK_BYTES; i++) {
-        double d = (double)raw[i] - (double)rec[i];
-        sse += d * d;
-      }
-      pthread_mutex_lock(&g_verify_mu);
-      g_sse_sum += sse / (double)BRICK_BYTES;
-      pthread_mutex_unlock(&g_verify_mu);
-    } else if (g_verify) {
-      atomic_fetch_sub(&g_psnr_bricks, 1);
-    }
+    for (uint32_t sz = 0; sz < bpc && !atomic_load(&j->failed); sz++)
+      for (uint32_t sy = 0; sy < bpc; sy++)
+        for (uint32_t sx = 0; sx < bpc; sx++) {
+          uint32_t bz = lz * bpc + sz, by = ly * bpc + sy, bx = lx * bpc + sx;
+          uint32_t b = (bz * SHARD_BPA + by) * SHARD_BPA + bx;
+          if (rc == 0) {
+            j->zero[b] = 1;
+            continue;
+          }
+          for (uint32_t r = 0; r < BRICK; r++) /* gather the 128^3 sub-cube */
+            for (uint32_t q_ = 0; q_ < BRICK; q_++)
+              memcpy(raw + ((size_t)r * BRICK + q_) * BRICK,
+                     chunk + (((size_t)(sz * BRICK + r) * chsz + sy * BRICK + q_) * chsz +
+                              sx * BRICK),
+                     BRICK);
+          if (all_zero(raw, BRICK_BYTES)) {
+            j->zero[b] = 1;
+            continue;
+          }
+          float q = g_quality / (float)(1u << (j->level < 3u ? j->level : 3u));
+          if (q < 0.25f) q = 0.25f;
+          c5d_brick_params p = c5d_brick_defaults(1.0f);
+          p.q = q;
+          size_t n = 0;
+          if (c5d_brick_encode(&p, raw, BRICK, &j->bricks[b].p, &n) != 0 ||
+              n > UINT32_MAX) {
+            atomic_store(&j->failed, 1);
+            break;
+          }
+          j->bricks[b].n = (uint32_t)n;
+          if (g_verify && atomic_fetch_add(&g_psnr_bricks, 1) < g_verify) {
+            if (c5d_brick_decode(j->bricks[b].p, n, rec, BRICK) != 0) {
+              atomic_store(&j->failed, 1);
+              break;
+            }
+            double sse = 0;
+            for (size_t i = 0; i < BRICK_BYTES; i++) {
+              double d = (double)raw[i] - (double)rec[i];
+              sse += d * d;
+            }
+            pthread_mutex_lock(&g_verify_mu);
+            g_sse_sum += sse / (double)BRICK_BYTES;
+            pthread_mutex_unlock(&g_verify_mu);
+          } else if (g_verify) {
+            atomic_fetch_sub(&g_psnr_bricks, 1);
+          }
+        }
   }
+  free(chunk);
   free(raw);
   free(rec);
   return NULL;
@@ -383,10 +412,11 @@ static int process_shard(uint32_t level, uint64_t oz, uint64_t oy, uint64_t ox,
   /* missing-list pass: enumerate instead of transcode */
   if (g_missing_list) {
     const level_info *lv = &g_lv[level];
-    for (uint32_t b = 0; b < NBRICKS; b++) {
-      uint64_t cz = oz * SHARD_BPA + b / (SHARD_BPA * SHARD_BPA);
-      uint64_t cy = oy * SHARD_BPA + (b / SHARD_BPA) % SHARD_BPA;
-      uint64_t cx = ox * SHARD_BPA + b % SHARD_BPA;
+    uint32_t cpa = SHARD / lv->chsz;
+    for (uint32_t b = 0; b < cpa * cpa * cpa; b++) {
+      uint64_t cz = oz * cpa + b / (cpa * cpa);
+      uint64_t cy = oy * cpa + (b / cpa) % cpa;
+      uint64_t cx = ox * cpa + b % cpa;
       if (cz >= lv->chunks.z || cy >= lv->chunks.y || cx >= lv->chunks.x) continue;
       if (level >= g_full_from || !chunk_wanted(lv, cz, cy, cx)) continue;
       char path[2048], marker[2064];
@@ -478,8 +508,8 @@ static int mark_surface(const char *surf_dir, uint32_t pad, uint32_t min_level,
       const uint64_t g[3] = {lv->chunks.z, lv->chunks.y, lv->chunks.x};
       for (int a = 0; a < 3; a++) {
         double lo = (c[a] - (double)pad) / (double)sc, hi = (c[a] + (double)pad) / (double)sc;
-        c0[a] = (int64_t)(lo / BRICK);
-        c1[a] = (int64_t)(hi / BRICK);
+        c0[a] = (int64_t)(lo / lv->chsz);
+        c1[a] = (int64_t)(hi / lv->chsz);
         if (c0[a] < 0) c0[a] = 0;
         if (c1[a] >= (int64_t)g[a]) c1[a] = (int64_t)g[a] - 1;
       }
@@ -490,10 +520,10 @@ static int mark_surface(const char *surf_dir, uint32_t pad, uint32_t min_level,
                           (uint64_t)ax;
             if (lv->cwant[ci]) continue;
             lv->cwant[ci] = 1;
-            lv->want[(((uint64_t)az * BRICK) / SHARD * lv->shards.y +
-                      ((uint64_t)ay * BRICK) / SHARD) *
+            lv->want[(((uint64_t)az * lv->chsz) / SHARD * lv->shards.y +
+                      ((uint64_t)ay * lv->chsz) / SHARD) *
                          lv->shards.x +
-                     ((uint64_t)ax * BRICK) / SHARD] = 1;
+                     ((uint64_t)ax * lv->chsz) / SHARD] = 1;
           }
     }
   }
@@ -636,13 +666,16 @@ int main(int argc, char **argv) {
     bool raw = false;
     if (read_zarray(l, &shape, &chunks, &raw) != 0) break;
     g_lv[l].raw = raw;
-    if (chunks.z != BRICK || chunks.y != BRICK || chunks.x != BRICK) {
-      fprintf(stderr, "zarr2c5d: L%u chunks are not 128^3\n", l);
+    if (chunks.z != chunks.y || chunks.y != chunks.x ||
+        (chunks.z != 128 && chunks.z != 256 && chunks.z != 512)) {
+      fprintf(stderr, "zarr2c5d: L%u chunks must be cubic 128/256/512\n", l);
       return 1;
     }
+    uint32_t ch = (uint32_t)chunks.z;
+    g_lv[l].chsz = ch;
     g_lv[l].shape = shape;
-    g_lv[l].chunks = (dims3){(shape.z + BRICK - 1) / BRICK, (shape.y + BRICK - 1) / BRICK,
-                             (shape.x + BRICK - 1) / BRICK};
+    g_lv[l].chunks = (dims3){(shape.z + ch - 1) / ch, (shape.y + ch - 1) / ch,
+                             (shape.x + ch - 1) / ch};
     g_lv[l].shards = (dims3){(shape.z + SHARD - 1) / SHARD, (shape.y + SHARD - 1) / SHARD,
                              (shape.x + SHARD - 1) / SHARD};
     g_nlev = l + 1;
@@ -690,7 +723,8 @@ int main(int argc, char **argv) {
            (unsigned long long)ns, lv->want ? " (surface" : "");
     if (lv->cwant)
       printf(", %llu/%llu chunks ~%.1f GB)", (unsigned long long)wc,
-             (unsigned long long)nc, (double)wc * 2.0 / 1024.0);
+             (unsigned long long)nc,
+             (double)wc * (double)lv->chsz * lv->chsz * lv->chsz / 1073741824.0);
     printf("\n");
   }
   printf("zarr2c5d: %llu shards total, %u levels, threads %u\n",

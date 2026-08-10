@@ -78,8 +78,12 @@ typedef struct r3d_frame_params {
   /* bit 0: orthographic rays (cam_right/up lengths = half-extents in box
    * units, cam_forward unit); bits 8..9: bricks slab-clip axis 0=z 1=x 2=y */
   uint32_t view_flags;
+  /* overlay volume (ink predictions): bit 0 of flags enables the tint,
+   * gain scales the overlay value before it drives the blend */
+  float overlay_gain;
+  uint32_t overlay_flags;
 } r3d_frame_params;
-static_assert(sizeof(r3d_frame_params) == 240, "must mirror shader FrameParams");
+static_assert(sizeof(r3d_frame_params) == 248, "must mirror shader FrameParams");
 
 #define R3D_VIEW_ORTHO 1u
 #define R3D_VIEW_SURF 2u /* flattened tifxyz segment view (needs r3d_surf_begin) */

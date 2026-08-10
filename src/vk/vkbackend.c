@@ -103,6 +103,13 @@ struct r3d_renderer {
   bool bricks_lod;
   uint32_t bricks_nlev, bricks_nx, bricks_ny, bricks_nz, bricks_maxdim;
   char bricks_root[1024];
+  /* overlay volume (e.g. 3D ink predictions): a second c5d LOD tree with
+   * IDENTICAL geometry — its bricks ride the same page table and slot
+   * assignment, decoded into a parallel atlas whenever a CT brick lands */
+  char ink_root[1024];
+  r3d_brlod_reader *ink_readers;
+  r3d_vkimage ink_atlas;
+  bool ink_active;
   r3d_brlod_level bricks_lev[BR_LOD_MAX];
   r3d_brlod_reader *bricks_readers;
   uint32_t bricks_nreaders;
@@ -363,14 +370,18 @@ static int create_pipeline(r3d_renderer *r) {
        .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
        .descriptorCount = 1,
        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT},
-      {.binding = 9, /* surf mode: flattened surface volume window (R8 3D) */
+      {.binding = 9, /* surf mode: flattened surface volume window (RG8 3D) */
+       .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+       .descriptorCount = 1,
+       .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT},
+      {.binding = 10, /* overlay (ink) atlas: slot-parallel to the brick atlas */
        .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
        .descriptorCount = 1,
        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT},
   };
   VkDescriptorSetLayoutCreateInfo dslci = {
       .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-      .bindingCount = 10,
+      .bindingCount = 11,
       .pBindings = bindings,
   };
   if (vkCreateDescriptorSetLayout(r->vk.dev, &dslci, NULL, &r->dsl) != VK_SUCCESS) return -1;
@@ -413,7 +424,7 @@ static int create_pipeline(r3d_renderer *r) {
 
   VkDescriptorPoolSize sizes[] = {
       {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1},
-      {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, r->tile_descriptors + 4},
+      {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, r->tile_descriptors + 5},
       {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1},
       {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1},
       {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 2},
@@ -873,6 +884,11 @@ void r3d_destroy(r3d_renderer *r) {
   for (uint32_t i = 0; i < r->bricks_nreaders; i++)
     if (r->bricks_readers[i].open) c5d_shard_close_reader(&r->bricks_readers[i].sr);
   free(r->bricks_readers);
+  if (r->ink_readers)
+    for (uint32_t i = 0; i < r->bricks_nreaders; i++)
+      if (r->ink_readers[i].open) c5d_shard_close_reader(&r->ink_readers[i].sr);
+  free(r->ink_readers);
+  r3d_vkimage_destroy(&r->vk, &r->ink_atlas);
   free(r->bs.slot_brick);
   free(r->bs.slot_use);
   free(r->bs.brick_slot);
@@ -1115,6 +1131,7 @@ typedef struct sv_push {
   uint32_t W, H, L, nback;
   uint32_t abpa, lod;
   float lstep;
+  uint32_t use_ink;
 } sv_push;
 
 int r3d_surfvol_begin(r3d_renderer *r, uint32_t w, uint32_t h, uint32_t layers,
@@ -1126,18 +1143,18 @@ int r3d_surfvol_begin(r3d_renderer *r, uint32_t w, uint32_t h, uint32_t layers,
   r->sv.nback = nback;
   r->sv.sx = sx;
   r->sv.sy = sy;
-  if (r3d_vkimage_create(&r->vk, VK_FORMAT_R8_UNORM, (VkExtent3D){w, h, layers}, 1,
+  if (r3d_vkimage_create(&r->vk, VK_FORMAT_R8G8_UNORM, (VkExtent3D){w, h, layers}, 1,
                          VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
                          &r->sv.vol) != 0)
     return -1;
   if (r3d_vk_image_to_general(&r->vk, r->pool, &r->sv.vol) != 0) return -1;
-  static const VkDescriptorType tt[5] = {
+  static const VkDescriptorType tt[6] = {
       VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
       VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-      VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER};
+      VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER};
   char sp[1024];
   snprintf(sp, sizeof sp, "%s/surfvol.spv", r->cfg.spv_dir);
-  if (r3d_vkcomp_create(&r->vk, sp, tt, 5, sizeof(sv_push), &r->sv.comp) != 0) return -1;
+  if (r3d_vkcomp_create(&r->vk, sp, tt, 6, sizeof(sv_push), &r->sv.comp) != 0) return -1;
   r3d_vkcomp_bind_image(&r->vk, &r->sv.comp, 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                         r->sv.vol.view, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL);
   r3d_vkcomp_bind_image(&r->vk, &r->sv.comp, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
@@ -1149,6 +1166,10 @@ int r3d_surfvol_begin(r3d_renderer *r, uint32_t w, uint32_t h, uint32_t layers,
   r3d_vkcomp_bind_buffer(&r->vk, &r->sv.comp, 3, r->page_buf.buf, 0, VK_WHOLE_SIZE);
   r3d_vkcomp_bind_image(&r->vk, &r->sv.comp, 4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                         r->brick_atlas.view, r->samp_vol, VK_IMAGE_LAYOUT_GENERAL);
+  /* overlay atlas when active, else the CT atlas as an inert placeholder */
+  r3d_vkcomp_bind_image(&r->vk, &r->sv.comp, 5, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                        r->ink_active ? r->ink_atlas.view : r->brick_atlas.view, r->samp_vol,
+                        VK_IMAGE_LAYOUT_GENERAL);
   write_image_dset(r, 9, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, r->sv.vol.view,
                    r->samp_vol, VK_IMAGE_LAYOUT_GENERAL);
   r->sv.step = 0.0f; /* no window yet */
@@ -1585,8 +1606,8 @@ done:
   return rc;
 }
 
-static const uint8_t *bricks_source_blob(r3d_renderer *r, uint32_t b, size_t *n) {
-  if (!r->bricks_lod) return c5d_shard_brick(&r->bs.sr, b, n);
+static const uint8_t *brlod_blob(r3d_renderer *r, const char *root,
+                                 r3d_brlod_reader *readers, uint32_t b, size_t *n) {
   uint32_t li = 0;
   while (li + 1u < r->bricks_nlev && b >= r->bricks_lev[li + 1u].page_off) li++;
   const r3d_brlod_level *l = &r->bricks_lev[li];
@@ -1596,11 +1617,10 @@ static const uint8_t *bricks_source_blob(r3d_renderer *r, uint32_t b, size_t *n)
   uint32_t sx = bx / BR_SHARD_BPA, sy = by / BR_SHARD_BPA, sz = bz / BR_SHARD_BPA;
   uint32_t ri = l->shard_off + (sz * l->sy + sy) * l->sx + sx;
   if (ri >= r->bricks_nreaders) return NULL;
-  r3d_brlod_reader *rd = &r->bricks_readers[ri];
+  r3d_brlod_reader *rd = &readers[ri];
   if (!rd->open) {
     char path[1400];
-    int pn = snprintf(path, sizeof path, "%s/c5d/L%u/%u_%u_%u.c5s", r->bricks_root, li,
-                      sz, sy, sx);
+    int pn = snprintf(path, sizeof path, "%s/c5d/L%u/%u_%u_%u.c5s", root, li, sz, sy, sx);
     if (pn < 0 || (size_t)pn >= sizeof path || c5d_shard_open(path, &rd->sr) != 0) return NULL;
     if (rd->sr.foot.brick_dim != BR_SLOT_DIM || rd->sr.foot.shard_dim != 1024u ||
         rd->sr.foot.lod_level != li) {
@@ -1612,6 +1632,11 @@ static const uint8_t *bricks_source_blob(r3d_renderer *r, uint32_t b, size_t *n)
   uint32_t lbx = bx % BR_SHARD_BPA, lby = by % BR_SHARD_BPA, lbz = bz % BR_SHARD_BPA;
   uint32_t bi = (lbz * BR_SHARD_BPA + lby) * BR_SHARD_BPA + lbx;
   return c5d_shard_brick(&rd->sr, bi, n);
+}
+
+static const uint8_t *bricks_source_blob(r3d_renderer *r, uint32_t b, size_t *n) {
+  if (!r->bricks_lod) return c5d_shard_brick(&r->bs.sr, b, n);
+  return brlod_blob(r, r->bricks_root, r->bricks_readers, b, n);
 }
 
 static int bcand_cmp(const void *a, const void *b) {
@@ -1843,7 +1868,8 @@ static int bricks_post_fill(r3d_renderer *r, const uint32_t *sel_slot, const uin
  * the render queue caused multi-hundred-millisecond stalls on unified GPUs;
  * the worker now performs entropy+IDCT on CPU and leaves the queue only this
  * compact copy plus the per-slot mip blits above. */
-static int bricks_upload_raw(r3d_renderer *r, const uint32_t *sel_slot, uint32_t n) {
+static int bricks_upload_raw(r3d_renderer *r, r3d_vkimage *atlas, const uint32_t *sel_slot,
+                             uint32_t n) {
   VkBufferImageCopy reg[BR_MAX_BATCH];
   uint32_t abpa = r->bricks_abpa;
   for (uint32_t i = 0; i < n; i++) {
@@ -1859,13 +1885,13 @@ static int bricks_upload_raw(r3d_renderer *r, const uint32_t *sel_slot, uint32_t
   }
   VkCommandBuffer cmd = r3d_vk_oneshot_begin(&r->vk, r->bs.upload_pool);
   if (!cmd) return -1;
-  r3d_vk_image_barrier(cmd, r->brick_atlas.img, VK_IMAGE_LAYOUT_GENERAL,
+  r3d_vk_image_barrier(cmd, atlas->img, VK_IMAGE_LAYOUT_GENERAL,
                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                        VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT,
                        VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, 0, 1);
-  vkCmdCopyBufferToImage(cmd, r->bs.raw_stage.buf, r->brick_atlas.img,
+  vkCmdCopyBufferToImage(cmd, r->bs.raw_stage.buf, atlas->img,
                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, n, reg);
-  r3d_vk_image_barrier(cmd, r->brick_atlas.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+  r3d_vk_image_barrier(cmd, atlas->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                        VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_COPY_BIT,
                        VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_BLIT_BIT,
                        VK_ACCESS_2_TRANSFER_READ_BIT, 0, 1);
@@ -1885,21 +1911,21 @@ static int bricks_upload_raw(r3d_renderer *r, const uint32_t *sel_slot, uint32_t
                          {(sx + 1) * d1, (sy + 1) * d1, (sz + 1) * d1}},
       };
       VkBlitImageInfo2 bi = {.sType = VK_STRUCTURE_TYPE_BLIT_IMAGE_INFO_2,
-                             .srcImage = r->brick_atlas.img,
+                             .srcImage = atlas->img,
                              .srcImageLayout = VK_IMAGE_LAYOUT_GENERAL,
-                             .dstImage = r->brick_atlas.img,
+                             .dstImage = atlas->img,
                              .dstImageLayout = VK_IMAGE_LAYOUT_GENERAL,
                              .regionCount = 1,
                              .pRegions = &blit,
                              .filter = VK_FILTER_LINEAR};
       vkCmdBlitImage2(cmd, &bi);
     }
-    r3d_vk_image_barrier(cmd, r->brick_atlas.img, VK_IMAGE_LAYOUT_GENERAL,
+    r3d_vk_image_barrier(cmd, atlas->img, VK_IMAGE_LAYOUT_GENERAL,
                          VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_BLIT_BIT,
                          VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_BLIT_BIT,
                          VK_ACCESS_2_TRANSFER_READ_BIT, m, 1);
   }
-  r3d_vk_image_barrier(cmd, r->brick_atlas.img, VK_IMAGE_LAYOUT_GENERAL,
+  r3d_vk_image_barrier(cmd, atlas->img, VK_IMAGE_LAYOUT_GENERAL,
                        VK_IMAGE_LAYOUT_GENERAL,
                        VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_BLIT_BIT,
                        VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
@@ -1923,7 +1949,18 @@ static int bricks_decode_batch(r3d_renderer *r, uint32_t n) {
       if (dst[v] > mx) mx = dst[v];
     r->bs.maxes[i] = mx;
   }
-  if (bricks_upload_raw(r, r->bs.sel_slot, n) != 0) return -1;
+  if (bricks_upload_raw(r, &r->brick_atlas, r->bs.sel_slot, n) != 0) return -1;
+  if (r->ink_active) {
+    /* same bricks, same slots, the overlay tree's data (absent brick = 0) */
+    for (uint32_t i = 0; i < n; i++) {
+      uint8_t *dst = raw + (size_t)i * BR_RAW_BYTES;
+      size_t bn = 0;
+      const uint8_t *blob = brlod_blob(r, r->ink_root, r->ink_readers, r->bs.sel_b[i], &bn);
+      if (!blob || c5d_brick_decode_par(blob, bn, dst, BR_SLOT_DIM, 4) != 0)
+        memset(dst, 0, BR_RAW_BYTES);
+    }
+    if (bricks_upload_raw(r, &r->ink_atlas, r->bs.sel_slot, n) != 0) return -1;
+  }
   return 0;
 }
 
@@ -2347,6 +2384,66 @@ void r3d_bricks_params(const r3d_renderer *r, r3d_frame_params *p) {
   else
     p->brick_mode = r->bricks_bpa | (r->bricks_abpa << 8u) |
                     (r->bricks_identity ? 0x10000u : 0u);
+}
+
+int r3d_bricks_overlay(r3d_renderer *r, const char *lod_root) {
+  if (!r->bricks_lod || !r->bs.cpu_decode || r->ink_active) {
+    fprintf(stderr, "bricks: overlay needs an active CPU-decode LOD manifest\n");
+    return -1;
+  }
+  size_t rn = strlen(lod_root);
+  if (rn >= sizeof r->ink_root) return -1;
+  memcpy(r->ink_root, lod_root, rn + 1);
+  char mp[1280];
+  snprintf(mp, sizeof mp, "%s/manifest.json", lod_root);
+  FILE *mf = fopen(mp, "r");
+  if (!mf) {
+    fprintf(stderr, "bricks: overlay manifest %s missing\n", mp);
+    return -1;
+  }
+  char head[512] = {0};
+  size_t hn = fread(head, 1, sizeof head - 1, mf);
+  fclose(mf);
+  (void)hn;
+  char want[128];
+  snprintf(want, sizeof want, "\"shape\": [%u, %u, %u]", r->bricks_nz, r->bricks_ny,
+           r->bricks_nx);
+  if (!strstr(head, want)) {
+    fprintf(stderr, "bricks: overlay shape mismatch (need %s)\n", want);
+    return -1;
+  }
+  r->ink_readers = calloc(r->bricks_nreaders, sizeof *r->ink_readers);
+  if (!r->ink_readers) return -1;
+  if (r3d_vkimage_create(&r->vk, VK_FORMAT_R8_UNORM, r->brick_atlas.extent, 1,
+                         VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                             VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                         &r->ink_atlas) != 0)
+    return -1;
+  if (img_general_clear(r, &r->ink_atlas) != 0) return -1;
+  write_image_dset(r, 10, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, r->ink_atlas.view,
+                   r->samp_vol, VK_IMAGE_LAYOUT_GENERAL);
+  r->ink_active = true;
+  /* backfill the already-resident bricks (incl. the pinned coarsest level) */
+  uint8_t *raw = r->bs.raw_stage.mapped;
+  uint32_t sel[BR_MAX_BATCH], nb_ = 0, filled = 0;
+  for (uint32_t s = 0; s < r->bs.nslots; s++) {
+    uint32_t b = r->bs.slot_brick[s];
+    if (b == BR_INVALID) continue;
+    size_t bn = 0;
+    const uint8_t *blob = brlod_blob(r, r->ink_root, r->ink_readers, b, &bn);
+    uint8_t *dst = raw + (size_t)nb_ * BR_RAW_BYTES;
+    if (!blob || c5d_brick_decode_par(blob, bn, dst, BR_SLOT_DIM, 4) != 0)
+      memset(dst, 0, BR_RAW_BYTES);
+    sel[nb_++] = s;
+    filled++;
+    if (nb_ == BR_MAX_BATCH) {
+      if (bricks_upload_raw(r, &r->ink_atlas, sel, nb_) != 0) return -1;
+      nb_ = 0;
+    }
+  }
+  if (nb_ && bricks_upload_raw(r, &r->ink_atlas, sel, nb_) != 0) return -1;
+  printf("bricks: overlay %s active (%u resident bricks backfilled)\n", lod_root, filled);
+  return 0;
 }
 
 void r3d_bricks_extent(const r3d_renderer *r, float extent[3]) {
@@ -3909,7 +4006,8 @@ int r3d_frame_views(r3d_renderer *r, const r3d_frame_params *views, uint32_t nvi
                     .nback = r->sv.nback,
                     .abpa = r->bricks_abpa,
                     .lod = lodq,
-                    .lstep = 1.0f}; /* depth stays native-res regardless of xy zoom */
+                    .lstep = 1.0f, /* depth stays native-res regardless of xy zoom */
+                    .use_ink = r->ink_active ? 1u : 0u};
     r3d_vkcomp_dispatch(cmd, &r->sv.comp, &push, sizeof push, (r->sv.W + 7) / 8,
                         (r->sv.H + 7) / 8, (r->sv.L + 3) / 4);
     r3d_vk_image_barrier(cmd, r->sv.vol.img, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
