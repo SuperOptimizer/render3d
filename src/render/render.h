@@ -94,6 +94,8 @@ typedef struct r3d_bricks_stats {
   uint32_t failures;
   uint32_t nlevels, lod_wanted[8]; /* latest projected-footprint desired set */
   uint64_t lod_requests[8];        /* cumulative visible desired bricks */
+  uint32_t net_pending;            /* net-ingest chunks queued or in flight */
+  uint64_t net_fetched, net_encoded; /* cumulative chunks fetched / bricks cached */
 } r3d_bricks_stats;
 void r3d_bricks_get_stats(r3d_renderer *r, r3d_bricks_stats *st);
 /* Wait for the currently queued streaming batch (benchmark/shutdown boundary). */

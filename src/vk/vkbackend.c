@@ -4,6 +4,7 @@
  * WSI, timestamp queries around the dispatch. */
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
+#include <blosc.h>
 #include <curl/curl.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -110,6 +111,28 @@ struct r3d_renderer {
   r3d_brlod_reader *ink_readers;
   r3d_vkimage ink_atlas;
   bool ink_active;
+  /* net ingest: on a brick miss, fetch the owning RAW zarr chunk from
+   * source.json's URL, transcode its bricks to c5d and cache them under
+   * <root>/bricks/L<l>/<z>_<y>_<x>.c5b (empty file = absent upstream) —
+   * each chunk is downloaded exactly once, then everything is local */
+  struct {
+    bool active, quit;
+    char url[1024];
+    uint32_t chsz[BR_LOD_MAX];
+    bool raw[BR_LOD_MAX];
+    float q0;
+    pthread_t th[4];
+    uint32_t nth;
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    uint64_t queue[256];   /* chunk ids: level<<48 | z<<32 | y<<16 | x */
+    uint32_t qn;
+    uint64_t inflight[8];  /* chunks being fetched right now */
+    uint32_t nin;
+    _Atomic uint64_t fetched, absent_chunks, encoded;
+    uint8_t *scratch;      /* render-thread .c5b read buffer */
+    size_t scratch_cap;
+  } ni;
   r3d_brlod_level bricks_lev[BR_LOD_MAX];
   r3d_brlod_reader *bricks_readers;
   uint32_t bricks_nreaders;
@@ -889,6 +912,16 @@ void r3d_destroy(r3d_renderer *r) {
       if (r->ink_readers[i].open) c5d_shard_close_reader(&r->ink_readers[i].sr);
   free(r->ink_readers);
   r3d_vkimage_destroy(&r->vk, &r->ink_atlas);
+  if (r->ni.active) {
+    pthread_mutex_lock(&r->ni.mu);
+    r->ni.quit = true;
+    pthread_cond_broadcast(&r->ni.cv);
+    pthread_mutex_unlock(&r->ni.mu);
+    for (uint32_t t = 0; t < r->ni.nth; t++) pthread_join(r->ni.th[t], NULL);
+    pthread_mutex_destroy(&r->ni.mu);
+    pthread_cond_destroy(&r->ni.cv);
+  }
+  free(r->ni.scratch);
   free(r->bs.slot_brick);
   free(r->bs.slot_use);
   free(r->bs.brick_slot);
@@ -1634,9 +1667,244 @@ static const uint8_t *brlod_blob(r3d_renderer *r, const char *root,
   return c5d_shard_brick(&rd->sr, bi, n);
 }
 
+/* global brick index -> (level, brick coords) */
+static void brlod_locate(r3d_renderer *r, uint32_t b, uint32_t *li, uint32_t *bx,
+                         uint32_t *by, uint32_t *bz) {
+  uint32_t l = 0;
+  while (l + 1u < r->bricks_nlev && b >= r->bricks_lev[l + 1u].page_off) l++;
+  const r3d_brlod_level *lv = &r->bricks_lev[l];
+  uint32_t local = b - lv->page_off;
+  *li = l;
+  *bx = local % lv->bx;
+  *by = (local / lv->bx) % lv->by;
+  *bz = local / (lv->bx * lv->by);
+}
+
+static void ni_brick_path(r3d_renderer *r, char path[1400], uint32_t li, uint32_t bz,
+                          uint32_t by, uint32_t bx) {
+  snprintf(path, 1400, "%s/bricks/L%u/%u_%u_%u.c5b", r->bricks_root, li, bz, by, bx);
+}
+
 static const uint8_t *bricks_source_blob(r3d_renderer *r, uint32_t b, size_t *n) {
   if (!r->bricks_lod) return c5d_shard_brick(&r->bs.sr, b, n);
-  return brlod_blob(r, r->bricks_root, r->bricks_readers, b, n);
+  const uint8_t *blob = brlod_blob(r, r->bricks_root, r->bricks_readers, b, n);
+  if (blob || !r->ni.active) return blob;
+  /* net-ingest cache tier: per-brick c5d blobs written by the fetch pool */
+  uint32_t li, bx, by, bz;
+  brlod_locate(r, b, &li, &bx, &by, &bz);
+  char path[1400];
+  ni_brick_path(r, path, li, bz, by, bx);
+  FILE *f = fopen(path, "rb");
+  if (!f) return NULL;
+  fseek(f, 0, SEEK_END);
+  long fn = ftell(f);
+  fseek(f, 0, SEEK_SET);
+  if (fn <= 0) { /* empty marker: definitively absent upstream */
+    fclose(f);
+    return NULL;
+  }
+  if ((size_t)fn > r->ni.scratch_cap) {
+    uint8_t *ns = realloc(r->ni.scratch, (size_t)fn);
+    if (!ns) {
+      fclose(f);
+      return NULL;
+    }
+    r->ni.scratch = ns;
+    r->ni.scratch_cap = (size_t)fn;
+  }
+  size_t got = fread(r->ni.scratch, 1, (size_t)fn, f);
+  fclose(f);
+  if (got != (size_t)fn) return NULL;
+  *n = got;
+  return r->ni.scratch;
+}
+
+/* Enqueue the zarr chunk that owns brick b (dedup against queue+inflight).
+ * Returns true while the brick may still arrive (queued/inflight/back-off),
+ * false when the cache says the brick is definitively absent upstream. */
+static bool bricks_net_request(r3d_renderer *r, uint32_t b) {
+  if (!r->ni.active) return false;
+  uint32_t li, bx, by, bz;
+  brlod_locate(r, b, &li, &bx, &by, &bz);
+  char path[1400];
+  ni_brick_path(r, path, li, bz, by, bx);
+  struct stat st;
+  if (stat(path, &st) == 0 && st.st_size == 0) return false; /* absent marker */
+  uint32_t cb = r->ni.chsz[li] / BR_SLOT_DIM; /* bricks per chunk axis */
+  uint64_t id = ((uint64_t)li << 48) | ((uint64_t)(bz / cb) << 32) |
+                ((uint64_t)(by / cb) << 16) | (uint64_t)(bx / cb);
+  pthread_mutex_lock(&r->ni.mu);
+  bool known = false;
+  for (uint32_t i = 0; i < r->ni.qn && !known; i++) known = r->ni.queue[i] == id;
+  for (uint32_t i = 0; i < r->ni.nin && !known; i++) known = r->ni.inflight[i] == id;
+  if (!known && r->ni.qn < 256u) {
+    r->ni.queue[r->ni.qn++] = id;
+    pthread_cond_signal(&r->ni.cv);
+  }
+  pthread_mutex_unlock(&r->ni.mu);
+  return true;
+}
+
+static size_t ni_curl_write(const void *data, size_t sz, size_t nm, void *ud) {
+  struct ni_buf { uint8_t *p; size_t n, cap; } *bf = ud;
+  size_t n = sz * nm;
+  if (bf->n + n > bf->cap) {
+    size_t nc = bf->cap ? bf->cap * 2 : (4u << 20);
+    while (nc < bf->n + n) nc *= 2;
+    uint8_t *np = realloc(bf->p, nc);
+    if (!np) return 0;
+    bf->p = np;
+    bf->cap = nc;
+  }
+  memcpy(bf->p + bf->n, data, n);
+  bf->n += n;
+  return n;
+}
+
+static int ni_write_file(const char *path, const void *data, size_t n) {
+  char tmp[1460];
+  int pn = snprintf(tmp, sizeof tmp, "%s.tmp.%ld", path, (long)getpid());
+  if (pn < 0 || (size_t)pn >= sizeof tmp) return -1;
+  FILE *f = fopen(tmp, "wb");
+  if (!f) return -1;
+  int rc = (n == 0 || fwrite(data, 1, n, f) == n) && fflush(f) == 0 ? 0 : -1;
+  if (fclose(f) != 0) rc = -1;
+  if (rc == 0 && rename(tmp, path) != 0) rc = -1;
+  if (rc != 0) unlink(tmp);
+  return rc;
+}
+
+static void *ni_worker(void *arg) {
+  r3d_renderer *r = arg;
+  CURL *curl = curl_easy_init();
+  struct { uint8_t *p; size_t n, cap; } buf = {0};
+  uint8_t *chunk = NULL, *raw = malloc((size_t)BR_SLOT_DIM * BR_SLOT_DIM * BR_SLOT_DIM);
+  size_t chunk_cap = 0;
+  if (!curl || !raw) goto out;
+  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, ni_curl_write);
+  curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+  curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30L);
+  curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1024L);
+  curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 60L);
+  for (;;) {
+    pthread_mutex_lock(&r->ni.mu);
+    while (!r->ni.quit && r->ni.qn == 0) pthread_cond_wait(&r->ni.cv, &r->ni.mu);
+    if (r->ni.quit) {
+      pthread_mutex_unlock(&r->ni.mu);
+      break;
+    }
+    uint64_t id = r->ni.queue[0]; /* nearest-first order from the pick loop */
+    memmove(r->ni.queue, r->ni.queue + 1, --r->ni.qn * sizeof id);
+    if (r->ni.nin < 8u) r->ni.inflight[r->ni.nin++] = id;
+    pthread_mutex_unlock(&r->ni.mu);
+
+    uint32_t li = (uint32_t)(id >> 48), cz = (uint32_t)(id >> 32) & 0xffffu,
+             cy = (uint32_t)(id >> 16) & 0xffffu, cx = (uint32_t)id & 0xffffu;
+    uint32_t chsz = r->ni.chsz[li], cb = chsz / BR_SLOT_DIM;
+    size_t chunk_bytes = (size_t)chsz * chsz * chsz;
+    char url[1400];
+    snprintf(url, sizeof url, "%s/%u/%u/%u/%u", r->ni.url, li, cz, cy, cx);
+    long code = 0;
+    CURLcode crc = CURLE_OK;
+    for (int attempt = 0; attempt < 4; attempt++) {
+      buf.n = 0;
+      curl_easy_setopt(curl, CURLOPT_URL, url);
+      curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buf);
+      crc = curl_easy_perform(curl);
+      curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+      if (crc == CURLE_OK && (code == 200 || code == 404)) break;
+      sleep((unsigned)(1 << attempt));
+    }
+    bool have = crc == CURLE_OK && code == 200;
+    if (crc == CURLE_OK && code == 404) atomic_fetch_add(&r->ni.absent_chunks, 1);
+    if (have) {
+      atomic_fetch_add(&r->ni.fetched, 1);
+      if (chunk_cap < chunk_bytes) {
+        uint8_t *nc = realloc(chunk, chunk_bytes);
+        if (nc) {
+          chunk = nc;
+          chunk_cap = chunk_bytes;
+        } else
+          have = false;
+      }
+    }
+    if (have) {
+      if (r->ni.raw[li]) {
+        have = buf.n == chunk_bytes;
+        if (have) memcpy(chunk, buf.p, chunk_bytes);
+      } else {
+        size_t nbytes = 0, cbytes = 0, blocksize = 0;
+        blosc_cbuffer_sizes(buf.p, &nbytes, &cbytes, &blocksize);
+        have = nbytes == chunk_bytes && cbytes <= buf.n &&
+               blosc_decompress_ctx(buf.p, chunk, chunk_bytes, 1) == (int)chunk_bytes;
+      }
+      if (!have)
+        fprintf(stderr, "bricks: bad chunk payload %s (%zu bytes)\n", url, buf.n);
+    }
+    if (crc == CURLE_OK && (code == 200 || code == 404)) {
+      const r3d_brlod_level *lv = &r->bricks_lev[li];
+      char dir[1360];
+      snprintf(dir, sizeof dir, "%s/bricks", r->bricks_root);
+      mkdir(dir, 0755);
+      snprintf(dir, sizeof dir, "%s/bricks/L%u", r->bricks_root, li);
+      mkdir(dir, 0755);
+      float q = r->ni.q0 / (float)(1u << (li < 3u ? li : 3u));
+      if (q < 0.25f) q = 0.25f;
+      for (uint32_t sz_ = 0; sz_ < cb; sz_++)
+        for (uint32_t sy = 0; sy < cb; sy++)
+          for (uint32_t sx = 0; sx < cb; sx++) {
+            uint32_t bz = cz * cb + sz_, by = cy * cb + sy, bx = cx * cb + sx;
+            if (bx >= lv->bx || by >= lv->by || bz >= lv->bz) continue;
+            char path[1400];
+            ni_brick_path(r, path, li, bz, by, bx);
+            struct stat st;
+            if (stat(path, &st) == 0) continue; /* another chunk already wrote it */
+            bool zero = !have;
+            if (have) {
+              for (uint32_t rr = 0; rr < BR_SLOT_DIM; rr++)
+                for (uint32_t qq = 0; qq < BR_SLOT_DIM; qq++)
+                  memcpy(raw + ((size_t)rr * BR_SLOT_DIM + qq) * BR_SLOT_DIM,
+                         chunk + (((size_t)(sz_ * BR_SLOT_DIM + rr) * chsz +
+                                   sy * BR_SLOT_DIM + qq) *
+                                      chsz +
+                                  sx * BR_SLOT_DIM),
+                         BR_SLOT_DIM);
+              zero = true;
+              for (size_t v = 0; v < (size_t)BR_SLOT_DIM * BR_SLOT_DIM * BR_SLOT_DIM; v++)
+                if (raw[v]) {
+                  zero = false;
+                  break;
+                }
+            }
+            if (zero) {
+              ni_write_file(path, NULL, 0); /* empty marker = air/absent */
+              continue;
+            }
+            c5d_brick_params bp = c5d_brick_defaults(1.0f);
+            bp.q = q;
+            uint8_t *enc = NULL;
+            size_t en = 0;
+            if (c5d_brick_encode(&bp, raw, BR_SLOT_DIM, &enc, &en) == 0) {
+              ni_write_file(path, enc, en);
+              atomic_fetch_add(&r->ni.encoded, 1);
+              free(enc);
+            }
+          }
+    }
+    pthread_mutex_lock(&r->ni.mu);
+    for (uint32_t i = 0; i < r->ni.nin; i++)
+      if (r->ni.inflight[i] == id) {
+        r->ni.inflight[i] = r->ni.inflight[--r->ni.nin];
+        break;
+      }
+    pthread_mutex_unlock(&r->ni.mu);
+  }
+out:
+  if (curl) curl_easy_cleanup(curl);
+  free(buf.p);
+  free(chunk);
+  free(raw);
+  return NULL;
 }
 
 static int bcand_cmp(const void *a, const void *b) {
@@ -2070,6 +2338,57 @@ int r3d_bricks_begin(r3d_renderer *r, const char *c5s_path, uint32_t pool_bpa,
     nb = r->bs.nb;
     printf("bricks: LOD manifest %u levels, %ux%ux%u voxels, %u virtual bricks\n",
            r->bricks_nlev, r->bricks_nx, r->bricks_ny, r->bricks_nz, nb);
+    /* source.json next to the manifest enables on-demand net ingest: brick
+     * misses fetch their raw zarr chunk, transcode, and cache to disk */
+    char sp[1360];
+    snprintf(sp, sizeof sp, "%s/source.json", r->bricks_root);
+    FILE *sf = fopen(sp, "r");
+    if (sf) {
+      char sj[8192] = {0};
+      size_t sn = fread(sj, 1, sizeof sj - 1, sf);
+      fclose(sf);
+      (void)sn;
+      const char *u = strstr(sj, "\"url\": \"");
+      const char *q = strstr(sj, "\"quality\": ");
+      bool ok = u && q && strstr(sj, "render3d.c5d-source.v1");
+      if (ok) {
+        u += 8;
+        const char *ue = strchr(u, '"');
+        ok = ue && (size_t)(ue - u) < sizeof r->ni.url;
+        if (ok) {
+          memcpy(r->ni.url, u, (size_t)(ue - u));
+          r->ni.url[ue - u] = 0;
+          r->ni.q0 = strtof(q + 11, NULL);
+          const char *lp = sj;
+          for (uint32_t l = 0; l < r->bricks_nlev && ok; l++) {
+            lp = strstr(lp, "\"chunk\": ");
+            ok = lp != NULL;
+            if (!ok) break;
+            r->ni.chsz[l] = (uint32_t)strtoul(lp + 9, NULL, 10);
+            const char *rp = strstr(lp, "\"raw\": ");
+            r->ni.raw[l] = rp && strncmp(rp + 7, "true", 4) == 0;
+            ok = r->ni.chsz[l] >= BR_SLOT_DIM && r->ni.chsz[l] % BR_SLOT_DIM == 0;
+            lp += 9;
+          }
+        }
+      }
+      if (ok) {
+        pthread_mutex_init(&r->ni.mu, NULL);
+        pthread_cond_init(&r->ni.cv, NULL);
+        r->ni.nth = 4;
+        for (uint32_t t = 0; t < r->ni.nth; t++)
+          if (pthread_create(&r->ni.th[t], NULL, ni_worker, r) != 0) {
+            r->ni.nth = t;
+            break;
+          }
+        r->ni.active = r->ni.nth > 0;
+        if (r->ni.active)
+          printf("bricks: net ingest active (%s, %u fetchers, cache %s/bricks)\n",
+                 r->ni.url, r->ni.nth, r->bricks_root);
+      } else {
+        fprintf(stderr, "bricks: malformed %s ignored\n", sp);
+      }
+    }
   } else {
     fprintf(stderr, "bricks: cannot open c5d shard or LOD manifest %s\n", c5s_path);
     return -1;
@@ -2723,8 +3042,10 @@ void r3d_bricks_stream_submit(r3d_renderer *r, uint32_t budget) {
     if (r->bs.brick_slot[b] != BR_INVALID) continue; /* duped across collects */
     size_t bn = 0;
     const uint8_t *blob = warm_get(r, b, &bn);
-    if (!blob) { /* absent in the shard: never request again */
-      r->bs.brick_maxk[b] = 0;
+    if (!blob) {
+      /* not in any local tier: net-ingest it (stays a candidate until the
+       * fetch pool caches it), or mark definitively absent */
+      if (!bricks_net_request(r, b)) r->bs.brick_maxk[b] = 0;
       continue;
     }
     uint32_t s = bricks_pick_slot(r);
@@ -2796,6 +3117,13 @@ void r3d_bricks_get_stats(r3d_renderer *r, r3d_bricks_stats *st) {
   memcpy(st->lod_wanted, r->bs.lod_wanted, sizeof st->lod_wanted);
   memcpy(st->lod_requests, r->bs.lod_requests, sizeof st->lod_requests);
   if (r->bs.worker_up) pthread_mutex_unlock(&r->bs.mu);
+  if (r->ni.active) {
+    pthread_mutex_lock(&r->ni.mu);
+    st->net_pending = r->ni.qn + r->ni.nin;
+    pthread_mutex_unlock(&r->ni.mu);
+    st->net_fetched = atomic_load(&r->ni.fetched);
+    st->net_encoded = atomic_load(&r->ni.encoded);
+  }
 }
 
 void r3d_bricks_flush(r3d_renderer *r) {

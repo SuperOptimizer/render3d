@@ -1353,6 +1353,10 @@ int main(int argc, char **argv) {
       igText("bricks: hot %u/%u slots  warm %u (%.0f/%llu MB)%s", bst.hot, bst.hot_cap,
              bst.warm_bricks, (double)bst.warm_bytes / 1048576.0,
              (unsigned long long)(bst.warm_cap >> 20), bst.inflight ? "  streaming..." : "");
+      if (bst.net_pending || bst.net_fetched)
+        igText("net ingest: %u pending  %llu chunks fetched  %llu bricks cached",
+               bst.net_pending, (unsigned long long)bst.net_fetched,
+               (unsigned long long)bst.net_encoded);
       if (bst.nlevels > 1)
         igText("wanted L0..L%u: %u %u %u %u %u %u %u %u", bst.nlevels - 1u,
                bst.lod_wanted[0], bst.lod_wanted[1], bst.lod_wanted[2], bst.lod_wanted[3],

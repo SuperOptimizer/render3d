@@ -695,11 +695,10 @@ int main(int argc, char **argv) {
     }
   }
   if (g_full_from > g_nlev) g_full_from = g_nlev;
-  if (g_full_from > 0 && !surf_dir && only_level == UINT32_MAX) {
-    fprintf(stderr, "zarr2c5d: levels 0..%u need --surface (or --full-from 0)\n",
-            g_full_from - 1);
-    return 2;
-  }
+  if (g_full_from > 0 && !surf_dir && only_level == UINT32_MAX)
+    printf("zarr2c5d: no --surface: transcoding only levels >= %u (bootstrap; the "
+           "renderer can stream the rest on demand from source.json)\n",
+           g_full_from);
   if (surf_dir && mark_surface(surf_dir, pad, min_level, have_rect ? rect : NULL) != 0)
     return 1;
 
@@ -740,6 +739,28 @@ int main(int argc, char **argv) {
   } else if (mkdirs(g_out, true) != 0 || write_manifest() != 0) {
     fprintf(stderr, "zarr2c5d: cannot initialise output\n");
     return 1;
+  }
+  if (!missing_path && g_url) {
+    /* source descriptor: lets the RENDERER fetch + transcode chunks on
+     * demand into <out>/bricks/L*, downloading each chunk exactly once */
+    char sj[4096];
+    size_t sn = (size_t)snprintf(sj, sizeof sj,
+                                 "{\n  \"format\": \"render3d.c5d-source.v1\",\n"
+                                 "  \"url\": \"%s\",\n  \"quality\": %.6g,\n"
+                                 "  \"levels\": [\n",
+                                 g_url, (double)g_quality);
+    for (uint32_t l = 0; l < g_nlev; l++)
+      sn += (size_t)snprintf(sj + sn, sizeof sj - sn,
+                             "    {\"level\": %u, \"chunk\": %u, \"raw\": %s}%s\n", l,
+                             g_lv[l].chsz, g_lv[l].raw ? "true" : "false",
+                             l + 1u == g_nlev ? "" : ",");
+    sn += (size_t)snprintf(sj + sn, sizeof sj - sn, "  ]\n}\n");
+    char sp2[2048];
+    snprintf(sp2, sizeof sp2, "%s/source.json", g_out);
+    if (sn >= sizeof sj || write_atomic(sp2, sj, sn) != 0) {
+      fprintf(stderr, "zarr2c5d: cannot write source.json\n");
+      return 1;
+    }
   }
 
   for (uint32_t l = 0; l < g_nlev; l++) {

@@ -44,6 +44,7 @@ find_package(Vulkan REQUIRED)
 find_package(Threads REQUIRED)
 find_package(CURL REQUIRED)
 find_package(TIFF REQUIRED) # tifxyz segment surfaces (BigTIFF/LZW/predictor-3)
+find_library(BLOSC_LIB blosc REQUIRED) # zarr v2 chunk decode (zarr2c5d + net ingest)
 
 # --- core (backend-agnostic: math, camera, volume, transfer, stats) ---
 add_library(r3d_core STATIC
@@ -168,7 +169,7 @@ add_library(r3d_vk STATIC
   src/vk/vkgui.c)
 target_include_directories(r3d_vk PUBLIC src)
 target_link_libraries(r3d_vk PUBLIC Vulkan::Vulkan SDL3::SDL3 CURL::libcurl r3d_imgui r3d_shard r3d_c5d
-                             PRIVATE r3d_warnings r3d_sanitize)
+                             PRIVATE ${BLOSC_LIB} r3d_warnings r3d_sanitize)
 
 # --- shaders (Slang -> SPIR-V) ---
 include(src/shaders/shaders.cmake)
@@ -197,7 +198,6 @@ add_executable(mkvol tools/mkvol/main.c)
 target_link_libraries(mkvol PRIVATE m r3d_warnings r3d_sanitize)
 add_executable(tifxyz-transform tools/tifxyz-transform/main.c)
 target_link_libraries(tifxyz-transform PRIVATE r3d_core m r3d_warnings r3d_sanitize)
-find_library(BLOSC_LIB blosc REQUIRED) # zarr v2 chunk decode (zarr2c5d)
 add_executable(zarr2c5d tools/zarr2c5d/main.c)
 target_link_libraries(zarr2c5d PRIVATE r3d_core r3d_c5d ${BLOSC_LIB} CURL::libcurl
                                        r3d_warnings r3d_sanitize)

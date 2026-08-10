@@ -1014,3 +1014,22 @@ shards are written — no raw mirror. The mirror dir holds just the per-level
 .zarray metadata. Validated byte-identical to the mirror-based path on L4
 (12/12 shards, 198 chunks fetched, 0.4 GB). Mirror mode remains for
 pre-fetched data and re-runs.
+
+## 2026-08-10 — on-demand raw-volume streaming (fetch -> transcode -> cache)
+
+`--bricks` volumes no longer require a full offline transcode. A bootstrap
+run (`zarr2c5d --url U --full-from 5`, ~1 min: coarsest level + manifest +
+source.json) is enough; the renderer then streams everything else on demand.
+On a brick miss the pick loop enqueues the owning RAW zarr chunk
+(nearest-first, deduped); a 4-thread fetch pool downloads it (retry/backoff,
+404 = air), transcodes its (chsz/128)^3 bricks with the same quality ladder
+as the offline tool, and writes per-brick c5d blobs to
+<root>/bricks/L<l>/<z>_<y>_<x>.c5b (empty file = definitively absent, so a
+brick is never re-requested; each chunk downloads exactly once, ever).
+bricks_source_blob gained that cache as a tier between the shard tree and
+"absent"; pending bricks stay candidates instead of being poisoned with
+maxk=0. Verified on PHerc0172: bootstrap 33 chunks, then a 900-frame
+headless run fetched+cached 83 bricks live from S3 and rendered them (0
+failures); the second run served the same view from disk (10 fast decode
+jobs, no fetches). Offline zarr2c5d remains the bulk pre-warm path and both
+write layouts the renderer reads interchangeably.
