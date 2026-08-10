@@ -51,6 +51,7 @@ typedef struct level_info {
   dims3 shards;   /* 1024^3 shard grid */
   uint8_t *want;  /* shard selection bitmap (1 byte per shard), NULL = all */
   uint8_t *cwant; /* chunk selection bitmap; unwanted chunks transcode as zero */
+  bool raw;       /* "compressor": null — chunks are plain 128^3 u8 */
 } level_info;
 
 typedef struct blob {
@@ -119,7 +120,7 @@ static bool all_zero(const uint8_t *p, size_t n) {
 }
 
 /* Minimal .zarray probe: shape triplet + chunks triplet + dtype "|u1". */
-static int read_zarray(uint32_t level, dims3 *shape, dims3 *chunks) {
+static int read_zarray(uint32_t level, dims3 *shape, dims3 *chunks, bool *raw) {
   char path[2048];
   snprintf(path, sizeof path, "%s/%u/.zarray", g_mirror, level);
   FILE *f = fopen(path, "r");
@@ -138,6 +139,8 @@ static int read_zarray(uint32_t level, dims3 *shape, dims3 *chunks) {
   if (!(c = strchr(c, '[')) || sscanf(c, "[ %llu , %llu , %llu", &v[0], &v[1], &v[2]) != 3)
     return -1;
   *chunks = (dims3){v[0], v[1], v[2]};
+  const char *cp = strstr(buf, "\"compressor\"");
+  *raw = cp && strncmp(cp + 12, ": null", 6) == 0;
   return 0;
 }
 
@@ -175,6 +178,15 @@ static int load_chunk(uint32_t level, uint64_t cz, uint64_t cy, uint64_t cx, uin
   if (fn <= 0 || fn > (long)(BRICK_BYTES + (16u << 20))) {
     fclose(f);
     return -1;
+  }
+  if (lv->raw) { /* "compressor": null — the file IS the 128^3 payload */
+    size_t got = fread(dst, 1, BRICK_BYTES, f);
+    fclose(f);
+    if (got != BRICK_BYTES) {
+      fprintf(stderr, "zarr2c5d: raw chunk %s is %zu bytes\n", path, got);
+      return -1;
+    }
+    return 1;
   }
   uint8_t *comp = malloc((size_t)fn);
   if (!comp || fread(comp, 1, (size_t)fn, f) != (size_t)fn) {
@@ -341,12 +353,13 @@ static int process_shard(uint32_t level, uint64_t oz, uint64_t oy, uint64_t ox,
 
 /* --- surface-driven shard selection --------------------------------------- */
 
-static int mark_surface(const char *surf_dir, uint32_t pad) {
+static int mark_surface(const char *surf_dir, uint32_t pad, uint32_t min_level,
+                        const uint32_t rect[4]) {
   r3d_tifxyz s;
   if (r3d_tifxyz_load(&s, surf_dir) != 0) return -1;
   printf("zarr2c5d: surface %s: %ux%u grid, %llu valid points\n", surf_dir, s.w, s.h,
          (unsigned long long)s.nvalid);
-  for (uint32_t l = 0; l < g_full_from && l < g_nlev; l++) {
+  for (uint32_t l = min_level; l < g_full_from && l < g_nlev; l++) {
     level_info *lv = &g_lv[l];
     uint64_t ns = lv->shards.z * lv->shards.y * lv->shards.x;
     uint64_t nc = lv->chunks.z * lv->chunks.y * lv->chunks.x;
@@ -358,6 +371,12 @@ static int mark_surface(const char *surf_dir, uint32_t pad) {
     }
     uint32_t sc = 1u << l;
     for (uint64_t k = 0; k < (uint64_t)s.w * s.h; k++) {
+      /* --rect confines FULL-RES (level 0) coverage to a grid sub-rect; the
+       * coarser selective levels still track the whole surface */
+      if (l == 0 && rect) {
+        uint32_t gi = (uint32_t)(k % s.w), gj = (uint32_t)(k / s.w);
+        if (gi < rect[0] || gj < rect[1] || gi >= rect[2] || gj >= rect[3]) continue;
+      }
       const float *p = s.xyz + k * 3;
       if (!r3d_tifxyz_valid(p)) continue;
       /* world voxels -> level voxels -> chunk range covering p +/- pad */
@@ -437,14 +456,17 @@ int main(int argc, char **argv) {
   if (argc < 3) {
     fprintf(stderr,
             "usage: zarr2c5d <zarr-mirror-dir> <output-dir> [--surface DIR] [--pad N] "
-            "[--full-from L] [--threads N] [--c5d-quality Q] [--only-level L] "
+            "[--full-from L] [--min-level L] [--rect i0 j0 i1 j1] [--threads N] "
+            "[--c5d-quality Q] [--only-level L] "
             "[--list-missing FILE] [--dry-run] [--verify N] [--force]\n");
     return 2;
   }
   g_mirror = argv[1];
   g_out = argv[2];
   const char *surf_dir = NULL, *missing_path = NULL;
-  uint32_t pad = 64, threads = 0, only_level = UINT32_MAX;
+  uint32_t pad = 64, threads = 0, only_level = UINT32_MAX, min_level = 0;
+  uint32_t rect[4] = {0};
+  bool have_rect = false;
   bool dry = false, force = false;
   for (int i = 3; i < argc; i++) {
     if (strcmp(argv[i], "--surface") == 0 && i + 1 < argc)
@@ -459,6 +481,12 @@ int main(int argc, char **argv) {
       g_quality = strtof(argv[++i], NULL);
     else if (strcmp(argv[i], "--only-level") == 0 && i + 1 < argc)
       only_level = (uint32_t)strtoul(argv[++i], NULL, 10);
+    else if (strcmp(argv[i], "--min-level") == 0 && i + 1 < argc)
+      min_level = (uint32_t)strtoul(argv[++i], NULL, 10);
+    else if (strcmp(argv[i], "--rect") == 0 && i + 4 < argc) {
+      for (int k = 0; k < 4; k++) rect[k] = (uint32_t)strtoul(argv[++i], NULL, 10);
+      have_rect = true;
+    }
     else if (strcmp(argv[i], "--list-missing") == 0 && i + 1 < argc)
       missing_path = argv[++i];
     else if (strcmp(argv[i], "--dry-run") == 0)
@@ -480,7 +508,9 @@ int main(int argc, char **argv) {
   /* probe levels */
   for (uint32_t l = 0; l < MAX_LEVELS; l++) {
     dims3 shape, chunks;
-    if (read_zarray(l, &shape, &chunks) != 0) break;
+    bool raw = false;
+    if (read_zarray(l, &shape, &chunks, &raw) != 0) break;
+    g_lv[l].raw = raw;
     if (chunks.z != BRICK || chunks.y != BRICK || chunks.x != BRICK) {
       fprintf(stderr, "zarr2c5d: L%u chunks are not 128^3\n", l);
       return 1;
@@ -512,7 +542,8 @@ int main(int argc, char **argv) {
             g_full_from - 1);
     return 2;
   }
-  if (surf_dir && mark_surface(surf_dir, pad) != 0) return 1;
+  if (surf_dir && mark_surface(surf_dir, pad, min_level, have_rect ? rect : NULL) != 0)
+    return 1;
 
   uint64_t plan[MAX_LEVELS] = {0}, total = 0;
   for (uint32_t l = 0; l < g_nlev; l++) {
