@@ -203,6 +203,17 @@ typedef struct od_state {
   r3d_odlist scrolls, vols, segs, variants;
   int sel_scroll, sel_vol, sel_seg, sel_variant;
   bool scrolls_ok, vols_ok, segs_ok, variants_ok;
+  /* async listing worker: the GUI thread never blocks on the network or
+   * touches the filesystem — it posts requests and polls results */
+  pthread_t fth;
+  bool fth_up, fbusy, fquit;
+  pthread_mutex_t fmu;
+  pthread_cond_t fcv;
+  int freq, fdone; /* 1 scrolls, 2 vols+segs (of fscroll), 3 variants */
+  char fscroll[300], fseg[300];
+  r3d_odlist fres_a, fres_b;
+  bool *fcached; /* per-volume [cached] flags, computed on the worker */
+  bool *vol_cached;
   FILE *job;            /* running subprocess (popen, non-blocking reads) */
   char log[10][160];    /* rolling job output */
   int nlog;
@@ -273,6 +284,93 @@ static int od_pump(od_state *od) {
   int status = pclose(od->job);
   od->job = NULL;
   return status == 0 ? 1 : -1;
+}
+
+static void *od_fetch_worker(void *ud) {
+  od_state *od = ud;
+  for (;;) {
+    pthread_mutex_lock(&od->fmu);
+    while (!od->fquit && od->freq == 0) pthread_cond_wait(&od->fcv, &od->fmu);
+    if (od->fquit) {
+      pthread_mutex_unlock(&od->fmu);
+      return NULL;
+    }
+    int req = od->freq;
+    char scroll[300], seg[300];
+    snprintf(scroll, sizeof scroll, "%s", od->fscroll);
+    snprintf(seg, sizeof seg, "%s", od->fseg);
+    pthread_mutex_unlock(&od->fmu);
+
+    r3d_odlist a = {0}, b = {0};
+    bool *cached = NULL;
+    char pfx[700];
+    if (req == 1) {
+      r3d_odlist_fetch(OD_BUCKET, "", &a);
+    } else if (req == 2) {
+      snprintf(pfx, sizeof pfx, "%s/volumes/", scroll);
+      r3d_odlist_fetch(OD_BUCKET, pfx, &a);
+      snprintf(pfx, sizeof pfx, "%s/segments/", scroll);
+      r3d_odlist_fetch(OD_BUCKET, pfx, &b);
+      cached = calloc(a.ndirs ? a.ndirs : 1, sizeof *cached);
+      for (uint32_t i = 0; cached && i < a.ndirs; i++) {
+        char mp[900];
+        snprintf(mp, sizeof mp, "cache/od/%s/%s/manifest.json", scroll, a.dirs[i]);
+        cached[i] = od_file_exists(mp);
+      }
+    } else if (req == 3) {
+      snprintf(pfx, sizeof pfx, "%s/segments/%s/mesh/", scroll, seg);
+      r3d_odlist_fetch(OD_BUCKET, pfx, &a);
+    }
+    pthread_mutex_lock(&od->fmu);
+    r3d_odlist_free(&od->fres_a);
+    r3d_odlist_free(&od->fres_b);
+    free(od->fcached);
+    od->fres_a = a;
+    od->fres_b = b;
+    od->fcached = cached;
+    od->fdone = req;
+    od->freq = 0;
+    od->fbusy = false;
+    pthread_mutex_unlock(&od->fmu);
+  }
+}
+
+static void od_request(od_state *od, int req) {
+  if (!od->fth_up) {
+    pthread_mutex_init(&od->fmu, NULL);
+    pthread_cond_init(&od->fcv, NULL);
+    if (pthread_create(&od->fth, NULL, od_fetch_worker, od) != 0) return;
+    od->fth_up = true;
+  }
+  pthread_mutex_lock(&od->fmu);
+  if (!od->fbusy) {
+    od->freq = req;
+    od->fbusy = true;
+    if (od->sel_scroll >= 0)
+      snprintf(od->fscroll, sizeof od->fscroll, "%s", od->scrolls.dirs[od->sel_scroll]);
+    if (od->sel_seg >= 0)
+      snprintf(od->fseg, sizeof od->fseg, "%s", od->segs.dirs[od->sel_seg]);
+    pthread_cond_signal(&od->fcv);
+  }
+  pthread_mutex_unlock(&od->fmu);
+}
+
+/* returns the completed request id (once) and moves its results out */
+static int od_poll(od_state *od, r3d_odlist *a, r3d_odlist *b, bool **cached) {
+  if (!od->fth_up) return 0;
+  pthread_mutex_lock(&od->fmu);
+  int done = od->fdone;
+  if (done) {
+    *a = od->fres_a;
+    *b = od->fres_b;
+    *cached = od->fcached;
+    memset(&od->fres_a, 0, sizeof od->fres_a);
+    memset(&od->fres_b, 0, sizeof od->fres_b);
+    od->fcached = NULL;
+    od->fdone = 0;
+  }
+  pthread_mutex_unlock(&od->fmu);
+  return done;
 }
 
 /* The browser is an ordinary ImGui window in the frame loop. Opening a
@@ -346,6 +444,34 @@ static void od_browser_window(od_state *od, bool *open, char *next_bricks, size_
     od_log(od, "opening...");
   }
 
+  {
+    r3d_odlist ra = {0}, rb = {0};
+    bool *rc_ = NULL;
+    int done = od_poll(od, &ra, &rb, &rc_);
+    if (done == 1) {
+      r3d_odlist_free(&od->scrolls);
+      od->scrolls = ra;
+      od->scrolls_ok = true;
+    } else if (done == 2) {
+      r3d_odlist_free(&od->vols);
+      r3d_odlist_free(&od->segs);
+      free(od->vol_cached);
+      od->vols = ra;
+      od->segs = rb;
+      od->vol_cached = rc_;
+      rc_ = NULL;
+      od->vols_ok = od->segs_ok = true;
+    } else if (done == 3) {
+      r3d_odlist_free(&od->variants);
+      od->variants = ra;
+      od->variants_ok = true;
+    } else if (done) {
+      r3d_odlist_free(&ra);
+      r3d_odlist_free(&rb);
+    }
+    if (done != 2) free(rc_);
+  }
+
   if (!*open) return;
   igSetNextWindowSize((ImVec2){620, 640}, ImGuiCond_FirstUseEver);
   igSetNextWindowPos((ImVec2){380, 40}, ImGuiCond_FirstUseEver, (ImVec2){0, 0});
@@ -354,8 +480,8 @@ static void od_browser_window(od_state *od, bool *open, char *next_bricks, size_
     return;
   }
   if (!od->scrolls_ok) {
-    if (r3d_odlist_fetch(OD_BUCKET, "", &od->scrolls) == 0) od->scrolls_ok = true;
-    else igTextDisabled("bucket listing failed");
+    od_request(od, 1);
+    igTextDisabled("listing bucket...");
   }
   const char *cur = od->sel_scroll >= 0 ? od->scrolls.dirs[od->sel_scroll] : "<pick a scroll>";
   if (igBeginCombo("scroll", cur, 0)) {
@@ -372,23 +498,20 @@ static void od_browser_window(od_state *od, bool *open, char *next_bricks, size_
     igEndCombo();
   }
   if (od->sel_scroll >= 0 && !od->vols_ok) {
-    char pfx[300];
-    snprintf(pfx, sizeof pfx, "%s/volumes/", od->scrolls.dirs[od->sel_scroll]);
-    if (r3d_odlist_fetch(OD_BUCKET, pfx, &od->vols) == 0) od->vols_ok = true;
-    snprintf(pfx, sizeof pfx, "%s/segments/", od->scrolls.dirs[od->sel_scroll]);
-    if (r3d_odlist_fetch(OD_BUCKET, pfx, &od->segs) == 0) od->segs_ok = true;
+    od_request(od, 2);
+    igTextDisabled("listing scroll...");
   }
   if (od->vols_ok) {
     igText("volumes");
     igBeginChild_Str("odvols", (ImVec2){0, 140}, ImGuiChildFlags_Borders, 0);
     for (uint32_t i = 0; i < od->vols.ndirs; i++) {
-      char mp[700], label[800];
-      snprintf(mp, sizeof mp, "cache/od/%s/%s/manifest.json",
-               od->scrolls.dirs[od->sel_scroll], od->vols.dirs[i]);
-      snprintf(label, sizeof label, "%s%s", od_file_exists(mp) ? "[cached] " : "",
-               od->vols.dirs[i]);
-      if (igSelectable_Bool(label, (int)i == od->sel_vol, 0, (ImVec2){0, 0}))
+      char label[800];
+      snprintf(label, sizeof label, "%s%s",
+               od->vol_cached && od->vol_cached[i] ? "[cached] " : "", od->vols.dirs[i]);
+      if (igSelectable_Bool(label, (int)i == od->sel_vol, 0, (ImVec2){0, 0})) {
         od->sel_vol = (int)i;
+        printf("odbrowse: volume %s selected\n", od->vols.dirs[i]);
+      }
     }
     igEndChild();
   }
@@ -404,12 +527,7 @@ static void od_browser_window(od_state *od, bool *open, char *next_bricks, size_
       }
     igEndChild();
   }
-  if (od->sel_seg >= 0 && !od->variants_ok) {
-    char pfx[500];
-    snprintf(pfx, sizeof pfx, "%s/segments/%s/mesh/", od->scrolls.dirs[od->sel_scroll],
-             od->segs.dirs[od->sel_seg]);
-    if (r3d_odlist_fetch(OD_BUCKET, pfx, &od->variants) == 0) od->variants_ok = true;
-  }
+  if (od->sel_seg >= 0 && !od->variants_ok) od_request(od, 3);
   char volid[64] = "";
   if (od->sel_vol >= 0) { /* volume id = dir name up to the first '-' */
     snprintf(volid, sizeof volid, "%s", od->vols.dirs[od->sel_vol]);
@@ -432,6 +550,8 @@ static void od_browser_window(od_state *od, bool *open, char *next_bricks, size_
     igEndChild();
   }
   bool busy = od->stage != 0;
+  igTextDisabled("sel: scroll %d vol %d seg %d variant %d stage %d", od->sel_scroll,
+                 od->sel_vol, od->sel_seg, od->sel_variant, od->stage);
   igBeginDisabled(busy || od->sel_vol < 0);
   bool go_vol = igButton("open volume", (ImVec2){0, 0});
   igEndDisabled();
@@ -2206,6 +2326,13 @@ int main(int argc, char **argv) {
   r3d_bricks_end(renderer); /* dataset swap: teardown, then reopen */
   if (slab_src.voxels) r3d_volume_close(&slab_src);
   } /* dataset loop */
+  if (od.fth_up) { /* stop the browser's listing worker */
+    pthread_mutex_lock(&od.fmu);
+    od.fquit = true;
+    pthread_cond_broadcast(&od.fcv);
+    pthread_mutex_unlock(&od.fmu);
+    pthread_join(od.fth, NULL);
+  }
   r3d_destroy(renderer);
   SDL_DestroyWindow(win);
   SDL_Quit();

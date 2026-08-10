@@ -130,8 +130,10 @@ struct r3d_renderer {
     uint64_t inflight[8];  /* chunks being fetched right now */
     uint32_t nin;
     _Atomic uint64_t fetched, absent_chunks, encoded;
-    uint8_t *scratch;      /* render-thread .c5b read buffer */
-    size_t scratch_cap;
+    /* per-brick cache state, written by workers only: 0 unknown,
+     * 1 = .c5b on disk, 2 = definitively absent/air. The render thread
+     * never touches the filesystem — it consults this map. */
+    _Atomic uint8_t *have;
   } ni;
   r3d_brlod_level bricks_lev[BR_LOD_MAX];
   r3d_brlod_reader *bricks_readers;
@@ -858,7 +860,7 @@ static void bricks_teardown(r3d_renderer *r) {
     pthread_mutex_destroy(&r->ni.mu);
     pthread_cond_destroy(&r->ni.cv);
   }
-  free(r->ni.scratch);
+  free((void *)r->ni.have);
   if (r->vk.dev) r3d_vkctx_device_wait_idle(&r->vk);
   if (r->bs.upload_pool) vkDestroyCommandPool(r->vk.dev, r->bs.upload_pool, NULL);
   if (r->c5d) r3d_vkc5d_destroy(r->c5d);
@@ -1014,7 +1016,7 @@ void r3d_destroy(r3d_renderer *r) {
     pthread_mutex_destroy(&r->ni.mu);
     pthread_cond_destroy(&r->ni.cv);
   }
-  free(r->ni.scratch);
+  free((void *)r->ni.have);
   free(r->bs.slot_brick);
   free(r->bs.slot_use);
   free(r->bs.brick_slot);
@@ -1787,9 +1789,13 @@ static void ni_brick_path(r3d_renderer *r, char path[1400], uint32_t li, uint32_
 
 static const uint8_t *bricks_source_blob(r3d_renderer *r, uint32_t b, size_t *n) {
   if (!r->bricks_lod) return c5d_shard_brick(&r->bs.sr, b, n);
-  const uint8_t *blob = brlod_blob(r, r->bricks_root, r->bricks_readers, b, n);
-  if (blob || !r->ni.active) return blob;
-  /* net-ingest cache tier: per-brick c5d blobs written by the fetch pool */
+  return brlod_blob(r, r->bricks_root, r->bricks_readers, b, n);
+}
+
+/* Load a net-ingested brick blob from its cache file (WORKER THREAD ONLY —
+ * the render thread never performs file IO; it selects these bricks via the
+ * ni.have map and the worker resolves them here). malloc'd result. */
+static uint8_t *ni_load_brick(r3d_renderer *r, uint32_t b, size_t *n) {
   uint32_t li, bx, by, bz;
   brlod_locate(r, b, &li, &bx, &by, &bz);
   char path[1400];
@@ -1799,24 +1805,19 @@ static const uint8_t *bricks_source_blob(r3d_renderer *r, uint32_t b, size_t *n)
   fseek(f, 0, SEEK_END);
   long fn = ftell(f);
   fseek(f, 0, SEEK_SET);
-  if (fn <= 0) { /* empty marker: definitively absent upstream */
+  if (fn <= 0) {
     fclose(f);
     return NULL;
   }
-  if ((size_t)fn > r->ni.scratch_cap) {
-    uint8_t *ns = realloc(r->ni.scratch, (size_t)fn);
-    if (!ns) {
-      fclose(f);
-      return NULL;
-    }
-    r->ni.scratch = ns;
-    r->ni.scratch_cap = (size_t)fn;
-  }
-  size_t got = fread(r->ni.scratch, 1, (size_t)fn, f);
+  uint8_t *buf = malloc((size_t)fn);
+  size_t got = buf ? fread(buf, 1, (size_t)fn, f) : 0;
   fclose(f);
-  if (got != (size_t)fn) return NULL;
+  if (got != (size_t)fn) {
+    free(buf);
+    return NULL;
+  }
   *n = got;
-  return r->ni.scratch;
+  return buf;
 }
 
 /* Enqueue the zarr chunk that owns brick b (dedup against queue+inflight).
@@ -1824,12 +1825,9 @@ static const uint8_t *bricks_source_blob(r3d_renderer *r, uint32_t b, size_t *n)
  * false when the cache says the brick is definitively absent upstream. */
 static bool bricks_net_request(r3d_renderer *r, uint32_t b) {
   if (!r->ni.active) return false;
+  if (atomic_load(&r->ni.have[b]) == 2u) return false; /* definitively absent */
   uint32_t li, bx, by, bz;
   brlod_locate(r, b, &li, &bx, &by, &bz);
-  char path[1400];
-  ni_brick_path(r, path, li, bz, by, bx);
-  struct stat st;
-  if (stat(path, &st) == 0 && st.st_size == 0) return false; /* absent marker */
   uint32_t cb = r->ni.chsz[li] / BR_SLOT_DIM; /* bricks per chunk axis */
   uint64_t id = ((uint64_t)li << 48) | ((uint64_t)(bz / cb) << 32) |
                 ((uint64_t)(by / cb) << 16) | (uint64_t)(bx / cb);
@@ -1902,6 +1900,35 @@ static void *ni_worker(void *arg) {
              cy = (uint32_t)(id >> 16) & 0xffffu, cx = (uint32_t)id & 0xffffu;
     uint32_t chsz = r->ni.chsz[li], cb = chsz / BR_SLOT_DIM;
     size_t chunk_bytes = (size_t)chsz * chsz * chsz;
+    { /* cache files from an earlier session? publish them without fetching */
+      const r3d_brlod_level *lv = &r->bricks_lev[li];
+      bool all_known = true;
+      for (uint32_t sz_ = 0; sz_ < cb && all_known; sz_++)
+        for (uint32_t sy = 0; sy < cb && all_known; sy++)
+          for (uint32_t sx = 0; sx < cb; sx++) {
+            uint32_t bz = cz * cb + sz_, by = cy * cb + sy, bx = cx * cb + sx;
+            if (bx >= lv->bx || by >= lv->by || bz >= lv->bz) continue;
+            char path[1400];
+            ni_brick_path(r, path, li, bz, by, bx);
+            struct stat st;
+            if (stat(path, &st) != 0) {
+              all_known = false;
+              break;
+            }
+            atomic_store(&r->ni.have[lv->page_off + (bz * lv->by + by) * lv->bx + bx],
+                         st.st_size ? 1u : 2u);
+          }
+      if (all_known) {
+        pthread_mutex_lock(&r->ni.mu);
+        for (uint32_t i = 0; i < r->ni.nin; i++)
+          if (r->ni.inflight[i] == id) {
+            r->ni.inflight[i] = r->ni.inflight[--r->ni.nin];
+            break;
+          }
+        pthread_mutex_unlock(&r->ni.mu);
+        continue;
+      }
+    }
     char url[1400];
     snprintf(url, sizeof url, "%s/%u/%u/%u/%u", r->ni.url, li, cz, cy, cx);
     long code = 0;
@@ -1958,7 +1985,11 @@ static void *ni_worker(void *arg) {
             char path[1400];
             ni_brick_path(r, path, li, bz, by, bx);
             struct stat st;
-            if (stat(path, &st) == 0) continue; /* another chunk already wrote it */
+            if (stat(path, &st) == 0) { /* already cached by an earlier run */
+              atomic_store(&r->ni.have[lv->page_off + (bz * lv->by + by) * lv->bx + bx],
+                           st.st_size ? 1u : 2u);
+              continue;
+            }
             bool zero = !have;
             if (have) {
               for (uint32_t rr = 0; rr < BR_SLOT_DIM; rr++)
@@ -1976,8 +2007,10 @@ static void *ni_worker(void *arg) {
                   break;
                 }
             }
+            uint32_t gb = lv->page_off + (bz * lv->by + by) * lv->bx + bx;
             if (zero) {
               ni_write_file(path, NULL, 0); /* empty marker = air/absent */
+              atomic_store(&r->ni.have[gb], 2u);
               continue;
             }
             c5d_brick_params bp = c5d_brick_defaults(1.0f);
@@ -1986,6 +2019,7 @@ static void *ni_worker(void *arg) {
             size_t en = 0;
             if (c5d_brick_encode(&bp, raw, BR_SLOT_DIM, &enc, &en) == 0) {
               ni_write_file(path, enc, en);
+              atomic_store(&r->ni.have[gb], 1u);
               atomic_fetch_add(&r->ni.encoded, 1);
               free(enc);
             }
@@ -2310,8 +2344,20 @@ static int bricks_decode_batch(r3d_renderer *r, uint32_t n) {
   uint8_t *raw = r->bs.raw_stage.mapped;
   for (uint32_t i = 0; i < n; i++) {
     uint8_t *dst = raw + (size_t)i * BR_RAW_BYTES;
-    if (c5d_brick_decode_par(r->bs.srcs[i].blob, r->bs.srcs[i].n, dst, BR_SLOT_DIM, 4) != 0)
+    const uint8_t *blob = r->bs.srcs[i].blob;
+    size_t bn = r->bs.srcs[i].n;
+    uint8_t *owned = NULL;
+    if (!blob) { /* net-ingest cache brick: file IO on THIS worker thread */
+      owned = ni_load_brick(r, r->bs.sel_b[i], &bn);
+      blob = owned;
+    }
+    int drc = blob ? c5d_brick_decode_par(blob, bn, dst, BR_SLOT_DIM, 4) : -1;
+    free(owned);
+    if (drc != 0) {
+      fprintf(stderr, "bricks: decode failed b=%u n=%zu%s\n", r->bs.sel_b[i], bn,
+              r->bs.srcs[i].blob ? "" : " (cache tier)");
       return -1;
+    }
     uint8_t mx = 0;
     for (size_t v = 0; v < BR_RAW_BYTES; v++)
       if (dst[v] > mx) mx = dst[v];
@@ -2471,6 +2517,10 @@ int r3d_bricks_begin(r3d_renderer *r, const char *c5s_path, uint32_t pool_bpa,
             lp += 9;
           }
         }
+      }
+      if (ok) {
+        r->ni.have = calloc(r->bs.nb, sizeof *r->ni.have);
+        ok = r->ni.have != NULL;
       }
       if (ok) {
         pthread_mutex_init(&r->ni.mu, NULL);
@@ -3142,7 +3192,10 @@ void r3d_bricks_stream_submit(r3d_renderer *r, uint32_t budget) {
     if (r->bs.brick_slot[b] != BR_INVALID) continue; /* duped across collects */
     size_t bn = 0;
     const uint8_t *blob = warm_get(r, b, &bn);
-    if (!blob) {
+    bool from_cache = false;
+    if (!blob && r->ni.active && atomic_load(&r->ni.have[b]) == 1u)
+      from_cache = true; /* on disk; the decode worker reads it (no IO here) */
+    if (!blob && !from_cache) {
       /* not in any local tier: net-ingest it (stays a candidate until the
        * fetch pool caches it), or mark definitively absent */
       if (!bricks_net_request(r, b)) r->bs.brick_maxk[b] = 0;
