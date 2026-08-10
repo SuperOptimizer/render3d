@@ -557,6 +557,7 @@ int main(int argc, char **argv) {
   int mv_sv_cool = 0;
   uint32_t mv_visible = 0xfu; /* per-view visibility; collapsed views cost nothing */
   int mv_solo = -1;           /* Space on a hovered view maximizes it */
+  bool mv_panel_open = true;  /* docked left panel; collapses to a slim bar */
   mv_lines mv_ol[4] = {0}, mv_ol_off[4] = {0}; /* intersection polylines */
   double mv_ol_slice[4] = {1e30, 1e30, 1e30, 1e30};
   double mv_ol_zoff = 1e30;
@@ -875,11 +876,13 @@ int main(int argc, char **argv) {
     }
 
     uint32_t mv_mask = mv_solo >= 0 ? 1u << mv_solo : (mv_visible ? mv_visible : 0xfu);
+    int mv_panel_w = multiview_path ? (mv_panel_open ? 360 : 26) : 0;
+    if (mv_panel_w >= w) mv_panel_w = 0;
     if (multiview_path) {
       r3d_mview lay[4];
-      r3d_mv_layout_mask(lay, w, h, mv_mask);
+      r3d_mv_layout_mask(lay, w - mv_panel_w, h, mv_mask);
       for (int i = 0; i < 4; i++) {
-        mv[i].px = lay[i].px;
+        mv[i].px = lay[i].px + (lay[i].pw ? mv_panel_w : 0);
         mv[i].py = lay[i].py;
         mv[i].pw = lay[i].pw;
         mv[i].ph = lay[i].ph;
@@ -889,9 +892,9 @@ int main(int argc, char **argv) {
         if (mv_solo >= 0) mv_solo = -1;
         else if (hv >= 0) mv_solo = hv;
         mv_mask = mv_solo >= 0 ? 1u << mv_solo : (mv_visible ? mv_visible : 0xfu);
-        r3d_mv_layout_mask(lay, w, h, mv_mask);
+        r3d_mv_layout_mask(lay, w - mv_panel_w, h, mv_mask);
         for (int i = 0; i < 4; i++) {
-          mv[i].px = lay[i].px;
+          mv[i].px = lay[i].px + (lay[i].pw ? mv_panel_w : 0);
           mv[i].py = lay[i].py;
           mv[i].pw = lay[i].pw;
           mv[i].ph = lay[i].ph;
@@ -1186,12 +1189,33 @@ int main(int argc, char **argv) {
     uint32_t rvw = half_res ? (uint32_t)w / 2 : (uint32_t)w;
     uint32_t rvh = half_res ? (uint32_t)h / 2 : (uint32_t)h;
 
-    /* control panel */
+    /* control panel: floating window normally; in multiview a docked left
+     * side panel that collapses to a slim bar (views reflow to fill) */
     fps_smooth = fps_smooth * 0.95f + (dt > 0 ? 0.05f / dt : 0.0f);
     r3d_gui_begin(renderer);
-    igSetNextWindowPos((ImVec2){10, 10}, ImGuiCond_FirstUseEver, (ImVec2){0, 0});
-    igBegin("render3d", NULL, ImGuiWindowFlags_AlwaysAutoResize);
-    igText("%.0f fps   gpu %.2f ms", (double)fps_smooth, (double)last_gpu_ns / 1e6);
+    bool panel_content = true;
+    if (multiview_path) {
+      igSetNextWindowPos((ImVec2){0, 0}, ImGuiCond_Always, (ImVec2){0, 0});
+      igSetNextWindowSize((ImVec2){(float)mv_panel_w, (float)h}, ImGuiCond_Always);
+      igBegin("render3d", NULL,
+              ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
+                  ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse |
+                  (mv_panel_open ? 0 : ImGuiWindowFlags_NoScrollbar));
+      if (igButton(mv_panel_open ? "<<" : ">>", (ImVec2){0, 0}))
+        mv_panel_open = !mv_panel_open;
+      panel_content = mv_panel_open;
+      if (panel_content) {
+        igSameLine(0, 10);
+        igText("%.0f fps  gpu %.1f ms", (double)fps_smooth, (double)last_gpu_ns / 1e6);
+        igSeparator();
+      }
+    } else {
+      igSetNextWindowPos((ImVec2){10, 10}, ImGuiCond_FirstUseEver, (ImVec2){0, 0});
+      igBegin("render3d", NULL, ImGuiWindowFlags_AlwaysAutoResize);
+    }
+    if (panel_content) {
+    if (!multiview_path)
+      igText("%.0f fps   gpu %.2f ms", (double)fps_smooth, (double)last_gpu_ns / 1e6);
     int m = (int)mode;
     if (igCombo_Str("mode", &m, "full\0mip\0depth\0heatmap\0raydir\0flat\0", 6))
       mode = (uint32_t)m;
@@ -1426,6 +1450,7 @@ int main(int argc, char **argv) {
                      "ctrl+shift+drag rot vol | wheel zoom | WASD pan | F12 shot");
     else
       igTextDisabled("click: fly (Esc releases)   WASD+QE: move   F12: shot");
+    } /* panel_content */
     igEnd();
 
     if (umbilicus_path) {

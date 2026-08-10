@@ -4352,11 +4352,28 @@ int r3d_frame_views(r3d_renderer *r, const r3d_frame_params *views, uint32_t nvi
                          VK_ACCESS_2_SHADER_SAMPLED_READ_BIT, 0, 1);
   }
 
-  /* offscreen: whatever -> GENERAL for compute write (contents fully overwritten) */
-  r3d_vk_image_barrier(cmd, r->offscreen.img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
-                       VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0,
-                       VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                       0, 1);
+  /* offscreen -> GENERAL for compute write. Multi-view layouts may leave
+   * uncovered regions (side panel strip), so clear the image first there;
+   * single view overwrites every pixel. */
+  if (nviews > 1) {
+    r3d_vk_image_barrier(cmd, r->offscreen.img, VK_IMAGE_LAYOUT_UNDEFINED,
+                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                         VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0,
+                         VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, 0, 1);
+    VkClearColorValue cc = {.float32 = {0.05f, 0.05f, 0.06f, 1.0f}};
+    VkImageSubresourceRange rr = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdClearColorImage(cmd, r->offscreen.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &cc, 1,
+                         &rr);
+    r3d_vk_image_barrier(cmd, r->offscreen.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                         VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_CLEAR_BIT,
+                         VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                         VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, 0, 1);
+  } else {
+    r3d_vk_image_barrier(cmd, r->offscreen.img, VK_IMAGE_LAYOUT_UNDEFINED,
+                         VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0,
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                         VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, 0, 1);
+  }
 
   if (r->query)
     vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, r->query, slot * 4);
