@@ -78,6 +78,37 @@ can be displayed without per-tile pop-in. This ring uses about 5.4 GB here;
 jump cache, the maximum annotation-mode cache footprint is about 9.2 GB on this
 machine. The benchmark script also runs a repeatable 20-slice fine-scroll test.
 
+### 2x2 multi-view (vc3d-style) on AWS open data
+
+`--multiview <tifxyz-dir>` opens the volume-cartographer layout: top-left the
+flattened segment, top-right XY, bottom-left XZ, bottom-right YZ — all
+orthographic slice views over the `--bricks` LOD cache with a shared focus.
+Drag pans a view, wheel zooms about the cursor, Shift+wheel (or R/F) scrubs
+the hovered view's slice — on the segment view it slides the sampling shell
+along the local surface normal. **Ctrl+click sets the focus point**: all
+plane views recenter and re-slice through it, and the segment view recenters
+on the nearest surface point. Plane views draw the segment intersection curve
+(+ a translucent copy at the current normal offset); the segment view draws
+the three plane traces (orange XY / red XZ / yellow YZ).
+
+Test data comes straight from the `vesuvius-challenge-open-data` S3 bucket
+(PHerc0172 pairs tifxyz segments with their exact source volume):
+
+```sh
+aws s3 cp --no-sign-request --recursive \
+  "s3://vesuvius-challenge-open-data/PHerc0172/segments/<seg>/mesh/<id>.tifxyz/" \
+  cache/PHerc0172-segments/w062/
+# mirror coarse levels fully + fine chunks near the surface, then transcode
+./build/release/zarr2c5d cache/PHerc0172-zarr cache/PHerc0172-lod \
+  --surface cache/PHerc0172-segments/w062 --pad 64 --dry-run   # plan/estimate
+./build/release/zarr2c5d ... --list-missing missing.txt        # chunk list
+tools/fetch_chunks.sh <volume-zarr-url> cache/PHerc0172-zarr missing.txt 24
+./build/release/zarr2c5d cache/PHerc0172-zarr cache/PHerc0172-lod \
+  --surface cache/PHerc0172-segments/w062 --pad 64 --verify 64
+./build/release/render3d --bricks cache/PHerc0172-lod/manifest.json \
+  --multiview cache/PHerc0172-segments/w062
+```
+
 ### Multiresolution Zarr + c5d bricks
 
 `lodpack` builds the PHerc1218 pyramid without ever expanding the 18 GiB

@@ -12,6 +12,7 @@
 #include "core/mathx.h"
 #include "core/slab.h"
 #include "core/stats.h"
+#include "core/segtrace.h"
 #include "core/tifxyz.h"
 #include "core/umbilicus.h"
 #include "core/vslab.h"
@@ -212,6 +213,27 @@ static void tifxyz_write_plane(const char *path, const float *v, uint32_t w, uin
   TIFFClose(tf);
 }
 
+typedef struct tr_acc {
+  uint32_t n;
+  float gi_min, gi_max, wu_min, wu_max;
+} tr_acc;
+
+static void tr_emit(void *ud, float wu0, float wv0, float wu1, float wv1, float gi0,
+                    float gj0, float gi1, float gj1) {
+  (void)wv0;
+  (void)wv1;
+  (void)gj0;
+  (void)gj1;
+  tr_acc *a = ud;
+  a->n++;
+  float gmin = gi0 < gi1 ? gi0 : gi1, gmax = gi0 < gi1 ? gi1 : gi0;
+  float wmin = wu0 < wu1 ? wu0 : wu1, wmax = wu0 < wu1 ? wu1 : wu0;
+  if (gmin < a->gi_min) a->gi_min = gmin;
+  if (gmax > a->gi_max) a->gi_max = gmax;
+  if (wmin < a->wu_min) a->wu_min = wmin;
+  if (wmax > a->wu_max) a->wu_max = wmax;
+}
+
 static void test_tifxyz(void) {
   char dir[] = "/tmp/r3d_test_tifxyz_XXXXXX";
   CHECK(mkdtemp(dir) != NULL);
@@ -257,6 +279,15 @@ static void test_tifxyz(void) {
   CHECK(r3d_tifxyz_at(&s, 7, 0)[1] == -1.0f);        /* whole triplet forced */
   CHECK(s.bbox[0][0] == 100.0f && s.bbox[1][0] == 100.0f + 20.0f * (W - 1));
   CHECK(s.bbox[0][2] == 3000.0f);
+  /* segtrace: the synthetic surface has z = 3000 + 0.25*i, so the z=3001.6
+   * plane crosses at grid i = 6.4 — one cell-row segment per j except the
+   * row poisoned by the invalid point at (7,0) */
+  tr_acc acc = {0, 1e9f, -1e9f, 1e9f, -1e9f};
+  uint32_t nseg = r3d_segtrace(&s, NULL, 0.0f, 2, 0, 1, 3001.6, tr_emit, &acc);
+  CHECK(nseg == acc.n && nseg == H - 2);
+  CHECK(acc.gi_min > 6.35f && acc.gi_max < 6.45f); /* crossing at i = 6.4 */
+  CHECK(acc.wu_min > 227.9f && acc.wu_max < 228.1f); /* world x = 100 + 20*6.4 */
+
   r3d_tifxyz_free(&s);
   CHECK(s.xyz == NULL);
 

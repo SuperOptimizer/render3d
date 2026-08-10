@@ -13,6 +13,7 @@
 #include "core/input.h"
 #include "core/mview.h"
 #include "core/screenshot.h"
+#include "core/segtrace.h"
 #include "core/stats.h"
 #include "core/tifxyz.h"
 #include "core/umbilicus.h"
@@ -102,6 +103,36 @@ static int save_umbilicus(r3d_umbilicus *u, const char *path, char status[256]) 
   }
   snprintf(status, 256, "saved %zu point%s", u->count, u->count == 1 ? "" : "s");
   return 0;
+}
+
+/* Cached segment/plane intersection polylines (world uv + grid ij pairs). */
+typedef struct mv_lines {
+  float *w, *g; /* 4 floats per segment each */
+  uint32_t n, cap;
+} mv_lines;
+
+static void mv_lines_emit(void *ud, float wu0, float wv0, float wu1, float wv1, float gi0,
+                          float gj0, float gi1, float gj1) {
+  mv_lines *l = ud;
+  if (l->n == l->cap) {
+    uint32_t nc = l->cap ? l->cap * 2 : 4096;
+    float *nw = realloc(l->w, (size_t)nc * 4 * sizeof *nw);
+    if (nw) l->w = nw;
+    float *ng = realloc(l->g, (size_t)nc * 4 * sizeof *ng);
+    if (ng) l->g = ng;
+    if (!nw || !ng) return; /* drop segments on OOM */
+    l->cap = nc;
+  }
+  float *w4 = l->w + (size_t)l->n * 4, *g4 = l->g + (size_t)l->n * 4;
+  w4[0] = wu0;
+  w4[1] = wv0;
+  w4[2] = wu1;
+  w4[3] = wv1;
+  g4[0] = gi0;
+  g4[1] = gj0;
+  g4[2] = gi1;
+  g4[3] = gj1;
+  l->n++;
 }
 
 /* Build the surf-view GPU grids from a tifxyz segment: RGBA32F coords
@@ -509,6 +540,10 @@ int main(int argc, char **argv) {
   double mv_focus[3] = {0, 0, 0}; /* world voxels x,y,z */
   int mv_thick = 1;               /* plane-view slab thickness (voxels) */
   int mv_drag_view = -1;
+  float *mv_normals = NULL; /* per-vertex normals kept for overlays/zoff shell */
+  mv_lines mv_ol[4] = {0}, mv_ol_off[4] = {0}; /* intersection polylines */
+  double mv_ol_slice[4] = {1e30, 1e30, 1e30, 1e30};
+  double mv_ol_zoff = 1e30;
   if (multiview_path) {
     if (!bricks_path || !brick_is_lod) {
       fprintf(stderr, "--multiview needs --bricks with a LOD manifest\n");
@@ -533,14 +568,13 @@ int main(int argc, char **argv) {
     mv[R3D_MV_SEG].cu = (double)mv_seg.w * 0.5;
     mv[R3D_MV_SEG].cv = (double)mv_seg.h * 0.5;
     mv[R3D_MV_SEG].slice = 0.0;
-    float *seg_coords = NULL, *seg_normals = NULL;
-    if (mv_build_grids(&mv_seg, &seg_coords, &seg_normals) != 0 ||
-        r3d_surf_begin(renderer, mv_seg.w, mv_seg.h, seg_coords, seg_normals) != 0) {
+    float *seg_coords = NULL;
+    if (mv_build_grids(&mv_seg, &seg_coords, &mv_normals) != 0 ||
+        r3d_surf_begin(renderer, mv_seg.w, mv_seg.h, seg_coords, mv_normals) != 0) {
       fprintf(stderr, "multiview: surf grid upload failed\n");
       return EXIT_FAILURE;
     }
     free(seg_coords);
-    free(seg_normals);
   }
 
   int64_t vs_z0 = umbilicus_path ? annotation_z0(annotation_z, vsnz, (uint32_t)vsd)
@@ -1326,10 +1360,69 @@ int main(int argc, char **argv) {
       }
     }
 
-    if (multiview_path) { /* focus marker + quadrant borders in every view */
+    if (multiview_path) { /* overlays: intersections, focus marker, borders */
+      /* recompute intersection polylines only when their inputs move */
+      double zoff = mv[R3D_MV_SEG].slice;
+      for (int i = 1; i < 4; i++) {
+        const uint8_t *ax = r3d_mv_axes[i];
+        if (mv_ol_slice[i] != mv[i].slice) {
+          mv_ol[i].n = 0;
+          r3d_segtrace(&mv_seg, NULL, 0.0f, ax[2], ax[0], ax[1], mv[i].slice, mv_lines_emit,
+                       &mv_ol[i]);
+        }
+        if (mv_ol_slice[i] != mv[i].slice || mv_ol_zoff != zoff) {
+          mv_ol_off[i].n = 0;
+          if (zoff != 0.0)
+            r3d_segtrace(&mv_seg, mv_normals, (float)zoff, ax[2], ax[0], ax[1], mv[i].slice,
+                         mv_lines_emit, &mv_ol_off[i]);
+        }
+        mv_ol_slice[i] = mv[i].slice;
+      }
+      mv_ol_zoff = zoff;
+
       ImDrawList *draw = igGetBackgroundDrawList_Nil();
       const ImU32 fc = 0xffd7ff32u; /* vc3d focus teal (50,255,215), ABGR */
       const ImU32 bc = 0x60808080u;
+      const ImU32 seg_col = 0xff50dcffu;      /* active segment: warm yellow */
+      const ImU32 seg_off_col = 0x9050dcffu;  /* zoff shell: same, translucent */
+      /* plane trace colors on the segment view (vc3d): XY orange, XZ red,
+       * YZ yellow */
+      const ImU32 trace_col[4] = {0, 0xff008cffu, 0xff0000ffu, 0xff00ffffu};
+      for (int i = 1; i < 4; i++) { /* segment curve on each plane view */
+        ImVec2 cmin = {(float)mv[i].px, (float)mv[i].py};
+        ImVec2 cmax = {(float)(mv[i].px + mv[i].pw), (float)(mv[i].py + mv[i].ph)};
+        ImDrawList_PushClipRect(draw, cmin, cmax, false);
+        for (uint32_t k = 0; k < mv_ol[i].n; k++) {
+          const float *s4 = mv_ol[i].w + (size_t)k * 4;
+          float x0, y0, x1, y1;
+          r3d_mv_project(&mv[i], (double)s4[0], (double)s4[1], &x0, &y0);
+          r3d_mv_project(&mv[i], (double)s4[2], (double)s4[3], &x1, &y1);
+          ImDrawList_AddLine(draw, (ImVec2){x0, y0}, (ImVec2){x1, y1}, seg_col, 1.6f);
+        }
+        for (uint32_t k = 0; k < mv_ol_off[i].n; k++) {
+          const float *s4 = mv_ol_off[i].w + (size_t)k * 4;
+          float x0, y0, x1, y1;
+          r3d_mv_project(&mv[i], (double)s4[0], (double)s4[1], &x0, &y0);
+          r3d_mv_project(&mv[i], (double)s4[2], (double)s4[3], &x1, &y1);
+          ImDrawList_AddLine(draw, (ImVec2){x0, y0}, (ImVec2){x1, y1}, seg_off_col, 1.0f);
+        }
+        ImDrawList_PopClipRect(draw);
+      }
+      { /* plane trace lines on the flattened segment view */
+        const r3d_mview *sv = &mv[R3D_MV_SEG];
+        ImVec2 cmin = {(float)sv->px, (float)sv->py};
+        ImVec2 cmax = {(float)(sv->px + sv->pw), (float)(sv->py + sv->ph)};
+        ImDrawList_PushClipRect(draw, cmin, cmax, false);
+        for (int i = 1; i < 4; i++)
+          for (uint32_t k = 0; k < mv_ol[i].n; k++) {
+            const float *g4 = mv_ol[i].g + (size_t)k * 4;
+            float x0, y0, x1, y1;
+            r3d_mv_project(sv, (double)g4[0], (double)g4[1], &x0, &y0);
+            r3d_mv_project(sv, (double)g4[2], (double)g4[3], &x1, &y1);
+            ImDrawList_AddLine(draw, (ImVec2){x0, y0}, (ImVec2){x1, y1}, trace_col[i], 1.4f);
+          }
+        ImDrawList_PopClipRect(draw);
+      }
       ImDrawList_AddLine(draw, (ImVec2){(float)(w / 2), 0}, (ImVec2){(float)(w / 2), (float)h},
                          bc, 1.0f);
       ImDrawList_AddLine(draw, (ImVec2){0, (float)(h / 2)}, (ImVec2){(float)w, (float)(h / 2)},
@@ -1672,7 +1765,16 @@ int main(int argc, char **argv) {
   if (umbilicus_path && umbilicus.dirty)
     save_umbilicus(&umbilicus, umbilicus_path, annotation_status);
   r3d_umbilicus_free(&umbilicus);
-  if (multiview_path) r3d_tifxyz_free(&mv_seg);
+  if (multiview_path) {
+    r3d_tifxyz_free(&mv_seg);
+    free(mv_normals);
+    for (int i = 0; i < 4; i++) {
+      free(mv_ol[i].w);
+      free(mv_ol[i].g);
+      free(mv_ol_off[i].w);
+      free(mv_ol_off[i].g);
+    }
+  }
   free(prof_samples);
   r3d_destroy(renderer);
   SDL_DestroyWindow(win);

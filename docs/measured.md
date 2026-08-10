@@ -906,3 +906,48 @@ failures. A 600-frame full-z `zsweep` averaged 0.90 ms GPU, decoded 144 bricks
 in 28 batches, and also recorded zero failures. Benchmark JSON records the
 desired-level set and cumulative per-level request counts so the LOD walk is
 machine-checkable.
+
+## 2026-08-10 — vc3d-style 2x2 multi-view on AWS open-data PHerc0172
+
+Data: the `vesuvius-challenge-open-data` S3 bucket is the one place where
+tifxyz segments and their exact source volume coexist — PHerc0172 has 53
+segments traced on volume 20241024131838 (21000x6700x9100, zarr v2 u8,
+blosc-zstd, 128³ chunks == c5d bricks, levels 0-5 prebuilt). `zarr2c5d`
+transcodes a local chunk mirror into the `--bricks` c5d LOD tree without any
+zarr output; selection is CHUNK-granular around a segment surface (a first
+shard-granular cut selected 254 L0 shards ≈ 254 GB — chunk granularity cut
+that to 26,977 L0 chunks; the w062 fetch totalled 33,167 chunks / 38 GB
+mirrored, transcoded to an 8.9 GB c5d tree in ~10 min at 12 threads).
+Absent-on-S3 (masked air, zero-fill) is distinguished from not-yet-fetched by
+`.missing` markers written by the 404s in `tools/fetch_chunks.sh`. `--verify`
+PSNR: 54.05 dB on L3-L5 (box-filtered), 39.32 dB on L0 (q2 on raw scan
+noise) — consistent with the codec's known quality at those rates.
+
+Renderer: `r3d_frame_views` records up to four dispatches into `view_org`
+rects of the one offscreen image; per-frame state stays in the dynamic-offset
+UBO ring (now FRAMES_IN_FLIGHT x R3D_MAX_VIEWS slots) — no push constants
+were added and no descriptor duplication. Orthographic rays are a FrameParams
+flag (origin offset across the image plane, constant per-pixel LOD footprint)
+and the bricks slab clip generalized from z-only to any axis, so the XY/XZ/YZ
+quadrants are plain ortho MIP slice views over the same bricks cache. The
+streaming pump split into begin/collect/submit: each plane view submits an
+auto-coarsening AABB collect at its own px/voxel magnification, and the
+flattened view requests bricks point-wise along the visible decimated grid.
+4-view GPU cost at 1280x720: raycast ~2.0 ms avg (single-view XY slab was
+~1.0 ms) — well inside 60 fps.
+
+Flattened segment view (R3D_MODE=5): per pixel, a manual bilinear tap of the
+RGBA32F coords grid (any invalid corner poisons the quad — vc3d semantics),
+per-pixel normal offset (Shift+wheel zoff), then one bricks-LOD virtual-volume
+sample. Cross-view sync follows vc3d: Ctrl+click sets the shared focus POI;
+plane views recenter and re-slice through it; the segment view recenters via
+nearest-surface search (100-voxel tolerance). Intersection overlays are one
+marching-squares pass per plane over the tifxyz grid (`core/segtrace`,
+unit-tested), doubly parameterized so the same segments draw the surface
+curve on plane views (+ translucent zoff shell) and the plane trace lines on
+the flattened view (vc3d colors); w062 at mid-scroll yields 704/985/1244
+segments for XY/XZ/YZ, recomputed only on slice/zoff change.
+
+Follow-ups: perspective 3D quadrant option, vc3d segment-aligned plane
+orientation + rotation handles, per-view GPU timestamps, ink-detection
+overlay textures, multi-segment display.

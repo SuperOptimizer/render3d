@@ -54,6 +54,7 @@ add_library(r3d_core STATIC
   src/core/umbilicus.c
   src/core/input.c
   src/core/tifxyz.c
+  src/core/segtrace.c
   src/core/screenshot.c)
 target_include_directories(r3d_core PUBLIC src)
 target_link_libraries(r3d_core PRIVATE r3d_warnings r3d_sanitize
