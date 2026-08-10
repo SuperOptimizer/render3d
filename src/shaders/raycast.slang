@@ -358,7 +358,10 @@ void main(uint3 tid: SV_DispatchThreadID) {
     /* Flattened segment: view plane IS the tifxyz grid. cam_origin.xy =
      * grid-space view center, cam_right.x / cam_up.y = half-extents in grid
      * units, slab_z0 = offset along the per-pixel surface normal (voxels),
-     * slab_px = voxels per grid step (1/scale). */
+     * slab_depth = slab thickness marched along the normal (voxels),
+     * slab_px = voxels per grid step (1/scale). Per pixel this raymarches a
+     * REAL volumetric slab centered zoff along the local surface normal —
+     * the flattened analogue of the plane views' ortho slabs. */
     float2 ndc = pix_ndc(tid.xy);
     float2 g = pc.cam_origin.xy + ndc.x * pc.cam_right.xy + ndc.y * pc.cam_up.xy;
     uint2 dim;
@@ -379,29 +382,68 @@ void main(uint3 tid: SV_DispatchThreadID) {
       return;
     }
     float3 wp = lerp(lerp(c00.xyz, c10.xyz, fr.x), lerp(c01.xyz, c11.xyz, fr.x), fr.y);
-    if (pc.slab_z0 != 0.0) {
-      float3 n00 = surf_normals.Load(int3(i0, 0)).xyz;
-      float3 n10 = surf_normals.Load(int3(i0 + int2(1, 0), 0)).xyz;
-      float3 n01 = surf_normals.Load(int3(i0 + int2(0, 1), 0)).xyz;
-      float3 n11 = surf_normals.Load(int3(i0 + int2(1, 1), 0)).xyz;
-      float3 nn = lerp(lerp(n00, n10, fr.x), lerp(n01, n11, fr.x), fr.y);
-      float nl = length(nn);
-      if (nl > 1e-4) wp += nn / nl * pc.slab_z0;
-    }
-    float3 shape = float3(page[1], page[2], page[3]);
-    float md = max(shape.x, max(shape.y, shape.z));
-    if (any(wp < float3(0)) || any(wp >= shape)) {
+    float3 n00 = surf_normals.Load(int3(i0, 0)).xyz;
+    float3 n10 = surf_normals.Load(int3(i0 + int2(1, 0), 0)).xyz;
+    float3 n01 = surf_normals.Load(int3(i0 + int2(0, 1), 0)).xyz;
+    float3 n11 = surf_normals.Load(int3(i0 + int2(1, 1), 0)).xyz;
+    float3 nrm = lerp(lerp(n00, n10, fr.x), lerp(n01, n11, fr.x), fr.y);
+    float nl = length(nrm);
+    if (nl < 1e-4) {
       out_image[opix] = bg;
       return;
     }
+    nrm /= nl;
+    float3 shape = float3(page[1], page[2], page[3]);
+    float md = max(shape.x, max(shape.y, shape.z));
     /* footprint: grid-units per pixel * voxels per grid unit */
     float vpp = 2.0 * length(pc.cam_right.xy) * pc.slab_px / float(pc.viewport.x);
     float lod = clamp(log2(max(vpp, 1.0)) + pc.lod_bias, 0.0, float(page[0] - 1u));
-    BrickCtx c = bricks_lod_locate(wp / md, lod);
     float inv = 1.0 / (float((pc.brick_mode & 0xffu)) * BR_SLOT);
-    float v = c.ok ? bricks_fetch(c.slot_org, c.bl, c.atlas_lod, inv) : 0.0;
-    if (v < pc.threshold) v = 0.0;
-    out_image[opix] = float4(float3(v * pc.density), 1);
+
+    float depth = max(float(pc.slab_depth), 1.0);
+    float dt = pc.step_voxels * max(exp2(lod) * 0.5, 1.0); /* voxels along n */
+    float t = -0.5 * depth + pc.slab_z0 + hash12(tid.xy, pc.frame_index) * dt;
+    float tf_end = 0.5 * depth + pc.slab_z0;
+    float mip_max = 0.0;
+    float4 acc = float4(0);
+    bool composite = pc.mode != MODE_MIP;
+    for (uint k = 0; k < 256u && t < tf_end; k++, t += dt) {
+      float3 sp = wp + nrm * t;
+      if (any(sp < float3(0)) || any(sp >= shape)) continue;
+      BrickCtx c = bricks_lod_locate(sp / md, lod);
+      if (!c.ok) continue;
+      float v = bricks_fetch(c.slot_org, c.bl, c.atlas_lod, inv);
+      if (v < pc.threshold) continue;
+      if (v > mip_max) mip_max = v;
+      if (!composite) continue;
+      float4 s = tf.SampleLevel(v, 0);
+      float a = 1.0 - pow(1.0 - s.a, pc.density * dt);
+      if (a <= 0.003) continue;
+      float3 col = s.rgb;
+      if (pc.mode == MODE_FULL) { /* gradient-lit like the box marcher */
+        float ev = c.grad_vox;
+        float3 gr = float3(
+            bricks_fetch(c.slot_org, c.bl + float3(ev, 0, 0), c.atlas_lod, inv) -
+                bricks_fetch(c.slot_org, c.bl + float3(-ev, 0, 0), c.atlas_lod, inv),
+            bricks_fetch(c.slot_org, c.bl + float3(0, ev, 0), c.atlas_lod, inv) -
+                bricks_fetch(c.slot_org, c.bl + float3(0, -ev, 0), c.atlas_lod, inv),
+            bricks_fetch(c.slot_org, c.bl + float3(0, 0, ev), c.atlas_lod, inv) -
+                bricks_fetch(c.slot_org, c.bl + float3(0, 0, -ev), c.atlas_lod, inv));
+        float gm = length(gr);
+        if (gm > 1e-4) {
+          float3 nn = gr / gm;
+          float diff = 0.7 * abs(dot(nn, nrm)) + 0.3;
+          float lit = 0.25 + 0.75 * diff;
+          col = col * lerp(1.0, lit, saturate(gm * 6.0));
+        }
+      }
+      acc.rgb += (1.0 - acc.a) * a * col;
+      acc.a += (1.0 - acc.a) * a;
+      if (acc.a >= ALPHA_CUTOFF) break;
+    }
+    float3 color = composite ? acc.rgb + (1.0 - acc.a) * bg.rgb
+                             : float3(mip_max * pc.density);
+    out_image[opix] = float4(color, 1);
     return;
   }
 

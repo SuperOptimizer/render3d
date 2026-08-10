@@ -556,7 +556,8 @@ int main(int argc, char **argv) {
     if (r3d_tifxyz_valid(mc)) /* center the focus ON the sheet when possible */
       for (int a = 0; a < 3; a++) mv_focus[a] = (double)mc[a];
     brick_depth = 0; /* multiview owns per-view slab clips */
-    mode = R3D_MODE_MIP; /* plane views are plain slice viewers */
+    mode = R3D_MODE_FULL; /* volumetric slabs in every quadrant (Tab: MIP etc.) */
+    mv_thick = 24;
     for (int i = 0; i < 4; i++) {
       const uint8_t *ax = r3d_mv_axes[i];
       mv[i].cu = mv_focus[ax[0]];
@@ -1267,7 +1268,7 @@ int main(int argc, char **argv) {
         igText("XY z %.0f | XZ y %.0f | YZ x %.0f", mv[R3D_MV_XY].slice,
                mv[R3D_MV_XZ].slice, mv[R3D_MV_YZ].slice);
         int th = mv_thick;
-        if (igSliderInt("slice thickness", &th, 1, 64, "%d", 0)) mv_thick = th;
+        if (igSliderInt("slice thickness", &th, 1, 128, "%d", 0)) mv_thick = th;
         float zo = (float)mv[R3D_MV_SEG].slice;
         if (igSliderFloat("segment offset", &zo, -64.0f, 64.0f, "%.0f vox", 0))
           mv[R3D_MV_SEG].slice = (double)zo;
@@ -1648,7 +1649,7 @@ int main(int argc, char **argv) {
           q.cam_up[1] = (float)-((double)mv[i].ph * 0.5 / mv[i].zoom);
           q.slab_px = 1.0f / mv_seg.sx; /* voxels per grid step */
           q.slab_z0 = (float)mv[i].slice; /* normal offset, voxels */
-          q.slab_depth = 0;
+          q.slab_depth = (uint32_t)mv_thick; /* volumetric shell thickness */
           vp4[i] = q;
           continue;
         }
