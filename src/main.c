@@ -1040,6 +1040,7 @@ int main(int argc, char **argv) {
   mv_lines mv_ol[4] = {0}, mv_ol_off[4] = {0}; /* intersection polylines */
   double mv_ol_slice[4] = {1e30, 1e30, 1e30, 1e30};
   double mv_ol_zoff = 1e30;
+  r3d_segrows mv_rows = {0}; /* per-row coord bounds: segtrace row skipping */
   if (multiview_path) {
     if (!bricks_path || !brick_is_lod) {
       fprintf(stderr, "--multiview needs --bricks with a LOD manifest\n");
@@ -1047,6 +1048,7 @@ int main(int argc, char **argv) {
     }
     SDL_PumpEvents(); /* dataset swap: multi-second setup, stay responsive */
     if (r3d_tifxyz_load(&mv_seg, multiview_path) != 0) return EXIT_FAILURE;
+    if (r3d_segrows_build(&mv_seg, &mv_rows) != 0) return EXIT_FAILURE;
     SDL_PumpEvents();
     for (int a = 0; a < 3; a++)
       mv_focus[a] = ((double)mv_seg.bbox[0][a] + (double)mv_seg.bbox[1][a]) * 0.5;
@@ -1999,14 +2001,14 @@ int main(int argc, char **argv) {
         const uint8_t *ax = r3d_mv_axes[i];
         if (mv_ol_slice[i] != mv[i].slice) {
           mv_ol[i].n = 0;
-          r3d_segtrace(&mv_seg, NULL, 0.0f, ax[2], ax[0], ax[1], mv[i].slice, mv_lines_emit,
-                       &mv_ol[i]);
+          r3d_segtrace(&mv_seg, &mv_rows, NULL, 0.0f, ax[2], ax[0], ax[1], mv[i].slice,
+                       mv_lines_emit, &mv_ol[i]);
         }
         if (mv_ol_slice[i] != mv[i].slice || mv_ol_zoff != zoff) {
           mv_ol_off[i].n = 0;
           if (zoff != 0.0)
-            r3d_segtrace(&mv_seg, mv_normals, (float)zoff, ax[2], ax[0], ax[1], mv[i].slice,
-                         mv_lines_emit, &mv_ol_off[i]);
+            r3d_segtrace(&mv_seg, &mv_rows, mv_normals, (float)zoff, ax[2], ax[0], ax[1],
+                         mv[i].slice, mv_lines_emit, &mv_ol_off[i]);
         }
         mv_ol_slice[i] = mv[i].slice;
       }
@@ -2415,6 +2417,7 @@ int main(int argc, char **argv) {
   r3d_umbilicus_free(&umbilicus);
   if (multiview_path) {
     r3d_tifxyz_free(&mv_seg);
+    r3d_segrows_free(&mv_rows);
     free(mv_normals);
     for (int i = 0; i < 4; i++) {
       free(mv_ol[i].w);

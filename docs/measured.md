@@ -1061,3 +1061,26 @@ mv_draw_lines 3.3% (projection) + ~1.4% driver/allocator munmap+fault noise
 --shot F` headless runs are the repeatable scenarios; perf attach to a
 running instance failed (rc=255, environment), record-with-`--delay` + time
 slicing works. All 5 test suites green.
+
+## 2026-08-10 — hitch hunting round 2: progressive surfvol re-bake + segtrace tiles
+
+Two frame-spike sources removed on the static GP multiview scenario:
+
+1. Residency-arrival surfvol re-bakes dispatched the full 2048^2x96 window in
+   one frame (~75 ms GPU hitch, recurring while bricks stream in). Arrival
+   re-bakes keep the window mapping unchanged, so rewriting any texel subset
+   in place is exactly correct: they now bake progressively, SV_PROG_ROWS=128
+   rows per frame (~5 ms GPU each, 16 frames to converge — under the 20-frame
+   arrival cooldown). Window moves (pan/zoom/zoff snaps) keep the immediate
+   full rebuild, since a partial rebuild there would mix two mappings.
+2. Slice-change segtrace marched the full 1820x2530 grid per plane (~25 ms
+   each; gui max 73 ms with the zoff shell). r3d_segrows now caches per-row
+   and per-16x16-tile coordinate bounds per axis (built once at segment load,
+   ~1 MB); traces skip rows and hop whole tiles that cannot straddle the
+   slice, with a |zoff| margin for the shell since normals are unit length.
+   GP mid-volume slices: 27 -> 4.5 / 1.7 / 0.3 ms (x / y / z axis, 6-103x),
+   byte-identical output (unit-tested).
+
+Same 900-frame scenario: gui max 73 -> 5.4 ms, cpu p99 58 -> ~27 ms, cpu max
+90 -> ~50 ms (remaining spikes are the one-time initial full bake + startup),
+gpu max 7.1 -> 6.8 ms steady. All 5 suites green; screenshot pixel-identical.

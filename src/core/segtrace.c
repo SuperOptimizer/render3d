@@ -2,6 +2,8 @@
 
 #include <math.h>
 #include <stddef.h>
+#include <stdlib.h>
+#include <string.h>
 
 /* linear crossing parameter on an edge whose field values are fa, fb */
 static float xt(float fa, float fb) {
@@ -9,8 +11,65 @@ static float xt(float fa, float fb) {
   return fabsf(d) < 1e-12f ? 0.5f : fa / d;
 }
 
-uint32_t r3d_segtrace(const r3d_tifxyz *s, const float *normals_rgba, float zoff, int axis_n,
-                      int axis_u, int axis_v, double slice, r3d_segtrace_emit emit, void *ud) {
+int r3d_segrows_build(const r3d_tifxyz *s, r3d_segrows *out) {
+  const uint32_t T = R3D_SEGROWS_TILE;
+  memset(out, 0, sizeof *out);
+  out->h = s->h;
+  out->w = s->w;
+  out->tw = (s->w + T - 1) / T;
+  out->th = (s->h + T - 1) / T;
+  size_t nt = (size_t)out->tw * out->th;
+  out->mn = malloc((size_t)s->h * 3 * sizeof *out->mn);
+  out->mx = malloc((size_t)s->h * 3 * sizeof *out->mx);
+  out->tmn = malloc(nt * 3 * sizeof *out->tmn);
+  out->tmx = malloc(nt * 3 * sizeof *out->tmx);
+  if (!out->mn || !out->mx || !out->tmn || !out->tmx) {
+    r3d_segrows_free(out);
+    return -1;
+  }
+  for (size_t k = 0; k < nt * 3; k++) {
+    out->tmn[k] = INFINITY;
+    out->tmx[k] = -INFINITY;
+  }
+  for (uint32_t j = 0; j < s->h; j++) {
+    float mn[3] = {INFINITY, INFINITY, INFINITY};
+    float mx[3] = {-INFINITY, -INFINITY, -INFINITY};
+    /* a point on a tile's low edge also bounds cells of the previous tile */
+    uint32_t tj0 = (j ? j - 1 : 0) / T, tj1 = j / T;
+    for (uint32_t i = 0; i < s->w; i++) {
+      const float *p = r3d_tifxyz_at(s, i, j);
+      if (!r3d_tifxyz_valid(p)) continue;
+      uint32_t ti0 = (i ? i - 1 : 0) / T, ti1 = i / T;
+      for (int a = 0; a < 3; a++) {
+        if (p[a] < mn[a]) mn[a] = p[a];
+        if (p[a] > mx[a]) mx[a] = p[a];
+        for (uint32_t tj = tj0; tj <= tj1; tj++)
+          for (uint32_t ti = ti0; ti <= ti1; ti++) {
+            size_t t = (size_t)a * out->tw * out->th + (size_t)tj * out->tw + ti;
+            if (p[a] < out->tmn[t]) out->tmn[t] = p[a];
+            if (p[a] > out->tmx[t]) out->tmx[t] = p[a];
+          }
+      }
+    }
+    for (int a = 0; a < 3; a++) {
+      out->mn[(size_t)a * s->h + j] = mn[a];
+      out->mx[(size_t)a * s->h + j] = mx[a];
+    }
+  }
+  return 0;
+}
+
+void r3d_segrows_free(r3d_segrows *r) {
+  free(r->mn);
+  free(r->mx);
+  free(r->tmn);
+  free(r->tmx);
+  memset(r, 0, sizeof *r);
+}
+
+uint32_t r3d_segtrace(const r3d_tifxyz *s, const r3d_segrows *rows, const float *normals_rgba,
+                      float zoff, int axis_n, int axis_u, int axis_v, double slice,
+                      r3d_segtrace_emit emit, void *ud) {
   /* per marching-squares case: pairs of edge indices forming segments
    * (edge 0 = bottom (j), 1 = right, 2 = top (j+1), 3 = left); -1 ends */
   static const int8_t cases[16][4] = {
@@ -19,8 +78,33 @@ uint32_t r3d_segtrace(const r3d_tifxyz *s, const float *normals_rgba, float zoff
       {2, 3, -1, -1},   {2, 0, -1, -1},  {0, 1, 2, 3},    {2, 1, -1, -1},
       {1, 3, -1, -1},   {1, 0, -1, -1},  {0, 3, -1, -1},  {-1, -1, -1, -1}};
   uint32_t emitted = 0;
-  for (uint32_t j = 0; j + 1 < s->h; j++)
+  const uint32_t T = R3D_SEGROWS_TILE;
+  const float *rmn = NULL, *rmx = NULL, *tmn = NULL, *tmx = NULL;
+  uint32_t tw = 0;
+  float margin = normals_rgba ? fabsf(zoff) + 1e-3f : 1e-3f;
+  if (rows && rows->h == s->h && rows->w == s->w) {
+    rmn = rows->mn + (size_t)axis_n * s->h;
+    rmx = rows->mx + (size_t)axis_n * s->h;
+    tmn = rows->tmn + (size_t)axis_n * rows->tw * rows->th;
+    tmx = rows->tmx + (size_t)axis_n * rows->tw * rows->th;
+    tw = rows->tw;
+  }
+  for (uint32_t j = 0; j + 1 < s->h; j++) {
+    if (rmn) { /* row band [j, j+1] can't straddle the slice: skip it whole */
+      float lo = (rmn[j] < rmn[j + 1] ? rmn[j] : rmn[j + 1]) - margin;
+      float hi = (rmx[j] > rmx[j + 1] ? rmx[j] : rmx[j + 1]) + margin;
+      if (slice < (double)lo || slice > (double)hi) continue;
+    }
+    const float *trn = tmn ? tmn + (size_t)(j / T) * tw : NULL;
+    const float *trx = tmx ? tmx + (size_t)(j / T) * tw : NULL;
     for (uint32_t i = 0; i + 1 < s->w; i++) {
+      if (trn) { /* tile can't straddle the slice: hop to the next tile */
+        uint32_t ti = i / T;
+        if (slice < (double)(trn[ti] - margin) || slice > (double)(trx[ti] + margin)) {
+          i = (ti + 1) * T - 1; /* loop increment lands on the next tile */
+          continue;
+        }
+      }
       const float *c[4] = {r3d_tifxyz_at(s, i, j), r3d_tifxyz_at(s, i + 1, j),
                            r3d_tifxyz_at(s, i + 1, j + 1), r3d_tifxyz_at(s, i, j + 1)};
       if (!r3d_tifxyz_valid(c[0]) || !r3d_tifxyz_valid(c[1]) || !r3d_tifxyz_valid(c[2]) ||
@@ -65,5 +149,6 @@ uint32_t r3d_segtrace(const r3d_tifxyz *s, const float *normals_rgba, float zoff
         emitted++;
       }
     }
+  }
   return emitted;
 }

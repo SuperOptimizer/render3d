@@ -70,7 +70,8 @@ struct r3d_renderer {
     r3d_vkcomp comp;
     uint32_t W, H, L, nback;
     float u0, v0, step, zoff0;
-    float sx, sy; /* tifxyz grid scale (kernel push) */
+    float sx, sy;      /* tifxyz grid scale (kernel push) */
+    uint32_t prog_row; /* residency-arrival re-bake cursor (UINT32_MAX idle) */
   } sv;
   VkSampler samp_vol;    /* trilinear + mip linear, clamp */
   VkSampler samp_tf;     /* linear, clamp */
@@ -1255,6 +1256,9 @@ int r3d_surf_begin(r3d_renderer *r, uint32_t w, uint32_t h, const float *coords_
   return 0;
 }
 
+/* rows per progressive surfvol re-bake dispatch (2048x128x96 ~= 5 ms GPU) */
+#define SV_PROG_ROWS 128u
+
 /* push-constant mirror of surfvol.comp */
 typedef struct sv_push {
   float u0, v0, step, zoff0;
@@ -1263,6 +1267,7 @@ typedef struct sv_push {
   uint32_t abpa, lod;
   float lstep;
   uint32_t use_ink;
+  uint32_t y0;
 } sv_push;
 
 int r3d_surfvol_begin(r3d_renderer *r, uint32_t w, uint32_t h, uint32_t layers,
@@ -1313,6 +1318,7 @@ int r3d_surfvol_begin(r3d_renderer *r, uint32_t w, uint32_t h, uint32_t layers,
   r->sv.step = 0.0f; /* no window yet */
   r->sv.active = true;
   r->sv.dirty = false;
+  r->sv.prog_row = UINT32_MAX;
   return 0;
 }
 
@@ -1326,10 +1332,14 @@ void r3d_surfvol_window(r3d_renderer *r, double u0, double v0, float step, float
   r->sv.step = step;
   r->sv.zoff0 = zoff0;
   r->sv.dirty = true;
+  r->sv.prog_row = UINT32_MAX; /* mapping changed: the full rebuild supersedes */
 }
 
 void r3d_surfvol_mark(r3d_renderer *r) {
-  if (r->sv.active && r->sv.step > 0.0f) r->sv.dirty = true;
+  /* Residency arrival with an unchanged window mapping: rewriting any texel
+   * subset in place is exactly correct, so re-bake progressively (a row band
+   * per frame) instead of hitching one frame with the full-window dispatch. */
+  if (r->sv.active && r->sv.step > 0.0f && !r->sv.dirty) r->sv.prog_row = 0;
 }
 
 void r3d_surfvol_params(const r3d_renderer *r, r3d_frame_params *p) {
@@ -4508,11 +4518,25 @@ int r3d_frame_views(r3d_renderer *r, const r3d_frame_params *views, uint32_t nvi
 
   if (r->query) vkCmdResetQueryPool(cmd, r->query, slot * 4, 4);
 
-  if (r->sv.active && r->sv.dirty && r->sv.step > 0.0f) {
-    /* rebuild the flattened surface volume before this frame samples it.
-     * Serialize against the previous frame's sampling reads, fill, then
-     * make the writes visible to this frame's raycast. */
-    r->sv.dirty = false;
+  if (r->sv.active && r->sv.step > 0.0f &&
+      (r->sv.dirty || r->sv.prog_row != UINT32_MAX)) {
+    /* rebuild the flattened surface volume before this frame samples it:
+     * the full window when the mapping moved (dirty), else the next row band
+     * of a progressive residency-arrival re-bake (~SV_PROG_ROWS rows/frame
+     * keeps the extra GPU work under a vsync interval; the full 2048^2x96
+     * dispatch was a ~75 ms frame hitch). Serialize against the previous
+     * frame's sampling reads, fill, then make the writes visible to this
+     * frame's raycast. */
+    uint32_t y0 = 0, rows = r->sv.H;
+    if (r->sv.dirty) {
+      r->sv.dirty = false;
+      r->sv.prog_row = UINT32_MAX;
+    } else {
+      y0 = r->sv.prog_row;
+      rows = r->sv.H - y0;
+      if (rows > SV_PROG_ROWS) rows = SV_PROG_ROWS;
+      r->sv.prog_row = y0 + rows >= r->sv.H ? UINT32_MAX : y0 + rows;
+    }
     r3d_vk_image_barrier(cmd, r->sv.vol.img, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
                          VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                          VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
@@ -4533,9 +4557,10 @@ int r3d_frame_views(r3d_renderer *r, const r3d_frame_params *views, uint32_t nvi
                     .abpa = r->bricks_abpa,
                     .lod = lodq,
                     .lstep = 1.0f, /* depth stays native-res regardless of xy zoom */
-                    .use_ink = r->ink_active ? 1u : 0u};
+                    .use_ink = r->ink_active ? 1u : 0u,
+                    .y0 = y0};
     r3d_vkcomp_dispatch(cmd, &r->sv.comp, &push, sizeof push, (r->sv.W + 7) / 8,
-                        (r->sv.H + 7) / 8, (r->sv.L + 3) / 4);
+                        (rows + 7) / 8, (r->sv.L + 3) / 4);
     r3d_vk_image_barrier(cmd, r->sv.vol.img, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
                          VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                          VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,

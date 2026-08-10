@@ -310,10 +310,23 @@ static void test_tifxyz(void) {
    * plane crosses at grid i = 6.4 — one cell-row segment per j except the
    * row poisoned by the invalid point at (7,0) */
   tr_acc acc = {0, 1e9f, -1e9f, 1e9f, -1e9f};
-  uint32_t nseg = r3d_segtrace(&s, NULL, 0.0f, 2, 0, 1, 3001.6, tr_emit, &acc);
+  uint32_t nseg = r3d_segtrace(&s, NULL, NULL, 0.0f, 2, 0, 1, 3001.6, tr_emit, &acc);
   CHECK(nseg == acc.n && nseg == H - 2);
   CHECK(acc.gi_min > 6.35f && acc.gi_max < 6.45f); /* crossing at i = 6.4 */
   CHECK(acc.wu_min > 227.9f && acc.wu_max < 228.1f); /* world x = 100 + 20*6.4 */
+
+  /* row-bounds index: identical trace with skipping enabled, and a slice
+   * outside every row's z range emits nothing */
+  r3d_segrows rows;
+  CHECK(r3d_segrows_build(&s, &rows) == 0);
+  tr_acc acc2 = {0, 1e9f, -1e9f, 1e9f, -1e9f};
+  uint32_t nseg2 = r3d_segtrace(&s, &rows, NULL, 0.0f, 2, 0, 1, 3001.6, tr_emit, &acc2);
+  CHECK(nseg2 == nseg && acc2.n == acc.n);
+  CHECK(fabsf(acc2.gi_min - acc.gi_min) < 1e-6f && fabsf(acc2.wu_max - acc.wu_max) < 1e-6f);
+  tr_acc acc3 = {0, 1e9f, -1e9f, 1e9f, -1e9f};
+  CHECK(r3d_segtrace(&s, &rows, NULL, 0.0f, 2, 0, 1, 9000.0, tr_emit, &acc3) == 0);
+  r3d_segrows_free(&rows);
+  CHECK(rows.mn == NULL);
 
   r3d_tifxyz_free(&s);
   CHECK(s.xyz == NULL);
