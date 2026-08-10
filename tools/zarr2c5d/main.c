@@ -590,6 +590,7 @@ int main(int argc, char **argv) {
   g_mirror = argv[1];
   g_out = argv[2];
   const char *surf_dir = NULL, *missing_path = NULL;
+  bool bootstrap = false;
   uint32_t pad = 64, threads = 0, only_level = UINT32_MAX, min_level = 0;
   uint32_t rect[4] = {0};
   bool have_rect = false;
@@ -601,6 +602,8 @@ int main(int argc, char **argv) {
       pad = (uint32_t)strtoul(argv[++i], NULL, 10);
     else if (strcmp(argv[i], "--full-from") == 0 && i + 1 < argc)
       g_full_from = (uint32_t)strtoul(argv[++i], NULL, 10);
+    else if (strcmp(argv[i], "--bootstrap") == 0)
+      bootstrap = true; /* full-from = coarsest level only (set after probe) */
     else if (strcmp(argv[i], "--threads") == 0 && i + 1 < argc)
       threads = (uint32_t)strtoul(argv[++i], NULL, 10);
     else if (strcmp(argv[i], "--c5d-quality") == 0 && i + 1 < argc)
@@ -694,6 +697,7 @@ int main(int argc, char **argv) {
       return 1;
     }
   }
+  if (bootstrap) g_full_from = g_nlev ? g_nlev - 1u : 0u;
   if (g_full_from > g_nlev) g_full_from = g_nlev;
   if (g_full_from > 0 && !surf_dir && only_level == UINT32_MAX)
     printf("zarr2c5d: no --surface: transcoding only levels >= %u (bootstrap; the "

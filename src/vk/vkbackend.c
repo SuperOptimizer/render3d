@@ -834,6 +834,99 @@ void r3d_gui_event(r3d_renderer *r, const SDL_Event *ev) {
   if (r->gui_up) r3d_vkgui_event(ev);
 }
 
+/* Tear down everything DATASET-scoped in the bricks family (streamer, both
+ * atlases, page table, net ingest, surf textures, surface volume) so another
+ * r3d_bricks_begin can follow — the dataset is ordinary mutable state. Core
+ * renderer objects (descriptor set, pipelines, samplers) are untouched. */
+static void bricks_teardown(r3d_renderer *r) {
+  if (r->bs.worker_up) {
+    pthread_mutex_lock(&r->bs.mu);
+    r->bs.quit = true;
+    pthread_cond_broadcast(&r->bs.cv);
+    pthread_mutex_unlock(&r->bs.mu);
+    pthread_join(r->bs.worker, NULL);
+    pthread_mutex_destroy(&r->bs.mu);
+    pthread_cond_destroy(&r->bs.cv);
+    r->bs.worker_up = false;
+  }
+  if (r->ni.active) {
+    pthread_mutex_lock(&r->ni.mu);
+    r->ni.quit = true;
+    pthread_cond_broadcast(&r->ni.cv);
+    pthread_mutex_unlock(&r->ni.mu);
+    for (uint32_t t = 0; t < r->ni.nth; t++) pthread_join(r->ni.th[t], NULL);
+    pthread_mutex_destroy(&r->ni.mu);
+    pthread_cond_destroy(&r->ni.cv);
+  }
+  free(r->ni.scratch);
+  if (r->vk.dev) r3d_vkctx_device_wait_idle(&r->vk);
+  if (r->bs.upload_pool) vkDestroyCommandPool(r->vk.dev, r->bs.upload_pool, NULL);
+  if (r->c5d) r3d_vkc5d_destroy(r->c5d);
+  r->c5d = NULL;
+  if (r->brick_atlas_mip0) vkDestroyImageView(r->vk.dev, r->brick_atlas_mip0, NULL);
+  r->brick_atlas_mip0 = VK_NULL_HANDLE;
+  r3d_vkimage_destroy(&r->vk, &r->brick_atlas);
+  r3d_vkimage_destroy(&r->vk, &r->brick_occ);
+  r3d_vkbuf_destroy(&r->vk, &r->page_buf);
+  r3d_vkbuf_destroy(&r->vk, &r->bs.raw_stage);
+  if (r->bs.comp_ready) {
+    r3d_vkcomp_destroy(&r->vk, &r->bs.omax);
+    r3d_vkcomp_destroy(&r->vk, &r->bs.odil);
+  }
+  r3d_vkimage_destroy(&r->vk, &r->bs.occraw);
+  r3d_vkbuf_destroy(&r->vk, &r->bs.warm);
+  if (r->bs.sr_open) c5d_shard_close_reader(&r->bs.sr);
+  for (uint32_t i = 0; i < r->bricks_nreaders; i++)
+    if (r->bricks_readers[i].open) c5d_shard_close_reader(&r->bricks_readers[i].sr);
+  free(r->bricks_readers);
+  r->bricks_readers = NULL;
+  if (r->ink_readers)
+    for (uint32_t i = 0; i < r->bricks_nreaders; i++)
+      if (r->ink_readers[i].open) c5d_shard_close_reader(&r->ink_readers[i].sr);
+  free(r->ink_readers);
+  r->ink_readers = NULL;
+  r3d_vkimage_destroy(&r->vk, &r->ink_atlas);
+  r->ink_active = false;
+  free(r->bs.slot_brick);
+  free(r->bs.slot_use);
+  free(r->bs.brick_slot);
+  free(r->bs.brick_want);
+  free(r->bs.brick_maxk);
+  free(r->bs.cands);
+  free(r->bs.srcs);
+  free(r->bs.sel_b);
+  free(r->bs.sel_slot);
+  free(r->bs.maxes);
+  free(r->bs.warm_off);
+  free(r->bs.warm_len);
+  free(r->bs.warm_use);
+  free(r->bs.wfree);
+  memset(&r->bs, 0, sizeof r->bs);
+  memset(&r->ni, 0, sizeof r->ni);
+  r3d_vkimage_destroy(&r->vk, &r->surf_coords);
+  r3d_vkimage_destroy(&r->vk, &r->surf_normals);
+  r->surf_active = false;
+  r3d_vkimage_destroy(&r->vk, &r->sv.vol);
+  r3d_vkcomp_destroy(&r->vk, &r->sv.comp);
+  memset(&r->sv, 0, sizeof r->sv);
+  r->bricks_lod = false;
+  r->bricks_nlev = 0;
+  r->bricks_nreaders = 0;
+  r->bricks_bpa = r->bricks_abpa = 0;
+  r->bricks_nx = r->bricks_ny = r->bricks_nz = r->bricks_maxdim = 0;
+  r->bricks_root[0] = r->ink_root[0] = 0;
+}
+
+int r3d_bricks_end(r3d_renderer *r) {
+  if (!r->bs.active && !r->bricks_lod && !r->bricks_bpa) return 0;
+  bricks_teardown(r);
+  /* leave dataset bindings pointing at safe placeholders (occupancy image),
+   * matching the pre-begin state well enough for non-bricks pipelines */
+  write_image_dset(r, 3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, r->occ.view, r->samp_near,
+                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+  return 0;
+}
+
 void r3d_destroy(r3d_renderer *r) {
   if (!r) return;
   if (r->bs.worker_up) {

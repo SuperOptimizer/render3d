@@ -6,8 +6,14 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
 #include "cimgui.h"
 #include "core/camera.h"
+#include "core/odbrowse.h"
 #include "core/transfer.h"
 #include "core/volume.h"
 #include "core/input.h"
@@ -189,6 +195,269 @@ static float tf_min_visible(const uint8_t lut[256][4]) {
   return 255.0f;
 }
 
+/* ---- open-data browser: browse the bucket, bootstrap + relaunch ---------- */
+
+static const char OD_BUCKET[] = "https://vesuvius-challenge-open-data.s3.amazonaws.com";
+
+typedef struct od_state {
+  r3d_odlist scrolls, vols, segs, variants;
+  int sel_scroll, sel_vol, sel_seg, sel_variant;
+  bool scrolls_ok, vols_ok, segs_ok, variants_ok;
+  FILE *job;            /* running subprocess (popen, non-blocking reads) */
+  char log[10][160];    /* rolling job output */
+  int nlog;
+  int stage;            /* 0 idle, 1 volume bootstrap, 2 segment download */
+  char vol_dir[512], seg_dir[512];
+  bool with_segment, spawned_vol, spawned_seg;
+  char linebuf[512];
+  size_t linelen;
+} od_state;
+
+static void od_log(od_state *od, const char *line) {
+  if (od->nlog == 10) {
+    memmove(od->log[0], od->log[1], sizeof od->log - sizeof od->log[0]);
+    od->nlog--;
+  }
+  snprintf(od->log[od->nlog++], sizeof od->log[0], "%s", line);
+}
+
+static void od_exe_dir(char out[512]) {
+  ssize_t n = readlink("/proc/self/exe", out, 511);
+  if (n <= 0) {
+    snprintf(out, 512, ".");
+    return;
+  }
+  out[n] = 0;
+  char *slash = strrchr(out, '/');
+  if (slash) *slash = 0;
+}
+
+static bool od_file_exists(const char *path) {
+  struct stat st;
+  return stat(path, &st) == 0;
+}
+
+/* start a shell command with merged stderr, non-blocking stdout */
+static int od_spawn(od_state *od, const char *cmd) {
+  char full[4096];
+  snprintf(full, sizeof full, "%s 2>&1", cmd);
+  od->job = popen(full, "r");
+  if (!od->job) return -1;
+  int fd = fileno(od->job);
+  fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+  od->linelen = 0;
+  return 0;
+}
+
+/* pump the job pipe; returns 1 when finished (status ok), -1 failed, 0 busy */
+static int od_pump(od_state *od) {
+  if (!od->job) return 0;
+  char buf[512];
+  for (;;) {
+    ssize_t n = read(fileno(od->job), buf, sizeof buf);
+    if (n > 0) {
+      for (ssize_t i = 0; i < n; i++) {
+        if (buf[i] == '\n' || od->linelen + 1 >= sizeof od->linebuf) {
+          od->linebuf[od->linelen] = 0;
+          if (od->linelen) od_log(od, od->linebuf);
+          od->linelen = 0;
+        } else if (buf[i] != '\r') {
+          od->linebuf[od->linelen++] = buf[i];
+        }
+      }
+      continue;
+    }
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;
+    break; /* EOF or error */
+  }
+  int status = pclose(od->job);
+  od->job = NULL;
+  return status == 0 ? 1 : -1;
+}
+
+/* The browser is an ordinary ImGui window in the frame loop. Opening a
+ * dataset runs background jobs (zarr2c5d --bootstrap, tifxyz download);
+ * when everything is local it writes the chosen paths and requests a
+ * dataset swap — plain mutable state, reopened in the same session. */
+static void od_browser_window(od_state *od, bool *open, char *next_bricks, size_t nb_cap,
+                              char *next_seg, size_t ns_cap, bool *swap) {
+  int prc = od_pump(od);
+  if (prc < 0 && od->stage) {
+    od_log(od, "job FAILED");
+    od->stage = 0;
+  }
+  if (od->stage == 1 && !od->job) { /* ensure the volume is bootstrapped */
+    char mp[600];
+    snprintf(mp, sizeof mp, "%s/manifest.json", od->vol_dir);
+    if (od_file_exists(mp)) {
+      od_log(od, "volume ready");
+      od->stage = od->with_segment ? 2 : 3;
+    } else if (od->spawned_vol) {
+      od_log(od, "bootstrap produced no manifest");
+      od->stage = 0;
+    } else {
+      od->spawned_vol = true;
+      char exe[512], cmd[4096];
+      od_exe_dir(exe);
+      snprintf(cmd, sizeof cmd,
+               "'%s/zarr2c5d' '%s/meta' '%s' --url '%s/%s/volumes/%s' --bootstrap "
+               "--threads 8",
+               exe, od->vol_dir, od->vol_dir, OD_BUCKET, od->scrolls.dirs[od->sel_scroll],
+               od->vols.dirs[od->sel_vol]);
+      od_log(od, "bootstrapping volume (coarsest level + source.json)...");
+      if (od_spawn(od, cmd) != 0) od->stage = 0;
+    }
+  }
+  if (od->stage == 2 && !od->job) { /* ensure the segment tifxyz is local */
+    char probe[600];
+    snprintf(probe, sizeof probe, "%s/meta.json", od->seg_dir);
+    if (od_file_exists(probe)) {
+      od_log(od, "segment ready");
+      od->stage = 3;
+    } else if (od->spawned_seg) {
+      od_log(od, "segment download incomplete");
+      od->stage = 0;
+    } else {
+      od->spawned_seg = true;
+      char murl[1100], cmd[4096];
+      snprintf(murl, sizeof murl, "%s/%s/segments/%s/mesh/%s", OD_BUCKET,
+               od->scrolls.dirs[od->sel_scroll], od->segs.dirs[od->sel_seg],
+               od->variants.dirs[od->sel_variant]);
+      snprintf(cmd, sizeof cmd,
+               "mkdir -p '%s' && curl -fsS -o '%s/x.tif' '%s/x.tif' && "
+               "curl -fsS -o '%s/y.tif' '%s/y.tif' && "
+               "curl -fsS -o '%s/z.tif' '%s/z.tif' && "
+               "curl -fsS -o '%s/meta.json.dl' '%s/meta.json' && "
+               "mv '%s/meta.json.dl' '%s/meta.json' && echo downloaded",
+               od->seg_dir, od->seg_dir, murl, od->seg_dir, murl, od->seg_dir, murl,
+               od->seg_dir, murl, od->seg_dir, od->seg_dir);
+      od_log(od, "downloading segment tifxyz...");
+      if (od_spawn(od, cmd) != 0) od->stage = 0;
+    }
+  }
+  if (od->stage == 3) { /* everything local: request the dataset swap */
+    snprintf(next_bricks, nb_cap, "%s/manifest.json", od->vol_dir);
+    if (od->with_segment)
+      snprintf(next_seg, ns_cap, "%s", od->seg_dir);
+    else
+      next_seg[0] = 0;
+    *swap = true;
+    od->stage = 0;
+    od_log(od, "opening...");
+  }
+
+  if (!*open) return;
+  igSetNextWindowSize((ImVec2){620, 640}, ImGuiCond_FirstUseEver);
+  igSetNextWindowPos((ImVec2){380, 40}, ImGuiCond_FirstUseEver, (ImVec2){0, 0});
+  if (!igBegin("open data browser", open, 0)) {
+    igEnd();
+    return;
+  }
+  if (!od->scrolls_ok) {
+    if (r3d_odlist_fetch(OD_BUCKET, "", &od->scrolls) == 0) od->scrolls_ok = true;
+    else igTextDisabled("bucket listing failed");
+  }
+  const char *cur = od->sel_scroll >= 0 ? od->scrolls.dirs[od->sel_scroll] : "<pick a scroll>";
+  if (igBeginCombo("scroll", cur, 0)) {
+    for (uint32_t i = 0; i < od->scrolls.ndirs; i++)
+      if (igSelectable_Bool(od->scrolls.dirs[i], (int)i == od->sel_scroll, 0,
+                            (ImVec2){0, 0})) {
+        od->sel_scroll = (int)i;
+        r3d_odlist_free(&od->vols);
+        r3d_odlist_free(&od->segs);
+        r3d_odlist_free(&od->variants);
+        od->vols_ok = od->segs_ok = od->variants_ok = false;
+        od->sel_vol = od->sel_seg = od->sel_variant = -1;
+      }
+    igEndCombo();
+  }
+  if (od->sel_scroll >= 0 && !od->vols_ok) {
+    char pfx[300];
+    snprintf(pfx, sizeof pfx, "%s/volumes/", od->scrolls.dirs[od->sel_scroll]);
+    if (r3d_odlist_fetch(OD_BUCKET, pfx, &od->vols) == 0) od->vols_ok = true;
+    snprintf(pfx, sizeof pfx, "%s/segments/", od->scrolls.dirs[od->sel_scroll]);
+    if (r3d_odlist_fetch(OD_BUCKET, pfx, &od->segs) == 0) od->segs_ok = true;
+  }
+  if (od->vols_ok) {
+    igText("volumes");
+    igBeginChild_Str("odvols", (ImVec2){0, 140}, ImGuiChildFlags_Borders, 0);
+    for (uint32_t i = 0; i < od->vols.ndirs; i++) {
+      char mp[700], label[800];
+      snprintf(mp, sizeof mp, "cache/od/%s/%s/manifest.json",
+               od->scrolls.dirs[od->sel_scroll], od->vols.dirs[i]);
+      snprintf(label, sizeof label, "%s%s", od_file_exists(mp) ? "[cached] " : "",
+               od->vols.dirs[i]);
+      if (igSelectable_Bool(label, (int)i == od->sel_vol, 0, (ImVec2){0, 0}))
+        od->sel_vol = (int)i;
+    }
+    igEndChild();
+  }
+  if (od->segs_ok && od->segs.ndirs) {
+    igText("segments (%u)", od->segs.ndirs);
+    igBeginChild_Str("odsegs", (ImVec2){0, 150}, ImGuiChildFlags_Borders, 0);
+    for (uint32_t i = 0; i < od->segs.ndirs; i++)
+      if (igSelectable_Bool(od->segs.dirs[i], (int)i == od->sel_seg, 0, (ImVec2){0, 0})) {
+        od->sel_seg = (int)i;
+        r3d_odlist_free(&od->variants);
+        od->variants_ok = false;
+        od->sel_variant = -1;
+      }
+    igEndChild();
+  }
+  if (od->sel_seg >= 0 && !od->variants_ok) {
+    char pfx[500];
+    snprintf(pfx, sizeof pfx, "%s/segments/%s/mesh/", od->scrolls.dirs[od->sel_scroll],
+             od->segs.dirs[od->sel_seg]);
+    if (r3d_odlist_fetch(OD_BUCKET, pfx, &od->variants) == 0) od->variants_ok = true;
+  }
+  char volid[64] = "";
+  if (od->sel_vol >= 0) { /* volume id = dir name up to the first '-' */
+    snprintf(volid, sizeof volid, "%s", od->vols.dirs[od->sel_vol]);
+    char *dash = strchr(volid, '-');
+    if (dash) *dash = 0;
+  }
+  if (od->variants_ok && od->variants.ndirs) {
+    igText("segment mesh (tifxyz)");
+    igBeginChild_Str("odvar", (ImVec2){0, 90}, ImGuiChildFlags_Borders, 0);
+    char onvol[80];
+    snprintf(onvol, sizeof onvol, "-on-%s", volid);
+    for (uint32_t i = 0; i < od->variants.ndirs; i++) {
+      bool match = volid[0] && strstr(od->variants.dirs[i], onvol) != NULL;
+      char label[700];
+      snprintf(label, sizeof label, "%s%s", match ? "[matches volume] " : "",
+               od->variants.dirs[i]);
+      if (igSelectable_Bool(label, (int)i == od->sel_variant, 0, (ImVec2){0, 0}))
+        od->sel_variant = (int)i;
+    }
+    igEndChild();
+  }
+  bool busy = od->stage != 0;
+  igBeginDisabled(busy || od->sel_vol < 0);
+  bool go_vol = igButton("open volume", (ImVec2){0, 0});
+  igEndDisabled();
+  igSameLine(0, 10);
+  igBeginDisabled(busy || od->sel_vol < 0 || od->sel_variant < 0);
+  bool go_seg = igButton("open volume + segment", (ImVec2){0, 0});
+  igEndDisabled();
+  if ((go_vol || go_seg) && od->sel_vol >= 0) {
+    od->with_segment = go_seg && od->sel_variant >= 0;
+    od->spawned_vol = od->spawned_seg = false;
+    snprintf(od->vol_dir, sizeof od->vol_dir, "cache/od/%s/%s",
+             od->scrolls.dirs[od->sel_scroll], od->vols.dirs[od->sel_vol]);
+    if (od->with_segment)
+      snprintf(od->seg_dir, sizeof od->seg_dir, "cache/od/segments/%s",
+               od->variants.dirs[od->sel_variant]);
+    od->stage = 1;
+  }
+  if (busy) {
+    igSameLine(0, 12);
+    igTextDisabled("working...");
+  }
+  igSeparator();
+  for (int i = 0; i < od->nlog; i++) igTextDisabled("%s", od->log[i]);
+  igEnd();
+}
+
 static void gui_event_hook(void *ud, const SDL_Event *ev) {
   r3d_gui_event((r3d_renderer *)ud, ev);
 }
@@ -334,6 +603,7 @@ int main(int argc, char **argv) {
   const char *umbilicus_path = NULL;
   const char *multiview_path = NULL; /* tifxyz dir: vc3d-style 2x2 viewer */
   const char *overlay_path = NULL;   /* second c5d LOD root (ink predictions) */
+  bool od_browse = false;            /* start with the open-data browser window */
   int sv_w = 2048, sv_h = 2048, sv_l = 96; /* flattened surface-volume window */
   int annotation_prefetch = 5; /* annotation steps ahead; one slot is kept behind */
   int annotation_z_prefetch = 32; /* contiguous GPU-resident fine-scroll margin */
@@ -385,6 +655,7 @@ int main(int argc, char **argv) {
     if (i < argc - 1 && strcmp(argv[i], "--umbilicus") == 0) umbilicus_path = argv[i + 1];
     if (i < argc - 1 && strcmp(argv[i], "--multiview") == 0) multiview_path = argv[i + 1];
     if (i < argc - 1 && strcmp(argv[i], "--overlay") == 0) overlay_path = argv[i + 1];
+    if (strcmp(argv[i], "--browse") == 0) od_browse = true;
     if (i < argc - 3 && strcmp(argv[i], "--surfvol") == 0) {
       sv_w = atoi(argv[i + 1]);
       sv_h = atoi(argv[i + 2]);
@@ -491,6 +762,24 @@ int main(int argc, char **argv) {
     return EXIT_FAILURE;
   }
   r3d_set_quality(renderer, quality_policy == 2 ? R3D_QUALITY_FAST : R3D_QUALITY_FULL);
+
+  /* the dataset (volume + segment + overlay) is ordinary mutable state: the
+   * open-data browser swaps it by tearing the bricks family down and
+   * re-opening inside this loop, same window, same renderer */
+  od_state od = {.sel_scroll = -1, .sel_vol = -1, .sel_seg = -1, .sel_variant = -1};
+  bool od_window = od_browse;
+  char od_next_bricks[640] = "", od_next_seg[560] = "";
+  bool od_swap = false;
+  for (;;) {
+  if (od_swap) {
+    od_swap = false;
+    bricks_path = od_next_bricks;
+    multiview_path = od_next_seg[0] ? od_next_seg : NULL;
+    overlay_path = NULL; /* browser-opened datasets have no overlay tree yet */
+    umbilicus_path = NULL;
+    vslab_mode = false;
+    clip_mode = false;
+  }
 
   /* positional args: <volume.u8> <nx> <ny> <nz> */
   uint32_t mode = R3D_MODE_RAYDIR;
@@ -1216,6 +1505,7 @@ int main(int argc, char **argv) {
     if (panel_content) {
     if (!multiview_path)
       igText("%.0f fps   gpu %.2f ms", (double)fps_smooth, (double)last_gpu_ns / 1e6);
+    if (igButton("data browser", (ImVec2){0, 0})) od_window = true;
     int m = (int)mode;
     if (igCombo_Str("mode", &m, "full\0mip\0depth\0heatmap\0raydir\0flat\0", 6))
       mode = (uint32_t)m;
@@ -1452,6 +1742,10 @@ int main(int argc, char **argv) {
       igTextDisabled("click: fly (Esc releases)   WASD+QE: move   F12: shot");
     } /* panel_content */
     igEnd();
+
+    od_browser_window(&od, &od_window, od_next_bricks, sizeof od_next_bricks, od_next_seg,
+                      sizeof od_next_seg, &od_swap);
+    if (od_swap) running = false; /* teardown + reopen in the dataset loop */
 
     if (umbilicus_path) {
       if (annotation_z < 0) annotation_z = 0;
@@ -1908,6 +2202,10 @@ int main(int argc, char **argv) {
     }
   }
   free(prof_samples);
+  if (!od_swap) break;
+  r3d_bricks_end(renderer); /* dataset swap: teardown, then reopen */
+  if (slab_src.voxels) r3d_volume_close(&slab_src);
+  } /* dataset loop */
   r3d_destroy(renderer);
   SDL_DestroyWindow(win);
   SDL_Quit();

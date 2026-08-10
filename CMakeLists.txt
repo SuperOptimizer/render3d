@@ -56,10 +56,12 @@ add_library(r3d_core STATIC
   src/core/input.c
   src/core/tifxyz.c
   src/core/segtrace.c
+  src/core/odbrowse.c
   src/core/screenshot.c)
 target_include_directories(r3d_core PUBLIC src)
 target_link_libraries(r3d_core PRIVATE r3d_warnings r3d_sanitize
-                               PUBLIC m Threads::Threads SDL3::SDL3 TIFF::TIFF)
+                               PUBLIC m Threads::Threads SDL3::SDL3 TIFF::TIFF
+                                      CURL::libcurl)
 
 # --- c5d codec (pinned source dependency) ---
 # The GPU host/kernel contract is not a stable c5d public ABI.  Compiling a
