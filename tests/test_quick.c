@@ -12,6 +12,7 @@
 #include "core/mathx.h"
 #include "core/slab.h"
 #include "core/stats.h"
+#include "core/tifxyz.h"
 #include "core/umbilicus.h"
 #include "core/vslab.h"
 #include "core/transfer.h"
@@ -178,6 +179,94 @@ static void test_umbilicus(void) {
   unlink(path);
   r3d_umbilicus_free(&v);
   r3d_umbilicus_free(&u);
+}
+
+#include <string.h>
+#include <tiffio.h>
+
+/* Write one plane the way vc3d/the AWS exports do: tiled BigTIFF, LZW,
+ * floating-point predictor. */
+static void tifxyz_write_plane(const char *path, const float *v, uint32_t w, uint32_t h) {
+  TIFF *tf = TIFFOpen(path, "w8");
+  CHECK(tf != NULL);
+  if (!tf) return;
+  TIFFSetField(tf, TIFFTAG_IMAGEWIDTH, w);
+  TIFFSetField(tf, TIFFTAG_IMAGELENGTH, h);
+  TIFFSetField(tf, TIFFTAG_BITSPERSAMPLE, 32);
+  TIFFSetField(tf, TIFFTAG_SAMPLEFORMAT, SAMPLEFORMAT_IEEEFP);
+  TIFFSetField(tf, TIFFTAG_SAMPLESPERPIXEL, 1);
+  TIFFSetField(tf, TIFFTAG_PHOTOMETRIC, PHOTOMETRIC_MINISBLACK);
+  TIFFSetField(tf, TIFFTAG_COMPRESSION, COMPRESSION_LZW);
+  TIFFSetField(tf, TIFFTAG_PREDICTOR, 3);
+  TIFFSetField(tf, TIFFTAG_TILEWIDTH, 16);
+  TIFFSetField(tf, TIFFTAG_TILELENGTH, 16);
+  float tile[16 * 16];
+  for (uint32_t ty = 0; ty < h; ty += 16)
+    for (uint32_t tx = 0; tx < w; tx += 16) {
+      memset(tile, 0, sizeof tile);
+      for (uint32_t r = 0; r < 16 && ty + r < h; r++)
+        for (uint32_t c = 0; c < 16 && tx + c < w; c++)
+          tile[r * 16 + c] = v[(uint64_t)(ty + r) * w + tx + c];
+      CHECK(TIFFWriteTile(tf, tile, tx, ty, 0, 0) >= 0);
+    }
+  TIFFClose(tf);
+}
+
+static void test_tifxyz(void) {
+  char dir[] = "/tmp/r3d_test_tifxyz_XXXXXX";
+  CHECK(mkdtemp(dir) != NULL);
+  enum { W = 21, H = 13 };
+  float px[W * H], py[W * H], pz[W * H];
+  for (uint32_t j = 0; j < H; j++)
+    for (uint32_t i = 0; i < W; i++) {
+      uint64_t k = (uint64_t)j * W + i;
+      px[k] = 100.0f + 20.0f * (float)i;
+      py[k] = 200.0f + 20.0f * (float)j;
+      pz[k] = 3000.0f + 0.25f * (float)i;
+    }
+  pz[5] = 0.0f;   /* unmapped: stored as zeros */
+  px[5] = 0.0f;
+  py[5] = 0.0f;
+  pz[7] = -4.0f;  /* z <= 0 is invalid even with nonzero x/y */
+  char path[300];
+  snprintf(path, sizeof path, "%s/x.tif", dir);
+  tifxyz_write_plane(path, px, W, H);
+  snprintf(path, sizeof path, "%s/y.tif", dir);
+  tifxyz_write_plane(path, py, W, H);
+  snprintf(path, sizeof path, "%s/z.tif", dir);
+  tifxyz_write_plane(path, pz, W, H);
+  snprintf(path, sizeof path, "%s/meta.json", dir);
+  FILE *f = fopen(path, "w");
+  CHECK(f != NULL);
+  if (f) {
+    fputs("{\n  \"format\": \"tifxyz\",\n  \"scale\": [\n    0.05,\n    0.05\n  ],\n"
+          "  \"type\": \"seg\"\n}\n", f);
+    fclose(f);
+  }
+
+  r3d_tifxyz s;
+  CHECK(r3d_tifxyz_load(&s, dir) == 0);
+  CHECK(s.w == W && s.h == H);
+  CHECK(fabsf(s.sx - 0.05f) < 1e-6f && fabsf(s.sy - 0.05f) < 1e-6f);
+  CHECK(s.nvalid == W * H - 2);
+  const float *p = r3d_tifxyz_at(&s, 2, 1);
+  CHECK(r3d_tifxyz_valid(p));
+  CHECK(p[0] == 140.0f && p[1] == 220.0f && fabsf(p[2] - 3000.5f) < 1e-3f);
+  CHECK(!r3d_tifxyz_valid(r3d_tifxyz_at(&s, 5, 0))); /* zeros -> invalid */
+  CHECK(!r3d_tifxyz_valid(r3d_tifxyz_at(&s, 7, 0))); /* z<0  -> invalid */
+  CHECK(r3d_tifxyz_at(&s, 7, 0)[1] == -1.0f);        /* whole triplet forced */
+  CHECK(s.bbox[0][0] == 100.0f && s.bbox[1][0] == 100.0f + 20.0f * (W - 1));
+  CHECK(s.bbox[0][2] == 3000.0f);
+  r3d_tifxyz_free(&s);
+  CHECK(s.xyz == NULL);
+
+  /* cleanup */
+  static const char *nm[4] = {"x.tif", "y.tif", "z.tif", "meta.json"};
+  for (int i = 0; i < 4; i++) {
+    snprintf(path, sizeof path, "%s/%s", dir, nm[i]);
+    unlink(path);
+  }
+  rmdir(dir);
 }
 
 static void test_slab(void) {
@@ -351,6 +440,7 @@ int main(void) {
   test_orbit();
   test_transfer();
   test_umbilicus();
+  test_tifxyz();
   if (failures) {
     fprintf(stderr, "%d failure(s)\n", failures);
     return EXIT_FAILURE;
