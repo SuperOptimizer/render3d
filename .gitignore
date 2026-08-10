@@ -9,3 +9,4 @@ cache/
 *.shard
 pyramid/
 *.c5s
+imgui.ini
