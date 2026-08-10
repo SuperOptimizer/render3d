@@ -970,3 +970,24 @@ zoomed out. Rebuilds are one 100M-texel dispatch triggered by hysteresis
 arrivals (cooldown 20 frames); render-time zoff slides within the baked
 ±48-voxel range for free. Depth knobs match vc3d composite: N layers
 in front/behind at bake, marched thickness at render.
+
+## 2026-08-10 — tifxyz-transform: volume-to-volume segment remapping
+
+PHercParis4's 2.4um volume (75784x32693x32693, uncompressed zarr v2 chunks)
+ships a transform.json: schema 1.0.0, a single 3x4 XYZ affine meaning
+p_fixed = M @ p_moving in per-volume voxel units (the landmarks are
+provenance, not an applied warp — volume-cartographer has no non-affine
+transform type). fixed_volume here is the CANONICAL 7.91um scan, so mapping
+canonical-traced segments onto the 2.4um volume applies the INVERSE
+(landmark check: 1.9 vox RMS in fixed space). `tifxyz-transform`
+reimplements vc_transform_geom: p' = s_after * (M @ (s_before * p)),
+invalids pass through, grid resampled by the measured median adjacent-point
+spacing ratio (interior 10-90%, step 4), meta scale preserved, bbox
+recomputed. Validation is exact: our output of the GP banner (7.91um ->
+2.4um) matches the bucket's published -on-2.4um.tifxyz on the same
+1820x2530 grid at 0.002 vox mean / 0.016 max error — pure f32 rounding.
+(A first comparison suggested a ~60-voxel "refinement" residual; that was a
+half-grid-cell misregistration in the comparison itself, worth remembering:
+1 grid cell = 1/scale = 20 voxels, so tiny index-convention errors read as
+huge coordinate errors.) Any canonical Scroll 1 segment can now be carried
+onto the 2.4um (or 1.129um) volumes locally.
