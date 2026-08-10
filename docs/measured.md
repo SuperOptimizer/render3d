@@ -1132,3 +1132,19 @@ than CPU for these dense bricks; reverted. Two things that did work:
 Launch-to-render: cold (first ever) 13.5 s, warm 4.6 s — 8.5x vs the 39.4 s
 baseline. Verified: screenshot identical, truncated-file and stale-manifest
 fallbacks re-decode and rewrite the cache, all 5 suites green.
+
+## 2026-08-10 — surfvol full rebuilds: visible-box-first + progressive rest
+
+The last full-window bake trigger was a zoom's pitch change (once per octave,
+~75 ms), plus the initial bake. r3d_surfvol_visible now hints the window
+sub-box the view can actually see (main.c: view rect in window texels, zoff
++- mv_thick in layers, +64-texel/+8-layer margin); a full rebuild bakes just
+that box in-frame (typically 3-15% of 2048^2x96 -> a few ms; gpu max 13.5 ms
+including the initial bake, was ~75) and restarts the progressive pass to
+refresh the remainder at 128 rows/frame. Content outside the box keeps the
+old mapping for the ~quarter second the pass takes — only visible if the
+user pans immediately after zooming. Window shifts now restart (rather than
+cancel) an in-flight progressive pass so stale regions can't survive a
+zoom-then-pan. Static 900-frame scenario, best numbers yet: cpu max 37 ms,
+frame max 34 ms, no main-thread phase max above 33 ms; converged frame
+bit-identical to the previous build. All 5 suites green.

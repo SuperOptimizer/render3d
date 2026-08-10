@@ -75,6 +75,7 @@ struct r3d_renderer {
     bool baked;        /* window content valid (a full bake has been recorded) */
     bool shift_pending; /* integer-texel window move: shift + bake exposed bands */
     int32_t sh_u, sh_v, sh_z;
+    uint32_t vx0, vy0, vz0, vx1, vy1, vz1; /* view-visible sub-box (texels) */
   } sv;
   VkSampler samp_vol;    /* trilinear + mip linear, clamp */
   VkSampler samp_tf;     /* linear, clamp */
@@ -1362,7 +1363,7 @@ void r3d_surfvol_window(r3d_renderer *r, double u0, double v0, float step, float
       r->sv.u0 = (float)u0;
       r->sv.v0 = (float)v0;
       r->sv.zoff0 = zoff0;
-      r->sv.prog_row = UINT32_MAX;
+      /* an in-flight progressive pass restarts when the shift executes */
       return;
     }
   }
@@ -1373,6 +1374,17 @@ void r3d_surfvol_window(r3d_renderer *r, double u0, double v0, float step, float
   r->sv.dirty = true;
   r->sv.shift_pending = false;
   r->sv.prog_row = UINT32_MAX; /* mapping changed: the full rebuild supersedes */
+}
+
+void r3d_surfvol_visible(r3d_renderer *r, uint32_t x0, uint32_t y0, uint32_t z0, uint32_t x1,
+                         uint32_t y1, uint32_t z1) {
+  if (!r->sv.active) return;
+  r->sv.vx0 = x0 < r->sv.W ? x0 : r->sv.W;
+  r->sv.vy0 = y0 < r->sv.H ? y0 : r->sv.H;
+  r->sv.vz0 = z0 < r->sv.L ? z0 : r->sv.L;
+  r->sv.vx1 = x1 < r->sv.W ? x1 : r->sv.W;
+  r->sv.vy1 = y1 < r->sv.H ? y1 : r->sv.H;
+  r->sv.vz1 = z1 < r->sv.L ? z1 : r->sv.L;
 }
 
 void r3d_surfvol_mark(r3d_renderer *r) {
@@ -4943,12 +4955,33 @@ int r3d_frame_views(r3d_renderer *r, const r3d_frame_params *views, uint32_t nvi
     bool shifted = false;
     if (r->sv.dirty) {
       r->sv.dirty = false;
-      r->sv.prog_row = UINT32_MAX;
       r->sv.baked = true;
-      bands[nband++] = (struct svband){0, 0, 0, r->sv.W, r->sv.H, r->sv.L};
+      /* Bake the view-visible sub-box now (with a margin) and refresh the
+       * rest progressively — a zoom's pitch change stops costing the
+       * whole-window dispatch. Outside the box the content keeps the OLD
+       * mapping until the progressive pass reaches it; that's only visible
+       * if the user pans within the ~quarter second the pass takes. */
+      uint32_t m = 64;
+      uint32_t x0 = r->sv.vx0 > m ? r->sv.vx0 - m : 0;
+      uint32_t y0 = r->sv.vy0 > m ? r->sv.vy0 - m : 0;
+      uint32_t z0 = r->sv.vz0 > 8u ? r->sv.vz0 - 8u : 0;
+      uint32_t x1 = r->sv.vx1 + m < r->sv.W ? r->sv.vx1 + m : r->sv.W;
+      uint32_t y1 = r->sv.vy1 + m < r->sv.H ? r->sv.vy1 + m : r->sv.H;
+      uint32_t z1 = r->sv.vz1 + 8u < r->sv.L ? r->sv.vz1 + 8u : r->sv.L;
+      if (x1 > x0 && y1 > y0 && z1 > z0 &&
+          ((size_t)(x1 - x0) * (y1 - y0) * (z1 - z0)) * 2u <
+              (size_t)r->sv.W * r->sv.H * r->sv.L) {
+        bands[nband++] = (struct svband){x0, y0, z0, x1 - x0, y1 - y0, z1 - z0};
+        r->sv.prog_row = 0; /* the progressive pass rebakes the whole window */
+      } else { /* no useful visibility hint: the whole window in one go */
+        bands[nband++] = (struct svband){0, 0, 0, r->sv.W, r->sv.H, r->sv.L};
+        r->sv.prog_row = UINT32_MAX;
+      }
     } else if (r->sv.shift_pending) {
       r->sv.shift_pending = false;
       shifted = true;
+      if (r->sv.prog_row != UINT32_MAX)
+        r->sv.prog_row = 0; /* restart: rows moved under the cursor */
       int32_t su = r->sv.sh_u, sv2 = r->sv.sh_v, sz = r->sv.sh_z;
       if (su)
         bands[nband++] = (struct svband){su > 0 ? r->sv.W - (uint32_t)su : 0, 0, 0,

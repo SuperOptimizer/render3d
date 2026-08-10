@@ -1526,6 +1526,19 @@ int main(int argc, char **argv) {
         double v0 = floor((cv_vox - (double)sv_h * 0.5 * stepd) / snap) * snap;
         double zsnap = 24.0; /* layers are 1 voxel regardless of xy zoom */
         double z0 = floor(sv->slice / zsnap + 0.5) * zsnap;
+        /* visible sub-box hint: full-window rebuilds bake this box in-frame
+         * and refresh the rest progressively */
+        double half_u = (double)sv->pw * 0.5 * vox_per_px;
+        double half_v = (double)sv->ph * 0.5 / (sv->zoom * (double)mv_seg.sy);
+        double tx0 = (cu_vox - half_u - u0) / stepd, tx1 = (cu_vox + half_u - u0) / stepd;
+        double ty0 = (cv_vox - half_v - v0) / stepd, ty1 = (cv_vox + half_v - v0) / stepd;
+        int lc = sv_l / 2 + (int)lround(sv->slice - z0);
+        int lz0 = lc - mv_thick, lz1 = lc + mv_thick + 1;
+        r3d_surfvol_visible(renderer, (uint32_t)(tx0 > 0.0 ? tx0 : 0.0),
+                            (uint32_t)(ty0 > 0.0 ? ty0 : 0.0), (uint32_t)(lz0 > 0 ? lz0 : 0),
+                            (uint32_t)(tx1 > 0.0 ? tx1 + 1.0 : 0.0),
+                            (uint32_t)(ty1 > 0.0 ? ty1 + 1.0 : 0.0),
+                            (uint32_t)(lz1 > 0 ? lz1 : 0));
         r3d_surfvol_window(renderer, u0, v0, (float)stepd, (float)z0);
         r3d_bricks_stats svst;
         r3d_bricks_get_stats(renderer, &svst);

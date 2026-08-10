@@ -153,6 +153,12 @@ int r3d_surf_begin(r3d_renderer *r, uint32_t w, uint32_t h, const float *coords_
 int r3d_surfvol_begin(r3d_renderer *r, uint32_t w, uint32_t h, uint32_t layers,
                       uint32_t nback, float sx, float sy);
 void r3d_surfvol_window(r3d_renderer *r, double u0, double v0, float step, float zoff0);
+/* Hint the window sub-box the view can currently see (texel/layer ranges,
+ * half-open). Full-window rebuilds bake this box first, in-frame, and refresh
+ * the rest progressively — a zoom's pitch change costs a few ms instead of
+ * the whole-window ~75 ms. Call each frame before r3d_frame_views. */
+void r3d_surfvol_visible(r3d_renderer *r, uint32_t x0, uint32_t y0, uint32_t z0, uint32_t x1,
+                         uint32_t y1, uint32_t z1);
 void r3d_surfvol_mark(r3d_renderer *r);
 void r3d_surfvol_params(const r3d_renderer *r, r3d_frame_params *p);
 
