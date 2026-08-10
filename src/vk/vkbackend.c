@@ -59,6 +59,8 @@ struct r3d_renderer {
   r3d_vkimage volume;    /* R8 3D + full mip chain (dummy 2^3 until upload) */
   r3d_vkimage tf;        /* 256x1 RGBA8 transfer function */
   r3d_vkimage occ;       /* per-8^3-block max (dilated), for empty-space skip */
+  r3d_vkimage surf_coords, surf_normals; /* tifxyz grid (RGBA32F; w=valid), surf mode */
+  bool surf_active;
   VkSampler samp_vol;    /* trilinear + mip linear, clamp */
   VkSampler samp_tf;     /* linear, clamp */
   VkSampler samp_near;   /* nearest, clamp (occupancy) */
@@ -201,7 +203,7 @@ struct r3d_renderer {
 
   VkDescriptorSetLayout dsl;
   VkPipelineLayout pipe_layout;
-  VkPipeline raycast[R3D_QUALITY_COUNT][5]; /* quality x sampling architecture */
+  VkPipeline raycast[R3D_QUALITY_COUNT][6]; /* quality x sampling architecture */
   VkPipeline raycast_cube_8x8; /* X1-85 reduced-resolution divergence path */
   uint32_t quality;
   VkDescriptorPool dpool;
@@ -343,10 +345,18 @@ static int create_pipeline(r3d_renderer *r) {
        .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
        .descriptorCount = 1,
        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT},
+      {.binding = 7, /* surf mode: tifxyz coords grid (RGBA32F, w = valid) */
+       .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+       .descriptorCount = 1,
+       .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT},
+      {.binding = 8, /* surf mode: per-vertex surface normals */
+       .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+       .descriptorCount = 1,
+       .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT},
   };
   VkDescriptorSetLayoutCreateInfo dslci = {
       .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-      .bindingCount = 7,
+      .bindingCount = 9,
       .pBindings = bindings,
   };
   if (vkCreateDescriptorSetLayout(r->vk.dev, &dslci, NULL, &r->dsl) != VK_SUCCESS) return -1;
@@ -362,11 +372,11 @@ static int create_pipeline(r3d_renderer *r) {
    * otherwise the measured X1-85 path additionally keeps an 8x8 pipeline for
    * reduced-resolution interaction while full resolution remains 16x8. */
   const char *wg = getenv("R3D_WG");
-  const char *names[R3D_QUALITY_COUNT][5] = {
+  const char *names[R3D_QUALITY_COUNT][6] = {
       {"raycast_cube.spv", "raycast_slab.spv", "raycast_clip.spv", "raycast_bricks.spv",
-       "raycast_vslab.spv"},
+       "raycast_vslab.spv", "raycast_surf.spv"},
       {"raycast_fast_cube.spv", "raycast_fast_slab.spv", "raycast_fast_clip.spv",
-       "raycast_fast_bricks.spv", "raycast_fast_vslab.spv"}};
+       "raycast_fast_bricks.spv", "raycast_fast_vslab.spv", "raycast_surf.spv"}};
   r->wg_x = 16;
   r->wg_y = 8;
   if (wg && strcmp(wg, "8x8") == 0) {
@@ -379,7 +389,7 @@ static int create_pipeline(r3d_renderer *r) {
   r->adaptive_wg = !wg && r->vk.caps.vendor_id == 0x5143u &&
                    r->vk.caps.device_id == 0x43050c01u && r->vk.caps.subgroup_size == 128u;
   for (uint32_t q = 0; q < R3D_QUALITY_COUNT; q++)
-  for (uint32_t m = 0; m < 5; m++) {
+  for (uint32_t m = 0; m < 6; m++) {
     if (!r->tiled_modes && m != 0 && m != 3) continue;
     if (create_compute_pipeline(r, names[q][m], &r->raycast[q][m]) != 0) return -1;
   }
@@ -392,11 +402,12 @@ static int create_pipeline(r3d_renderer *r) {
       {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, r->tile_descriptors + 3},
       {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1},
       {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1},
+      {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 2},
   };
   VkDescriptorPoolCreateInfo dpci = {
       .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
       .maxSets = 1,
-      .poolSizeCount = 4,
+      .poolSizeCount = 5,
       .pPoolSizes = sizes,
   };
   if (vkCreateDescriptorPool(r->vk.dev, &dpci, NULL, &r->dpool) != VK_SUCCESS) return -1;
@@ -826,7 +837,7 @@ void r3d_destroy(r3d_renderer *r) {
   if (r->pool) vkDestroyCommandPool(r->vk.dev, r->pool, NULL);
   if (r->dpool) vkDestroyDescriptorPool(r->vk.dev, r->dpool, NULL);
   for (uint32_t q = 0; q < R3D_QUALITY_COUNT; q++)
-    for (uint32_t m = 0; m < 5; m++)
+    for (uint32_t m = 0; m < 6; m++)
       if (r->raycast[q][m]) vkDestroyPipeline(r->vk.dev, r->raycast[q][m], NULL);
   if (r->raycast_cube_8x8) vkDestroyPipeline(r->vk.dev, r->raycast_cube_8x8, NULL);
   if (r->pipe_layout) vkDestroyPipelineLayout(r->vk.dev, r->pipe_layout, NULL);
@@ -878,6 +889,8 @@ void r3d_destroy(r3d_renderer *r) {
   r3d_vkimage_destroy(&r->vk, &r->volume);
   r3d_vkimage_destroy(&r->vk, &r->tf);
   r3d_vkimage_destroy(&r->vk, &r->occ);
+  r3d_vkimage_destroy(&r->vk, &r->surf_coords);
+  r3d_vkimage_destroy(&r->vk, &r->surf_normals);
   r3d_vkimage_destroy(&r->vk, &r->offscreen);
   r3d_vkswap_destroy(&r->vk, &r->swap);
   r3d_vkctx_destroy(&r->vk);
@@ -1054,6 +1067,29 @@ int r3d_upload_volume(r3d_renderer *r, const r3d_volume_desc *d, const uint8_t *
 fail:
   r3d_vkimage_destroy(&r->vk, &im);
   return -1;
+}
+
+int r3d_surf_begin(r3d_renderer *r, uint32_t w, uint32_t h, const float *coords_rgba,
+                   const float *normals_rgba) {
+  if (!w || !h || !coords_rgba || !normals_rgba || r->surf_active) return -1;
+  VkExtent3D e = {w, h, 1};
+  VkDeviceSize n = (VkDeviceSize)w * h * 4 * sizeof(float);
+  if (r3d_vkimage_create(&r->vk, VK_FORMAT_R32G32B32A32_SFLOAT, e, 1,
+                         VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                         &r->surf_coords) != 0 ||
+      r3d_vkimage_create(&r->vk, VK_FORMAT_R32G32B32A32_SFLOAT, e, 1,
+                         VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                         &r->surf_normals) != 0)
+    return -1;
+  if (upload_small_image(r, &r->surf_coords, coords_rgba, n) != 0 ||
+      upload_small_image(r, &r->surf_normals, normals_rgba, n) != 0)
+    return -1;
+  write_image_dset(r, 7, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, r->surf_coords.view, VK_NULL_HANDLE,
+                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+  write_image_dset(r, 8, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, r->surf_normals.view, VK_NULL_HANDLE,
+                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+  r->surf_active = true;
+  return 0;
 }
 
 int r3d_set_transfer(r3d_renderer *r, const uint8_t rgba[256][4]) {
@@ -3763,9 +3799,12 @@ int r3d_frame_views(r3d_renderer *r, const r3d_frame_params *views, uint32_t nvi
   VkPipeline bound = VK_NULL_HANDLE;
   for (uint32_t v = 0; v < nviews; v++) {
     const r3d_frame_params *vp = &views[v];
-    uint32_t rmode = vp->slab_grid & (1u << 24)
-                         ? 4u
-                         : (vp->clip_valid ? 2u : (vp->brick_mode ? 3u : (vp->slab_grid ? 1u : 0u)));
+    uint32_t rmode =
+        vp->view_flags & R3D_VIEW_SURF
+            ? 5u
+            : (vp->slab_grid & (1u << 24)
+                   ? 4u
+                   : (vp->clip_valid ? 2u : (vp->brick_mode ? 3u : (vp->slab_grid ? 1u : 0u))));
     uint32_t vw = vp->viewport[0] ? vp->viewport[0] : r->swap.extent.width;
     uint32_t vh = vp->viewport[1] ? vp->viewport[1] : r->swap.extent.height;
     uint32_t ox = vp->view_org & 0xffffu, oy = vp->view_org >> 16;

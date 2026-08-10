@@ -82,6 +82,7 @@ typedef struct r3d_frame_params {
 static_assert(sizeof(r3d_frame_params) == 240, "must mirror shader FrameParams");
 
 #define R3D_VIEW_ORTHO 1u
+#define R3D_VIEW_SURF 2u /* flattened tifxyz segment view (needs r3d_surf_begin) */
 #define R3D_VIEW_AXIS(a) ((uint32_t)(a) << 8) /* 0=z 1=x 2=y */
 #define R3D_MAX_VIEWS 4u
 

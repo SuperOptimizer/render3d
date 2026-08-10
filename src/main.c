@@ -104,6 +104,53 @@ static int save_umbilicus(r3d_umbilicus *u, const char *path, char status[256]) 
   return 0;
 }
 
+/* Build the surf-view GPU grids from a tifxyz segment: RGBA32F coords
+ * (w = valid) and per-vertex normals (bilinear-tangent cross product, vc3d
+ * grid_normal). Returns malloc'd w*h*4 float pairs via out params. */
+static int mv_build_grids(const r3d_tifxyz *s, float **coords_out, float **normals_out) {
+  uint64_t n = (uint64_t)s->w * s->h;
+  float *co = malloc(n * 4 * sizeof *co), *no = calloc(n * 4, sizeof *no);
+  if (!co || !no) {
+    free(co);
+    free(no);
+    return -1;
+  }
+  for (uint64_t k = 0; k < n; k++) {
+    const float *p = s->xyz + k * 3;
+    bool ok = r3d_tifxyz_valid(p);
+    co[k * 4 + 0] = p[0];
+    co[k * 4 + 1] = p[1];
+    co[k * 4 + 2] = p[2];
+    co[k * 4 + 3] = ok ? 1.0f : 0.0f;
+  }
+  for (uint32_t j = 0; j < s->h; j++)
+    for (uint32_t i = 0; i < s->w; i++) {
+      uint64_t k = (uint64_t)j * s->w + i;
+      if (co[k * 4 + 3] < 0.5f) continue;
+      /* central differences, shrinking to one-sided at edges/invalid */
+      uint32_t i0 = i > 0 ? i - 1 : i, i1 = i + 1 < s->w ? i + 1 : i;
+      uint32_t j0 = j > 0 ? j - 1 : j, j1 = j + 1 < s->h ? j + 1 : j;
+      const float *pu0 = r3d_tifxyz_at(s, i0, j), *pu1 = r3d_tifxyz_at(s, i1, j);
+      const float *pv0 = r3d_tifxyz_at(s, i, j0), *pv1 = r3d_tifxyz_at(s, i, j1);
+      const float *pc_ = r3d_tifxyz_at(s, i, j);
+      if (!r3d_tifxyz_valid(pu0)) pu0 = pc_;
+      if (!r3d_tifxyz_valid(pu1)) pu1 = pc_;
+      if (!r3d_tifxyz_valid(pv0)) pv0 = pc_;
+      if (!r3d_tifxyz_valid(pv1)) pv1 = pc_;
+      r3d_v3 tu = v3(pu1[0] - pu0[0], pu1[1] - pu0[1], pu1[2] - pu0[2]);
+      r3d_v3 tv = v3(pv1[0] - pv0[0], pv1[1] - pv0[1], pv1[2] - pv0[2]);
+      r3d_v3 nn = v3_cross(tu, tv);
+      float l = v3_len(nn);
+      if (l < 1e-6f) continue;
+      no[k * 4 + 0] = nn.x / l;
+      no[k * 4 + 1] = nn.y / l;
+      no[k * 4 + 2] = nn.z / l;
+    }
+  *coords_out = co;
+  *normals_out = no;
+  return 0;
+}
+
 /* first voxel value with nonzero TF alpha: below it, samples are invisible */
 static float tf_min_visible(const uint8_t lut[256][4]) {
   for (uint32_t i = 0; i < 256; i++)
@@ -482,9 +529,18 @@ int main(int argc, char **argv) {
       mv[i].slice = mv_focus[ax[2]];
       mv[i].zoom = 0.0; /* fitted on the first frame once quadrants exist */
     }
-    /* TL overview: whole XY extent until the surf view lands */
-    mv[R3D_MV_SEG].cu = (double)brick_shape[0] * 0.5;
-    mv[R3D_MV_SEG].cv = (double)brick_shape[1] * 0.5;
+    /* TL = flattened segment view: grid-space camera, slice = normal offset */
+    mv[R3D_MV_SEG].cu = (double)mv_seg.w * 0.5;
+    mv[R3D_MV_SEG].cv = (double)mv_seg.h * 0.5;
+    mv[R3D_MV_SEG].slice = 0.0;
+    float *seg_coords = NULL, *seg_normals = NULL;
+    if (mv_build_grids(&mv_seg, &seg_coords, &seg_normals) != 0 ||
+        r3d_surf_begin(renderer, mv_seg.w, mv_seg.h, seg_coords, seg_normals) != 0) {
+      fprintf(stderr, "multiview: surf grid upload failed\n");
+      return EXIT_FAILURE;
+    }
+    free(seg_coords);
+    free(seg_normals);
   }
 
   int64_t vs_z0 = umbilicus_path ? annotation_z0(annotation_z, vsnz, (uint32_t)vsd)
@@ -767,9 +823,9 @@ int main(int argc, char **argv) {
         mv[i].ph = lay[i].ph;
       }
       if (mv[0].zoom <= 0.0) { /* first frame: fit */
-        double fit = (double)mv[R3D_MV_SEG].ph / (double)(brick_shape[1] ? brick_shape[1] : 1);
-        double fx2 = (double)mv[R3D_MV_SEG].pw / (double)(brick_shape[0] ? brick_shape[0] : 1);
-        mv[R3D_MV_SEG].zoom = fit < fx2 ? fit : fx2;
+        double fy2 = (double)mv[R3D_MV_SEG].ph / (double)(mv_seg.h ? mv_seg.h : 1);
+        double fx2 = (double)mv[R3D_MV_SEG].pw / (double)(mv_seg.w ? mv_seg.w : 1);
+        mv[R3D_MV_SEG].zoom = fy2 < fx2 ? fy2 : fx2;
         for (int i = 1; i < 4; i++) mv[i].zoom = (double)mv[i].ph / 2048.0;
       }
       int hover = r3d_mv_hit(mv, in.mouse_xy[0], in.mouse_xy[1]);
@@ -792,20 +848,69 @@ int main(int argc, char **argv) {
       }
       if (hover >= 0 && (in.zdelta || in.zpage))
         mv[hover].slice += (double)(in.zdelta + in.zpage * 10);
-      for (int i = 0; i < 4; i++) { /* clamp slices to the volume */
+      /* SEG slice = normal offset, symmetric around the sheet */
+      if (mv[R3D_MV_SEG].slice < -512.0) mv[R3D_MV_SEG].slice = -512.0;
+      if (mv[R3D_MV_SEG].slice > 512.0) mv[R3D_MV_SEG].slice = 512.0;
+      for (int i = 1; i < 4; i++) { /* plane slices clamp to the volume */
         uint32_t n = brick_shape[r3d_mv_axes[i][2]];
         if (mv[i].slice < 0.0) mv[i].slice = 0.0;
         if (n && mv[i].slice > (double)n - 1.0) mv[i].slice = (double)n - 1.0;
       }
       if (in.annotate_click && in.click_ctrl) { /* Ctrl+click = set focus POI */
         int cv_ = r3d_mv_hit(mv, in.click_xy[0], in.click_xy[1]);
-        if (cv_ >= 0) {
+        bool focused = false;
+        if (cv_ == R3D_MV_SEG) {
+          /* focus at the surface point under the cursor (CPU bilinear tap) */
+          double gu, gv;
+          r3d_mv_unproject(&mv[cv_], in.click_xy[0], in.click_xy[1], &gu, &gv);
+          if (gu >= 0.0 && gv >= 0.0 && gu <= (double)mv_seg.w - 1.0 &&
+              gv <= (double)mv_seg.h - 1.0) {
+            uint32_t gi = (uint32_t)gu, gj = (uint32_t)gv;
+            if (gi > mv_seg.w - 2) gi = mv_seg.w - 2;
+            if (gj > mv_seg.h - 2) gj = mv_seg.h - 2;
+            const float *q00 = r3d_tifxyz_at(&mv_seg, gi, gj);
+            const float *q10 = r3d_tifxyz_at(&mv_seg, gi + 1, gj);
+            const float *q01 = r3d_tifxyz_at(&mv_seg, gi, gj + 1);
+            const float *q11 = r3d_tifxyz_at(&mv_seg, gi + 1, gj + 1);
+            if (r3d_tifxyz_valid(q00) && r3d_tifxyz_valid(q10) && r3d_tifxyz_valid(q01) &&
+                r3d_tifxyz_valid(q11)) {
+              double fx_ = gu - gi, fy_ = gv - gj;
+              for (int a = 0; a < 3; a++)
+                mv_focus[a] = ((double)q00[a] * (1 - fx_) + (double)q10[a] * fx_) * (1 - fy_) +
+                              ((double)q01[a] * (1 - fx_) + (double)q11[a] * fx_) * fy_;
+              focused = true;
+            }
+          }
+        } else if (cv_ > 0) {
           const uint8_t *ax = r3d_mv_axes[cv_];
           double u, vq;
           r3d_mv_unproject(&mv[cv_], in.click_xy[0], in.click_xy[1], &u, &vq);
           mv_focus[ax[0]] = u;
           mv_focus[ax[1]] = vq;
           mv_focus[ax[2]] = mv[cv_].slice;
+          focused = true;
+          /* recenter the segment view on the surface point nearest the focus */
+          double best = 1e30;
+          uint32_t bi = 0, bj = 0;
+          for (uint32_t gj = 0; gj < mv_seg.h; gj += 2)
+            for (uint32_t gi = 0; gi < mv_seg.w; gi += 2) {
+              const float *sp = r3d_tifxyz_at(&mv_seg, gi, gj);
+              if (!r3d_tifxyz_valid(sp)) continue;
+              double dx = (double)sp[0] - mv_focus[0], dy = (double)sp[1] - mv_focus[1],
+                     dz = (double)sp[2] - mv_focus[2];
+              double d2 = dx * dx + dy * dy + dz * dz;
+              if (d2 < best) {
+                best = d2;
+                bi = gi;
+                bj = gj;
+              }
+            }
+          if (best < 100.0 * 100.0) { /* vc3d tolerance: 100 voxels */
+            mv[R3D_MV_SEG].cu = (double)bi;
+            mv[R3D_MV_SEG].cv = (double)bj;
+          }
+        }
+        if (focused) {
           for (int a = 0; a < 3; a++) { /* clamp into the volume */
             if (mv_focus[a] < 0.0) mv_focus[a] = 0.0;
             if (brick_shape[a] && mv_focus[a] > (double)brick_shape[a] - 1.0)
@@ -1129,6 +1234,9 @@ int main(int argc, char **argv) {
                mv[R3D_MV_XZ].slice, mv[R3D_MV_YZ].slice);
         int th = mv_thick;
         if (igSliderInt("slice thickness", &th, 1, 64, "%d", 0)) mv_thick = th;
+        float zo = (float)mv[R3D_MV_SEG].slice;
+        if (igSliderFloat("segment offset", &zo, -64.0f, 64.0f, "%.0f vox", 0))
+          mv[R3D_MV_SEG].slice = (double)zo;
         igTextDisabled("segment %ux%u  %llu valid points", mv_seg.w, mv_seg.h,
                        (unsigned long long)mv_seg.nvalid);
       }
@@ -1340,7 +1448,35 @@ int main(int argc, char **argv) {
         for (int a = 1; a < 3; a++)
           if (brick_shape[a] > mdim) mdim = brick_shape[a];
         if (r3d_bricks_stream_begin(renderer)) {
-          for (int i = 0; i < 4; i++) {
+          { /* segment view: walk the visible grid rect decimated and request
+             * the bricks its surface points (+ normal offset) touch */
+            const r3d_mview *sv = &mv[R3D_MV_SEG];
+            double hw = (double)sv->pw * 0.5 / sv->zoom, hh = (double)sv->ph * 0.5 / sv->zoom;
+            int64_t g0 = (int64_t)(sv->cu - hw), g1 = (int64_t)(sv->cu + hw) + 1;
+            int64_t j0 = (int64_t)(sv->cv - hh), j1 = (int64_t)(sv->cv + hh) + 1;
+            if (g0 < 0) g0 = 0;
+            if (j0 < 0) j0 = 0;
+            if (g1 > (int64_t)mv_seg.w) g1 = mv_seg.w;
+            if (j1 > (int64_t)mv_seg.h) j1 = mv_seg.h;
+            double span = (double)((g1 - g0) * (j1 - j0));
+            int64_t step = span > 0 ? (int64_t)(sqrt(span / 384.0) + 1.0) : 1;
+            /* voxels per pixel: (grid units per px) / (grid units per voxel) */
+            float vf = (float)(1.0 / (sv->zoom * (double)mv_seg.sx)) * exp2f(lod_bias);
+            uint32_t lvl = 0;
+            while (vf >= 2.0f && lvl < 7u) {
+              vf *= 0.5f;
+              lvl++;
+            }
+            for (int64_t gj = j0; gj < j1; gj += step)
+              for (int64_t gi = g0; gi < g1; gi += step) {
+                const float *sp = r3d_tifxyz_at(&mv_seg, (uint32_t)gi, (uint32_t)gj);
+                if (!r3d_tifxyz_valid(sp)) continue;
+                float pp[3] = {sp[0] / (float)mdim, sp[1] / (float)mdim,
+                               sp[2] / (float)mdim};
+                r3d_bricks_stream_point(renderer, pp, lvl, p.skip_gate);
+              }
+          }
+          for (int i = 1; i < 4; i++) {
             const uint8_t *ax = r3d_mv_axes[i];
             double hw = (double)mv[i].pw * 0.5 / mv[i].zoom;
             double hh = (double)mv[i].ph * 0.5 / mv[i].zoom;
@@ -1406,6 +1542,23 @@ int main(int argc, char **argv) {
         q.viewport[0] = (uint32_t)mv[i].pw;
         q.viewport[1] = (uint32_t)mv[i].ph;
         q.view_org = (uint32_t)mv[i].px | ((uint32_t)mv[i].py << 16);
+        if (i == R3D_MV_SEG) {
+          /* flattened segment: grid-space "camera" (see raycast surf path) */
+          q.view_flags = R3D_VIEW_SURF;
+          q.cam_origin[0] = (float)mv[i].cu;
+          q.cam_origin[1] = (float)mv[i].cv;
+          q.cam_origin[2] = 0.0f;
+          memset(q.cam_right, 0, sizeof q.cam_right);
+          memset(q.cam_up, 0, sizeof q.cam_up);
+          memset(q.cam_forward, 0, sizeof q.cam_forward);
+          q.cam_right[0] = (float)((double)mv[i].pw * 0.5 / mv[i].zoom);
+          q.cam_up[1] = (float)-((double)mv[i].ph * 0.5 / mv[i].zoom);
+          q.slab_px = 1.0f / mv_seg.sx; /* voxels per grid step */
+          q.slab_z0 = (float)mv[i].slice; /* normal offset, voxels */
+          q.slab_depth = 0;
+          vp4[i] = q;
+          continue;
+        }
         q.view_flags = R3D_VIEW_ORTHO | R3D_VIEW_AXIS(axis_code[ax[2]]);
         double hw = (double)mv[i].pw * 0.5 / mv[i].zoom / (double)mdim;
         double hh = (double)mv[i].ph * 0.5 / mv[i].zoom / (double)mdim;

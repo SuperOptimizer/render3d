@@ -20,6 +20,7 @@ set(_variants
   "raycast_clip:raycast:-DR3D_MODE=2 -DWG_X=16 -DWG_Y=8"
   "raycast_bricks:raycast:-DR3D_MODE=3 -DWG_X=16 -DWG_Y=8"
   "raycast_vslab:raycast:-DR3D_MODE=4 -DWG_X=16 -DWG_Y=8"
+  "raycast_surf:raycast:-DR3D_MODE=5 -DWG_X=16 -DWG_Y=8"
   "raycast_fast_cube:raycast:-DR3D_MODE=0 -DR3D_FAST_GRADIENT=1 -DWG_X=16 -DWG_Y=8"
   "raycast_fast_slab:raycast:-DR3D_MODE=1 -DR3D_FAST_GRADIENT=1 -DWG_X=16 -DWG_Y=8"
   "raycast_fast_clip:raycast:-DR3D_MODE=2 -DR3D_FAST_GRADIENT=1 -DWG_X=16 -DWG_Y=8"

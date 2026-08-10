@@ -16,6 +16,11 @@ import common;
 // page[bi] = slot_index | brick_max<<24, 0xFFFFFFFF = not resident
 [[vk::binding(4, 0)]] Sampler3D<float> brick_atlas;
 [[vk::binding(5, 0)]] StructuredBuffer<uint> page;
+// surf mode (R3D_MODE 5): tifxyz segment grid — volume-voxel coords
+// (w = 1 valid / 0 invalid) and unit surface normals, manually bilerped so
+// invalid grid points poison their quad (vc3d semantics)
+[[vk::binding(7, 0)]] Texture2D<float4> surf_coords;
+[[vk::binding(8, 0)]] Texture2D<float4> surf_normals;
 
 static const uint MODE_FULL = 0;
 static const uint MODE_MIP = 1;
@@ -40,6 +45,7 @@ bool is_slab() { return R3D_MODE == 1; }
 bool is_clip() { return R3D_MODE == 2; }
 bool is_bricks() { return R3D_MODE == 3; }
 bool is_vslab() { return R3D_MODE == 4; } /* virtual slab: toroidal window */
+bool is_surf() { return R3D_MODE == 5; }  /* flattened tifxyz segment */
 
 /* bricks mode: one page-table resolve per sample position; the fetch (and
  * the 6 gradient taps reusing the context) are then plain atlas samples. */
@@ -347,6 +353,58 @@ float2 box_hit(float3 o, float3 d, float3 lo, float3 hi) {
 void main(uint3 tid: SV_DispatchThreadID) {
   if (tid.x >= pc.viewport.x || tid.y >= pc.viewport.y) return;
   uint2 opix = tid.xy + uint2(pc.view_org & 0xffffu, pc.view_org >> 16);
+
+  if (is_surf()) {
+    /* Flattened segment: view plane IS the tifxyz grid. cam_origin.xy =
+     * grid-space view center, cam_right.x / cam_up.y = half-extents in grid
+     * units, slab_z0 = offset along the per-pixel surface normal (voxels),
+     * slab_px = voxels per grid step (1/scale). */
+    float2 ndc = pix_ndc(tid.xy);
+    float2 g = pc.cam_origin.xy + ndc.x * pc.cam_right.xy + ndc.y * pc.cam_up.xy;
+    uint2 dim;
+    surf_coords.GetDimensions(dim.x, dim.y);
+    float4 bg = float4(0.02, 0.02, 0.03, 1);
+    if (g.x < 0.0 || g.y < 0.0 || g.x > float(dim.x - 1) || g.y > float(dim.y - 1)) {
+      out_image[opix] = bg;
+      return;
+    }
+    int2 i0 = int2(min(uint2(g), dim - 2u));
+    float2 fr = g - float2(i0);
+    float4 c00 = surf_coords.Load(int3(i0, 0));
+    float4 c10 = surf_coords.Load(int3(i0 + int2(1, 0), 0));
+    float4 c01 = surf_coords.Load(int3(i0 + int2(0, 1), 0));
+    float4 c11 = surf_coords.Load(int3(i0 + int2(1, 1), 0));
+    if (min(min(c00.w, c10.w), min(c01.w, c11.w)) < 0.5) { /* unmapped quad */
+      out_image[opix] = bg;
+      return;
+    }
+    float3 wp = lerp(lerp(c00.xyz, c10.xyz, fr.x), lerp(c01.xyz, c11.xyz, fr.x), fr.y);
+    if (pc.slab_z0 != 0.0) {
+      float3 n00 = surf_normals.Load(int3(i0, 0)).xyz;
+      float3 n10 = surf_normals.Load(int3(i0 + int2(1, 0), 0)).xyz;
+      float3 n01 = surf_normals.Load(int3(i0 + int2(0, 1), 0)).xyz;
+      float3 n11 = surf_normals.Load(int3(i0 + int2(1, 1), 0)).xyz;
+      float3 nn = lerp(lerp(n00, n10, fr.x), lerp(n01, n11, fr.x), fr.y);
+      float nl = length(nn);
+      if (nl > 1e-4) wp += nn / nl * pc.slab_z0;
+    }
+    float3 shape = float3(page[1], page[2], page[3]);
+    float md = max(shape.x, max(shape.y, shape.z));
+    if (any(wp < float3(0)) || any(wp >= shape)) {
+      out_image[opix] = bg;
+      return;
+    }
+    /* footprint: grid-units per pixel * voxels per grid unit */
+    float vpp = 2.0 * length(pc.cam_right.xy) * pc.slab_px / float(pc.viewport.x);
+    float lod = clamp(log2(max(vpp, 1.0)) + pc.lod_bias, 0.0, float(page[0] - 1u));
+    BrickCtx c = bricks_lod_locate(wp / md, lod);
+    float inv = 1.0 / (float((pc.brick_mode & 0xffu)) * BR_SLOT);
+    float v = c.ok ? bricks_fetch(c.slot_org, c.bl, c.atlas_lod, inv) : 0.0;
+    if (v < pc.threshold) v = 0.0;
+    out_image[opix] = float4(float3(v * pc.density), 1);
+    return;
+  }
+
   float3 dir = ray_dir(tid.xy);
 
   if (pc.mode == MODE_RAYDIR) {

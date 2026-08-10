@@ -124,6 +124,13 @@ typedef struct r3d_vslab_prefetch_stats {
 } r3d_vslab_prefetch_stats;
 void r3d_vslab_prefetch_get(r3d_renderer *r, r3d_vslab_prefetch_stats *st);
 
+/* Flattened-segment (surf) view data: two W x H RGBA32F grids — coords
+ * (volume voxel x,y,z; w = 1 valid / 0 invalid) and unit normals. A view
+ * with R3D_VIEW_SURF then renders the segment by sampling the bricks LOD
+ * volume at coords + normal * zoff (see FrameParams reuse in the shader). */
+int r3d_surf_begin(r3d_renderer *r, uint32_t w, uint32_t h, const float *coords_rgba,
+                   const float *normals_rgba);
+
 int r3d_set_transfer(r3d_renderer *r, const uint8_t rgba[256][4]);
 /* Select the full six-tap or fast four-tap shading pipeline. */
 void r3d_set_quality(r3d_renderer *r, uint32_t quality);
