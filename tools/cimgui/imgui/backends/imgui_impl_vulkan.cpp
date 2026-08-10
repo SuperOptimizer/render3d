@@ -251,6 +251,10 @@ struct ImGui_ImplVulkan_FrameRenderBuffers
     VkDeviceSize        IndexBufferSize;
     VkBuffer            VertexBuffer;
     VkBuffer            IndexBuffer;
+    // [render3d] persistent mappings: map/unmap per frame made some drivers
+    // (msm/Turnip) drop the pages, re-faulting every upload byte each frame
+    void*               VertexBufferMapped;
+    void*               IndexBufferMapped;
 };
 
 // Each viewport will hold 1 ImGui_ImplVulkanH_WindowRenderBuffers
@@ -589,17 +593,31 @@ void ImGui_ImplVulkan_RenderDrawData(ImDrawData* draw_data, VkCommandBuffer comm
         VkDeviceSize vertex_size = AlignBufferSize(draw_data->TotalVtxCount * sizeof(ImDrawVert), bd->BufferMemoryAlignment);
         VkDeviceSize index_size = AlignBufferSize(draw_data->TotalIdxCount * sizeof(ImDrawIdx), bd->BufferMemoryAlignment);
         if (rb->VertexBuffer == VK_NULL_HANDLE || rb->VertexBufferSize < vertex_size)
+        {
             CreateOrResizeBuffer(rb->VertexBuffer, rb->VertexBufferMemory, rb->VertexBufferSize, vertex_size, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+            rb->VertexBufferMapped = nullptr; // freed memory was implicitly unmapped
+        }
         if (rb->IndexBuffer == VK_NULL_HANDLE || rb->IndexBufferSize < index_size)
+        {
             CreateOrResizeBuffer(rb->IndexBuffer, rb->IndexBufferMemory, rb->IndexBufferSize, index_size, VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+            rb->IndexBufferMapped = nullptr;
+        }
 
         // Upload vertex/index data into a single contiguous GPU buffer
-        ImDrawVert* vtx_dst = nullptr;
-        ImDrawIdx* idx_dst = nullptr;
-        VkResult err = vkMapMemory(v->Device, rb->VertexBufferMemory, 0, vertex_size, 0, (void**)&vtx_dst);
-        check_vk_result(err);
-        err = vkMapMemory(v->Device, rb->IndexBufferMemory, 0, index_size, 0, (void**)&idx_dst);
-        check_vk_result(err);
+        // [render3d] buffers stay mapped for their whole lifetime (see struct)
+        VkResult err;
+        if (rb->VertexBufferMapped == nullptr)
+        {
+            err = vkMapMemory(v->Device, rb->VertexBufferMemory, 0, VK_WHOLE_SIZE, 0, &rb->VertexBufferMapped);
+            check_vk_result(err);
+        }
+        if (rb->IndexBufferMapped == nullptr)
+        {
+            err = vkMapMemory(v->Device, rb->IndexBufferMemory, 0, VK_WHOLE_SIZE, 0, &rb->IndexBufferMapped);
+            check_vk_result(err);
+        }
+        ImDrawVert* vtx_dst = (ImDrawVert*)rb->VertexBufferMapped;
+        ImDrawIdx* idx_dst = (ImDrawIdx*)rb->IndexBufferMapped;
         for (const ImDrawList* draw_list : draw_data->CmdLists)
         {
             memcpy(vtx_dst, draw_list->VtxBuffer.Data, draw_list->VtxBuffer.Size * sizeof(ImDrawVert));
@@ -616,8 +634,6 @@ void ImGui_ImplVulkan_RenderDrawData(ImDrawData* draw_data, VkCommandBuffer comm
         range[1].size = VK_WHOLE_SIZE;
         err = vkFlushMappedMemoryRanges(v->Device, 2, range);
         check_vk_result(err);
-        vkUnmapMemory(v->Device, rb->VertexBufferMemory);
-        vkUnmapMemory(v->Device, rb->IndexBufferMemory);
     }
 
     // Setup render state structure (for callbacks and custom texture bindings)
@@ -1500,6 +1516,8 @@ void ImGui_ImplVulkan_DestroyFrameRenderBuffers(VkDevice device, ImGui_ImplVulka
     if (buffers->IndexBufferMemory) { vkFreeMemory(device, buffers->IndexBufferMemory, allocator); buffers->IndexBufferMemory = VK_NULL_HANDLE; }
     buffers->VertexBufferSize = 0;
     buffers->IndexBufferSize = 0;
+    buffers->VertexBufferMapped = nullptr; // vkFreeMemory implicitly unmapped
+    buffers->IndexBufferMapped = nullptr;
 }
 
 void ImGui_ImplVulkan_DestroyWindowRenderBuffers(VkDevice device, ImGui_ImplVulkan_WindowRenderBuffers* buffers, const VkAllocationCallbacks* allocator)

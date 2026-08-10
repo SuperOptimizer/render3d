@@ -1148,3 +1148,18 @@ cancel) an in-flight progressive pass so stale regions can't survive a
 zoom-then-pan. Static 900-frame scenario, best numbers yet: cpu max 37 ms,
 frame max 34 ms, no main-thread phase max above 33 ms; converged frame
 bit-identical to the previous build. All 5 suites green.
+
+## 2026-08-10 — ImGui Vulkan backend: persistently mapped vertex buffers
+
+The steady-tail profile showed ~20% of main-thread samples in page-fault
+handling under ImGui_ImplVulkan_RenderDrawData's upload memcpy: the stock
+backend vkMapMemory/vkUnmapMemory's its vertex+index buffers every frame,
+and on msm/Turnip the unmap drops the pages — every upload byte re-faults
+through msm_gem_fault each frame. Patched the vendored backend
+(tools/cimgui/imgui/backends/imgui_impl_vulkan.cpp, [render3d] comments) to
+map each frame-render buffer once at (re)creation and keep it mapped for the
+buffer's lifetime (flush stays; vkFreeMemory implicitly unmaps). Command
+recording: 1.73 -> 0.45 ms/frame; RenderDrawData fell from 33% to 3.6% of
+steady main-thread samples. Remaining active main-thread work is AddPolyline
+tessellation + mv_draw_lines projection (~1.4 ms gui phase in a 16.7 ms
+vsync frame) — left alone. All 5 suites green.
