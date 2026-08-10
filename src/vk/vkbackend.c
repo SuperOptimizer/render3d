@@ -172,6 +172,7 @@ struct r3d_renderer {
     uint64_t warm_cap, warm_bytes;
     uint32_t warm_bricks;
     uint32_t *warm_off, *warm_len, *warm_use; /* per brick; off UINT32_MAX = absent */
+    uint32_t *warm_list, warm_list_cap; /* brick ids currently warm (LRU scan set) */
     struct wfnode { uint32_t off, len; } *wfree; /* offset-sorted free list */
     uint32_t nwf, cwf;
     VkCommandPool upload_pool;
@@ -902,6 +903,7 @@ static void bricks_teardown(r3d_renderer *r) {
   free(r->bs.warm_off);
   free(r->bs.warm_len);
   free(r->bs.warm_use);
+  free(r->bs.warm_list);
   free(r->bs.wfree);
   memset(&r->bs, 0, sizeof r->bs);
   memset(&r->ni, 0, sizeof r->ni);
@@ -1030,6 +1032,7 @@ void r3d_destroy(r3d_renderer *r) {
   free(r->bs.warm_off);
   free(r->bs.warm_len);
   free(r->bs.warm_use);
+  free(r->bs.warm_list);
   free(r->bs.wfree);
   if (r->samp_vol) vkDestroySampler(r->vk.dev, r->samp_vol, NULL);
   if (r->samp_tf) vkDestroySampler(r->vk.dev, r->samp_tf, NULL);
@@ -2142,18 +2145,23 @@ static void warm_release(r3d_renderer *r, uint32_t off, uint32_t rawlen) {
 }
 
 static bool warm_evict_one(r3d_renderer *r) {
-  uint32_t best = BR_INVALID, bu = UINT32_MAX;
-  for (uint32_t b = 0; b < r->bs.nb; b++)
-    if (r->bs.warm_off[b] != BR_INVALID && r->bs.warm_use[b] != r->bs.frame &&
-        r->bs.warm_use[b] < bu) {
+  /* LRU over the compact warm-resident set — never the full virtual-brick
+   * range (44M bricks for a large LOD tree; scanning that per eviction once
+   * cost ~10% of the render thread on PHercParis4). */
+  uint32_t best = BR_INVALID, besti = 0, bu = UINT32_MAX;
+  for (uint32_t i = 0; i < r->bs.warm_bricks; i++) {
+    uint32_t b = r->bs.warm_list[i];
+    if (r->bs.warm_use[b] != r->bs.frame && r->bs.warm_use[b] < bu) {
       bu = r->bs.warm_use[b];
       best = b;
+      besti = i;
     }
+  }
   if (best == BR_INVALID) return false;
   warm_release(r, r->bs.warm_off[best], r->bs.warm_len[best]);
   r->bs.warm_bytes -= r->bs.warm_len[best];
   r->bs.warm_off[best] = BR_INVALID;
-  r->bs.warm_bricks--;
+  r->bs.warm_list[besti] = r->bs.warm_list[--r->bs.warm_bricks];
   return true;
 }
 
@@ -2174,10 +2182,21 @@ static const uint8_t *warm_get(r3d_renderer *r, uint32_t b, size_t *n) {
   uint32_t off;
   while ((off = warm_alloc(r, (uint32_t)sz)) == BR_INVALID)
     if (!warm_evict_one(r)) return blob;
+  if (r->bs.warm_bricks == r->bs.warm_list_cap) {
+    uint32_t nc = r->bs.warm_list_cap ? r->bs.warm_list_cap * 2u : 1024u;
+    uint32_t *nl = realloc(r->bs.warm_list, (size_t)nc * sizeof *nl);
+    if (!nl) {
+      warm_release(r, off, (uint32_t)sz);
+      return blob;
+    }
+    r->bs.warm_list = nl;
+    r->bs.warm_list_cap = nc;
+  }
   memcpy((uint8_t *)r->bs.warm.mapped + off, blob, sz);
   r->bs.warm_off[b] = off;
   r->bs.warm_len[b] = (uint32_t)sz;
   r->bs.warm_use[b] = r->bs.frame;
+  r->bs.warm_list[r->bs.warm_bricks] = b;
   r->bs.warm_bricks++;
   r->bs.warm_bytes += sz;
   return (const uint8_t *)r->bs.warm.mapped + off;

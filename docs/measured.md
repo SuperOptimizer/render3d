@@ -1033,3 +1033,31 @@ headless run fetched+cached 83 bricks live from S3 and rendered them (0
 failures); the second run served the same view from disk (10 fast decode
 jobs, no fetches). Offline zarr2c5d remains the bulk pre-warm path and both
 write layouts the renderer reads interchangeably.
+
+## 2026-08-10 — main-thread profiling: phase timers + two hotspot fixes
+
+Added a per-frame main-thread phase profiler (poll / nav / gui / stream /
+frame timers; EMA in the profile GUI section, sum/max printed at exit as
+`mainthread avg: ...`) and ran perf (dwarf call graphs, steady-state tail
+sliced with `perf report --time 60%-100%`) on the static GP-banner multiview
+with ink overlay. Two real hotspots surfaced, both fixed:
+
+1. `warm_evict_one` scanned ALL virtual bricks per eviction — 44.4M for
+   PHercParis4 — inside `warm_get`'s retry loop; ~10% of the render thread
+   at steady state and the source of `stream max 84 ms` spikes. Now the warm
+   tier keeps a compact list of resident brick ids (thousands) and the LRU
+   scan walks only that.
+2. Intersection overlays drew one anti-aliased AddLine per marching-squares
+   cell (~6000/frame): AddPolyline tessellation ~11% + ImGui vertex upload
+   memcpy ~15% of the main thread. mv_draw_lines now chains head-to-tail
+   segments into single AddPolyline calls, collapses sub-pixel steps, and
+   drops chains whose screen bbox misses the pane.
+
+Same 900-frame static scenario, before -> after: gui 2.93 -> 1.52 ms, stream
+0.43 -> 0.09 ms (max 84 -> 10 ms); ~58 fps with frame-phase time now vsync
+wait. Remaining main-thread steady-state cost is AddPolyline 5.3% +
+mv_draw_lines 3.3% (projection) + ~1.4% driver/allocator munmap+fault noise
+— all sub-0.5 ms/frame, left alone. Automation note: `--frames N --warmup M
+--shot F` headless runs are the repeatable scenarios; perf attach to a
+running instance failed (rc=255, environment), record-with-`--delay` + time
+slicing works. All 5 test suites green.

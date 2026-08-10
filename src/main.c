@@ -141,6 +141,76 @@ static void mv_lines_emit(void *ud, float wu0, float wv0, float wu1, float wv1, 
   l->n++;
 }
 
+/* Draw a cached segment soup as chained polylines: marching squares emits
+ * mostly head-to-tail runs, so consecutive segments sharing an endpoint merge
+ * into one AddPolyline, sub-pixel steps collapse into the previous point, and
+ * chains whose bounds miss the pane are dropped before tessellation. The
+ * per-segment AddLine version tessellated + uploaded thousands of AA quads
+ * every frame regardless of zoom (~25% of the render thread on the GP
+ * banner). */
+static void mv_draw_lines(ImDrawList *draw, const r3d_mview *v, const float *seg, uint32_t n,
+                          ImU32 col, float thick) {
+  static ImVec2 *pts;
+  static uint32_t cap;
+  if (!n) return;
+  if (cap < n + 2) {
+    uint32_t nc = n + 2;
+    ImVec2 *np_ = realloc(pts, (size_t)nc * sizeof *np_);
+    if (!np_) return;
+    pts = np_;
+    cap = nc;
+  }
+  float pxmin = (float)v->px, pymin = (float)v->py;
+  float pxmax = pxmin + (float)v->pw, pymax = pymin + (float)v->ph;
+  uint32_t np = 0;
+  float bx0 = 0.0f, by0 = 0.0f, bx1 = 0.0f, by1 = 0.0f; /* chain screen bbox */
+  float lu = 0.0f, lv = 0.0f;                           /* chain tail, source space */
+  for (uint32_t k = 0; k <= n; k++) {
+    float nu = 0.0f, nv = 0.0f;
+    bool brk = k == n;
+    if (!brk) {
+      const float *s4 = seg + (size_t)k * 4;
+      if (np == 0) {
+        float x, y;
+        r3d_mv_project(v, (double)s4[0], (double)s4[1], &x, &y);
+        pts[np++] = (ImVec2){x, y};
+        bx0 = bx1 = x;
+        by0 = by1 = y;
+        nu = s4[2];
+        nv = s4[3];
+      } else if (fabsf(s4[0] - lu) < 1e-2f && fabsf(s4[1] - lv) < 1e-2f) {
+        nu = s4[2];
+        nv = s4[3];
+      } else if (fabsf(s4[2] - lu) < 1e-2f && fabsf(s4[3] - lv) < 1e-2f) {
+        nu = s4[0];
+        nv = s4[1];
+      } else {
+        brk = true;
+        k--; /* flush, then revisit this segment as a new chain start */
+      }
+    }
+    if (brk) {
+      if (np >= 2 && bx1 >= pxmin && bx0 < pxmax && by1 >= pymin && by0 < pymax)
+        ImDrawList_AddPolyline(draw, pts, (int)np, col, thick, 0);
+      np = 0;
+      continue;
+    }
+    float x, y;
+    r3d_mv_project(v, (double)nu, (double)nv, &x, &y);
+    float dx = x - pts[np - 1].x, dy = y - pts[np - 1].y;
+    if (np >= 2 && dx * dx + dy * dy < 1.0f)
+      pts[np - 1] = (ImVec2){x, y}; /* sub-pixel step: slide the chain tail */
+    else
+      pts[np++] = (ImVec2){x, y};
+    if (x < bx0) bx0 = x;
+    if (x > bx1) bx1 = x;
+    if (y < by0) by0 = y;
+    if (y > by1) by1 = y;
+    lu = nu;
+    lv = nv;
+  }
+}
+
 /* Build the surf-view GPU grids from a tifxyz segment: RGBA32F coords
  * (w = valid) and per-vertex normals (bilinear-tangent cross product, vc3d
  * grid_normal). Returns malloc'd w*h*4 float pairs via out params. */
@@ -1126,6 +1196,11 @@ int main(int argc, char **argv) {
   bool adaptive_res = quality_policy != 0; /* interactive/fast halve resolution while moving */
   int settle = 0;
   uint64_t last_gpu_ns = 0;
+  /* main-thread phase profile: poll / nav / gui / stream / frame (ns) */
+  enum { MT_POLL, MT_NAV, MT_GUI, MT_STREAM, MT_FRAME, MT_N };
+  static const char *mt_name[MT_N] = {"poll", "nav", "gui", "stream", "frame"};
+  uint64_t mt_sum[MT_N] = {0}, mt_max[MT_N] = {0}, mt_frames = 0;
+  double mt_ema[MT_N] = {0};
   r3d_frame_stats prof = {0};   /* EMA-smoothed for display */
   r3d_frame_stats prof_sum = {0}; /* running sums for the exit report */
   uint64_t prof_frames = 0;
@@ -1146,9 +1221,12 @@ int main(int argc, char **argv) {
     prev_ns = t0;
     if (dt > 0.1f) dt = 0.1f;
 
+    uint64_t mt_t[MT_N + 1];
+    mt_t[0] = r3d_now_ns();
     ImGuiIO *io = igGetIO_Nil(); /* Want* flags reflect last frame — fine */
     r3d_input_poll(&in, win, gui_event_hook, renderer, !io->WantCaptureMouse,
                    cam_mode == CAM_FLY, umbilicus_path != NULL, multiview_path != NULL);
+    mt_t[1] = r3d_now_ns();
     if (io->WantCaptureKeyboard && !in.captured)
       in.move[0] = in.move[1] = in.move[2] = 0.0f;
     if (in.quit) running = false;
@@ -1299,6 +1377,20 @@ int main(int argc, char **argv) {
         mv[i].py = lay[i].py;
         mv[i].pw = lay[i].pw;
         mv[i].ph = lay[i].ph;
+      }
+      if (getenv("R3D_MV_EXERCISE")) {
+        /* automated GUI interaction for profiling: scrub slices, wiggle
+         * zoom and pan — drives overlay recompute, surfvol re-bakes and
+         * streaming exactly like a user session, reproducibly */
+        double ph = (double)frame_index * 0.02;
+        for (int i = 1; i < 4; i++)
+          mv[i].slice += (frame_index % 20) < 10 ? 1.0 : -1.0;
+        mv[R3D_MV_SEG].slice = 24.0 * sin(ph);
+        r3d_mview *ev = &mv[1 + (frame_index / 120) % 3];
+        r3d_mv_zoom(ev, (float)(ev->px + ev->pw / 2), (float)(ev->py + ev->ph / 2),
+                    (frame_index % 240) < 120 ? 1.01 : 0.99, 1.0 / 256.0, 10.0);
+        ev->cu += 3.0 * sin(ph * 1.7);
+        ev->cv += 3.0 * cos(ph * 1.3);
       }
       if (in.view_toggle) { /* Space: solo/restore the hovered view */
         int hv = r3d_mv_hit(mv, in.mouse_xy[0], in.mouse_xy[1]);
@@ -1602,6 +1694,7 @@ int main(int argc, char **argv) {
     uint32_t rvw = half_res ? (uint32_t)w / 2 : (uint32_t)w;
     uint32_t rvh = half_res ? (uint32_t)h / 2 : (uint32_t)h;
 
+    mt_t[2] = r3d_now_ns();
     /* control panel: floating window normally; in multiview a docked left
      * side panel that collapses to a slim bar (views reflow to fill) */
     fps_smooth = fps_smooth * 0.95f + (dt > 0 ? 0.05f / dt : 0.0f);
@@ -1850,6 +1943,10 @@ int main(int argc, char **argv) {
       igText("cpu acquire %6.2f ms", (double)prof.cpu_acquire_ns / 1e6);
       igText("cpu record  %6.2f ms", (double)prof.cpu_record_ns / 1e6);
       igText("cpu submit  %6.2f ms", (double)prof.cpu_submit_ns / 1e6);
+      igSeparator();
+      for (int ph = 0; ph < MT_N; ph++)
+        igText("mt %-6s   %6.2f ms (max %6.1f)", mt_name[ph], mt_ema[ph] / 1e6,
+               (double)mt_max[ph] / 1e6);
     }
     if (umbilicus_path)
       igTextDisabled("click: set point | wheel, R/F: 1 slice\n"
@@ -1928,20 +2025,8 @@ int main(int argc, char **argv) {
         ImVec2 cmin = {(float)mv[i].px, (float)mv[i].py};
         ImVec2 cmax = {(float)(mv[i].px + mv[i].pw), (float)(mv[i].py + mv[i].ph)};
         ImDrawList_PushClipRect(draw, cmin, cmax, false);
-        for (uint32_t k = 0; k < mv_ol[i].n; k++) {
-          const float *s4 = mv_ol[i].w + (size_t)k * 4;
-          float x0, y0, x1, y1;
-          r3d_mv_project(&mv[i], (double)s4[0], (double)s4[1], &x0, &y0);
-          r3d_mv_project(&mv[i], (double)s4[2], (double)s4[3], &x1, &y1);
-          ImDrawList_AddLine(draw, (ImVec2){x0, y0}, (ImVec2){x1, y1}, seg_col, 1.6f);
-        }
-        for (uint32_t k = 0; k < mv_ol_off[i].n; k++) {
-          const float *s4 = mv_ol_off[i].w + (size_t)k * 4;
-          float x0, y0, x1, y1;
-          r3d_mv_project(&mv[i], (double)s4[0], (double)s4[1], &x0, &y0);
-          r3d_mv_project(&mv[i], (double)s4[2], (double)s4[3], &x1, &y1);
-          ImDrawList_AddLine(draw, (ImVec2){x0, y0}, (ImVec2){x1, y1}, seg_off_col, 1.0f);
-        }
+        mv_draw_lines(draw, &mv[i], mv_ol[i].w, mv_ol[i].n, seg_col, 1.6f);
+        mv_draw_lines(draw, &mv[i], mv_ol_off[i].w, mv_ol_off[i].n, seg_off_col, 1.0f);
         ImDrawList_PopClipRect(draw);
       }
       if (mv_mask & 1u) { /* plane trace lines on the flattened segment view */
@@ -1950,13 +2035,8 @@ int main(int argc, char **argv) {
         ImVec2 cmax = {(float)(sv->px + sv->pw), (float)(sv->py + sv->ph)};
         ImDrawList_PushClipRect(draw, cmin, cmax, false);
         for (int i = 1; i < 4; i++)
-          for (uint32_t k = 0; mv_mask & (1u << i) && k < mv_ol[i].n; k++) {
-            const float *g4 = mv_ol[i].g + (size_t)k * 4;
-            float x0, y0, x1, y1;
-            r3d_mv_project(sv, (double)g4[0], (double)g4[1], &x0, &y0);
-            r3d_mv_project(sv, (double)g4[2], (double)g4[3], &x1, &y1);
-            ImDrawList_AddLine(draw, (ImVec2){x0, y0}, (ImVec2){x1, y1}, trace_col[i], 1.4f);
-          }
+          if (mv_mask & (1u << i))
+            mv_draw_lines(draw, sv, mv_ol[i].g, mv_ol[i].n, trace_col[i], 1.4f);
         ImDrawList_PopClipRect(draw);
       }
       for (int i = 1; i < 4; i++) { /* pane borders around visible views */
@@ -1981,6 +2061,7 @@ int main(int argc, char **argv) {
       }
     }
 
+    mt_t[3] = r3d_now_ns();
     r3d_frame_params p = {
         .cam_origin = {cam.pos.x, cam.pos.y, cam.pos.z},
         .cam_right = {right.x, right.y, right.z},
@@ -2166,6 +2247,7 @@ int main(int argc, char **argv) {
                (unsigned long long)clip_z0, fx, fy);
       clip_valid_disp = p.clip_valid;
     }
+    mt_t[4] = r3d_now_ns();
     r3d_frame_stats st = {0};
     int frc;
     if (multiview_path) {
@@ -2236,6 +2318,14 @@ int main(int argc, char **argv) {
       if (prof_samples && prof_frames < exit_frames) prof_samples[prof_frames] = st;
       prof_frames++;
     }
+    mt_t[5] = r3d_now_ns();
+    for (int ph = 0; ph < MT_N; ph++) {
+      uint64_t d = mt_t[ph + 1] - mt_t[ph];
+      mt_sum[ph] += d;
+      if (d > mt_max[ph]) mt_max[ph] = d;
+      mt_ema[ph] = mt_ema[ph] * 0.95 + (double)d * 0.05;
+    }
+    mt_frames++;
     if (frc < 0) {
       fprintf(stderr, "r3d_frame failed\n");
       running = false;
@@ -2261,6 +2351,14 @@ int main(int argc, char **argv) {
 
   r3d_stats_report_now(&stats);
   if (slab_src.voxels) r3d_volume_close(&slab_src);
+  if (mt_frames > 2) {
+    printf("mainthread avg:");
+    for (int ph = 0; ph < MT_N; ph++)
+      printf(" %s %.2f", mt_name[ph], (double)mt_sum[ph] / (double)mt_frames / 1e6);
+    printf(" ms | max:");
+    for (int ph = 0; ph < MT_N; ph++) printf(" %s %.1f", mt_name[ph], (double)mt_max[ph] / 1e6);
+    printf(" ms\n");
+  }
   if (prof_frames > 2) {
     /* skip warmup skew: averages include first frames with empty queries */
     double n = (double)prof_frames;
