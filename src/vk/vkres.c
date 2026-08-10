@@ -381,6 +381,18 @@ void r3d_vkcomp_bind_image(r3d_vkctx *c, r3d_vkcomp *p, uint32_t binding, VkDesc
   vkUpdateDescriptorSets(c->dev, 1, &w, 0, NULL);
 }
 
+void r3d_vkcomp_bind_buffer(r3d_vkctx *c, r3d_vkcomp *p, uint32_t binding, VkBuffer buf,
+                            VkDeviceSize offset, VkDeviceSize range) {
+  VkDescriptorBufferInfo bi = {.buffer = buf, .offset = offset, .range = range};
+  VkWriteDescriptorSet w = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                            .dstSet = p->dset,
+                            .dstBinding = binding,
+                            .descriptorCount = 1,
+                            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                            .pBufferInfo = &bi};
+  vkUpdateDescriptorSets(c->dev, 1, &w, 0, NULL);
+}
+
 void r3d_vkcomp_dispatch(VkCommandBuffer cmd, r3d_vkcomp *p, const void *push,
                          uint32_t push_size, uint32_t gx, uint32_t gy, uint32_t gz) {
   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p->pipe);

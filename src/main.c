@@ -541,6 +541,8 @@ int main(int argc, char **argv) {
   int mv_thick = 1;               /* plane-view slab thickness (voxels) */
   int mv_drag_view = -1;
   float *mv_normals = NULL; /* per-vertex normals kept for overlays/zoff shell */
+  uint64_t mv_sv_decoded = 0; /* residency-driven surfvol rebuild bookkeeping */
+  int mv_sv_cool = 0;
   mv_lines mv_ol[4] = {0}, mv_ol_off[4] = {0}; /* intersection polylines */
   double mv_ol_slice[4] = {1e30, 1e30, 1e30, 1e30};
   double mv_ol_zoff = 1e30;
@@ -576,6 +578,12 @@ int main(int argc, char **argv) {
       return EXIT_FAILURE;
     }
     free(seg_coords);
+    /* flattened surface volume window: 1024^2 x 96 layers (48 behind) R8
+     * = 96 MB, resampled on the GPU from the shared brick cache */
+    if (r3d_surfvol_begin(renderer, 1024, 1024, 96, 48, mv_seg.sx, mv_seg.sy) != 0) {
+      fprintf(stderr, "multiview: surface-volume window init failed\n");
+      return EXIT_FAILURE;
+    }
   }
 
   int64_t vs_z0 = umbilicus_path ? annotation_z0(annotation_z, vsnz, (uint32_t)vsd)
@@ -957,6 +965,29 @@ int main(int argc, char **argv) {
             mv[i].cv = mv_focus[a2[1]];
             mv[i].slice = mv_focus[a2[2]];
           }
+        }
+      }
+
+      { /* keep the flattened surface-volume window under the view (snapped
+         * for hysteresis) and rebuild it when brick residency improves */
+        const r3d_mview *sv = &mv[R3D_MV_SEG];
+        double vox_per_px = 1.0 / (sv->zoom * (double)mv_seg.sx);
+        double stepd = 1.0;
+        while (stepd * 2.0 <= vox_per_px) stepd *= 2.0;
+        double cu_vox = sv->cu / (double)mv_seg.sx, cv_vox = sv->cv / (double)mv_seg.sy;
+        double snap = 128.0 * stepd; /* window W/8 */
+        double u0 = floor((cu_vox - 512.0 * stepd) / snap) * snap;
+        double v0 = floor((cv_vox - 512.0 * stepd) / snap) * snap;
+        double zsnap = 24.0; /* layers are 1 voxel regardless of xy zoom */
+        double z0 = floor(sv->slice / zsnap + 0.5) * zsnap;
+        r3d_surfvol_window(renderer, u0, v0, (float)stepd, (float)z0);
+        r3d_bricks_stats svst;
+        r3d_bricks_get_stats(renderer, &svst);
+        if (mv_sv_cool > 0) mv_sv_cool--;
+        if (svst.decoded != mv_sv_decoded && mv_sv_cool == 0) {
+          mv_sv_decoded = svst.decoded;
+          mv_sv_cool = 20; /* at most one residency rebuild per ~1/3 s */
+          r3d_surfvol_mark(renderer);
         }
       }
     }
@@ -1637,19 +1668,20 @@ int main(int argc, char **argv) {
         q.viewport[1] = (uint32_t)mv[i].ph;
         q.view_org = (uint32_t)mv[i].px | ((uint32_t)mv[i].py << 16);
         if (i == R3D_MV_SEG) {
-          /* flattened segment: grid-space "camera" (see raycast surf path) */
+          /* flattened segment: raycast the surface-volume window. Camera in
+           * FLATTENED VOXELS (grid / scale); window mapping from the backend. */
           q.view_flags = R3D_VIEW_SURF;
-          q.cam_origin[0] = (float)mv[i].cu;
-          q.cam_origin[1] = (float)mv[i].cv;
+          q.cam_origin[0] = (float)(mv[i].cu / (double)mv_seg.sx);
+          q.cam_origin[1] = (float)(mv[i].cv / (double)mv_seg.sy);
           q.cam_origin[2] = 0.0f;
           memset(q.cam_right, 0, sizeof q.cam_right);
           memset(q.cam_up, 0, sizeof q.cam_up);
           memset(q.cam_forward, 0, sizeof q.cam_forward);
-          q.cam_right[0] = (float)((double)mv[i].pw * 0.5 / mv[i].zoom);
-          q.cam_up[1] = (float)-((double)mv[i].ph * 0.5 / mv[i].zoom);
-          q.slab_px = 1.0f / mv_seg.sx; /* voxels per grid step */
-          q.slab_z0 = (float)mv[i].slice; /* normal offset, voxels */
-          q.slab_depth = (uint32_t)mv_thick; /* volumetric shell thickness */
+          q.cam_right[0] = (float)((double)mv[i].pw * 0.5 / mv[i].zoom / (double)mv_seg.sx);
+          q.cam_up[1] = (float)-((double)mv[i].ph * 0.5 / mv[i].zoom / (double)mv_seg.sy);
+          r3d_surfvol_params(renderer, &q);
+          q.slab_z0 = (float)mv[i].slice; /* render-time normal offset (voxels) */
+          q.slab_depth = (uint32_t)mv_thick; /* marched thickness (voxels) */
           vp4[i] = q;
           continue;
         }

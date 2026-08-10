@@ -951,3 +951,22 @@ segments for XY/XZ/YZ, recomputed only on slice/zoff change.
 Follow-ups: perspective 3D quadrant option, vc3d segment-aligned plane
 orientation + rotation handles, per-view GPU timestamps, ink-detection
 overlay textures, multi-segment display.
+
+## 2026-08-10 — flattened surface volume (vc3d composite, volumetric)
+
+The segment quadrant no longer marches bricks per pixel: a `surfvol.comp`
+kernel resamples the shared bricks cache into an R8 3D **flattened surface
+volume** — a 1024x1024x96 window over (u, v, layer) where texel (x,y,l)
+samples `surface(u,v) + normal(u,v) * (zoff0 + (l - 48))`. This is vc3d's
+"composite" layer stack materialized as a texture instead of collapsed to
+2D, so the view renders it with the real volumetric raycaster (trilinear
+across layers, gradients in flattened space). Layers stay at native 1-voxel
+pitch regardless of xy zoom — an early version scaled layer pitch with the
+xy LOD and produced sub-sample speckle once the marched thickness dropped
+below one layer. xy pitch follows the view (power-of-two voxels/texel), so
+the 96 MB window covers a screenful at full resolution or the whole segment
+zoomed out. Rebuilds are one 100M-texel dispatch triggered by hysteresis
+(window origin snapped to W/8, zoff0 to 24 voxels) or by brick-residency
+arrivals (cooldown 20 frames); render-time zoff slides within the baked
+±48-voxel range for free. Depth knobs match vc3d composite: N layers
+in front/behind at bake, marched thickness at render.

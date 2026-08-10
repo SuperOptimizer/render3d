@@ -1,0 +1,88 @@
+/* Flattened surface volume: resample the bricks LOD virtual volume into an
+ * R8 3D window texture over flattened segment space (u, v, layer).
+ * Texel (x,y,l) samples the volume at
+ *   surface(u,v) + normal(u,v) * (zoff0 + (l - nback) * step)
+ * with u = u0 + (x+0.5)*step flattened voxels (arc length), grid coords via
+ * the tifxyz scale, bilinear coords/normals with vc3d invalid-quad semantics.
+ * Layer spacing equals the xy texel pitch so the window is an isotropic
+ * volume at the view's LOD, rendered afterwards by the surf raycast path. */
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 4) in;
+
+layout(binding = 0, r8) uniform writeonly image3D out_vol;
+layout(binding = 1) uniform sampler2D coords;  /* rgba32f: xyz + valid */
+layout(binding = 2) uniform sampler2D normals; /* unit normals */
+layout(binding = 3) readonly buffer Page { uint page[]; };
+layout(binding = 4) uniform sampler3D atlas;
+
+layout(push_constant) uniform Push {
+  float u0, v0, step, zoff0; /* window origin + xy texel pitch (voxels), base offset */
+  float sx, sy;              /* tifxyz grid scale (grid = voxels * scale) */
+  uint W, H, L, nback;       /* window dims, layers behind the surface */
+  uint abpa, lod;            /* atlas bricks per axis, on-disk level to fetch */
+  float lstep;               /* layer pitch along the normal (voxels; zoom-independent) */
+} pc;
+
+const float BR_SLOT = 128.0;
+const uint BR_PAGE_HEADER = 64u;
+
+float bricks_sample(vec3 wp, vec3 shape, float md) {
+  uint nlev = page[0];
+  vec3 base_v = clamp(wp, vec3(0.0), max(shape - 0.001, vec3(0.0)));
+  int desired = int(min(pc.lod, nlev - 1u));
+  int last = int(nlev) - 1;
+  float inv = 1.0 / (float(pc.abpa) * BR_SLOT);
+  for (uint stp = 0u; stp < 4u; stp++) {
+    int li = stp < 3u ? desired + int(stp) : last;
+    if (li < 0 || li > last || (stp == 3u && li <= desired + 2)) continue;
+    uint h = 4u + uint(li) * 4u;
+    uint off = page[h], packed = page[h + 1u], scale = page[h + 2u];
+    uvec3 bd = uvec3(packed & 1023u, (packed >> 10u) & 1023u, packed >> 20u);
+    vec3 lv = base_v / float(scale);
+    uvec3 bc = min(uvec3(lv) >> 7u, bd - 1u);
+    uint e = page[off + (bc.z * bd.y + bc.y) * bd.x + bc.x];
+    if (e == 0xFFFFFFFFu) continue;
+    uint slot = e & 0xFFFFFFu;
+    vec3 so = vec3(uvec3(slot % pc.abpa, (slot / pc.abpa) % pc.abpa,
+                         slot / (pc.abpa * pc.abpa))) * BR_SLOT;
+    vec3 bl = clamp(lv - vec3(bc << 7u), vec3(0.5), vec3(127.5));
+    return textureLod(atlas, (so + bl) * inv, 0.0).r;
+  }
+  return 0.0;
+}
+
+void main() {
+  uvec3 t = gl_GlobalInvocationID.xyz;
+  if (t.x >= pc.W || t.y >= pc.H || t.z >= pc.L) return;
+  float fu = pc.u0 + (float(t.x) + 0.5) * pc.step;
+  float fv = pc.v0 + (float(t.y) + 0.5) * pc.step;
+  vec2 g = vec2(fu * pc.sx, fv * pc.sy); /* grid coords */
+  ivec2 dim = textureSize(coords, 0);
+  float v = 0.0;
+  if (g.x >= 0.0 && g.y >= 0.0 && g.x <= float(dim.x - 1) && g.y <= float(dim.y - 1)) {
+    ivec2 i0 = min(ivec2(g), dim - 2);
+    vec2 fr = g - vec2(i0);
+    vec4 c00 = texelFetch(coords, i0, 0);
+    vec4 c10 = texelFetch(coords, i0 + ivec2(1, 0), 0);
+    vec4 c01 = texelFetch(coords, i0 + ivec2(0, 1), 0);
+    vec4 c11 = texelFetch(coords, i0 + ivec2(1, 1), 0);
+    if (min(min(c00.w, c10.w), min(c01.w, c11.w)) >= 0.5) {
+      vec3 wp = mix(mix(c00.xyz, c10.xyz, fr.x), mix(c01.xyz, c11.xyz, fr.x), fr.y);
+      vec3 n00 = texelFetch(normals, i0, 0).xyz;
+      vec3 n10 = texelFetch(normals, i0 + ivec2(1, 0), 0).xyz;
+      vec3 n01 = texelFetch(normals, i0 + ivec2(0, 1), 0).xyz;
+      vec3 n11 = texelFetch(normals, i0 + ivec2(1, 1), 0).xyz;
+      vec3 nrm = mix(mix(n00, n10, fr.x), mix(n01, n11, fr.x), fr.y);
+      float nl = length(nrm);
+      if (nl > 1e-4) {
+        wp += nrm / nl * (pc.zoff0 + (float(t.z) - float(pc.nback)) * pc.lstep);
+        vec3 shape = vec3(page[1], page[2], page[3]);
+        float md = max(shape.x, max(shape.y, shape.z));
+        if (all(greaterThanEqual(wp, vec3(0.0))) && all(lessThan(wp, shape)))
+          v = bricks_sample(wp, shape, md);
+      }
+    }
+  }
+  imageStore(out_vol, ivec3(t), vec4(v));
+}

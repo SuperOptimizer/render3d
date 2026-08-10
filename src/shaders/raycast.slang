@@ -21,6 +21,9 @@ import common;
 // invalid grid points poison their quad (vc3d semantics)
 [[vk::binding(7, 0)]] Texture2D<float4> surf_coords;
 [[vk::binding(8, 0)]] Texture2D<float4> surf_normals;
+// flattened surface volume window (u, v, layer) — resampled from the bricks
+// cache by surfvol.comp; the surf view raycasts THIS like a real volume
+[[vk::binding(9, 0)]] Sampler3D<float> flat_vol;
 
 static const uint MODE_FULL = 0;
 static const uint MODE_MIP = 1;
@@ -355,84 +358,61 @@ void main(uint3 tid: SV_DispatchThreadID) {
   uint2 opix = tid.xy + uint2(pc.view_org & 0xffffu, pc.view_org >> 16);
 
   if (is_surf()) {
-    /* Flattened segment: view plane IS the tifxyz grid. cam_origin.xy =
-     * grid-space view center, cam_right.x / cam_up.y = half-extents in grid
-     * units, slab_z0 = offset along the per-pixel surface normal (voxels),
-     * slab_depth = slab thickness marched along the normal (voxels),
-     * slab_px = voxels per grid step (1/scale). Per pixel this raymarches a
-     * REAL volumetric slab centered zoff along the local surface normal —
-     * the flattened analogue of the plane views' ortho slabs. */
+    /* Flattened segment: raycast the flattened surface volume — a REAL R8 3D
+     * texture over (u, v, layer) that surfvol.comp resampled from the bricks
+     * cache along the per-vertex surface normals. FrameParams mapping:
+     * cam_origin.xy = view center (flattened voxels), cam_right.x/cam_up.y =
+     * half-extents (voxels); slab_x0/y0 = window origin, slab_px = texel
+     * pitch (voxels), slab_nx/ny = window texels, slab_wz = layer count,
+     * slab_grid = layers behind the surface, max_mip = baked zoff0;
+     * slab_z0 = render-time normal offset, slab_depth = marched thickness. */
     float2 ndc = pix_ndc(tid.xy);
-    float2 g = pc.cam_origin.xy + ndc.x * pc.cam_right.xy + ndc.y * pc.cam_up.xy;
-    uint2 dim;
-    surf_coords.GetDimensions(dim.x, dim.y);
+    float2 fu = pc.cam_origin.xy + ndc.x * pc.cam_right.xy + ndc.y * pc.cam_up.xy;
     float4 bg = float4(0.02, 0.02, 0.03, 1);
-    if (g.x < 0.0 || g.y < 0.0 || g.x > float(dim.x - 1) || g.y > float(dim.y - 1)) {
+    float2 txy = (fu - float2(pc.slab_x0, pc.slab_y0)) / pc.slab_px; /* texel coords */
+    if (txy.x < 0.0 || txy.y < 0.0 || txy.x >= pc.slab_nx || txy.y >= pc.slab_ny) {
       out_image[opix] = bg;
       return;
     }
-    int2 i0 = int2(min(uint2(g), dim - 2u));
-    float2 fr = g - float2(i0);
-    float4 c00 = surf_coords.Load(int3(i0, 0));
-    float4 c10 = surf_coords.Load(int3(i0 + int2(1, 0), 0));
-    float4 c01 = surf_coords.Load(int3(i0 + int2(0, 1), 0));
-    float4 c11 = surf_coords.Load(int3(i0 + int2(1, 1), 0));
-    if (min(min(c00.w, c10.w), min(c01.w, c11.w)) < 0.5) { /* unmapped quad */
+    float L = float(pc.slab_wz);
+    /* render-time zoff maps into the baked layer range (1 layer = 1 voxel
+     * along the normal, independent of the xy zoom) */
+    float center = (pc.slab_z0 - pc.max_mip) + float(pc.slab_grid & 0xffffu);
+    float halfd = 0.5 * max(float(pc.slab_depth), 1.0);
+    float lo = clamp(center - halfd, 0.0, L);
+    float hi = clamp(center + halfd, 0.0, L);
+    if (lo >= hi) {
       out_image[opix] = bg;
       return;
     }
-    float3 wp = lerp(lerp(c00.xyz, c10.xyz, fr.x), lerp(c01.xyz, c11.xyz, fr.x), fr.y);
-    float3 n00 = surf_normals.Load(int3(i0, 0)).xyz;
-    float3 n10 = surf_normals.Load(int3(i0 + int2(1, 0), 0)).xyz;
-    float3 n01 = surf_normals.Load(int3(i0 + int2(0, 1), 0)).xyz;
-    float3 n11 = surf_normals.Load(int3(i0 + int2(1, 1), 0)).xyz;
-    float3 nrm = lerp(lerp(n00, n10, fr.x), lerp(n01, n11, fr.x), fr.y);
-    float nl = length(nrm);
-    if (nl < 1e-4) {
-      out_image[opix] = bg;
-      return;
-    }
-    nrm /= nl;
-    float3 shape = float3(page[1], page[2], page[3]);
-    float md = max(shape.x, max(shape.y, shape.z));
-    /* footprint: grid-units per pixel * voxels per grid unit */
-    float vpp = 2.0 * length(pc.cam_right.xy) * pc.slab_px / float(pc.viewport.x);
-    float lod = clamp(log2(max(vpp, 1.0)) + pc.lod_bias, 0.0, float(page[0] - 1u));
-    float inv = 1.0 / (float((pc.brick_mode & 0xffu)) * BR_SLOT);
-
-    float depth = max(float(pc.slab_depth), 1.0);
-    float dt = pc.step_voxels * max(exp2(lod) * 0.5, 1.0); /* voxels along n */
-    float t = -0.5 * depth + pc.slab_z0 + hash12(tid.xy, pc.frame_index) * dt;
-    float tf_end = 0.5 * depth + pc.slab_z0;
+    float dt = max(pc.step_voxels, 0.25); /* layers per step (1 layer = 1 texel) */
+    float t = lo + hash12(tid.xy, pc.frame_index) * dt;
+    float3 inv_dim = 1.0 / float3(pc.slab_nx, pc.slab_ny, L);
     float mip_max = 0.0;
     float4 acc = float4(0);
     bool composite = pc.mode != MODE_MIP;
-    for (uint k = 0; k < 256u && t < tf_end; k++, t += dt) {
-      float3 sp = wp + nrm * t;
-      if (any(sp < float3(0)) || any(sp >= shape)) continue;
-      BrickCtx c = bricks_lod_locate(sp / md, lod);
-      if (!c.ok) continue;
-      float v = bricks_fetch(c.slot_org, c.bl, c.atlas_lod, inv);
+    for (uint k = 0; k < 512u && t < hi; k++, t += dt) {
+      float3 uvw = float3(txy, t) * inv_dim;
+      float v = flat_vol.SampleLevel(uvw, 0);
       if (v < pc.threshold) continue;
       if (v > mip_max) mip_max = v;
       if (!composite) continue;
       float4 s = tf.SampleLevel(v, 0);
-      float a = 1.0 - pow(1.0 - s.a, pc.density * dt);
+      float a = 1.0 - pow(1.0 - s.a, pc.density * pc.step_voxels);
       if (a <= 0.003) continue;
       float3 col = s.rgb;
-      if (pc.mode == MODE_FULL) { /* gradient-lit like the box marcher */
-        float ev = c.grad_vox;
-        float3 gr = float3(
-            bricks_fetch(c.slot_org, c.bl + float3(ev, 0, 0), c.atlas_lod, inv) -
-                bricks_fetch(c.slot_org, c.bl + float3(-ev, 0, 0), c.atlas_lod, inv),
-            bricks_fetch(c.slot_org, c.bl + float3(0, ev, 0), c.atlas_lod, inv) -
-                bricks_fetch(c.slot_org, c.bl + float3(0, -ev, 0), c.atlas_lod, inv),
-            bricks_fetch(c.slot_org, c.bl + float3(0, 0, ev), c.atlas_lod, inv) -
-                bricks_fetch(c.slot_org, c.bl + float3(0, 0, -ev), c.atlas_lod, inv));
+      if (pc.mode == MODE_FULL) { /* gradients in flattened space (1-texel taps) */
+        float3 e = inv_dim;
+        float3 gr = float3(flat_vol.SampleLevel(uvw + float3(e.x, 0, 0), 0) -
+                               flat_vol.SampleLevel(uvw - float3(e.x, 0, 0), 0),
+                           flat_vol.SampleLevel(uvw + float3(0, e.y, 0), 0) -
+                               flat_vol.SampleLevel(uvw - float3(0, e.y, 0), 0),
+                           flat_vol.SampleLevel(uvw + float3(0, 0, e.z), 0) -
+                               flat_vol.SampleLevel(uvw - float3(0, 0, e.z), 0));
         float gm = length(gr);
         if (gm > 1e-4) {
           float3 nn = gr / gm;
-          float diff = 0.7 * abs(dot(nn, nrm)) + 0.3;
+          float diff = 0.7 * abs(nn.z) + 0.3; /* headlight along the layer axis */
           float lit = 0.25 + 0.75 * diff;
           col = col * lerp(1.0, lit, saturate(gm * 6.0));
         }

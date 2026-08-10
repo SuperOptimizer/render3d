@@ -87,6 +87,8 @@ int r3d_vkcomp_create(r3d_vkctx *c, const char *spv_path, const VkDescriptorType
 void r3d_vkcomp_destroy(r3d_vkctx *c, r3d_vkcomp *p);
 void r3d_vkcomp_bind_image(r3d_vkctx *c, r3d_vkcomp *p, uint32_t binding, VkDescriptorType type,
                            VkImageView view, VkSampler sampler, VkImageLayout layout);
+void r3d_vkcomp_bind_buffer(r3d_vkctx *c, r3d_vkcomp *p, uint32_t binding, VkBuffer buf,
+                            VkDeviceSize offset, VkDeviceSize range);
 void r3d_vkcomp_dispatch(VkCommandBuffer cmd, r3d_vkcomp *p, const void *push,
                          uint32_t push_size, uint32_t gx, uint32_t gy, uint32_t gz);
 

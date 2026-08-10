@@ -61,6 +61,16 @@ struct r3d_renderer {
   r3d_vkimage occ;       /* per-8^3-block max (dilated), for empty-space skip */
   r3d_vkimage surf_coords, surf_normals; /* tifxyz grid (RGBA32F; w=valid), surf mode */
   bool surf_active;
+  /* flattened surface volume: R8 3D window over (u, v, layer) resampled from
+   * the bricks cache by the surfvol kernel; rebuilt in-frame when dirty */
+  struct {
+    bool active, dirty;
+    r3d_vkimage vol;
+    r3d_vkcomp comp;
+    uint32_t W, H, L, nback;
+    float u0, v0, step, zoff0;
+    float sx, sy; /* tifxyz grid scale (kernel push) */
+  } sv;
   VkSampler samp_vol;    /* trilinear + mip linear, clamp */
   VkSampler samp_tf;     /* linear, clamp */
   VkSampler samp_near;   /* nearest, clamp (occupancy) */
@@ -353,10 +363,14 @@ static int create_pipeline(r3d_renderer *r) {
        .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
        .descriptorCount = 1,
        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT},
+      {.binding = 9, /* surf mode: flattened surface volume window (R8 3D) */
+       .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+       .descriptorCount = 1,
+       .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT},
   };
   VkDescriptorSetLayoutCreateInfo dslci = {
       .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-      .bindingCount = 9,
+      .bindingCount = 10,
       .pBindings = bindings,
   };
   if (vkCreateDescriptorSetLayout(r->vk.dev, &dslci, NULL, &r->dsl) != VK_SUCCESS) return -1;
@@ -399,7 +413,7 @@ static int create_pipeline(r3d_renderer *r) {
 
   VkDescriptorPoolSize sizes[] = {
       {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1},
-      {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, r->tile_descriptors + 3},
+      {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, r->tile_descriptors + 4},
       {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1},
       {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1},
       {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 2},
@@ -891,6 +905,8 @@ void r3d_destroy(r3d_renderer *r) {
   r3d_vkimage_destroy(&r->vk, &r->occ);
   r3d_vkimage_destroy(&r->vk, &r->surf_coords);
   r3d_vkimage_destroy(&r->vk, &r->surf_normals);
+  r3d_vkimage_destroy(&r->vk, &r->sv.vol);
+  r3d_vkcomp_destroy(&r->vk, &r->sv.comp);
   r3d_vkimage_destroy(&r->vk, &r->offscreen);
   r3d_vkswap_destroy(&r->vk, &r->swap);
   r3d_vkctx_destroy(&r->vk);
@@ -1090,6 +1106,82 @@ int r3d_surf_begin(r3d_renderer *r, uint32_t w, uint32_t h, const float *coords_
                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
   r->surf_active = true;
   return 0;
+}
+
+/* push-constant mirror of surfvol.comp */
+typedef struct sv_push {
+  float u0, v0, step, zoff0;
+  float sx, sy;
+  uint32_t W, H, L, nback;
+  uint32_t abpa, lod;
+  float lstep;
+} sv_push;
+
+int r3d_surfvol_begin(r3d_renderer *r, uint32_t w, uint32_t h, uint32_t layers,
+                      uint32_t nback, float sx, float sy) {
+  if (!r->surf_active || !r->bricks_lod || r->sv.active) return -1;
+  r->sv.W = w;
+  r->sv.H = h;
+  r->sv.L = layers;
+  r->sv.nback = nback;
+  r->sv.sx = sx;
+  r->sv.sy = sy;
+  if (r3d_vkimage_create(&r->vk, VK_FORMAT_R8_UNORM, (VkExtent3D){w, h, layers}, 1,
+                         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                         &r->sv.vol) != 0)
+    return -1;
+  if (r3d_vk_image_to_general(&r->vk, r->pool, &r->sv.vol) != 0) return -1;
+  static const VkDescriptorType tt[5] = {
+      VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+      VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+      VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER};
+  char sp[1024];
+  snprintf(sp, sizeof sp, "%s/surfvol.spv", r->cfg.spv_dir);
+  if (r3d_vkcomp_create(&r->vk, sp, tt, 5, sizeof(sv_push), &r->sv.comp) != 0) return -1;
+  r3d_vkcomp_bind_image(&r->vk, &r->sv.comp, 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                        r->sv.vol.view, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL);
+  r3d_vkcomp_bind_image(&r->vk, &r->sv.comp, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                        r->surf_coords.view, r->samp_near,
+                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+  r3d_vkcomp_bind_image(&r->vk, &r->sv.comp, 2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                        r->surf_normals.view, r->samp_near,
+                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+  r3d_vkcomp_bind_buffer(&r->vk, &r->sv.comp, 3, r->page_buf.buf, 0, VK_WHOLE_SIZE);
+  r3d_vkcomp_bind_image(&r->vk, &r->sv.comp, 4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                        r->brick_atlas.view, r->samp_vol, VK_IMAGE_LAYOUT_GENERAL);
+  write_image_dset(r, 9, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, r->sv.vol.view,
+                   r->samp_vol, VK_IMAGE_LAYOUT_GENERAL);
+  r->sv.step = 0.0f; /* no window yet */
+  r->sv.active = true;
+  r->sv.dirty = false;
+  return 0;
+}
+
+void r3d_surfvol_window(r3d_renderer *r, double u0, double v0, float step, float zoff0) {
+  if (!r->sv.active) return;
+  if ((float)u0 == r->sv.u0 && (float)v0 == r->sv.v0 && step == r->sv.step &&
+      zoff0 == r->sv.zoff0)
+    return;
+  r->sv.u0 = (float)u0;
+  r->sv.v0 = (float)v0;
+  r->sv.step = step;
+  r->sv.zoff0 = zoff0;
+  r->sv.dirty = true;
+}
+
+void r3d_surfvol_mark(r3d_renderer *r) {
+  if (r->sv.active && r->sv.step > 0.0f) r->sv.dirty = true;
+}
+
+void r3d_surfvol_params(const r3d_renderer *r, r3d_frame_params *p) {
+  p->slab_x0 = r->sv.u0;
+  p->slab_y0 = r->sv.v0;
+  p->slab_px = r->sv.step;
+  p->slab_nx = (float)r->sv.W;
+  p->slab_ny = (float)r->sv.H;
+  p->slab_wz = r->sv.L;
+  p->slab_grid = r->sv.nback;
+  p->max_mip = r->sv.zoff0;
 }
 
 int r3d_set_transfer(r3d_renderer *r, const uint8_t rgba[256][4]) {
@@ -3779,6 +3871,40 @@ int r3d_frame_views(r3d_renderer *r, const r3d_frame_params *views, uint32_t nvi
   vkBeginCommandBuffer(cmd, &bi);
 
   if (r->query) vkCmdResetQueryPool(cmd, r->query, slot * 4, 4);
+
+  if (r->sv.active && r->sv.dirty && r->sv.step > 0.0f) {
+    /* rebuild the flattened surface volume before this frame samples it.
+     * Serialize against the previous frame's sampling reads, fill, then
+     * make the writes visible to this frame's raycast. */
+    r->sv.dirty = false;
+    r3d_vk_image_barrier(cmd, r->sv.vol.img, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                         VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                         VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, 0, 1);
+    uint32_t lodq = 0;
+    for (float s = r->sv.step; s >= 2.0f && lodq + 1u < r->bricks_nlev; s *= 0.5f) lodq++;
+    sv_push push = {.u0 = r->sv.u0,
+                    .v0 = r->sv.v0,
+                    .step = r->sv.step,
+                    .zoff0 = r->sv.zoff0,
+                    .sx = r->sv.sx,
+                    .sy = r->sv.sy,
+                    .W = r->sv.W,
+                    .H = r->sv.H,
+                    .L = r->sv.L,
+                    .nback = r->sv.nback,
+                    .abpa = r->bricks_abpa,
+                    .lod = lodq,
+                    .lstep = 1.0f}; /* depth stays native-res regardless of xy zoom */
+    r3d_vkcomp_dispatch(cmd, &r->sv.comp, &push, sizeof push, (r->sv.W + 7) / 8,
+                        (r->sv.H + 7) / 8, (r->sv.L + 3) / 4);
+    r3d_vk_image_barrier(cmd, r->sv.vol.img, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                         VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                         VK_ACCESS_2_SHADER_SAMPLED_READ_BIT, 0, 1);
+  }
 
   /* offscreen: whatever -> GENERAL for compute write (contents fully overwritten) */
   r3d_vk_image_barrier(cmd, r->offscreen.img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,

@@ -131,6 +131,19 @@ void r3d_vslab_prefetch_get(r3d_renderer *r, r3d_vslab_prefetch_stats *st);
 int r3d_surf_begin(r3d_renderer *r, uint32_t w, uint32_t h, const float *coords_rgba,
                    const float *normals_rgba);
 
+/* Flattened surface volume: a w x h x layers R8 3D window over flattened
+ * segment space, GPU-resampled from the bricks cache along the per-vertex
+ * normals (nback layers behind the surface, layers-nback in front; layer
+ * pitch == xy texel pitch == `step`, so the window is isotropic at the
+ * view's LOD). The surf view raycasts this texture. Call _window each frame
+ * with the wanted origin/pitch (rebuilds only on change), _mark when brick
+ * residency improved, _params to fill the surf view's FrameParams mapping. */
+int r3d_surfvol_begin(r3d_renderer *r, uint32_t w, uint32_t h, uint32_t layers,
+                      uint32_t nback, float sx, float sy);
+void r3d_surfvol_window(r3d_renderer *r, double u0, double v0, float step, float zoff0);
+void r3d_surfvol_mark(r3d_renderer *r);
+void r3d_surfvol_params(const r3d_renderer *r, r3d_frame_params *p);
+
 int r3d_set_transfer(r3d_renderer *r, const uint8_t rgba[256][4]);
 /* Select the full six-tap or fast four-tap shading pipeline. */
 void r3d_set_quality(r3d_renderer *r, uint32_t quality);
