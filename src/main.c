@@ -334,6 +334,7 @@ int main(int argc, char **argv) {
   const char *umbilicus_path = NULL;
   const char *multiview_path = NULL; /* tifxyz dir: vc3d-style 2x2 viewer */
   const char *overlay_path = NULL;   /* second c5d LOD root (ink predictions) */
+  int sv_w = 2048, sv_h = 2048, sv_l = 96; /* flattened surface-volume window */
   int annotation_prefetch = 5; /* annotation steps ahead; one slot is kept behind */
   int annotation_z_prefetch = 32; /* contiguous GPU-resident fine-scroll margin */
   bool vsz_given = false;
@@ -384,6 +385,11 @@ int main(int argc, char **argv) {
     if (i < argc - 1 && strcmp(argv[i], "--umbilicus") == 0) umbilicus_path = argv[i + 1];
     if (i < argc - 1 && strcmp(argv[i], "--multiview") == 0) multiview_path = argv[i + 1];
     if (i < argc - 1 && strcmp(argv[i], "--overlay") == 0) overlay_path = argv[i + 1];
+    if (i < argc - 3 && strcmp(argv[i], "--surfvol") == 0) {
+      sv_w = atoi(argv[i + 1]);
+      sv_h = atoi(argv[i + 2]);
+      sv_l = atoi(argv[i + 3]);
+    }
     if (i < argc - 1 && strcmp(argv[i], "--ann-prefetch") == 0)
       annotation_prefetch = atoi(argv[i + 1]);
     if (i < argc - 1 && strcmp(argv[i], "--ann-z-prefetch") == 0)
@@ -586,9 +592,13 @@ int main(int argc, char **argv) {
       return EXIT_FAILURE;
     }
     free(seg_coords);
-    /* flattened surface volume window: 1024^2 x 96 layers (48 behind) R8
-     * = 96 MB, resampled on the GPU from the shared brick cache */
-    if (r3d_surfvol_begin(renderer, 1024, 1024, 96, 48, mv_seg.sx, mv_seg.sy) != 0) {
+    /* flattened surface-volume window (RG8), resampled on the GPU from the
+     * shared brick cache; --surfvol W H L overrides, device caps clamp */
+    if (sv_w < 256) sv_w = 256;
+    if (sv_h < 256) sv_h = 256;
+    if (sv_l < 8) sv_l = 8;
+    if (r3d_surfvol_begin(renderer, (uint32_t)sv_w, (uint32_t)sv_h, (uint32_t)sv_l,
+                          (uint32_t)sv_l / 2, mv_seg.sx, mv_seg.sy) != 0) {
       fprintf(stderr, "multiview: surface-volume window init failed\n");
       return EXIT_FAILURE;
     }
@@ -1001,9 +1011,9 @@ int main(int argc, char **argv) {
         double stepd = 1.0;
         while (stepd * 2.0 <= vox_per_px) stepd *= 2.0;
         double cu_vox = sv->cu / (double)mv_seg.sx, cv_vox = sv->cv / (double)mv_seg.sy;
-        double snap = 128.0 * stepd; /* window W/8 */
-        double u0 = floor((cu_vox - 512.0 * stepd) / snap) * snap;
-        double v0 = floor((cv_vox - 512.0 * stepd) / snap) * snap;
+        double snap = (double)sv_w / 8.0 * stepd; /* window W/8 */
+        double u0 = floor((cu_vox - (double)sv_w * 0.5 * stepd) / snap) * snap;
+        double v0 = floor((cv_vox - (double)sv_h * 0.5 * stepd) / snap) * snap;
         double zsnap = 24.0; /* layers are 1 voxel regardless of xy zoom */
         double z0 = floor(sv->slice / zsnap + 0.5) * zsnap;
         r3d_surfvol_window(renderer, u0, v0, (float)stepd, (float)z0);

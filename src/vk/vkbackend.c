@@ -1170,6 +1170,13 @@ typedef struct sv_push {
 int r3d_surfvol_begin(r3d_renderer *r, uint32_t w, uint32_t h, uint32_t layers,
                       uint32_t nback, float sx, float sy) {
   if (!r->surf_active || !r->bricks_lod || r->sv.active) return -1;
+  uint32_t cap = r->vk.caps.max_dim_3d;
+  if (w > cap) w = cap;
+  if (h > cap) h = cap;
+  if (layers > cap) layers = cap;
+  if (nback >= layers) nback = layers / 2;
+  printf("surfvol: %ux%ux%u window (%.0f MB, %u layers behind)\n", w, h, layers,
+         (double)w * h * layers * 2.0 / 1048576.0, nback);
   r->sv.W = w;
   r->sv.H = h;
   r->sv.L = layers;
