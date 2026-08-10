@@ -900,8 +900,11 @@ int main(int argc, char **argv) {
         if (in.wheel_shift) { /* scrub the slice along the view normal */
           hv->slice += (double)(in.wheel > 0.0f ? 1 : -1);
         } else {
+          /* max zoom ~10 screen pixels per source voxel; the segment view's
+           * zoom unit is a grid step (1/scale voxels), so scale its cap */
+          double zmax = hover == R3D_MV_SEG ? 10.0 / (double)mv_seg.sx : 10.0;
           r3d_mv_zoom(hv, in.mouse_xy[0], in.mouse_xy[1],
-                      pow(1.05, (double)in.wheel * 2.0), 1.0 / 256.0, 64.0);
+                      pow(1.05, (double)in.wheel * 2.0), 1.0 / 256.0, zmax);
         }
         in.wheel = 0.0f;
       }
