@@ -72,6 +72,9 @@ struct r3d_renderer {
     float u0, v0, step, zoff0;
     float sx, sy;      /* tifxyz grid scale (kernel push) */
     uint32_t prog_row; /* residency-arrival re-bake cursor (UINT32_MAX idle) */
+    bool baked;        /* window content valid (a full bake has been recorded) */
+    bool shift_pending; /* integer-texel window move: shift + bake exposed bands */
+    int32_t sh_u, sh_v, sh_z;
   } sv;
   VkSampler samp_vol;    /* trilinear + mip linear, clamp */
   VkSampler samp_tf;     /* linear, clamp */
@@ -1267,7 +1270,7 @@ typedef struct sv_push {
   uint32_t abpa, lod;
   float lstep;
   uint32_t use_ink;
-  uint32_t y0;
+  uint32_t x0, y0, z0;
 } sv_push;
 
 int r3d_surfvol_begin(r3d_renderer *r, uint32_t w, uint32_t h, uint32_t layers,
@@ -1319,6 +1322,8 @@ int r3d_surfvol_begin(r3d_renderer *r, uint32_t w, uint32_t h, uint32_t layers,
   r->sv.active = true;
   r->sv.dirty = false;
   r->sv.prog_row = UINT32_MAX;
+  r->sv.baked = false;
+  r->sv.shift_pending = false;
   return 0;
 }
 
@@ -1327,11 +1332,41 @@ void r3d_surfvol_window(r3d_renderer *r, double u0, double v0, float step, float
   if ((float)u0 == r->sv.u0 && (float)v0 == r->sv.v0 && step == r->sv.step &&
       zoff0 == r->sv.zoff0)
     return;
+  /* Same pitch and an integer-texel move (the window origin snaps in texel
+   * multiples, zoff in whole layers): shift the surviving content in place
+   * and re-bake only the exposed bands, instead of the full ~75 ms window
+   * bake. uv moves and zoff moves are handled separately; a combined move
+   * (rare: it needs both snaps in one frame) falls through to a full bake. */
+  if (r->sv.baked && !r->sv.dirty && !r->sv.shift_pending && step == r->sv.step &&
+      step > 0.0f) {
+    double du = (u0 - (double)r->sv.u0) / (double)step;
+    double dv = (v0 - (double)r->sv.v0) / (double)step;
+    double dz = (double)zoff0 - (double)r->sv.zoff0; /* layer pitch lstep = 1 */
+    long idu = lround(du), idv = lround(dv), idz = lround(dz);
+    bool integral = fabs(du - (double)idu) < 1e-3 && fabs(dv - (double)idv) < 1e-3 &&
+                    fabs(dz - (double)idz) < 1e-3;
+    bool fits = labs(idu) < (long)r->sv.W && labs(idv) < (long)r->sv.H &&
+                labs(idz) < (long)r->sv.L;
+    bool uv_only = idz == 0 && (idu != 0 || idv != 0);
+    bool z_only = idz != 0 && idu == 0 && idv == 0;
+    if (integral && fits && (uv_only || z_only)) {
+      r->sv.sh_u = (int32_t)idu;
+      r->sv.sh_v = (int32_t)idv;
+      r->sv.sh_z = (int32_t)idz;
+      r->sv.shift_pending = true;
+      r->sv.u0 = (float)u0;
+      r->sv.v0 = (float)v0;
+      r->sv.zoff0 = zoff0;
+      r->sv.prog_row = UINT32_MAX;
+      return;
+    }
+  }
   r->sv.u0 = (float)u0;
   r->sv.v0 = (float)v0;
   r->sv.step = step;
   r->sv.zoff0 = zoff0;
   r->sv.dirty = true;
+  r->sv.shift_pending = false;
   r->sv.prog_row = UINT32_MAX; /* mapping changed: the full rebuild supersedes */
 }
 
@@ -4453,6 +4488,53 @@ int r3d_frame(r3d_renderer *r, const r3d_frame_params *p, r3d_frame_stats *st) {
   return r3d_frame_views(r, p, 1, st);
 }
 
+/* Shift the surface-volume window's surviving content in place after an
+ * integer-texel origin move: same-image strip copies along the moving axis
+ * (strip length = |shift|, so each copy's src/dst are disjoint), ordered so
+ * every strip is read before a later copy overwrites it (ascending for a
+ * positive shift, descending for negative) with transfer-transfer barriers
+ * between strips. new[p] = old[p + shift]. */
+static void sv_shift_copies(r3d_renderer *r, VkCommandBuffer cmd) {
+  int32_t su = r->sv.sh_u, sv2 = r->sv.sh_v, sz = r->sv.sh_z;
+  uint32_t W = r->sv.W, H = r->sv.H, L = r->sv.L;
+  uint32_t dx0 = su < 0 ? (uint32_t)-su : 0, dx1 = su > 0 ? W - (uint32_t)su : W;
+  uint32_t dy0 = sv2 < 0 ? (uint32_t)-sv2 : 0, dy1 = sv2 > 0 ? H - (uint32_t)sv2 : H;
+  uint32_t dz0 = sz < 0 ? (uint32_t)-sz : 0, dz1 = sz > 0 ? L - (uint32_t)sz : L;
+  int axis = su ? 0 : sv2 ? 1 : 2;
+  int32_t s = axis == 0 ? su : axis == 1 ? sv2 : sz;
+  uint32_t d = (uint32_t)(s > 0 ? s : -s);
+  uint32_t a0 = axis == 0 ? dx0 : axis == 1 ? dy0 : dz0;
+  uint32_t a1 = axis == 0 ? dx1 : axis == 1 ? dy1 : dz1;
+  if (a1 <= a0) return;
+  uint32_t nstrips = (a1 - a0 + d - 1) / d;
+  VkImageSubresourceLayers sub = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  for (uint32_t k = 0; k < nstrips; k++) {
+    uint32_t idx = s > 0 ? k : nstrips - 1 - k;
+    uint32_t b0 = a0 + idx * d;
+    uint32_t bl = b0 + d > a1 ? a1 - b0 : d;
+    int32_t dst[3] = {(int32_t)dx0, (int32_t)dy0, (int32_t)dz0};
+    uint32_t ext[3] = {dx1 - dx0, dy1 - dy0, dz1 - dz0};
+    dst[axis] = (int32_t)b0;
+    ext[axis] = bl;
+    VkImageCopy c = {
+        .srcSubresource = sub,
+        .srcOffset = {dst[0] + su, dst[1] + sv2, dst[2] + sz},
+        .dstSubresource = sub,
+        .dstOffset = {dst[0], dst[1], dst[2]},
+        .extent = {ext[0], ext[1], ext[2]},
+    };
+    if (k)
+      r3d_vk_image_barrier(cmd, r->sv.vol.img, VK_IMAGE_LAYOUT_GENERAL,
+                           VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                           VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                           VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                           VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT, 0,
+                           1);
+    vkCmdCopyImage(cmd, r->sv.vol.img, VK_IMAGE_LAYOUT_GENERAL, r->sv.vol.img,
+                   VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+  }
+}
+
 int r3d_frame_views(r3d_renderer *r, const r3d_frame_params *views, uint32_t nviews,
                     r3d_frame_stats *st) {
   if (!nviews || nviews > R3D_MAX_VIEWS) return -1;
@@ -4519,29 +4601,51 @@ int r3d_frame_views(r3d_renderer *r, const r3d_frame_params *views, uint32_t nvi
   if (r->query) vkCmdResetQueryPool(cmd, r->query, slot * 4, 4);
 
   if (r->sv.active && r->sv.step > 0.0f &&
-      (r->sv.dirty || r->sv.prog_row != UINT32_MAX)) {
-    /* rebuild the flattened surface volume before this frame samples it:
-     * the full window when the mapping moved (dirty), else the next row band
-     * of a progressive residency-arrival re-bake (~SV_PROG_ROWS rows/frame
-     * keeps the extra GPU work under a vsync interval; the full 2048^2x96
-     * dispatch was a ~75 ms frame hitch). Serialize against the previous
-     * frame's sampling reads, fill, then make the writes visible to this
-     * frame's raycast. */
-    uint32_t y0 = 0, rows = r->sv.H;
+      (r->sv.dirty || r->sv.prog_row != UINT32_MAX || r->sv.shift_pending)) {
+    /* update the flattened surface volume before this frame samples it:
+     * full window when the mapping changed shape (dirty); shift-in-place +
+     * exposed-band bakes for integer-texel window moves; else the next row
+     * band of a progressive residency-arrival re-bake (~SV_PROG_ROWS
+     * rows/frame keeps the extra GPU work under a vsync interval; the full
+     * 2048^2x96 dispatch was a ~75 ms frame hitch). Serialize against the
+     * previous frame's sampling reads, do the work, then make the writes
+     * visible to this frame's raycast. */
+    struct svband { uint32_t x0, y0, z0, w, h, l; } bands[2];
+    uint32_t nband = 0;
+    bool shifted = false;
     if (r->sv.dirty) {
       r->sv.dirty = false;
       r->sv.prog_row = UINT32_MAX;
+      r->sv.baked = true;
+      bands[nband++] = (struct svband){0, 0, 0, r->sv.W, r->sv.H, r->sv.L};
+    } else if (r->sv.shift_pending) {
+      r->sv.shift_pending = false;
+      shifted = true;
+      int32_t su = r->sv.sh_u, sv2 = r->sv.sh_v, sz = r->sv.sh_z;
+      if (su)
+        bands[nband++] = (struct svband){su > 0 ? r->sv.W - (uint32_t)su : 0, 0, 0,
+                                         (uint32_t)labs(su), r->sv.H, r->sv.L};
+      if (sv2)
+        bands[nband++] = (struct svband){0, sv2 > 0 ? r->sv.H - (uint32_t)sv2 : 0, 0,
+                                         r->sv.W, (uint32_t)labs(sv2), r->sv.L};
+      if (sz)
+        bands[nband++] = (struct svband){0, 0, sz > 0 ? r->sv.L - (uint32_t)sz : 0,
+                                         r->sv.W, r->sv.H, (uint32_t)labs(sz)};
     } else {
-      y0 = r->sv.prog_row;
-      rows = r->sv.H - y0;
+      uint32_t y0 = r->sv.prog_row, rows = r->sv.H - y0;
       if (rows > SV_PROG_ROWS) rows = SV_PROG_ROWS;
       r->sv.prog_row = y0 + rows >= r->sv.H ? UINT32_MAX : y0 + rows;
+      bands[nband++] = (struct svband){0, y0, 0, r->sv.W, rows, r->sv.L};
     }
     r3d_vk_image_barrier(cmd, r->sv.vol.img, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
                          VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                          VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
-                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                         VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, 0, 1);
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+                             VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                         VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
+                             VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                         0, 1);
+    if (shifted) sv_shift_copies(r, cmd);
     uint32_t lodq = 0;
     for (float s = r->sv.step; s >= 2.0f && lodq + 1u < r->bricks_nlev; s *= 0.5f) lodq++;
     sv_push push = {.u0 = r->sv.u0,
@@ -4557,13 +4661,18 @@ int r3d_frame_views(r3d_renderer *r, const r3d_frame_params *views, uint32_t nvi
                     .abpa = r->bricks_abpa,
                     .lod = lodq,
                     .lstep = 1.0f, /* depth stays native-res regardless of xy zoom */
-                    .use_ink = r->ink_active ? 1u : 0u,
-                    .y0 = y0};
-    r3d_vkcomp_dispatch(cmd, &r->sv.comp, &push, sizeof push, (r->sv.W + 7) / 8,
-                        (rows + 7) / 8, (r->sv.L + 3) / 4);
+                    .use_ink = r->ink_active ? 1u : 0u};
+    for (uint32_t b = 0; b < nband; b++) {
+      push.x0 = bands[b].x0;
+      push.y0 = bands[b].y0;
+      push.z0 = bands[b].z0;
+      r3d_vkcomp_dispatch(cmd, &r->sv.comp, &push, sizeof push, (bands[b].w + 7) / 8,
+                          (bands[b].h + 7) / 8, (bands[b].l + 3) / 4);
+    }
     r3d_vk_image_barrier(cmd, r->sv.vol.img, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
-                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                         VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+                             VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                         VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT,
                          VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                          VK_ACCESS_2_SHADER_SAMPLED_READ_BIT, 0, 1);
   }

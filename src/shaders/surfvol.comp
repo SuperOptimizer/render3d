@@ -24,7 +24,7 @@ layout(push_constant) uniform Push {
   uint abpa, lod;            /* atlas bricks per axis, on-disk level to fetch */
   float lstep;               /* layer pitch along the normal (voxels; zoom-independent) */
   uint use_ink;              /* sample the overlay atlas into G */
-  uint y0;                   /* first window row this dispatch covers */
+  uint x0, y0, z0;           /* window origin of the band this dispatch covers */
 } pc;
 
 const float BR_SLOT = 128.0;
@@ -59,8 +59,7 @@ vec2 bricks_sample(vec3 wp, vec3 shape, float md) {
 }
 
 void main() {
-  uvec3 t = gl_GlobalInvocationID.xyz;
-  t.y += pc.y0;
+  uvec3 t = gl_GlobalInvocationID.xyz + uvec3(pc.x0, pc.y0, pc.z0);
   if (t.x >= pc.W || t.y >= pc.H || t.z >= pc.L) return;
   float fu = pc.u0 + (float(t.x) + 0.5) * pc.step;
   float fv = pc.v0 + (float(t.y) + 0.5) * pc.step;

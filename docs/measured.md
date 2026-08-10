@@ -1084,3 +1084,25 @@ Two frame-spike sources removed on the static GP multiview scenario:
 Same 900-frame scenario: gui max 73 -> 5.4 ms, cpu p99 58 -> ~27 ms, cpu max
 90 -> ~50 ms (remaining spikes are the one-time initial full bake + startup),
 gpu max 7.1 -> 6.8 ms steady. All 5 suites green; screenshot pixel-identical.
+
+## 2026-08-10 — surfvol window moves: shift-in-place instead of full re-bake
+
+Pan snaps (W/8 = 256 texels) and zoff scrubs (24-layer snaps) in the segment
+view each cost the full ~75 ms window bake. The window origin only ever moves
+in integer texel multiples, so r3d_surfvol_window now detects same-pitch
+integer moves and shifts the surviving ~85% of the 3D window in place —
+same-image vkCmdCopyImage strips along the moving axis (strip length =
+|shift| keeps each copy's src/dst disjoint; strips ordered so every strip is
+read before a later copy overwrites it, transfer barriers between) — then
+bakes only the exposed bands (~10-20 ms total vs 75). uv moves and zoff
+moves shift independently; combined moves and zoom (pitch changes) still
+full-bake.
+
+Verified in-run: shift one snap mid-run, then force a full progressive
+re-bake with identical params and diff the frames before/after — u-only,
+v-only, z-only, u+v, all+ink each match the no-shift control exactly
+(seg-view residual mean 0.70 gray levels, identical across all cases; it is
+the natural refresh of bricks that arrived after the interior's last bake).
+A scary first diff turned out to be a stale surfvol.spv from mid-build
+testing, not the copies. Steady scenario unchanged (gui max 5.4 ms, stream
+max 11 ms); all 5 suites green.
