@@ -172,7 +172,10 @@ struct r3d_renderer {
     r3d_vkcomp omax, odil;      /* region-form occupancy kernels */
     bool comp_ready;
     r3d_vkbuf warm;
-    r3d_vkbuf raw_stage; /* CPU-decoded batch, copied to atlas mip0 */
+    r3d_vkbuf raw_stage; /* upload staging (write-combined; never read back) */
+    uint8_t *raw_host;   /* decode target + seed-cache source (heap: decode
+                            passes and cache fwrite both READ it; reading the
+                            mapped staging buffer ran at WC speeds) */
     uint64_t warm_cap, warm_bytes;
     uint32_t warm_bricks;
     uint32_t *warm_off, *warm_len, *warm_use; /* per brick; off UINT32_MAX = absent */
@@ -904,6 +907,7 @@ static void bricks_teardown(r3d_renderer *r) {
   free(r->bs.sel_b);
   free(r->bs.sel_slot);
   free(r->bs.maxes);
+  free(r->bs.raw_host);
   free(r->bs.warm_off);
   free(r->bs.warm_len);
   free(r->bs.warm_use);
@@ -1033,6 +1037,7 @@ void r3d_destroy(r3d_renderer *r) {
   free(r->bs.sel_b);
   free(r->bs.sel_slot);
   free(r->bs.maxes);
+  free(r->bs.raw_host);
   free(r->bs.warm_off);
   free(r->bs.warm_len);
   free(r->bs.warm_use);
@@ -2423,44 +2428,106 @@ static int bricks_upload_raw(r3d_renderer *r, r3d_vkimage *atlas, const uint32_t
   return r3d_vk_oneshot_end(&r->vk, r->bs.upload_pool, cmd);
 }
 
+/* Parallel CPU brick decode: one single-threaded c5d_brick_decode per brick,
+ * bricks distributed across all cores (an atomic cursor; the caller
+ * participates). Beats the old sequential-bricks x 4-lane-within-brick shape
+ * ~3x on 32-brick batches. Blobs are resolved by the caller beforehand
+ * (brlod_blob lazily opens shard readers and is not thread-safe); a NULL
+ * blob with ni_fallback resolves through the net-ingest brick cache (file
+ * IO on the decode threads, never the render thread). */
+struct brdec_item {
+  const uint8_t *blob;
+  size_t bn;
+  uint32_t b;
+};
+struct brdec {
+  r3d_renderer *r;
+  const struct brdec_item *it;
+  uint8_t *raw;    /* n consecutive BR_RAW_BYTES slabs */
+  uint8_t *maxes;  /* optional per-brick max out */
+  bool zero_on_fail; /* overlay semantics: absent/failed brick = zeros */
+  bool ni_fallback;
+  uint32_t n;
+  _Atomic uint32_t next;
+  _Atomic int rc;
+};
+
+static void *brdec_worker(void *arg) {
+  struct brdec *j = arg;
+  for (;;) {
+    uint32_t i = atomic_fetch_add_explicit(&j->next, 1, memory_order_relaxed);
+    if (i >= j->n) return NULL;
+    uint8_t *dst = j->raw + (size_t)i * BR_RAW_BYTES;
+    const uint8_t *blob = j->it[i].blob;
+    size_t bn = j->it[i].bn;
+    uint8_t *owned = NULL;
+    if (!blob && j->ni_fallback) {
+      owned = ni_load_brick(j->r, j->it[i].b, &bn);
+      blob = owned;
+    }
+    int rc = blob ? c5d_brick_decode(blob, bn, dst, BR_SLOT_DIM) : -1;
+    free(owned);
+    if (rc != 0) {
+      if (j->zero_on_fail) {
+        memset(dst, 0, BR_RAW_BYTES);
+        continue;
+      }
+      fprintf(stderr, "bricks: decode failed b=%u n=%zu%s\n", j->it[i].b, bn,
+              j->it[i].blob ? "" : " (cache tier)");
+      atomic_store(&j->rc, -1);
+      continue;
+    }
+    if (j->maxes) {
+      uint8_t mx = 0;
+      for (size_t v = 0; v < BR_RAW_BYTES; v++)
+        if (dst[v] > mx) mx = dst[v];
+      j->maxes[i] = mx;
+    }
+  }
+}
+
+static int brdec_run(struct brdec *j) {
+  long nc = sysconf(_SC_NPROCESSORS_ONLN);
+  if (nc < 1) nc = 4;
+  uint32_t nt = j->n < (uint32_t)nc ? j->n : (uint32_t)nc;
+  if (nt > 32) nt = 32;
+  pthread_t th[32];
+  uint32_t spawned = 0;
+  atomic_store(&j->next, 0);
+  atomic_store(&j->rc, 0);
+  for (uint32_t t = 0; t + 1 < nt; t++)
+    if (pthread_create(&th[spawned], NULL, brdec_worker, j) == 0) spawned++;
+  brdec_worker(j);
+  for (uint32_t t = 0; t < spawned; t++) pthread_join(th[t], NULL);
+  return atomic_load(&j->rc);
+}
+
 static int bricks_decode_batch(r3d_renderer *r, uint32_t n) {
   if (!r->bs.cpu_decode) {
     if (r3d_vkc5d_decode(r->c5d, r->bs.srcs, n, r->brick_atlas_mip0, r->bs.maxes) != 0)
       return -1;
     return bricks_post_fill(r, r->bs.sel_slot, r->bs.sel_b, n);
   }
-  uint8_t *raw = r->bs.raw_stage.mapped;
-  for (uint32_t i = 0; i < n; i++) {
-    uint8_t *dst = raw + (size_t)i * BR_RAW_BYTES;
-    const uint8_t *blob = r->bs.srcs[i].blob;
-    size_t bn = r->bs.srcs[i].n;
-    uint8_t *owned = NULL;
-    if (!blob) { /* net-ingest cache brick: file IO on THIS worker thread */
-      owned = ni_load_brick(r, r->bs.sel_b[i], &bn);
-      blob = owned;
-    }
-    int drc = blob ? c5d_brick_decode_par(blob, bn, dst, BR_SLOT_DIM, 4) : -1;
-    free(owned);
-    if (drc != 0) {
-      fprintf(stderr, "bricks: decode failed b=%u n=%zu%s\n", r->bs.sel_b[i], bn,
-              r->bs.srcs[i].blob ? "" : " (cache tier)");
-      return -1;
-    }
-    uint8_t mx = 0;
-    for (size_t v = 0; v < BR_RAW_BYTES; v++)
-      if (dst[v] > mx) mx = dst[v];
-    r->bs.maxes[i] = mx;
-  }
+  uint8_t *raw = r->bs.raw_host;
+  struct brdec_item items[BR_MAX_BATCH];
+  for (uint32_t i = 0; i < n; i++)
+    items[i] = (struct brdec_item){r->bs.srcs[i].blob, r->bs.srcs[i].n, r->bs.sel_b[i]};
+  struct brdec job = {
+      .r = r, .it = items, .raw = raw, .maxes = r->bs.maxes, .ni_fallback = true, .n = n};
+  if (brdec_run(&job) != 0) return -1;
+  memcpy(r->bs.raw_stage.mapped, raw, (size_t)n * BR_RAW_BYTES);
   if (bricks_upload_raw(r, &r->brick_atlas, r->bs.sel_slot, n) != 0) return -1;
   if (r->ink_active) {
     /* same bricks, same slots, the overlay tree's data (absent brick = 0) */
     for (uint32_t i = 0; i < n; i++) {
-      uint8_t *dst = raw + (size_t)i * BR_RAW_BYTES;
       size_t bn = 0;
-      const uint8_t *blob = brlod_blob(r, r->ink_root, r->ink_readers, r->bs.sel_b[i], &bn);
-      if (!blob || c5d_brick_decode_par(blob, bn, dst, BR_SLOT_DIM, 4) != 0)
-        memset(dst, 0, BR_RAW_BYTES);
+      items[i].blob = brlod_blob(r, r->ink_root, r->ink_readers, r->bs.sel_b[i], &bn);
+      items[i].bn = bn;
+      items[i].b = r->bs.sel_b[i];
     }
+    struct brdec ijob = {.r = r, .it = items, .raw = raw, .zero_on_fail = true, .n = n};
+    brdec_run(&ijob);
+    memcpy(r->bs.raw_stage.mapped, raw, (size_t)n * BR_RAW_BYTES);
     if (bricks_upload_raw(r, &r->ink_atlas, r->bs.sel_slot, n) != 0) return -1;
   }
   return 0;
@@ -2544,6 +2611,63 @@ static int img_general_clear(r3d_renderer *r, r3d_vkimage *img) {
                        VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                        VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT, 0, 1);
   return r3d_vk_oneshot_end(&r->vk, r->pool, cmd);
+}
+
+/* Decoded-seed cache: the pinned coarsest level decodes to the same ~1 GB of
+ * raw 128^3 bricks on every launch (~9 s of entropy work for PHercParis4's
+ * 555 dense bricks even across all cores). First launch writes the decoded
+ * slabs to <root>/seed.raw; later launches stream that file into the atlas
+ * instead (~1 s). Layout: header, a table sized for the whole level, then
+ * one BR_RAW_BYTES slab per decoded brick in table order. Guarded by the
+ * manifest's size+mtime (trees are write-once; a re-ingest rewrites it). */
+#define SEED_CACHE_MAGIC "r3dseed1"
+struct seed_hdr {
+  char magic[8];
+  uint32_t dim, level, count, nres;
+  uint64_t man_size, man_mtime;
+};
+struct seed_ent {
+  uint32_t gid;
+  uint8_t max;
+  uint8_t pad[3];
+};
+
+static void seed_manifest_stat(const char *root, uint64_t *size, uint64_t *mtime) {
+  char mp[1400];
+  snprintf(mp, sizeof mp, "%s/manifest.json", root);
+  struct stat st;
+  *size = *mtime = 0;
+  if (stat(mp, &st) == 0) {
+    *size = (uint64_t)st.st_size;
+    *mtime = (uint64_t)st.st_mtime;
+  }
+}
+
+/* open + validate a seed cache; returns entries (malloc'd) or NULL */
+static struct seed_ent *seed_cache_open(const char *root, uint32_t level, uint32_t count,
+                                        FILE **out_f, uint32_t *out_nres) {
+  char path[1400];
+  snprintf(path, sizeof path, "%s/seed.raw", root);
+  FILE *f = fopen(path, "rb");
+  if (!f) return NULL;
+  struct seed_hdr h;
+  uint64_t msz, mmt;
+  seed_manifest_stat(root, &msz, &mmt);
+  struct seed_ent *ents = NULL;
+  if (fread(&h, sizeof h, 1, f) != 1 || memcmp(h.magic, SEED_CACHE_MAGIC, 8) != 0 ||
+      h.dim != BR_SLOT_DIM || h.level != level || h.count != count || h.nres > count ||
+      h.man_size != msz || h.man_mtime != mmt)
+    goto fail;
+  ents = malloc((size_t)h.nres * sizeof *ents);
+  if (!ents || fread(ents, sizeof *ents, h.nres, f) != h.nres) goto fail;
+  if (fseek(f, (long)(sizeof h + (size_t)count * sizeof *ents), SEEK_SET) != 0) goto fail;
+  *out_f = f;
+  *out_nres = h.nres;
+  return ents;
+fail:
+  free(ents);
+  fclose(f);
+  return NULL;
 }
 
 int r3d_bricks_begin(r3d_renderer *r, const char *c5s_path, uint32_t pool_bpa,
@@ -2812,10 +2936,13 @@ int r3d_bricks_begin(r3d_renderer *r, const char *c5s_path, uint32_t pool_bpa,
                                   VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                               &r->bs.warm) != 0)
       return -1;
-    if (r->bs.cpu_decode &&
-        r3d_vkbuf_create_host(&r->vk, (VkDeviceSize)BR_MAX_BATCH * BR_RAW_BYTES,
-                              VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &r->bs.raw_stage) != 0)
-      return -1;
+    if (r->bs.cpu_decode) {
+      if (r3d_vkbuf_create_host(&r->vk, (VkDeviceSize)BR_MAX_BATCH * BR_RAW_BYTES,
+                                VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &r->bs.raw_stage) != 0)
+        return -1;
+      r->bs.raw_host = malloc((size_t)BR_MAX_BATCH * BR_RAW_BYTES);
+      if (!r->bs.raw_host) return -1;
+    }
     warm_release(r, 0, (uint32_t)r->bs.warm_cap); /* one node spanning the tier */
     /* A complete coarsest level is tiny (PHerc1218: three bricks).  Seed it
      * synchronously so every fine request has a resident fallback from the
@@ -2823,8 +2950,81 @@ int r3d_bricks_begin(r3d_renderer *r, const char *c5s_path, uint32_t pool_bpa,
     if (r->bricks_lod) {
       const r3d_brlod_level *cl = &r->bricks_lev[r->bricks_nlev - 1u];
       uint32_t first = cl->page_off, count = cl->bx * cl->by * cl->bz;
+      uint32_t level = r->bricks_nlev - 1u;
       uint32_t cursor = 0, next_slot = 0;
       r->bs.frame = 1;
+      uint64_t st0 = now_ns();
+      if (r->bs.cpu_decode) { /* fast path: stream previously decoded slabs */
+        FILE *scf = NULL;
+        uint32_t snres = 0;
+        struct seed_ent *ents = seed_cache_open(r->bricks_root, level, count, &scf, &snres);
+        if (ents) {
+          uint8_t *raw = r->bs.raw_stage.mapped;
+          uint32_t np = 0;
+          bool ok = snres <= nslots;
+          for (uint32_t i = 0; i < count; i++) r->bs.brick_maxk[first + i] = 0;
+          for (uint32_t e = 0; ok && e < snres; e++) {
+            uint32_t b = ents[e].gid;
+            uint8_t m = ents[e].max;
+            if (b < first || b >= first + count ||
+                fread(raw + (size_t)np * BR_RAW_BYTES, 1, BR_RAW_BYTES, scf) !=
+                    BR_RAW_BYTES) {
+              ok = false;
+              break;
+            }
+            uint32_t s = next_slot++;
+            r->bs.sel_slot[np++] = s;
+            r->bs.brick_maxk[b] = m;
+            if (m >= BR_NOISE_FLOOR) {
+              page[bricks_page_index(r, b)] = s | ((uint32_t)m << 24u);
+              r->bs.slot_brick[s] = b;
+              r->bs.slot_use[s] = r->bs.frame;
+              r->bs.brick_slot[b] = s;
+            }
+            if (np == BR_MAX_BATCH || e + 1u == snres) {
+              SDL_PumpEvents();
+              if (bricks_upload_raw(r, &r->brick_atlas, r->bs.sel_slot, np) != 0) ok = false;
+              np = 0;
+            }
+          }
+          fclose(scf);
+          free(ents);
+          if (ok) {
+            cursor = count;
+            printf("bricks: seeded L%u fallback from seed.raw (%u bricks, %.0f ms)\n", level,
+                   snres, (double)(now_ns() - st0) / 1e6);
+          } else { /* unusable cache: reset the level's state, decode below */
+            fprintf(stderr, "bricks: seed.raw unusable, re-decoding\n");
+            for (uint32_t i = 0; i < count; i++) {
+              uint32_t b = first + i;
+              uint32_t s = r->bs.brick_slot[b];
+              if (s != BR_INVALID) r->bs.slot_brick[s] = BR_INVALID;
+              r->bs.brick_slot[b] = BR_INVALID;
+              r->bs.brick_maxk[b] = -1;
+              page[bricks_page_index(r, b)] = BR_INVALID;
+            }
+            next_slot = 0;
+          }
+        }
+      }
+      /* decode path; writes seed.raw as a side effect so the entropy work
+       * only ever happens once per tree */
+      FILE *wf = NULL;
+      struct seed_ent *wents = NULL;
+      uint32_t wn = 0;
+      char wtmp[1408] = "", wfin[1400] = "";
+      if (cursor < count && r->bs.cpu_decode) {
+        snprintf(wfin, sizeof wfin, "%s/seed.raw", r->bricks_root);
+        snprintf(wtmp, sizeof wtmp, "%s.tmp", wfin);
+        wf = fopen(wtmp, "wb");
+        wents = wf ? malloc((size_t)count * sizeof *wents) : NULL;
+        long roff = (long)(sizeof(struct seed_hdr) + (size_t)count * sizeof(struct seed_ent));
+        if (wf && (!wents || fseek(wf, roff, SEEK_SET) != 0)) {
+          fclose(wf);
+          wf = NULL;
+          unlink(wtmp);
+        }
+      }
       while (cursor < count) {
         uint32_t np = 0;
         while (cursor < count && np < BR_MAX_BATCH) {
@@ -2850,6 +3050,16 @@ int r3d_bricks_begin(r3d_renderer *r, const char *c5s_path, uint32_t pool_bpa,
         SDL_PumpEvents(); /* multi-second synchronous phase: stay responsive */
         if (bricks_decode_batch(r, np) != 0)
           return -1;
+        if (wf) {
+          if (fwrite(r->bs.raw_host, BR_RAW_BYTES, np, wf) != np) {
+            fclose(wf);
+            wf = NULL;
+            unlink(wtmp);
+          } else {
+            for (uint32_t i = 0; i < np; i++)
+              wents[wn++] = (struct seed_ent){.gid = r->bs.sel_b[i], .max = r->bs.maxes[i]};
+          }
+        }
         for (uint32_t i = 0; i < np; i++) {
           uint32_t b = r->bs.sel_b[i], s = r->bs.sel_slot[i];
           uint8_t m = r->bs.maxes[i];
@@ -2861,7 +3071,21 @@ int r3d_bricks_begin(r3d_renderer *r, const char *c5s_path, uint32_t pool_bpa,
           r->bs.brick_slot[b] = s;
         }
       }
-      printf("bricks: seeded L%u fallback (%u bricks)\n", r->bricks_nlev - 1u, count);
+      if (wents) { /* the decode path ran: finish (or discard) the cache */
+        if (wf) {
+          struct seed_hdr h = {.dim = BR_SLOT_DIM, .level = level, .count = count, .nres = wn};
+          memcpy(h.magic, SEED_CACHE_MAGIC, 8);
+          seed_manifest_stat(r->bricks_root, &h.man_size, &h.man_mtime);
+          bool wok = fseek(wf, 0, SEEK_SET) == 0 && fwrite(&h, sizeof h, 1, wf) == 1 &&
+                     fwrite(wents, sizeof *wents, wn, wf) == wn && fclose(wf) == 0;
+          if (!wok || rename(wtmp, wfin) != 0) unlink(wtmp);
+        }
+        free(wents);
+        printf("bricks: seeded L%u fallback (%u bricks, %.0f ms%s)\n", level, count,
+               (double)(now_ns() - st0) / 1e6, wf ? "; seed.raw cached" : "");
+      } else if (!r->bs.cpu_decode) {
+        printf("bricks: seeded L%u fallback (%u bricks)\n", level, count);
+      }
     }
     if (pthread_mutex_init(&r->bs.mu, NULL) != 0) return -1;
     if (pthread_cond_init(&r->bs.cv, NULL) != 0) {
@@ -2981,27 +3205,131 @@ int r3d_bricks_overlay(r3d_renderer *r, const char *lod_root) {
   write_image_dset(r, 10, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, r->ink_atlas.view,
                    r->samp_vol, VK_IMAGE_LAYOUT_GENERAL);
   r->ink_active = true;
-  /* backfill the already-resident bricks (incl. the pinned coarsest level) */
+  /* backfill the already-resident bricks (incl. the pinned coarsest level);
+   * like the CT seed, the decoded slabs are cached in <ink_root>/seed.raw so
+   * the overlay's entropy work also only happens once per tree */
+  const r3d_brlod_level *cl = &r->bricks_lev[r->bricks_nlev - 1u];
+  uint32_t level = r->bricks_nlev - 1u, lcount = cl->bx * cl->by * cl->bz;
   uint8_t *raw = r->bs.raw_stage.mapped;
   uint32_t sel[BR_MAX_BATCH], nb_ = 0, filled = 0;
+  uint64_t t0 = now_ns();
+  {
+    FILE *scf = NULL;
+    uint32_t snres = 0;
+    struct seed_ent *ents = seed_cache_open(r->ink_root, level, lcount, &scf, &snres);
+    if (ents) {
+      long roff = (long)(sizeof(struct seed_hdr) + (size_t)lcount * sizeof(struct seed_ent));
+      bool ok = true;
+      for (uint32_t s = 0; ok && s < r->bs.nslots; s++) {
+        uint32_t b = r->bs.slot_brick[s];
+        if (b == BR_INVALID) continue;
+        uint32_t e = 0;
+        while (e < snres && ents[e].gid != b) e++;
+        if (e == snres) { /* resident set changed: the cache can't serve it */
+          ok = false;
+          break;
+        }
+        if (fseek(scf, roff + (long)((size_t)e * BR_RAW_BYTES), SEEK_SET) != 0 ||
+            fread(raw + (size_t)nb_ * BR_RAW_BYTES, 1, BR_RAW_BYTES, scf) != BR_RAW_BYTES) {
+          ok = false;
+          break;
+        }
+        sel[nb_++] = s;
+        filled++;
+        if (nb_ == BR_MAX_BATCH) {
+          SDL_PumpEvents();
+          if (bricks_upload_raw(r, &r->ink_atlas, sel, nb_) != 0) ok = false;
+          nb_ = 0;
+        }
+      }
+      if (ok && nb_ && bricks_upload_raw(r, &r->ink_atlas, sel, nb_) != 0) ok = false;
+      fclose(scf);
+      free(ents);
+      if (ok) {
+        printf("bricks: overlay %s active (%u bricks from seed.raw, %.0f ms)\n", lod_root,
+               filled, (double)(now_ns() - t0) / 1e6);
+        return 0;
+      }
+      /* unusable cache: the atlas may hold partial rows — the decode path
+       * below rewrites every resident slot (absent bricks become zeros) */
+      fprintf(stderr, "bricks: ink seed.raw unusable, re-decoding\n");
+      nb_ = 0;
+      filled = 0;
+    }
+  }
+  FILE *wf = NULL;
+  struct seed_ent *wents = malloc((size_t)lcount * sizeof *wents);
+  uint32_t wn = 0;
+  char wtmp[1408] = "", wfin[1400] = "";
+  snprintf(wfin, sizeof wfin, "%s/seed.raw", r->ink_root);
+  snprintf(wtmp, sizeof wtmp, "%s.tmp", wfin);
+  if (wents) {
+    wf = fopen(wtmp, "wb");
+    long roff = (long)(sizeof(struct seed_hdr) + (size_t)lcount * sizeof(struct seed_ent));
+    if (wf && fseek(wf, roff, SEEK_SET) != 0) {
+      fclose(wf);
+      wf = NULL;
+      unlink(wtmp);
+    }
+  }
+  struct brdec_item items[BR_MAX_BATCH];
+  uint32_t selb[BR_MAX_BATCH];
   for (uint32_t s = 0; s < r->bs.nslots; s++) {
     uint32_t b = r->bs.slot_brick[s];
     if (b == BR_INVALID) continue;
     size_t bn = 0;
-    const uint8_t *blob = brlod_blob(r, r->ink_root, r->ink_readers, b, &bn);
-    uint8_t *dst = raw + (size_t)nb_ * BR_RAW_BYTES;
-    if (!blob || c5d_brick_decode_par(blob, bn, dst, BR_SLOT_DIM, 4) != 0)
-      memset(dst, 0, BR_RAW_BYTES);
+    items[nb_].blob = brlod_blob(r, r->ink_root, r->ink_readers, b, &bn);
+    items[nb_].bn = bn;
+    items[nb_].b = b;
+    selb[nb_] = b;
     sel[nb_++] = s;
     filled++;
     if (nb_ == BR_MAX_BATCH) {
       SDL_PumpEvents();
+      struct brdec job = {.r = r, .it = items, .raw = r->bs.raw_host, .zero_on_fail = true,
+                          .n = nb_};
+      brdec_run(&job);
+      if (wf && wn + nb_ <= lcount) {
+        if (fwrite(r->bs.raw_host, BR_RAW_BYTES, nb_, wf) != nb_) {
+          fclose(wf);
+          wf = NULL;
+          unlink(wtmp);
+        } else {
+          for (uint32_t i = 0; i < nb_; i++) wents[wn++] = (struct seed_ent){.gid = selb[i]};
+        }
+      }
+      memcpy(raw, r->bs.raw_host, (size_t)nb_ * BR_RAW_BYTES);
       if (bricks_upload_raw(r, &r->ink_atlas, sel, nb_) != 0) return -1;
       nb_ = 0;
     }
   }
-  if (nb_ && bricks_upload_raw(r, &r->ink_atlas, sel, nb_) != 0) return -1;
-  printf("bricks: overlay %s active (%u resident bricks backfilled)\n", lod_root, filled);
+  if (nb_) {
+    struct brdec job = {.r = r, .it = items, .raw = r->bs.raw_host, .zero_on_fail = true,
+                        .n = nb_};
+    brdec_run(&job);
+    if (wf && wn + nb_ <= lcount) {
+      if (fwrite(r->bs.raw_host, BR_RAW_BYTES, nb_, wf) != nb_) {
+        fclose(wf);
+        wf = NULL;
+        unlink(wtmp);
+      } else {
+        for (uint32_t i = 0; i < nb_; i++) wents[wn++] = (struct seed_ent){.gid = selb[i]};
+      }
+    }
+    memcpy(raw, r->bs.raw_host, (size_t)nb_ * BR_RAW_BYTES);
+    if (bricks_upload_raw(r, &r->ink_atlas, sel, nb_) != 0) return -1;
+  }
+  if (wf) {
+    struct seed_hdr h = {.dim = BR_SLOT_DIM, .level = level, .count = lcount, .nres = wn};
+    memcpy(h.magic, SEED_CACHE_MAGIC, 8);
+    seed_manifest_stat(r->ink_root, &h.man_size, &h.man_mtime);
+    bool wok = fseek(wf, 0, SEEK_SET) == 0 && fwrite(&h, sizeof h, 1, wf) == 1 &&
+               fwrite(wents, sizeof *wents, wn, wf) == wn && fclose(wf) == 0;
+    if (!wok || rename(wtmp, wfin) != 0) unlink(wtmp);
+  }
+  free(wents);
+  printf("bricks: overlay %s active (%u resident bricks backfilled, %.0f ms)\n", lod_root,
+         filled, (double)(now_ns() - t0) / 1e6);
   return 0;
 }
 

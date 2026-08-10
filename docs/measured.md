@@ -1106,3 +1106,29 @@ the natural refresh of bricks that arrived after the interior's last bake).
 A scary first diff turned out to be a stale surfvol.spv from mid-build
 testing, not the copies. Steady scenario unchanged (gui max 5.4 ms, stream
 max 11 ms); all 5 suites green.
+
+## 2026-08-10 — startup: brick-parallel CPU decode + decoded-seed disk cache
+
+Startup on GP multiview + ink was 39.4 s wall, dominated by decoding the same
+pinned-coarsest bricks every launch (555 CT + 555 ink dense bricks, ~95 ms
+CPU each — the coarsest level is the whole scroll, so its bricks carry near
+max entropy). Tried GPU c5d decode for the seed first: 25 ms/brick on the
+Adreno (40 bricks/s vs the 228 in the ledger for typical bricks) — WORSE
+than CPU for these dense bricks; reverted. Two things that did work:
+
+1. Brick-parallel CPU decode: bricks_decode_batch (and the overlay backfill)
+   now run one single-threaded c5d_brick_decode per brick across all cores
+   (brdec_run: atomic cursor, caller participates) instead of sequential
+   bricks x 4-lane inner parallel_for. Steady streaming jobs 328 -> 133
+   ms/batch; also the decode target moved from the write-combined staging
+   buffer to a heap buffer (decode passes re-read dst; WC reads are ~100
+   MB/s) with a memcpy into staging before upload — overlay backfill
+   3.6 -> 1.9 s from that alone.
+2. Decoded-seed cache: first launch writes the decoded slabs + maxes to
+   <root>/seed.raw (~1.1 GB per tree, header/table/slabs, tmp+rename,
+   guarded by manifest size+mtime); later launches stream it into the atlas.
+   Seed 7.8 s -> 185 ms, ink backfill 1.9 s -> 302 ms.
+
+Launch-to-render: cold (first ever) 13.5 s, warm 4.6 s — 8.5x vs the 39.4 s
+baseline. Verified: screenshot identical, truncated-file and stale-manifest
+fallbacks re-decode and rewrite the cache, all 5 suites green.
