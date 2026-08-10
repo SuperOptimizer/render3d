@@ -543,6 +543,8 @@ int main(int argc, char **argv) {
   float *mv_normals = NULL; /* per-vertex normals kept for overlays/zoff shell */
   uint64_t mv_sv_decoded = 0; /* residency-driven surfvol rebuild bookkeeping */
   int mv_sv_cool = 0;
+  uint32_t mv_visible = 0xfu; /* per-view visibility; collapsed views cost nothing */
+  int mv_solo = -1;           /* Space on a hovered view maximizes it */
   mv_lines mv_ol[4] = {0}, mv_ol_off[4] = {0}; /* intersection polylines */
   double mv_ol_slice[4] = {1e30, 1e30, 1e30, 1e30};
   double mv_ol_zoff = 1e30;
@@ -856,14 +858,28 @@ int main(int argc, char **argv) {
       continue;
     }
 
+    uint32_t mv_mask = mv_solo >= 0 ? 1u << mv_solo : (mv_visible ? mv_visible : 0xfu);
     if (multiview_path) {
       r3d_mview lay[4];
-      r3d_mv_layout(lay, w, h);
+      r3d_mv_layout_mask(lay, w, h, mv_mask);
       for (int i = 0; i < 4; i++) {
         mv[i].px = lay[i].px;
         mv[i].py = lay[i].py;
         mv[i].pw = lay[i].pw;
         mv[i].ph = lay[i].ph;
+      }
+      if (in.view_toggle) { /* Space: solo/restore the hovered view */
+        int hv = r3d_mv_hit(mv, in.mouse_xy[0], in.mouse_xy[1]);
+        if (mv_solo >= 0) mv_solo = -1;
+        else if (hv >= 0) mv_solo = hv;
+        mv_mask = mv_solo >= 0 ? 1u << mv_solo : (mv_visible ? mv_visible : 0xfu);
+        r3d_mv_layout_mask(lay, w, h, mv_mask);
+        for (int i = 0; i < 4; i++) {
+          mv[i].px = lay[i].px;
+          mv[i].py = lay[i].py;
+          mv[i].pw = lay[i].pw;
+          mv[i].ph = lay[i].ph;
+        }
       }
       if (mv[0].zoom <= 0.0) { /* first frame: fit */
         double fy2 = (double)mv[R3D_MV_SEG].ph / (double)(mv_seg.h ? mv_seg.h : 1);
@@ -968,8 +984,9 @@ int main(int argc, char **argv) {
         }
       }
 
-      { /* keep the flattened surface-volume window under the view (snapped
-         * for hysteresis) and rebuild it when brick residency improves */
+      if (mv_mask & 1u) { /* keep the flattened surface-volume window under the
+         * view (snapped for hysteresis) and rebuild on residency arrivals;
+         * a collapsed segment view skips baking entirely */
         const r3d_mview *sv = &mv[R3D_MV_SEG];
         double vox_per_px = 1.0 / (sv->zoom * (double)mv_seg.sx);
         double stepd = 1.0;
@@ -1294,6 +1311,17 @@ int main(int argc, char **argv) {
       }
       if (multiview_path) {
         igSeparator();
+        static const char *mv_name[4] = {"segment", "XY", "XZ", "YZ"};
+        for (int i = 0; i < 4; i++) {
+          bool vis = (mv_visible >> i) & 1u;
+          if (i) igSameLine(0, 8);
+          if (igCheckbox(mv_name[i], &vis))
+            mv_visible = vis ? mv_visible | (1u << i) : mv_visible & ~(1u << i);
+        }
+        if (mv_solo >= 0) {
+          igSameLine(0, 12);
+          igTextDisabled("solo: %s (Space restores)", mv_name[mv_solo]);
+        }
         igText("multiview focus  x %.0f  y %.0f  z %.0f", mv_focus[0], mv_focus[1],
                mv_focus[2]);
         igText("XY z %.0f | XZ y %.0f | YZ x %.0f", mv[R3D_MV_XY].slice,
@@ -1361,7 +1389,8 @@ int main(int argc, char **argv) {
                      "Shift+drag: pan | Shift+wheel: zoom | F12: shot");
     else if (multiview_path)
       igTextDisabled("drag: pan view | wheel: zoom | Shift+wheel: slice\n"
-                     "R/F: slice | Ctrl+click: set focus | F12: shot");
+                     "R/F: slice | Ctrl+click: set focus | F12: shot\n"
+                     "Space: solo hovered view | checkboxes hide views");
     else if (cam_mode == CAM_ORBIT)
       igTextDisabled("drag orbit | shift+drag pan cam | ctrl+drag move vol\n"
                      "ctrl+shift+drag rot vol | wheel zoom | WASD pan | F12 shot");
@@ -1396,6 +1425,7 @@ int main(int argc, char **argv) {
       /* recompute intersection polylines only when their inputs move */
       double zoff = mv[R3D_MV_SEG].slice;
       for (int i = 1; i < 4; i++) {
+        if (!(mv_mask & (1u << i))) continue; /* hidden plane: no recompute */
         const uint8_t *ax = r3d_mv_axes[i];
         if (mv_ol_slice[i] != mv[i].slice) {
           mv_ol[i].n = 0;
@@ -1421,6 +1451,7 @@ int main(int argc, char **argv) {
        * YZ yellow */
       const ImU32 trace_col[4] = {0, 0xff008cffu, 0xff0000ffu, 0xff00ffffu};
       for (int i = 1; i < 4; i++) { /* segment curve on each plane view */
+        if (!(mv_mask & (1u << i))) continue;
         ImVec2 cmin = {(float)mv[i].px, (float)mv[i].py};
         ImVec2 cmax = {(float)(mv[i].px + mv[i].pw), (float)(mv[i].py + mv[i].ph)};
         ImDrawList_PushClipRect(draw, cmin, cmax, false);
@@ -1440,13 +1471,13 @@ int main(int argc, char **argv) {
         }
         ImDrawList_PopClipRect(draw);
       }
-      { /* plane trace lines on the flattened segment view */
+      if (mv_mask & 1u) { /* plane trace lines on the flattened segment view */
         const r3d_mview *sv = &mv[R3D_MV_SEG];
         ImVec2 cmin = {(float)sv->px, (float)sv->py};
         ImVec2 cmax = {(float)(sv->px + sv->pw), (float)(sv->py + sv->ph)};
         ImDrawList_PushClipRect(draw, cmin, cmax, false);
         for (int i = 1; i < 4; i++)
-          for (uint32_t k = 0; k < mv_ol[i].n; k++) {
+          for (uint32_t k = 0; mv_mask & (1u << i) && k < mv_ol[i].n; k++) {
             const float *g4 = mv_ol[i].g + (size_t)k * 4;
             float x0, y0, x1, y1;
             r3d_mv_project(sv, (double)g4[0], (double)g4[1], &x0, &y0);
@@ -1455,11 +1486,19 @@ int main(int argc, char **argv) {
           }
         ImDrawList_PopClipRect(draw);
       }
-      ImDrawList_AddLine(draw, (ImVec2){(float)(w / 2), 0}, (ImVec2){(float)(w / 2), (float)h},
-                         bc, 1.0f);
-      ImDrawList_AddLine(draw, (ImVec2){0, (float)(h / 2)}, (ImVec2){(float)w, (float)(h / 2)},
-                         bc, 1.0f);
+      for (int i = 1; i < 4; i++) { /* pane borders around visible views */
+        if (!(mv_mask & (1u << i))) continue;
+        if (mv[i].px > 0)
+          ImDrawList_AddLine(draw, (ImVec2){(float)mv[i].px, (float)mv[i].py},
+                             (ImVec2){(float)mv[i].px, (float)(mv[i].py + mv[i].ph)}, bc,
+                             1.0f);
+        if (mv[i].py > 0)
+          ImDrawList_AddLine(draw, (ImVec2){(float)mv[i].px, (float)mv[i].py},
+                             (ImVec2){(float)(mv[i].px + mv[i].pw), (float)mv[i].py}, bc,
+                             1.0f);
+      }
       for (int i = 1; i < 4; i++) {
+        if (!(mv_mask & (1u << i))) continue;
         const uint8_t *ax = r3d_mv_axes[i];
         float fx_, fy_;
         r3d_mv_project(&mv[i], mv_focus[ax[0]], mv_focus[ax[1]], &fx_, &fy_);
@@ -1573,8 +1612,8 @@ int main(int argc, char **argv) {
         for (int a = 1; a < 3; a++)
           if (brick_shape[a] > mdim) mdim = brick_shape[a];
         if (r3d_bricks_stream_begin(renderer)) {
-          { /* segment view: walk the visible grid rect decimated and request
-             * the bricks its surface points (+ normal offset) touch */
+          if (mv_mask & 1u) { /* segment view: walk the visible grid rect and
+             * request the bricks its surface points (+ normal offset) touch */
             const r3d_mview *sv = &mv[R3D_MV_SEG];
             double hw = (double)sv->pw * 0.5 / sv->zoom, hh = (double)sv->ph * 0.5 / sv->zoom;
             int64_t g0 = (int64_t)(sv->cu - hw), g1 = (int64_t)(sv->cu + hw) + 1;
@@ -1602,6 +1641,7 @@ int main(int argc, char **argv) {
               }
           }
           for (int i = 1; i < 4; i++) {
+            if (!(mv_mask & (1u << i))) continue; /* collapsed: no streaming */
             const uint8_t *ax = r3d_mv_axes[i];
             double hw = (double)mv[i].pw * 0.5 / mv[i].zoom;
             double hh = (double)mv[i].ph * 0.5 / mv[i].zoom;
@@ -1661,7 +1701,9 @@ int main(int argc, char **argv) {
         if (brick_shape[a] > mdim) mdim = brick_shape[a];
       static const uint32_t axis_code[3] = {1u, 2u, 0u}; /* world axis -> view_flags code */
       r3d_frame_params vp4[4];
+      uint32_t nvp = 0;
       for (int i = 0; i < 4; i++) {
+        if (!(mv_mask & (1u << i))) continue; /* collapsed: no dispatch at all */
         const uint8_t *ax = r3d_mv_axes[i];
         r3d_frame_params q = p;
         q.viewport[0] = (uint32_t)mv[i].pw;
@@ -1682,7 +1724,7 @@ int main(int argc, char **argv) {
           r3d_surfvol_params(renderer, &q);
           q.slab_z0 = (float)mv[i].slice; /* render-time normal offset (voxels) */
           q.slab_depth = (uint32_t)mv_thick; /* marched thickness (voxels) */
-          vp4[i] = q;
+          vp4[nvp++] = q;
           continue;
         }
         q.view_flags = R3D_VIEW_ORTHO | R3D_VIEW_AXIS(axis_code[ax[2]]);
@@ -1701,9 +1743,9 @@ int main(int argc, char **argv) {
         memcpy(q.cam_forward, fwdv, sizeof fwdv);
         q.slab_z0 = (float)mv[i].slice;
         q.slab_depth = (uint32_t)mv_thick;
-        vp4[i] = q;
+        vp4[nvp++] = q;
       }
-      frc = r3d_frame_views(renderer, vp4, 4, &st);
+      frc = r3d_frame_views(renderer, vp4, nvp, &st);
     } else {
       frc = r3d_frame(renderer, &p, &st);
     }

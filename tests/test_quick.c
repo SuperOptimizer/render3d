@@ -12,6 +12,7 @@
 #include "core/mathx.h"
 #include "core/slab.h"
 #include "core/stats.h"
+#include "core/mview.h"
 #include "core/segtrace.h"
 #include "core/tifxyz.h"
 #include "core/umbilicus.h"
@@ -211,6 +212,32 @@ static void tifxyz_write_plane(const char *path, const float *v, uint32_t w, uin
       CHECK(TIFFWriteTile(tf, tile, tx, ty, 0, 0) >= 0);
     }
   TIFFClose(tf);
+}
+
+static void test_mview(void) {
+  r3d_mview v[4] = {0};
+  r3d_mv_layout_mask(v, 1281, 721, 0xf); /* odd pixels go right/bottom */
+  CHECK(v[0].pw == 640 && v[0].ph == 360 && v[3].px == 640 && v[3].py == 360);
+  CHECK(v[3].pw == 641 && v[3].ph == 361);
+  CHECK(r3d_mv_hit(v, 1000.0f, 500.0f) == 3 && r3d_mv_hit(v, 10.0f, 10.0f) == 0);
+  r3d_mv_layout_mask(v, 1280, 720, 1u << 2); /* solo XZ */
+  CHECK(v[2].pw == 1280 && v[2].ph == 720 && v[0].pw == 0 && v[1].pw == 0);
+  CHECK(r3d_mv_hit(v, 10.0f, 10.0f) == 2); /* hidden views never hit */
+  r3d_mv_layout_mask(v, 1280, 720, 0xb); /* three visible: 0,1 top; 3 bottom */
+  CHECK(v[0].ph == 360 && v[1].px == 640 && v[3].py == 360 && v[3].pw == 1280);
+  CHECK(v[2].pw == 0);
+  r3d_mv_layout_mask(v, 1280, 720, 0x6); /* two: 1 left, 2 right */
+  CHECK(v[1].px == 0 && v[1].pw == 640 && v[2].px == 640 && v[2].ph == 720);
+  /* zoom about a fixed point keeps it fixed */
+  v[1].cu = 100.0;
+  v[1].cv = 200.0;
+  v[1].zoom = 1.0;
+  double u0, w0;
+  r3d_mv_unproject(&v[1], 400.0f, 300.0f, &u0, &w0);
+  r3d_mv_zoom(&v[1], 400.0f, 300.0f, 2.0, 0.01, 100.0);
+  double u1, w1;
+  r3d_mv_unproject(&v[1], 400.0f, 300.0f, &u1, &w1);
+  CHECK(fabs(u0 - u1) < 1e-9 && fabs(w0 - w1) < 1e-9 && v[1].zoom == 2.0);
 }
 
 typedef struct tr_acc {
@@ -472,6 +499,7 @@ int main(void) {
   test_transfer();
   test_umbilicus();
   test_tifxyz();
+  test_mview();
   if (failures) {
     fprintf(stderr, "%d failure(s)\n", failures);
     return EXIT_FAILURE;

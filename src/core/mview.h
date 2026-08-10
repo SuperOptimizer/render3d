@@ -31,27 +31,59 @@ typedef struct r3d_mview {
   int32_t pw, ph; /* quadrant size in window pixels */
 } r3d_mview;
 
-/* Fixed equal quadrants covering the whole w x h drawable (right/bottom
- * absorb odd pixels). Order: SEG, XY, XZ, YZ. */
-static inline void r3d_mv_layout(r3d_mview v[4], int32_t w, int32_t h) {
-  int32_t w0 = w / 2, h0 = h / 2;
-  int32_t rect[4][4] = {{0, 0, w0, h0},
-                        {w0, 0, w - w0, h0},
-                        {0, h0, w0, h - h0},
-                        {w0, h0, w - w0, h - h0}};
+/* Tile the visible views (bit i of `mask`) over the whole w x h drawable —
+ * collapsed views get zero-size rects and are skipped everywhere. 4 visible:
+ * 2x2 quadrants; 3: two on top, one full-width below; 2: side by side;
+ * 1: full window. Right/bottom tiles absorb odd pixels. */
+static inline void r3d_mv_layout_mask(r3d_mview v[4], int32_t w, int32_t h, uint32_t mask) {
+  int vis[4], n = 0;
   for (int i = 0; i < 4; i++) {
-    v[i].px = rect[i][0];
-    v[i].py = rect[i][1];
-    v[i].pw = rect[i][2];
-    v[i].ph = rect[i][3];
+    v[i].px = v[i].py = v[i].pw = v[i].ph = 0;
+    if (mask & (1u << i)) vis[n++] = i;
+  }
+  if (n == 0) return;
+  int32_t w0 = w / 2, h0 = h / 2;
+  if (n == 1) {
+    v[vis[0]].pw = w;
+    v[vis[0]].ph = h;
+  } else if (n == 2) {
+    v[vis[0]].pw = w0;
+    v[vis[0]].ph = h;
+    v[vis[1]].px = w0;
+    v[vis[1]].pw = w - w0;
+    v[vis[1]].ph = h;
+  } else if (n == 3) {
+    v[vis[0]].pw = w0;
+    v[vis[0]].ph = h0;
+    v[vis[1]].px = w0;
+    v[vis[1]].pw = w - w0;
+    v[vis[1]].ph = h0;
+    v[vis[2]].py = h0;
+    v[vis[2]].pw = w;
+    v[vis[2]].ph = h - h0;
+  } else {
+    const int32_t rect[4][4] = {{0, 0, w0, h0},
+                                {w0, 0, w - w0, h0},
+                                {0, h0, w0, h - h0},
+                                {w0, h0, w - w0, h - h0}};
+    for (int k = 0; k < 4; k++) {
+      v[vis[k]].px = rect[k][0];
+      v[vis[k]].py = rect[k][1];
+      v[vis[k]].pw = rect[k][2];
+      v[vis[k]].ph = rect[k][3];
+    }
   }
 }
 
-/* view containing window pixel (x,y); -1 if outside every quadrant */
+static inline void r3d_mv_layout(r3d_mview v[4], int32_t w, int32_t h) {
+  r3d_mv_layout_mask(v, w, h, 0xfu);
+}
+
+/* view containing window pixel (x,y); -1 if outside every visible quadrant */
 static inline int r3d_mv_hit(const r3d_mview v[4], float x, float y) {
   for (int i = 0; i < 4; i++)
-    if (x >= (float)v[i].px && x < (float)(v[i].px + v[i].pw) && y >= (float)v[i].py &&
-        y < (float)(v[i].py + v[i].ph))
+    if (v[i].pw > 0 && x >= (float)v[i].px && x < (float)(v[i].px + v[i].pw) &&
+        y >= (float)v[i].py && y < (float)(v[i].py + v[i].ph))
       return i;
   return -1;
 }
