@@ -1083,6 +1083,10 @@ int main(int argc, char **argv) {
     if (sv_w < 256) sv_w = 256;
     if (sv_h < 256) sv_h = 256;
     if (sv_l < 8) sv_l = 8;
+    int dim3d = (int)r3d_max_dim3d(renderer); /* --surfvol vs device limit */
+    if (sv_w > dim3d) sv_w = dim3d;
+    if (sv_h > dim3d) sv_h = dim3d;
+    if (sv_l > dim3d) sv_l = dim3d;
     if (r3d_surfvol_begin(renderer, (uint32_t)sv_w, (uint32_t)sv_h, (uint32_t)sv_l,
                           (uint32_t)sv_l / 2, mv_seg.sx, mv_seg.sy) != 0) {
       fprintf(stderr, "multiview: surface-volume window init failed\n");

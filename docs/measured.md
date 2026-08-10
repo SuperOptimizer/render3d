@@ -1163,3 +1163,24 @@ recording: 1.73 -> 0.45 ms/frame; RenderDrawData fell from 33% to 3.6% of
 steady main-thread samples. Remaining active main-thread work is AddPolyline
 tessellation + mv_draw_lines projection (~1.4 ms gui phase in a 16.7 ms
 vsync frame) — left alone. All 5 suites green.
+
+## 2026-08-10 — memory budgets derive from the device, not constants
+
+Component sizes now scale to the reported Vulkan memory budget instead of
+hard-coded values, for UMA (this 32 GB X1E: one 23 GiB shared heap, live
+budget ~15.8 GiB via VK_EXT_memory_budget) and discrete 8/16 GB targets:
+
+- Warm tier default: budget/8 clamped to [256 MB, 3 GiB] (u32-offset cap);
+  explicit --warm still wins. This machine: 256 MB -> ~2.6 GB.
+- Atlas ceiling: was a hard 12^3; now min(maxImageDimension3D/128, largest
+  cube under maxMemoryAllocationSize, budget-derived share assuming a second
+  overlay atlas + warm + surfvol + 2 GiB slack). Same 12^3 = 3.6 GiB here
+  (the ~4 GiB per-allocation limit binds); a simulated 8 GiB card
+  (--gpu-mem 6200) degrades to 9^3 + 774 MB warm and renders with 0
+  failures instead of over-committing; 16 GiB class keeps 12^3 + 1.7 GB.
+- --surfvol W/H/L clamp to maxImageDimension3D (new r3d_max_dim3d query).
+
+GPU total here: ~10 GiB of the ~15 GiB budget (2x 3.6 GiB atlases + 2.6 GB
+warm + 768 MB surfvol). CPU side stays implicit (per-brick bookkeeping ~1.4
+GB virtual; page cache covers seed.raw + shard mmaps). 900-frame scenario
+unchanged (frame max ~40 ms); all 5 suites green.

@@ -162,6 +162,9 @@ void r3d_surfvol_visible(r3d_renderer *r, uint32_t x0, uint32_t y0, uint32_t z0,
 void r3d_surfvol_mark(r3d_renderer *r);
 void r3d_surfvol_params(const r3d_renderer *r, r3d_frame_params *p);
 
+/* Device limit for 3D image dimensions (e.g. the surfvol window's W/H/L). */
+uint32_t r3d_max_dim3d(const r3d_renderer *r);
+
 int r3d_set_transfer(r3d_renderer *r, const uint8_t rgba[256][4]);
 /* Select the full six-tap or fast four-tap shading pipeline. */
 void r3d_set_quality(r3d_renderer *r, uint32_t quality);

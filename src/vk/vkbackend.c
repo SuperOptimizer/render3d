@@ -1376,6 +1376,8 @@ void r3d_surfvol_window(r3d_renderer *r, double u0, double v0, float step, float
   r->sv.prog_row = UINT32_MAX; /* mapping changed: the full rebuild supersedes */
 }
 
+uint32_t r3d_max_dim3d(const r3d_renderer *r) { return r->vk.caps.max_dim_3d; }
+
 void r3d_surfvol_visible(r3d_renderer *r, uint32_t x0, uint32_t y0, uint32_t z0, uint32_t x1,
                          uint32_t y1, uint32_t z1) {
   if (!r->sv.active) return;
@@ -2776,20 +2778,46 @@ int r3d_bricks_begin(r3d_renderer *r, const char *c5s_path, uint32_t pool_bpa,
    * fits; otherwise a smaller LRU atlas fed by the streaming pump */
   uint32_t abpa = pool_bpa ? pool_bpa : (r->bricks_lod ? 8u : (bpa < 8u ? bpa : 8u));
   if (!r->bricks_lod && abpa > bpa) abpa = bpa;
+  /* Warm-tier size, decided up front because the atlas ceiling budgets around
+   * it: explicit --warm wins, else 1/8 of the memory budget in [256 MB, 3 GiB]
+   * (the allocator's u32 offsets cap it at 3 GiB). */
+  uint64_t warm_want = warm_mb ? (uint64_t)warm_mb << 20 : 0;
+  if (!warm_want) {
+    warm_want = r3d_vkctx_budget_available(&r->vk) / 8;
+    if (warm_want < (256ull << 20)) warm_want = 256ull << 20;
+  }
+  if (warm_want > (3ull << 30)) warm_want = 3ull << 30;
+  /* Atlas ceiling from the device, not a constant: image dimension limit,
+   * single-allocation limit (this Adreno: 2048 / ~4 GiB -> 12^3 = 3.6 GiB),
+   * and the memory budget — assuming a second identical atlas may join for
+   * an overlay in LOD mode, after the warm tier, a surfvol window, and
+   * slack. An 8 GiB card lands around 9^3 instead of failing; bigger cards
+   * ride the per-allocation limit. */
+  uint32_t max_abpa = r->vk.caps.max_dim_3d / BR_SLOT_DIM;
+  while (max_abpa > 4u &&
+         (uint64_t)max_abpa * max_abpa * max_abpa * BR_RAW_BYTES > r->vk.caps.max_alloc_bytes)
+    max_abpa--;
+  uint64_t avail = r3d_vkctx_budget_available(&r->vk);
+  uint64_t reserve = warm_want + (2ull << 30); /* surfvol window + slack */
+  uint64_t for_atlas =
+      (avail > reserve ? avail - reserve : avail / 4) / (r->bricks_lod ? 2u : 1u);
+  while (max_abpa > 4u &&
+         (uint64_t)max_abpa * max_abpa * max_abpa * BR_RAW_BYTES > for_atlas)
+    max_abpa--;
   if (r->bricks_lod) {
     /* the coarsest level is permanently pinned in the atlas; grow the pool so
      * streaming still has headroom (a 6-level 81 TB volume pins 1216 slots,
      * which starves an 8^3 pool into never decoding anything) */
     const r3d_brlod_level *coarse_lv = &r->bricks_lev[r->bricks_nlev - 1u];
     uint32_t pinned = coarse_lv->bx * coarse_lv->by * coarse_lv->bz + 384u;
-    while (abpa < 12u && (uint64_t)abpa * abpa * abpa < pinned) abpa++;
+    while (abpa < max_abpa && (uint64_t)abpa * abpa * abpa < pinned) abpa++;
     if ((uint64_t)abpa * abpa * abpa < pinned)
       fprintf(stderr,
               "bricks: coarsest level (%u bricks) nearly fills the %u^3 slot pool; "
               "streaming will be limited\n",
               pinned - 384u, abpa);
   }
-  if (abpa > 12) abpa = 12; /* maxImageDimension3D=2048 / ~4 GiB allocation caps */
+  if (abpa > max_abpa) abpa = max_abpa;
   if (!abpa) return -1;
   bool streaming = r->bricks_lod || abpa < bpa;
   r->bs.cpu_decode = streaming && r->bricks_lod && !getenv("R3D_BRICKS_GPU_DECODE");
@@ -2941,8 +2969,7 @@ int r3d_bricks_begin(r3d_renderer *r, const char *c5s_path, uint32_t pool_bpa,
     }
     r->bricks_identity = np == nb;
   } else {
-    r->bs.warm_cap = (uint64_t)(warm_mb ? warm_mb : 256) << 20;
-    if (r->bs.warm_cap > (3ull << 30)) r->bs.warm_cap = 3ull << 30; /* u32 offsets */
+    r->bs.warm_cap = warm_want;
     if (r3d_vkbuf_create_host(&r->vk, r->bs.warm_cap,
                               VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                                   VK_BUFFER_USAGE_TRANSFER_DST_BIT,
