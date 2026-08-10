@@ -199,7 +199,7 @@ add_executable(tifxyz-transform tools/tifxyz-transform/main.c)
 target_link_libraries(tifxyz-transform PRIVATE r3d_core m r3d_warnings r3d_sanitize)
 find_library(BLOSC_LIB blosc REQUIRED) # zarr v2 chunk decode (zarr2c5d)
 add_executable(zarr2c5d tools/zarr2c5d/main.c)
-target_link_libraries(zarr2c5d PRIVATE r3d_core r3d_c5d ${BLOSC_LIB}
+target_link_libraries(zarr2c5d PRIVATE r3d_core r3d_c5d ${BLOSC_LIB} CURL::libcurl
                                        r3d_warnings r3d_sanitize)
 
 # --- tests ---

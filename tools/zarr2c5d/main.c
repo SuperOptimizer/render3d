@@ -29,6 +29,7 @@
 #include <unistd.h>
 
 #include <blosc.h>
+#include <curl/curl.h>
 
 #include "brick.h"
 #include "core/tifxyz.h"
@@ -60,6 +61,8 @@ typedef struct blob {
 } blob;
 
 static const char *g_mirror, *g_out;
+static const char *g_url = NULL; /* streaming ingest: fetch chunks, keep no mirror */
+static _Atomic uint64_t g_fetched_bytes = 0, g_fetched_n = 0, g_absent_n = 0;
 static level_info g_lv[MAX_LEVELS];
 static uint32_t g_nlev = 0, g_full_from = 3;
 static float g_quality = 2.0f;
@@ -152,15 +155,105 @@ static void chunk_path(char path[2048], uint32_t level, uint64_t cz, uint64_t cy
 
 /* Load one 128^3 chunk. Returns 1 = data, 0 = zero-fill, -1 = error,
  * -2 = not downloaded (recorded in the missing list when open). */
+/* --- streaming ingest: fetch a chunk over HTTP straight into memory ------- */
+
+typedef struct fetch_buf {
+  uint8_t *p;
+  size_t n, cap;
+} fetch_buf;
+
+static size_t fetch_write(const void *data, size_t sz, size_t nm, void *ud) {
+  fetch_buf *b = ud;
+  size_t n = sz * nm;
+  if (b->n + n > b->cap) {
+    size_t nc = b->cap ? b->cap * 2 : (4u << 20);
+    while (nc < b->n + n) nc *= 2;
+    uint8_t *np = realloc(b->p, nc);
+    if (!np) return 0;
+    b->p = np;
+    b->cap = nc;
+  }
+  memcpy(b->p + b->n, data, n);
+  b->n += n;
+  return n;
+}
+
+/* one CURL handle per worker thread (connection/TLS session reuse) */
+static _Thread_local CURL *t_curl = NULL;
+
+/* 1 = fetched into buf, 0 = absent (404 -> fill), -1 = error after retries */
+static int fetch_chunk(uint32_t level, uint64_t cz, uint64_t cy, uint64_t cx,
+                       fetch_buf *buf) {
+  if (!t_curl) {
+    t_curl = curl_easy_init();
+    if (!t_curl) return -1;
+    curl_easy_setopt(t_curl, CURLOPT_WRITEFUNCTION, fetch_write);
+    curl_easy_setopt(t_curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(t_curl, CURLOPT_CONNECTTIMEOUT, 30L);
+    curl_easy_setopt(t_curl, CURLOPT_LOW_SPEED_LIMIT, 1024L);
+    curl_easy_setopt(t_curl, CURLOPT_LOW_SPEED_TIME, 60L);
+  }
+  char url[2048];
+  snprintf(url, sizeof url, "%s/%u/%llu/%llu/%llu", g_url, level, (unsigned long long)cz,
+           (unsigned long long)cy, (unsigned long long)cx);
+  for (int attempt = 0; attempt < 4; attempt++) {
+    buf->n = 0;
+    curl_easy_setopt(t_curl, CURLOPT_URL, url);
+    curl_easy_setopt(t_curl, CURLOPT_WRITEDATA, buf);
+    CURLcode rc = curl_easy_perform(t_curl);
+    long code = 0;
+    curl_easy_getinfo(t_curl, CURLINFO_RESPONSE_CODE, &code);
+    if (rc == CURLE_OK && code == 200) {
+      atomic_fetch_add(&g_fetched_bytes, buf->n);
+      atomic_fetch_add(&g_fetched_n, 1);
+      return 1;
+    }
+    if (rc == CURLE_OK && code == 404) {
+      atomic_fetch_add(&g_absent_n, 1);
+      return 0;
+    }
+    if (attempt < 3) sleep((unsigned)(1 << attempt)); /* 1s, 2s, 4s backoff */
+  }
+  fprintf(stderr, "zarr2c5d: fetch failed after retries: %s\n", url);
+  return -1;
+}
+
 static bool chunk_wanted(const level_info *lv, uint64_t cz, uint64_t cy, uint64_t cx) {
   return !lv->cwant ||
          lv->cwant[(cz * lv->chunks.y + cy) * lv->chunks.x + cx];
 }
 
+static int decode_chunk_mem(const level_info *lv, const uint8_t *comp, size_t n,
+                            uint8_t *dst) {
+  if (lv->raw) {
+    if (n != BRICK_BYTES) return -1;
+    memcpy(dst, comp, BRICK_BYTES);
+    return 1;
+  }
+  size_t nbytes = 0, cbytes = 0, blocksize = 0;
+  blosc_cbuffer_sizes(comp, &nbytes, &cbytes, &blocksize);
+  if (nbytes != BRICK_BYTES || cbytes > n ||
+      blosc_decompress_ctx(comp, dst, BRICK_BYTES, 1) != (int)BRICK_BYTES)
+    return -1;
+  return 1;
+}
+
+static _Thread_local fetch_buf t_buf = {0};
+
 static int load_chunk(uint32_t level, uint64_t cz, uint64_t cy, uint64_t cx, uint8_t *dst) {
   const level_info *lv = &g_lv[level];
   if (cz >= lv->chunks.z || cy >= lv->chunks.y || cx >= lv->chunks.x) return 0;
   if (!chunk_wanted(lv, cz, cy, cx)) return 0; /* far from surface: air */
+  if (g_url) { /* streaming ingest: network -> memory -> brick, no mirror */
+    int rc = fetch_chunk(level, cz, cy, cx, &t_buf);
+    if (rc <= 0) return rc;
+    rc = decode_chunk_mem(lv, t_buf.p, t_buf.n, dst);
+    if (rc < 0)
+      fprintf(stderr, "zarr2c5d: bad fetched chunk %u/%llu/%llu/%llu (%zu bytes)\n", level,
+              (unsigned long long)cz, (unsigned long long)cy, (unsigned long long)cx,
+              t_buf.n);
+    return rc;
+  }
   char path[2048];
   chunk_path(path, level, cz, cy, cx);
   if (!file_exists(path)) {
@@ -455,10 +548,13 @@ static double now_seconds(void) {
 int main(int argc, char **argv) {
   if (argc < 3) {
     fprintf(stderr,
-            "usage: zarr2c5d <zarr-mirror-dir> <output-dir> [--surface DIR] [--pad N] "
-            "[--full-from L] [--min-level L] [--rect i0 j0 i1 j1] [--threads N] "
+            "usage: zarr2c5d <zarr-mirror-dir> <output-dir> [--url BASE] [--surface DIR] "
+            "[--pad N] [--full-from L] [--min-level L] [--rect i0 j0 i1 j1] [--threads N] "
             "[--c5d-quality Q] [--only-level L] "
-            "[--list-missing FILE] [--dry-run] [--verify N] [--force]\n");
+            "[--list-missing FILE] [--dry-run] [--verify N] [--force]\n"
+            "  --url: streaming ingest — chunks are fetched straight into memory and only "
+            "transcoded c5d shards are written (the mirror dir holds .zarray metadata "
+            "only); without it, chunks are read from a pre-fetched local mirror\n");
     return 2;
   }
   g_mirror = argv[1];
@@ -489,6 +585,8 @@ int main(int argc, char **argv) {
     }
     else if (strcmp(argv[i], "--list-missing") == 0 && i + 1 < argc)
       missing_path = argv[++i];
+    else if (strcmp(argv[i], "--url") == 0 && i + 1 < argc)
+      g_url = argv[++i];
     else if (strcmp(argv[i], "--dry-run") == 0)
       dry = true;
     else if (strcmp(argv[i], "--verify") == 0 && i + 1 < argc)
@@ -503,6 +601,33 @@ int main(int argc, char **argv) {
   if (!threads) {
     long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
     threads = ncpu > 0 ? (uint32_t)ncpu : 1u;
+  }
+  if (g_url) { /* streaming ingest: bootstrap per-level .zarray metadata only */
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+    for (uint32_t l = 0; l < MAX_LEVELS; l++) {
+      char zp[2048];
+      snprintf(zp, sizeof zp, "%s/%u/.zarray", g_mirror, l);
+      if (file_exists(zp)) continue;
+      fetch_buf fb = {0};
+      char zu[2048];
+      snprintf(zu, sizeof zu, "%s/%u/.zarray", g_url, l);
+      CURL *c = curl_easy_init();
+      if (!c) return 1;
+      curl_easy_setopt(c, CURLOPT_URL, zu);
+      curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, fetch_write);
+      curl_easy_setopt(c, CURLOPT_WRITEDATA, &fb);
+      curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
+      long code = 0;
+      CURLcode rc = curl_easy_perform(c);
+      curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
+      curl_easy_cleanup(c);
+      if (rc == CURLE_OK && code == 200 && fb.n && write_atomic(zp, fb.p, fb.n) == 0) {
+        free(fb.p);
+        continue;
+      }
+      free(fb.p);
+      break; /* first absent level ends the pyramid */
+    }
   }
 
   /* probe levels */
@@ -623,6 +748,11 @@ int main(int argc, char **argv) {
            (unsigned long long)g_missing_count, missing_path);
     return g_missing_count ? 3 : 0;
   }
+  if (g_url)
+    printf("zarr2c5d: fetched %llu chunks (%.1f GB), %llu absent (fill)\n",
+           (unsigned long long)atomic_load(&g_fetched_n),
+           (double)atomic_load(&g_fetched_bytes) / 1073741824.0,
+           (unsigned long long)atomic_load(&g_absent_n));
   uint64_t vb = atomic_load(&g_psnr_bricks);
   if (g_verify && vb) {
     uint64_t counted = vb < g_verify ? vb : g_verify;

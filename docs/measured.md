@@ -991,3 +991,26 @@ half-grid-cell misregistration in the comparison itself, worth remembering:
 1 grid cell = 1/scale = 20 voxels, so tiny index-convention errors read as
 huge coordinate errors.) Any canonical Scroll 1 segment can now be carried
 onto the 2.4um (or 1.129um) volumes locally.
+
+## 2026-08-10 — PHercParis4 2.4um GP banner + streaming ingest
+
+The 2023 Grand Prize banner (20230702185753, 1820x2530 grid, 4.03M valid
+points) now renders in the 2x2 viewer on the 2.4um volume (75784x32693x32693,
+6 zarr levels, uncompressed chunks). Tiered ingest: L1-L4 follow the whole
+surface (pad 32), L5 full (pinned), L0 confined to a central 400x500-grid
+--rect (~21 GB); 36,158 chunks / 72 GB total, 12 GB c5d tree, verify 51 dB.
+Two systemic fixes fell out: (1) the pinned coarsest level here is 1216
+bricks, which silently filled the whole 8^3 atlas pool — every slot
+permanently pinned, zero decodes, black fine levels; the pool now auto-grows
+(cap 12^3) to hold the coarsest level plus streaming headroom. (2) a
+chained "wait for fetch then transcode" shell loop deadlocked on
+`pgrep -f` matching its own command line — the pkill self-match rule
+applies to pgrep too.
+
+`zarr2c5d --url` is now a single-pass streaming ingest: worker threads
+fetch chunks over HTTP straight into memory (per-thread libcurl handles,
+connection reuse, 4-attempt backoff, 404 = fill) and only transcoded c5d
+shards are written — no raw mirror. The mirror dir holds just the per-level
+.zarray metadata. Validated byte-identical to the mirror-based path on L4
+(12/12 shards, 198 chunks fetched, 0.4 GB). Mirror mode remains for
+pre-fetched data and re-runs.

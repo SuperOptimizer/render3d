@@ -2046,6 +2046,19 @@ int r3d_bricks_begin(r3d_renderer *r, const char *c5s_path, uint32_t pool_bpa,
    * fits; otherwise a smaller LRU atlas fed by the streaming pump */
   uint32_t abpa = pool_bpa ? pool_bpa : (r->bricks_lod ? 8u : (bpa < 8u ? bpa : 8u));
   if (!r->bricks_lod && abpa > bpa) abpa = bpa;
+  if (r->bricks_lod) {
+    /* the coarsest level is permanently pinned in the atlas; grow the pool so
+     * streaming still has headroom (a 6-level 81 TB volume pins 1216 slots,
+     * which starves an 8^3 pool into never decoding anything) */
+    const r3d_brlod_level *coarse_lv = &r->bricks_lev[r->bricks_nlev - 1u];
+    uint32_t pinned = coarse_lv->bx * coarse_lv->by * coarse_lv->bz + 384u;
+    while (abpa < 12u && (uint64_t)abpa * abpa * abpa < pinned) abpa++;
+    if ((uint64_t)abpa * abpa * abpa < pinned)
+      fprintf(stderr,
+              "bricks: coarsest level (%u bricks) nearly fills the %u^3 slot pool; "
+              "streaming will be limited\n",
+              pinned - 384u, abpa);
+  }
   if (abpa > 12) abpa = 12; /* maxImageDimension3D=2048 / ~4 GiB allocation caps */
   if (!abpa) return -1;
   bool streaming = r->bricks_lod || abpa < bpa;
