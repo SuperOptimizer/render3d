@@ -975,7 +975,9 @@ int main(int argc, char **argv) {
       fprintf(stderr, "--multiview needs --bricks with a LOD manifest\n");
       return EXIT_FAILURE;
     }
+    SDL_PumpEvents(); /* dataset swap: multi-second setup, stay responsive */
     if (r3d_tifxyz_load(&mv_seg, multiview_path) != 0) return EXIT_FAILURE;
+    SDL_PumpEvents();
     for (int a = 0; a < 3; a++)
       mv_focus[a] = ((double)mv_seg.bbox[0][a] + (double)mv_seg.bbox[1][a]) * 0.5;
     const float *mc = r3d_tifxyz_at(&mv_seg, mv_seg.w / 2, mv_seg.h / 2);
@@ -996,8 +998,10 @@ int main(int argc, char **argv) {
     mv[R3D_MV_SEG].cv = (double)mv_seg.h * 0.5;
     mv[R3D_MV_SEG].slice = 0.0;
     float *seg_coords = NULL;
+    SDL_PumpEvents();
     if (mv_build_grids(&mv_seg, &seg_coords, &mv_normals) != 0 ||
-        r3d_surf_begin(renderer, mv_seg.w, mv_seg.h, seg_coords, mv_normals) != 0) {
+        (SDL_PumpEvents(),
+         r3d_surf_begin(renderer, mv_seg.w, mv_seg.h, seg_coords, mv_normals)) != 0) {
       fprintf(stderr, "multiview: surf grid upload failed\n");
       return EXIT_FAILURE;
     }

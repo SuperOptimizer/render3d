@@ -1872,6 +1872,16 @@ static int ni_write_file(const char *path, const void *data, size_t n) {
   return rc;
 }
 
+static int ni_abort_cb(void *ud, curl_off_t dt, curl_off_t dn, curl_off_t ut,
+                       curl_off_t un) {
+  (void)dt;
+  (void)dn;
+  (void)ut;
+  (void)un;
+  const r3d_renderer *r = ud;
+  return r->ni.quit ? 1 : 0; /* nonzero aborts the transfer promptly */
+}
+
 static void *ni_worker(void *arg) {
   r3d_renderer *r = arg;
   CURL *curl = curl_easy_init();
@@ -1884,6 +1894,9 @@ static void *ni_worker(void *arg) {
   curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30L);
   curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1024L);
   curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 60L);
+  curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+  curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, ni_abort_cb);
+  curl_easy_setopt(curl, CURLOPT_XFERINFODATA, r);
   for (;;) {
     pthread_mutex_lock(&r->ni.mu);
     while (!r->ni.quit && r->ni.qn == 0) pthread_cond_wait(&r->ni.cv, &r->ni.mu);
@@ -1940,7 +1953,18 @@ static void *ni_worker(void *arg) {
       crc = curl_easy_perform(curl);
       curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
       if (crc == CURLE_OK && (code == 200 || code == 404)) break;
-      sleep((unsigned)(1 << attempt));
+      if (r->ni.quit) break;
+      for (int w = 0; w < (1 << attempt) && !r->ni.quit; w++) sleep(1);
+    }
+    if (r->ni.quit) { /* teardown in progress: leave the chunk unfinished */
+      pthread_mutex_lock(&r->ni.mu);
+      for (uint32_t i = 0; i < r->ni.nin; i++)
+        if (r->ni.inflight[i] == id) {
+          r->ni.inflight[i] = r->ni.inflight[--r->ni.nin];
+          break;
+        }
+      pthread_mutex_unlock(&r->ni.mu);
+      break;
     }
     bool have = crc == CURLE_OK && code == 200;
     if (crc == CURLE_OK && code == 404) atomic_fetch_add(&r->ni.absent_chunks, 1);
@@ -2759,6 +2783,7 @@ int r3d_bricks_begin(r3d_renderer *r, const char *c5s_path, uint32_t pool_bpa,
           np++;
         }
         if (!np) continue;
+        SDL_PumpEvents(); /* multi-second synchronous phase: stay responsive */
         if (bricks_decode_batch(r, np) != 0)
           return -1;
         for (uint32_t i = 0; i < np; i++) {
@@ -2906,6 +2931,7 @@ int r3d_bricks_overlay(r3d_renderer *r, const char *lod_root) {
     sel[nb_++] = s;
     filled++;
     if (nb_ == BR_MAX_BATCH) {
+      SDL_PumpEvents();
       if (bricks_upload_raw(r, &r->ink_atlas, sel, nb_) != 0) return -1;
       nb_ = 0;
     }
