@@ -2,7 +2,7 @@
 
 void r3d_input_poll(r3d_input *in, SDL_Window *win,
                     void (*hook)(void *ud, const SDL_Event *ev), void *ud, bool allow_capture,
-                    bool fly_mode, bool annotation_mode) {
+                    bool fly_mode, bool annotation_mode, bool multiview_mode) {
   in->quit = false;
   in->screenshot = false;
   in->resized = false;
@@ -13,6 +13,7 @@ void r3d_input_poll(r3d_input *in, SDL_Window *win,
   in->density_scale = 1.0f;
   in->lod_delta = 0.0f;
   in->wheel = 0.0f;
+  in->wheel_shift = false;
   in->zdelta = 0;
   in->zpage = 0;
   in->annotate_click = false;
@@ -30,6 +31,13 @@ void r3d_input_poll(r3d_input *in, SDL_Window *win,
       break;
     case SDL_EVENT_MOUSE_BUTTON_DOWN:
       if (ev.button.button != SDL_BUTTON_LEFT || !allow_capture) break;
+      if (multiview_mode && (SDL_GetModState() & SDL_KMOD_CTRL)) {
+        in->annotate_click = true; /* focus gesture; plain LMB stays a drag */
+        in->click_ctrl = true;
+        in->click_xy[0] = ev.button.x;
+        in->click_xy[1] = ev.button.y;
+        break;
+      }
       if (annotation_mode && !(SDL_GetModState() & SDL_KMOD_SHIFT)) {
         in->annotate_click = true;
         in->click_ctrl = (SDL_GetModState() & SDL_KMOD_CTRL) != 0;
@@ -59,6 +67,7 @@ void r3d_input_poll(r3d_input *in, SDL_Window *win,
       break;
     case SDL_EVENT_MOUSE_WHEEL:
       in->wheel += ev.wheel.y;
+      if (SDL_GetModState() & SDL_KMOD_SHIFT) in->wheel_shift = true;
       break;
     case SDL_EVENT_KEY_DOWN:
       /* z-scroll keys repeat on hold */
@@ -93,6 +102,8 @@ void r3d_input_poll(r3d_input *in, SDL_Window *win,
       break;
     }
   }
+
+  SDL_GetMouseState(&in->mouse_xy[0], &in->mouse_xy[1]);
 
   const bool *keys = SDL_GetKeyboardState(NULL);
   in->move[0] = (keys[SDL_SCANCODE_D] ? 1.0f : 0.0f) - (keys[SDL_SCANCODE_A] ? 1.0f : 0.0f);

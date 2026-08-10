@@ -115,6 +115,8 @@ struct r3d_renderer {
     uint32_t *brick_want;            /* frame stamp: candidate de-duplication */
     int16_t *brick_maxk;             /* decoded max, -1 unknown (never re-request empties) */
     struct bcand { float d2; uint32_t b, priority; } *cands;
+    uint32_t ncand_pending; /* begin/collect/submit multi-view pump state */
+    bool stream_open;
     r3d_c5d_src *srcs;
     uint32_t *sel_b, *sel_slot;
     uint8_t *maxes;
@@ -408,7 +410,7 @@ static int create_pipeline(r3d_renderer *r) {
   VkDeviceSize a = r->vk.caps.min_ubo_alignment;
   if (a == 0) a = 1;
   r->frame_ubo_stride = (sizeof(r3d_frame_params) + a - 1) & ~(a - 1);
-  if (r3d_vkbuf_create_host(&r->vk, r->frame_ubo_stride * FRAMES_IN_FLIGHT,
+  if (r3d_vkbuf_create_host(&r->vk, r->frame_ubo_stride * FRAMES_IN_FLIGHT * R3D_MAX_VIEWS,
                             VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, &r->frame_ubo) != 0)
     return -1;
   VkDescriptorBufferInfo ubi = {
@@ -2219,11 +2221,11 @@ void r3d_bricks_shape(const r3d_renderer *r, uint32_t shape[3]) {
   shape[2] = r->bricks_nz;
 }
 
-void r3d_bricks_stream(r3d_renderer *r, const float eye[3], const float fwd[3], float half_tan,
-                       float pixel_cone, uint32_t slice_z0, uint32_t slice_depth, float gate,
-                       uint32_t budget) {
+bool r3d_bricks_stream_begin(r3d_renderer *r) {
   r->bs.last_inflight = 0;
-  if (!r->bs.active) return;
+  r->bs.ncand_pending = 0;
+  r->bs.stream_open = false;
+  if (!r->bs.active) return false;
   pthread_mutex_lock(&r->bs.mu);
   if (r->bs.job_state == 3) {
     uint64_t timeline = r->timeline_value;
@@ -2233,7 +2235,7 @@ void r3d_bricks_stream(r3d_renderer *r, const float eye[3], const float fwd[3], 
                                 .semaphoreCount = 1,
                                 .pSemaphores = &r->timeline,
                                 .pValues = &timeline};
-      if (vkWaitSemaphores(r->vk.dev, &wi, UINT64_MAX) != VK_SUCCESS) return;
+      if (vkWaitSemaphores(r->vk.dev, &wi, UINT64_MAX) != VK_SUCCESS) return false;
     }
     /* No previously submitted shader can still read these host-coherent page
      * entries. Publish the finished batch before this frame is submitted. */
@@ -2252,14 +2254,126 @@ void r3d_bricks_stream(r3d_renderer *r, const float eye[3], const float fwd[3], 
   if (r->bs.job_state != 0) {
     r->bs.last_inflight = r->bs.job_n;
     pthread_mutex_unlock(&r->bs.mu);
-    return;
+    return false;
   }
   pthread_mutex_unlock(&r->bs.mu);
-  if (budget == 0) return;
-  if (budget > BR_MAX_BATCH) budget = BR_MAX_BATCH;
   r->bs.frame++;
   memset(r->bs.lod_wanted, 0, sizeof r->bs.lod_wanted);
+  r->bs.stream_open = true;
+  return true;
+}
+
+/* Pin the coarsest level's LRU stamps (it is fully resident by construction)
+ * — shared by every collect flavor, cheap enough to run once per open. */
+static void bricks_touch_coarsest(r3d_renderer *r) {
+  const r3d_brlod_level *coarse = &r->bricks_lev[r->bricks_nlev - 1u];
+  uint32_t coarse_n = coarse->bx * coarse->by * coarse->bz;
+  for (uint32_t i = 0; i < coarse_n; i++) {
+    uint32_t b = coarse->page_off + i, slot = r->bs.brick_slot[b];
+    if (slot != BR_INVALID) r->bs.slot_use[slot] = r->bs.frame;
+    if (r->bs.warm_off[b] != BR_INVALID) r->bs.warm_use[b] = r->bs.frame;
+  }
+}
+
+/* AABB collect for an ortho/plane view: request the level whose voxel pitch
+ * matches pixel_cone across the given volume-space box (auto-coarsened until
+ * the walk is tractable), parent-first like the cone pump. */
+void r3d_bricks_stream_box(r3d_renderer *r, const float lo[3], const float hi[3],
+                           float pixel_cone, float gate) {
+  if (!r->bs.stream_open || !r->bricks_lod) return;
+  int g8 = (int)(gate * 255.0f + 0.5f);
+  if (g8 < BR_NOISE_FLOOR) g8 = BR_NOISE_FLOOR;
+  float maxdim = (float)r->bricks_maxdim;
+  float vpp = fmaxf(pixel_cone * maxdim, 1.0f); /* base voxels per pixel */
+  uint32_t desired = (uint32_t)floorf(log2f(vpp));
+  if (desired >= r->bricks_nlev) desired = r->bricks_nlev - 1u;
+  bricks_touch_coarsest(r);
+  uint32_t rng[3][2];
+  const r3d_brlod_level *l;
+  float edge;
+  for (;;) { /* coarsen until the box holds a sane brick count */
+    l = &r->bricks_lev[desired];
+    edge = (float)(BR_SLOT_DIM * l->scale) / maxdim;
+    const uint32_t bd[3] = {l->bx, l->by, l->bz};
+    uint64_t count = 1;
+    for (int a = 0; a < 3; a++) {
+      int64_t a0 = (int64_t)floorf(lo[a] / edge), a1 = (int64_t)floorf(hi[a] / edge) + 1;
+      if (a0 < 0) a0 = 0;
+      if (a1 > (int64_t)bd[a]) a1 = (int64_t)bd[a];
+      if (a1 < a0) a1 = a0;
+      rng[a][0] = (uint32_t)a0;
+      rng[a][1] = (uint32_t)a1;
+      count *= (uint64_t)(a1 - a0);
+    }
+    if (count <= 2048u || desired + 1u >= r->bricks_nlev) break;
+    desired++;
+  }
+  float cx0 = (lo[0] + hi[0]) * 0.5f, cy0 = (lo[1] + hi[1]) * 0.5f,
+        cz0 = (lo[2] + hi[2]) * 0.5f;
+  uint32_t ncand = r->bs.ncand_pending;
+  const r3d_brlod_level *pl = desired + 1u < r->bricks_nlev ? &r->bricks_lev[desired + 1u] : NULL;
+  for (uint32_t bz = rng[2][0]; bz < rng[2][1]; bz++)
+    for (uint32_t by = rng[1][0]; by < rng[1][1]; by++)
+      for (uint32_t bx = rng[0][0]; bx < rng[0][1]; bx++) {
+        float dx = ((float)bx + 0.5f) * edge - cx0;
+        float dy = ((float)by + 0.5f) * edge - cy0;
+        float dz = ((float)bz + 0.5f) * edge - cz0;
+        float d2 = dx * dx + dy * dy + dz * dz;
+        r->bs.lod_wanted[desired]++;
+        r->bs.lod_requests[desired]++;
+        uint32_t b = l->page_off + (bz * l->by + by) * l->bx + bx;
+        if (pl)
+          bricks_candidate(r,
+                           pl->page_off + ((bz >> 1u) * pl->by + (by >> 1u)) * pl->bx +
+                               (bx >> 1u),
+                           d2, 0u, g8, &ncand);
+        bricks_candidate(r, b, d2, 1u, g8, &ncand);
+      }
+  r->bs.ncand_pending = ncand;
+}
+
+void r3d_bricks_stream_point(r3d_renderer *r, const float p[3], uint32_t level, float gate) {
+  if (!r->bs.stream_open || !r->bricks_lod) return;
+  int g8 = (int)(gate * 255.0f + 0.5f);
+  if (g8 < BR_NOISE_FLOOR) g8 = BR_NOISE_FLOOR;
+  if (level >= r->bricks_nlev) level = r->bricks_nlev - 1u;
+  float maxdim = (float)r->bricks_maxdim;
+  const r3d_brlod_level *l = &r->bricks_lev[level];
+  float edge = (float)(BR_SLOT_DIM * l->scale) / maxdim;
+  uint32_t ncand = r->bs.ncand_pending;
+  uint32_t bc[3];
+  const uint32_t bd[3] = {l->bx, l->by, l->bz};
+  for (int a = 0; a < 3; a++) {
+    float v = p[a] / edge;
+    int64_t i = (int64_t)v;
+    if (i < 0) i = 0;
+    if (i >= (int64_t)bd[a]) i = (int64_t)bd[a] - 1;
+    bc[a] = (uint32_t)i;
+  }
+  if (level + 1u < r->bricks_nlev) {
+    const r3d_brlod_level *pl = &r->bricks_lev[level + 1u];
+    bricks_candidate(r,
+                     pl->page_off + ((bc[2] >> 1u) * pl->by + (bc[1] >> 1u)) * pl->bx +
+                         (bc[0] >> 1u),
+                     0.0f, 0u, g8, &ncand);
+  }
+  r->bs.lod_wanted[level]++;
+  r->bs.lod_requests[level]++;
+  bricks_candidate(r, l->page_off + (bc[2] * l->by + bc[1]) * l->bx + bc[0], 0.0f, 1u, g8,
+                   &ncand);
+  r->bs.ncand_pending = ncand;
+}
+
+void r3d_bricks_stream(r3d_renderer *r, const float eye[3], const float fwd[3], float half_tan,
+                       float pixel_cone, uint32_t slice_z0, uint32_t slice_depth, float gate,
+                       uint32_t budget) {
+  if (!r3d_bricks_stream_begin(r)) return;
+  if (budget == 0) {
+    r->bs.stream_open = false;
+    return;
+  }
   uint32_t bpa = r->bricks_bpa, abpa = r->bricks_abpa, nb = r->bs.nb;
+  (void)abpa;
   float tanw = half_tan * 1.15f + 1e-3f;
   int g8 = (int)(gate * 255.0f + 0.5f);
   if (g8 < BR_NOISE_FLOOR) g8 = BR_NOISE_FLOOR;
@@ -2268,13 +2382,7 @@ void r3d_bricks_stream(r3d_renderer *r, const float eye[3], const float fwd[3], 
    * camera. Resident ones get their LRU stamps; the rest become requests. */
   uint32_t ncand = 0;
   if (r->bricks_lod) {
-    const r3d_brlod_level *coarse = &r->bricks_lev[r->bricks_nlev - 1u];
-    uint32_t coarse_n = coarse->bx * coarse->by * coarse->bz;
-    for (uint32_t i = 0; i < coarse_n; i++) {
-      uint32_t b = coarse->page_off + i, slot = r->bs.brick_slot[b];
-      if (slot != BR_INVALID) r->bs.slot_use[slot] = r->bs.frame; /* permanently pinned */
-      if (r->bs.warm_off[b] != BR_INVALID) r->bs.warm_use[b] = r->bs.frame;
-    }
+    bricks_touch_coarsest(r);
     float maxdim = (float)r->bricks_maxdim;
     float lod_factor = fmaxf(pixel_cone * maxdim, 1e-6f);
     /* Level li is desired only inside its distance shell.  Restrict the grid
@@ -2355,7 +2463,18 @@ void r3d_bricks_stream(r3d_renderer *r, const float eye[3], const float fwd[3], 
       r->bs.cands[ncand++] = (struct bcand){d2, b, 0u};
     }
   }
-  if (!ncand) return;
+  r->bs.ncand_pending = ncand;
+  r3d_bricks_stream_submit(r, budget);
+}
+
+void r3d_bricks_stream_submit(r3d_renderer *r, uint32_t budget) {
+  if (!r->bs.stream_open) return;
+  r->bs.stream_open = false;
+  uint32_t ncand = r->bs.ncand_pending;
+  r->bs.ncand_pending = 0;
+  if (!ncand || !budget) return;
+  if (budget > BR_MAX_BATCH) budget = BR_MAX_BATCH;
+  uint32_t abpa = r->bricks_abpa;
   qsort(r->bs.cands, ncand, sizeof(struct bcand), bcand_cmp);
 
   /* nearest-first: warm-tier blob + hot slot per request, up to the budget */
@@ -2363,6 +2482,7 @@ void r3d_bricks_stream(r3d_renderer *r, const float eye[3], const float fwd[3], 
   uint32_t evict[BR_MAX_BATCH];
   for (uint32_t k = 0; k < ncand && n < budget; k++) {
     uint32_t b = r->bs.cands[k].b;
+    if (r->bs.brick_slot[b] != BR_INVALID) continue; /* duped across collects */
     size_t bn = 0;
     const uint8_t *blob = warm_get(r, b, &bn);
     if (!blob) { /* absent in the shard: never request again */
@@ -3556,6 +3676,13 @@ int r3d_clip_frame(r3d_renderer *r, double fx, double fy, uint64_t z0, r3d_frame
 }
 
 int r3d_frame(r3d_renderer *r, const r3d_frame_params *p, r3d_frame_stats *st) {
+  return r3d_frame_views(r, p, 1, st);
+}
+
+int r3d_frame_views(r3d_renderer *r, const r3d_frame_params *views, uint32_t nviews,
+                    r3d_frame_stats *st) {
+  if (!nviews || nviews > R3D_MAX_VIEWS) return -1;
+  const r3d_frame_params *p = &views[0];
   if (st) memset(st, 0, sizeof *st);
   uint32_t slot = r->slot;
   uint64_t tp = now_ns();
@@ -3606,7 +3733,10 @@ int r3d_frame(r3d_renderer *r, const r3d_frame_params *p, r3d_frame_stats *st) {
 
   tp = now_ns();
   VkCommandBuffer cmd = r->cmd[slot];
-  memcpy((uint8_t *)r->frame_ubo.mapped + (size_t)slot * r->frame_ubo_stride, p, sizeof *p);
+  for (uint32_t v = 0; v < nviews; v++)
+    memcpy((uint8_t *)r->frame_ubo.mapped +
+               (size_t)(slot * R3D_MAX_VIEWS + v) * r->frame_ubo_stride,
+           &views[v], sizeof views[v]);
   vkResetCommandBuffer(cmd, 0);
   VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
                                  .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
@@ -3622,32 +3752,51 @@ int r3d_frame(r3d_renderer *r, const r3d_frame_params *p, r3d_frame_stats *st) {
 
   if (r->query)
     vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, r->query, slot * 4);
-  uint32_t rmode = p->slab_grid & (1u << 24)
-                       ? 4u
-                       : (p->clip_valid ? 2u : (p->brick_mode ? 3u : (p->slab_grid ? 1u : 0u)));
   /* p->viewport may be smaller than the drawable (adaptive resolution while
-   * the camera moves): render into the top-left region, blit upscales */
+   * the camera moves, single-view only): render into the top-left region,
+   * blit upscales. Multi-view renders each view into its view_org rect and
+   * blits the whole offscreen 1:1. */
   uint32_t rw = p->viewport[0] ? p->viewport[0] : r->swap.extent.width;
   uint32_t rh = p->viewport[1] ? p->viewport[1] : r->swap.extent.height;
   if (rw > r->offscreen.extent.width) rw = r->offscreen.extent.width;
   if (rh > r->offscreen.extent.height) rh = r->offscreen.extent.height;
-  /* R3D_WG only builds full-quality cube variants; fast quality keeps the
-   * shader's default 16x8 local size. On the X1-85, 8x8 is 18.7% faster for
-   * the divergent reduced-resolution orbit path, but loses on dense static
-   * views, so use it only while adaptive resolution is actually reduced. */
-  VkPipeline pipeline = r->raycast[r->quality][rmode];
-  uint32_t wgx = rmode == 0 && r->quality == R3D_QUALITY_FULL ? r->wg_x : 16u;
-  uint32_t wgy = rmode == 0 && r->quality == R3D_QUALITY_FULL ? r->wg_y : 8u;
-  if (rmode == 0 && r->quality == R3D_QUALITY_FULL && r->adaptive_wg &&
-      (rw < r->swap.extent.width || rh < r->swap.extent.height)) {
-    pipeline = r->raycast_cube_8x8;
-    wgx = wgy = 8;
+  VkPipeline bound = VK_NULL_HANDLE;
+  for (uint32_t v = 0; v < nviews; v++) {
+    const r3d_frame_params *vp = &views[v];
+    uint32_t rmode = vp->slab_grid & (1u << 24)
+                         ? 4u
+                         : (vp->clip_valid ? 2u : (vp->brick_mode ? 3u : (vp->slab_grid ? 1u : 0u)));
+    uint32_t vw = vp->viewport[0] ? vp->viewport[0] : r->swap.extent.width;
+    uint32_t vh = vp->viewport[1] ? vp->viewport[1] : r->swap.extent.height;
+    uint32_t ox = vp->view_org & 0xffffu, oy = vp->view_org >> 16;
+    if (ox >= r->offscreen.extent.width || oy >= r->offscreen.extent.height) continue;
+    if (vw > r->offscreen.extent.width - ox) vw = r->offscreen.extent.width - ox;
+    if (vh > r->offscreen.extent.height - oy) vh = r->offscreen.extent.height - oy;
+    /* R3D_WG only builds full-quality cube variants; fast quality keeps the
+     * shader's default 16x8 local size. On the X1-85, 8x8 is 18.7% faster for
+     * the divergent reduced-resolution orbit path, but loses on dense static
+     * views, so use it only while adaptive resolution is actually reduced. */
+    VkPipeline pipeline = r->raycast[r->quality][rmode];
+    uint32_t wgx = rmode == 0 && r->quality == R3D_QUALITY_FULL ? r->wg_x : 16u;
+    uint32_t wgy = rmode == 0 && r->quality == R3D_QUALITY_FULL ? r->wg_y : 8u;
+    if (nviews == 1 && rmode == 0 && r->quality == R3D_QUALITY_FULL && r->adaptive_wg &&
+        (vw < r->swap.extent.width || vh < r->swap.extent.height)) {
+      pipeline = r->raycast_cube_8x8;
+      wgx = wgy = 8;
+    }
+    if (pipeline != bound) {
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+      bound = pipeline;
+    }
+    uint32_t ubo_offset = (uint32_t)((slot * R3D_MAX_VIEWS + v) * r->frame_ubo_stride);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r->pipe_layout, 0, 1, &r->dset,
+                            1, &ubo_offset);
+    vkCmdDispatch(cmd, (vw + wgx - 1) / wgx, (vh + wgy - 1) / wgy, 1);
   }
-  vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
-  uint32_t ubo_offset = (uint32_t)(slot * r->frame_ubo_stride);
-  vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r->pipe_layout, 0, 1, &r->dset, 1,
-                          &ubo_offset);
-  vkCmdDispatch(cmd, (rw + wgx - 1) / wgx, (rh + wgy - 1) / wgy, 1);
+  if (nviews > 1) { /* views cover the drawable; blit is identity */
+    rw = r->offscreen.extent.width;
+    rh = r->offscreen.extent.height;
+  }
   if (r->query)
     vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, r->query, slot * 4 + 1);
   r->slot_has_query[slot] = r->query != VK_NULL_HANDLE;

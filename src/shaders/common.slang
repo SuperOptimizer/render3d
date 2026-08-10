@@ -31,6 +31,11 @@ struct FrameParams {
   float skip_gate; // voxels below this are invisible under the current TF
   // virtual-slab mode (slab_grid bit 24): window world origin (z = slab_z0)
   float slab_x0, slab_y0;
+  // multi-view: offscreen pixel origin of this viewport (x | y<<16)
+  uint view_org;
+  // bit 0: orthographic rays (cam_right/up = half-extents, forward unit);
+  // bits 8..9: bricks slab-clip axis 0=z 1=x 2=y
+  uint view_flags;
 };
 
 // world -> volume space (R^T rotate about the box center, minus translation)

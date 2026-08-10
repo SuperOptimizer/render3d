@@ -61,6 +61,18 @@ void r3d_bricks_params(const r3d_renderer *r, r3d_frame_params *p);
 void r3d_bricks_stream(r3d_renderer *r, const float eye[3], const float fwd[3], float half_tan,
                        float pixel_cone, uint32_t slice_z0, uint32_t slice_depth, float gate,
                        uint32_t budget);
+/* Multi-view pump: begin (false = a batch is still in flight, skip collects),
+ * then any number of box/point collects, then submit. `lo/hi` are a volume-
+ * space AABB (normalized box units, same space as eye), `pixel_cone` chooses
+ * the level whose voxel pitch matches the view's px/voxel magnification.
+ * r3d_bricks_stream is begin + cone collect + submit. */
+bool r3d_bricks_stream_begin(r3d_renderer *r);
+void r3d_bricks_stream_box(r3d_renderer *r, const float lo[3], const float hi[3],
+                           float pixel_cone, float gate);
+/* Explicit residency request: the brick containing volume-space point p at
+ * `level` (plus its parent), nearest-first around `focus`. */
+void r3d_bricks_stream_point(r3d_renderer *r, const float p[3], uint32_t level, float gate);
+void r3d_bricks_stream_submit(r3d_renderer *r, uint32_t budget);
 /* Volume box in renderer coordinates. Legacy cubic shards return 1,1,1;
  * manifests preserve rectangular physical proportions using max(shape). */
 void r3d_bricks_extent(const r3d_renderer *r, float extent[3]);
@@ -118,6 +130,12 @@ void r3d_set_quality(r3d_renderer *r, uint32_t quality);
 
 /* Acquire -> raycast -> blit -> present. Fills st (may be zero). */
 int r3d_frame(r3d_renderer *r, const r3d_frame_params *p, r3d_frame_stats *st);
+/* Multi-viewport form: one dispatch per view into its view_org rect of the
+ * offscreen image, then a single full-window present. Views may use different
+ * render modes. nviews 1..R3D_MAX_VIEWS; r3d_frame is the nviews==1 case
+ * (which alone supports adaptive sub-drawable viewports). */
+int r3d_frame_views(r3d_renderer *r, const r3d_frame_params *views, uint32_t nviews,
+                    r3d_frame_stats *st);
 int r3d_resize(r3d_renderer *r);
 
 /* GUI (Dear ImGui via cimgui). Call r3d_gui_event for every SDL event, then

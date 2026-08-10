@@ -305,10 +305,25 @@ float vol_sample(float3 p, float lod) {
   return sample_tile(float3(u, v, w), iy * gx + ix);
 }
 
-float3 ray_dir(uint2 pix) {
+bool is_ortho() { return (pc.view_flags & 1u) != 0u; }
+
+float2 pix_ndc(uint2 pix) {
   float2 uv = (float2(pix) + 0.5) / float2(pc.viewport);
-  float2 ndc = float2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+  return float2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+}
+
+float3 ray_dir(uint2 pix) {
+  if (is_ortho()) return normalize(pc.cam_forward);
+  float2 ndc = pix_ndc(pix);
   return normalize(pc.cam_forward + ndc.x * pc.cam_right + ndc.y * pc.cam_up);
+}
+
+/* ortho views offset the origin across the image plane instead of fanning
+ * directions; cam_right/up carry the half-extents of the visible rect */
+float3 ray_origin(uint2 pix) {
+  if (!is_ortho()) return pc.cam_origin;
+  float2 ndc = pix_ndc(pix);
+  return pc.cam_origin + ndc.x * pc.cam_right + ndc.y * pc.cam_up;
 }
 
 // slab test against [lo, hi]; returns (tnear, tfar), tnear<=tfar means hit
@@ -331,10 +346,11 @@ float2 box_hit(float3 o, float3 d, float3 lo, float3 hi) {
 [numthreads(WG_X, WG_Y, 1)]
 void main(uint3 tid: SV_DispatchThreadID) {
   if (tid.x >= pc.viewport.x || tid.y >= pc.viewport.y) return;
+  uint2 opix = tid.xy + uint2(pc.view_org & 0xffffu, pc.view_org >> 16);
   float3 dir = ray_dir(tid.xy);
 
   if (pc.mode == MODE_RAYDIR) {
-    out_image[tid.xy] = float4(dir * 0.5 + 0.5, 1);
+    out_image[opix] = float4(dir * 0.5 + 0.5, 1);
     return;
   }
 
@@ -378,23 +394,26 @@ void main(uint3 tid: SV_DispatchThreadID) {
   float3 ext = vol_extent();
   /* move the ray into volume space: the model transform rotates the box about
    * its center and translates it; marching/shading all happen in this space */
-  float3 ro = to_volume_point(pc.cam_origin, ext * 0.5);
+  float3 ro = to_volume_point(ray_origin(tid.xy), ext * 0.5);
   dir = to_volume_dir(dir);
 
   float3 box_lo = float3(0), box_hi = ext;
   if (is_bricks() && bricks_is_lod() && pc.slab_depth > 0u) {
     float md = float(max(page[1], max(page[2], page[3])));
-    box_lo.z = clamp(pc.slab_z0 / md, 0.0, ext.z);
-    box_hi.z = clamp((pc.slab_z0 + float(pc.slab_depth)) / md, box_lo.z, ext.z);
+    uint axc = (pc.view_flags >> 8) & 3u; /* 0=z 1=x 2=y */
+    int a = axc == 1u ? 0 : (axc == 2u ? 1 : 2);
+    box_lo[a] = clamp(pc.slab_z0 / md, 0.0, ext[a]);
+    box_hi[a] = clamp((pc.slab_z0 + float(pc.slab_depth)) / md, box_lo[a], ext[a]);
   }
   float2 hit = box_hit(ro, dir, box_lo, box_hi);
   float tn = max(hit.x, 0.0), tf_ = hit.y;
   if (tn >= tf_) {
-    out_image[tid.xy] = float4(0.02, 0.02, 0.03, 1); // background
+    out_image[opix] = float4(0.02, 0.02, 0.03, 1); // background
     return;
   }
 
-  // ray-cone footprint: pixel angular size (cam_up is pre-scaled by tan(fov/2))
+  // ray-cone footprint: pixel angular size (cam_up is pre-scaled by tan(fov/2));
+  // ortho views have a constant per-pixel footprint instead (see lod below)
   float cone = 2.0 * length(pc.cam_up) / float(pc.viewport.y);
 
   float dt = pc.step_voxels * voxel;
@@ -433,7 +452,9 @@ void main(uint3 tid: SV_DispatchThreadID) {
     steps++;
     // LOD-on-distance: mip where the ray cone's width matches the voxel pitch;
     // step size scales with it so far-field marching is proportionally cheap.
-    float lod = clamp(log2(max(t * cone / voxel, 1.0)) + pc.lod_bias, 0.0, max_lod);
+    // Ortho: the footprint is depth-independent (parallel rays).
+    float foot = is_ortho() ? cone : t * cone;
+    float lod = clamp(log2(max(foot / voxel, 1.0)) + pc.lod_bias, 0.0, max_lod);
     /* Spatial filtering follows projected magnification.  The independent
      * depth step floor guarantees traversal of the whole ray without forcing
      * an isotropic coarse LOD (which visibly destroyed close-up XY detail). */
@@ -638,5 +659,5 @@ void main(uint3 tid: SV_DispatchThreadID) {
   } else { // MODE_MIP
     color = float3(mip_max * pc.density);
   }
-  out_image[tid.xy] = float4(color, 1);
+  out_image[opix] = float4(color, 1);
 }

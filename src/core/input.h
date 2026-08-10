@@ -23,9 +23,11 @@ typedef struct r3d_input {
   int zdelta;        /* slab window scroll in slices: R/F = ±1 (repeats) */
   int zpage;         /* slab window scroll in pages: PgUp/PgDn = ±1 */
   float wheel;       /* scroll this frame (+away from user) */
+  bool wheel_shift;  /* Shift held during any wheel event this frame */
   bool annotate_click; /* uncaptured LMB press in annotation mode */
   bool click_ctrl;     /* Ctrl was held for annotate_click */
   float click_xy[2];   /* window pixel coordinates of annotate_click */
+  float mouse_xy[2];   /* current pointer position (window pixels) */
   /* persistent */
   bool captured;     /* fly mode: pointer grabbed until Esc */
   bool dragging;     /* orbit mode: LMB held */
@@ -34,9 +36,11 @@ typedef struct r3d_input {
 /* hook (may be NULL) sees every event first (e.g. GUI). allow_capture=false
  * suppresses click-to-capture/drag (e.g. pointer over GUI). fly_mode picks
  * click semantics: capture-and-fly vs hold-drag-to-rotate. In annotation
- * mode, plain LMB produces annotate_click while Shift+LMB still pans. */
+ * mode, plain LMB produces annotate_click while Shift+LMB still pans. In
+ * multiview mode, plain LMB drags (pan) and Ctrl+LMB produces
+ * annotate_click (focus gesture; click_ctrl is set). */
 void r3d_input_poll(r3d_input *in, SDL_Window *win,
                     void (*hook)(void *ud, const SDL_Event *ev), void *ud, bool allow_capture,
-                    bool fly_mode, bool annotation_mode);
+                    bool fly_mode, bool annotation_mode, bool multiview_mode);
 
 #endif /* R3D_INPUT_H */

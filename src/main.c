@@ -11,8 +11,10 @@
 #include "core/transfer.h"
 #include "core/volume.h"
 #include "core/input.h"
+#include "core/mview.h"
 #include "core/screenshot.h"
 #include "core/stats.h"
+#include "core/tifxyz.h"
 #include "core/umbilicus.h"
 #include "render/render.h"
 #include "vk/vkctx.h"
@@ -252,6 +254,7 @@ int main(int argc, char **argv) {
   uint32_t vsnx = 43008, vsny = 43008, vsnz = 68608;
   const char *vscache = "band", *vsurl = NULL;
   const char *umbilicus_path = NULL;
+  const char *multiview_path = NULL; /* tifxyz dir: vc3d-style 2x2 viewer */
   int annotation_prefetch = 5; /* annotation steps ahead; one slot is kept behind */
   int annotation_z_prefetch = 32; /* contiguous GPU-resident fine-scroll margin */
   bool vsz_given = false;
@@ -300,6 +303,7 @@ int main(int argc, char **argv) {
       vsd = atoi(argv[i + 3]);
     }
     if (i < argc - 1 && strcmp(argv[i], "--umbilicus") == 0) umbilicus_path = argv[i + 1];
+    if (i < argc - 1 && strcmp(argv[i], "--multiview") == 0) multiview_path = argv[i + 1];
     if (i < argc - 1 && strcmp(argv[i], "--ann-prefetch") == 0)
       annotation_prefetch = atoi(argv[i + 1]);
     if (i < argc - 1 && strcmp(argv[i], "--ann-z-prefetch") == 0)
@@ -451,6 +455,38 @@ int main(int argc, char **argv) {
     mode = R3D_MODE_FULL;
   }
 
+  /* vc3d-style 2x2 multi-view: flattened segment (TL, milestone C — an XY
+   * overview until then) + XY/XZ/YZ ortho plane views, shared focus POI */
+  r3d_tifxyz mv_seg = {0};
+  r3d_mview mv[4] = {0};
+  double mv_focus[3] = {0, 0, 0}; /* world voxels x,y,z */
+  int mv_thick = 1;               /* plane-view slab thickness (voxels) */
+  int mv_drag_view = -1;
+  if (multiview_path) {
+    if (!bricks_path || !brick_is_lod) {
+      fprintf(stderr, "--multiview needs --bricks with a LOD manifest\n");
+      return EXIT_FAILURE;
+    }
+    if (r3d_tifxyz_load(&mv_seg, multiview_path) != 0) return EXIT_FAILURE;
+    for (int a = 0; a < 3; a++)
+      mv_focus[a] = ((double)mv_seg.bbox[0][a] + (double)mv_seg.bbox[1][a]) * 0.5;
+    const float *mc = r3d_tifxyz_at(&mv_seg, mv_seg.w / 2, mv_seg.h / 2);
+    if (r3d_tifxyz_valid(mc)) /* center the focus ON the sheet when possible */
+      for (int a = 0; a < 3; a++) mv_focus[a] = (double)mc[a];
+    brick_depth = 0; /* multiview owns per-view slab clips */
+    mode = R3D_MODE_MIP; /* plane views are plain slice viewers */
+    for (int i = 0; i < 4; i++) {
+      const uint8_t *ax = r3d_mv_axes[i];
+      mv[i].cu = mv_focus[ax[0]];
+      mv[i].cv = mv_focus[ax[1]];
+      mv[i].slice = mv_focus[ax[2]];
+      mv[i].zoom = 0.0; /* fitted on the first frame once quadrants exist */
+    }
+    /* TL overview: whole XY extent until the surf view lands */
+    mv[R3D_MV_SEG].cu = (double)brick_shape[0] * 0.5;
+    mv[R3D_MV_SEG].cv = (double)brick_shape[1] * 0.5;
+  }
+
   int64_t vs_z0 = umbilicus_path ? annotation_z0(annotation_z, vsnz, (uint32_t)vsd)
                                   : (int64_t)vsz0;
   double vs_fx = (double)vsnx * 0.5, vs_fy = (double)vsny * 0.5;
@@ -581,7 +617,7 @@ int main(int argc, char **argv) {
 
     ImGuiIO *io = igGetIO_Nil(); /* Want* flags reflect last frame — fine */
     r3d_input_poll(&in, win, gui_event_hook, renderer, !io->WantCaptureMouse,
-                   cam_mode == CAM_FLY, umbilicus_path != NULL);
+                   cam_mode == CAM_FLY, umbilicus_path != NULL, multiview_path != NULL);
     if (io->WantCaptureKeyboard && !in.captured)
       in.move[0] = in.move[1] = in.move[2] = 0.0f;
     if (in.quit) running = false;
@@ -609,7 +645,7 @@ int main(int argc, char **argv) {
       z_navigated = annotation_z != old_annotation_z;
       vs_z0 = annotation_z0(annotation_z, vsnz, (uint32_t)vsd);
     }
-    if (bricks_path && brick_depth > 0 && !umbilicus_path) {
+    if (bricks_path && brick_depth > 0 && !umbilicus_path && !multiview_path) {
       int old_brick_z = brick_z;
       int64_t nz = (int64_t)brick_z + in.zdelta + (int64_t)in.zpage * brick_depth;
       /* Global LOD slices use the same fine wheel semantics as annotation:
@@ -679,7 +715,9 @@ int main(int argc, char **argv) {
     density *= in.density_scale;
     lod_bias += in.lod_delta;
     cam.fov_y = fov_deg * 0.01745329f;
-    if (cam_mode == CAM_ORBIT) {
+    if (multiview_path) {
+      /* per-view interaction is handled after the quadrant layout below */
+    } else if (cam_mode == CAM_ORBIT) {
       /* drag grabs the cube; Shift pans the camera; Ctrl translates the
        * volume; Ctrl+Shift rotates the volume */
       if (in.dragging && (in.ctrl || in.fast)) {
@@ -717,6 +755,70 @@ int main(int argc, char **argv) {
     if (w <= 0 || h <= 0) {
       SDL_Delay(50);
       continue;
+    }
+
+    if (multiview_path) {
+      r3d_mview lay[4];
+      r3d_mv_layout(lay, w, h);
+      for (int i = 0; i < 4; i++) {
+        mv[i].px = lay[i].px;
+        mv[i].py = lay[i].py;
+        mv[i].pw = lay[i].pw;
+        mv[i].ph = lay[i].ph;
+      }
+      if (mv[0].zoom <= 0.0) { /* first frame: fit */
+        double fit = (double)mv[R3D_MV_SEG].ph / (double)(brick_shape[1] ? brick_shape[1] : 1);
+        double fx2 = (double)mv[R3D_MV_SEG].pw / (double)(brick_shape[0] ? brick_shape[0] : 1);
+        mv[R3D_MV_SEG].zoom = fit < fx2 ? fit : fx2;
+        for (int i = 1; i < 4; i++) mv[i].zoom = (double)mv[i].ph / 2048.0;
+      }
+      int hover = r3d_mv_hit(mv, in.mouse_xy[0], in.mouse_xy[1]);
+      if (in.dragging && mv_drag_view < 0) mv_drag_view = hover;
+      if (!in.dragging) mv_drag_view = -1;
+      if (mv_drag_view >= 0 && (in.look[0] != 0.0f || in.look[1] != 0.0f)) {
+        r3d_mview *dv = &mv[mv_drag_view];
+        dv->cu -= (double)in.look[0] / dv->zoom;
+        dv->cv -= (double)in.look[1] / dv->zoom;
+      }
+      if (hover >= 0 && in.wheel != 0.0f && !io->WantCaptureMouse) {
+        r3d_mview *hv = &mv[hover];
+        if (in.wheel_shift) { /* scrub the slice along the view normal */
+          hv->slice += (double)(in.wheel > 0.0f ? 1 : -1);
+        } else {
+          r3d_mv_zoom(hv, in.mouse_xy[0], in.mouse_xy[1],
+                      pow(1.05, (double)in.wheel * 2.0), 1.0 / 256.0, 64.0);
+        }
+        in.wheel = 0.0f;
+      }
+      if (hover >= 0 && (in.zdelta || in.zpage))
+        mv[hover].slice += (double)(in.zdelta + in.zpage * 10);
+      for (int i = 0; i < 4; i++) { /* clamp slices to the volume */
+        uint32_t n = brick_shape[r3d_mv_axes[i][2]];
+        if (mv[i].slice < 0.0) mv[i].slice = 0.0;
+        if (n && mv[i].slice > (double)n - 1.0) mv[i].slice = (double)n - 1.0;
+      }
+      if (in.annotate_click && in.click_ctrl) { /* Ctrl+click = set focus POI */
+        int cv_ = r3d_mv_hit(mv, in.click_xy[0], in.click_xy[1]);
+        if (cv_ >= 0) {
+          const uint8_t *ax = r3d_mv_axes[cv_];
+          double u, vq;
+          r3d_mv_unproject(&mv[cv_], in.click_xy[0], in.click_xy[1], &u, &vq);
+          mv_focus[ax[0]] = u;
+          mv_focus[ax[1]] = vq;
+          mv_focus[ax[2]] = mv[cv_].slice;
+          for (int a = 0; a < 3; a++) { /* clamp into the volume */
+            if (mv_focus[a] < 0.0) mv_focus[a] = 0.0;
+            if (brick_shape[a] && mv_focus[a] > (double)brick_shape[a] - 1.0)
+              mv_focus[a] = (double)brick_shape[a] - 1.0;
+          }
+          for (int i = 1; i < 4; i++) { /* recenter planes through the focus */
+            const uint8_t *a2 = r3d_mv_axes[i];
+            mv[i].cu = mv_focus[a2[0]];
+            mv[i].cv = mv_focus[a2[1]];
+            mv[i].slice = mv_focus[a2[2]];
+          }
+        }
+      }
     }
 
     /* scripted camera paths for reproducible perf runs (override user input) */
@@ -870,7 +972,7 @@ int main(int argc, char **argv) {
                   z_navigated || auto_scroll ||
                   in.move[0] != 0.0f || in.move[1] != 0.0f || in.move[2] != 0.0f;
     settle = moving ? 15 : (settle > 0 ? settle - 1 : 0);
-    bool half_res = adaptive_res && settle > 0;
+    bool half_res = adaptive_res && settle > 0 && !multiview_path;
     if (getenv("R3D_FORCE_HALF")) half_res = true; /* testing/benching the path */
     else if (in.screenshot || (total_frames && shot_path && frame_index + 1 >= total_frames))
       half_res = false; /* captures always full res */
@@ -1019,6 +1121,17 @@ int main(int argc, char **argv) {
             brick_z = (int)brick_shape[2] - brick_depth;
         }
       }
+      if (multiview_path) {
+        igSeparator();
+        igText("multiview focus  x %.0f  y %.0f  z %.0f", mv_focus[0], mv_focus[1],
+               mv_focus[2]);
+        igText("XY z %.0f | XZ y %.0f | YZ x %.0f", mv[R3D_MV_XY].slice,
+               mv[R3D_MV_XZ].slice, mv[R3D_MV_YZ].slice);
+        int th = mv_thick;
+        if (igSliderInt("slice thickness", &th, 1, 64, "%d", 0)) mv_thick = th;
+        igTextDisabled("segment %ux%u  %llu valid points", mv_seg.w, mv_seg.h,
+                       (unsigned long long)mv_seg.nvalid);
+      }
       igText("bricks: hot %u/%u slots  warm %u (%.0f/%llu MB)%s", bst.hot, bst.hot_cap,
              bst.warm_bricks, (double)bst.warm_bytes / 1048576.0,
              (unsigned long long)(bst.warm_cap >> 20), bst.inflight ? "  streaming..." : "");
@@ -1072,6 +1185,9 @@ int main(int argc, char **argv) {
       igTextDisabled("click: set point | wheel, R/F: 1 slice\n"
                      "PgUp/PgDn: z step | Ctrl+click: set + advance\n"
                      "Shift+drag: pan | Shift+wheel: zoom | F12: shot");
+    else if (multiview_path)
+      igTextDisabled("drag: pan view | wheel: zoom | Shift+wheel: slice\n"
+                     "R/F: slice | Ctrl+click: set focus | F12: shot");
     else if (cam_mode == CAM_ORBIT)
       igTextDisabled("drag orbit | shift+drag pan cam | ctrl+drag move vol\n"
                      "ctrl+shift+drag rot vol | wheel zoom | WASD pan | F12 shot");
@@ -1099,6 +1215,24 @@ int main(int argc, char **argv) {
                            (ImVec2){marker.x + 18.0f, marker.y}, yellow, 2.0f);
         ImDrawList_AddLine(draw, (ImVec2){marker.x, marker.y - 18.0f},
                            (ImVec2){marker.x, marker.y + 18.0f}, yellow, 2.0f);
+      }
+    }
+
+    if (multiview_path) { /* focus marker + quadrant borders in every view */
+      ImDrawList *draw = igGetBackgroundDrawList_Nil();
+      const ImU32 fc = 0xffd7ff32u; /* vc3d focus teal (50,255,215), ABGR */
+      const ImU32 bc = 0x60808080u;
+      ImDrawList_AddLine(draw, (ImVec2){(float)(w / 2), 0}, (ImVec2){(float)(w / 2), (float)h},
+                         bc, 1.0f);
+      ImDrawList_AddLine(draw, (ImVec2){0, (float)(h / 2)}, (ImVec2){(float)w, (float)(h / 2)},
+                         bc, 1.0f);
+      for (int i = 1; i < 4; i++) {
+        const uint8_t *ax = r3d_mv_axes[i];
+        float fx_, fy_;
+        r3d_mv_project(&mv[i], mv_focus[ax[0]], mv_focus[ax[1]], &fx_, &fy_);
+        if (fx_ >= (float)mv[i].px && fx_ < (float)(mv[i].px + mv[i].pw) &&
+            fy_ >= (float)mv[i].py && fy_ < (float)(mv[i].py + mv[i].ph))
+          ImDrawList_AddCircle(draw, (ImVec2){fx_, fy_}, 10.0f, fc, 24, 2.0f);
       }
     }
 
@@ -1199,8 +1333,39 @@ int main(int argc, char **argv) {
       float asp = (float)w / (float)h;
       float ht = tanf(cam.fov_y * 0.5f) * sqrtf(1.0f + asp * asp);
       float pixel_cone = 2.0f * tanf(cam.fov_y * 0.5f) / (float)(rvh ? rvh : 1) * exp2f(lod_bias);
-      r3d_bricks_stream(renderer, be, bf, ht, pixel_cone, (uint32_t)brick_z,
-                        (uint32_t)brick_depth, p.skip_gate, moving ? 2u : 6u);
+      if (multiview_path) {
+        /* per-view AABB collects: each plane view wants its visible rect at
+         * its own magnification, +- the slab thickness along the normal */
+        uint32_t mdim = brick_shape[0];
+        for (int a = 1; a < 3; a++)
+          if (brick_shape[a] > mdim) mdim = brick_shape[a];
+        if (r3d_bricks_stream_begin(renderer)) {
+          for (int i = 0; i < 4; i++) {
+            const uint8_t *ax = r3d_mv_axes[i];
+            double hw = (double)mv[i].pw * 0.5 / mv[i].zoom;
+            double hh = (double)mv[i].ph * 0.5 / mv[i].zoom;
+            double th = (double)mv_thick;
+            double wlo[3], whi[3];
+            wlo[ax[0]] = mv[i].cu - hw;
+            whi[ax[0]] = mv[i].cu + hw;
+            wlo[ax[1]] = mv[i].cv - hh;
+            whi[ax[1]] = mv[i].cv + hh;
+            wlo[ax[2]] = mv[i].slice - 1.0;
+            whi[ax[2]] = mv[i].slice + th + 1.0;
+            float lo[3], hi[3];
+            for (int a = 0; a < 3; a++) {
+              lo[a] = (float)(wlo[a] / (double)mdim);
+              hi[a] = (float)(whi[a] / (double)mdim);
+            }
+            float vpp = (float)(1.0 / (mv[i].zoom * (double)mdim)) * exp2f(lod_bias);
+            r3d_bricks_stream_box(renderer, lo, hi, vpp, p.skip_gate);
+          }
+          r3d_bricks_stream_submit(renderer, moving ? 3u : 8u);
+        }
+      } else {
+        r3d_bricks_stream(renderer, be, bf, ht, pixel_cone, (uint32_t)brick_z,
+                          (uint32_t)brick_depth, p.skip_gate, moving ? 2u : 6u);
+      }
       r3d_bricks_params(renderer, &p);
     }
     if (clip_mode) {
@@ -1226,7 +1391,43 @@ int main(int argc, char **argv) {
       clip_valid_disp = p.clip_valid;
     }
     r3d_frame_stats st = {0};
-    int frc = r3d_frame(renderer, &p, &st);
+    int frc;
+    if (multiview_path) {
+      /* one FrameParams per quadrant: axis-aligned ortho cameras over the
+       * bricks virtual volume, slab-clipped to each view's slice */
+      uint32_t mdim = brick_shape[0];
+      for (int a = 1; a < 3; a++)
+        if (brick_shape[a] > mdim) mdim = brick_shape[a];
+      static const uint32_t axis_code[3] = {1u, 2u, 0u}; /* world axis -> view_flags code */
+      r3d_frame_params vp4[4];
+      for (int i = 0; i < 4; i++) {
+        const uint8_t *ax = r3d_mv_axes[i];
+        r3d_frame_params q = p;
+        q.viewport[0] = (uint32_t)mv[i].pw;
+        q.viewport[1] = (uint32_t)mv[i].ph;
+        q.view_org = (uint32_t)mv[i].px | ((uint32_t)mv[i].py << 16);
+        q.view_flags = R3D_VIEW_ORTHO | R3D_VIEW_AXIS(axis_code[ax[2]]);
+        double hw = (double)mv[i].pw * 0.5 / mv[i].zoom / (double)mdim;
+        double hh = (double)mv[i].ph * 0.5 / mv[i].zoom / (double)mdim;
+        float org[3], rgt[3] = {0, 0, 0}, upv[3] = {0, 0, 0}, fwdv[3] = {0, 0, 0};
+        org[ax[0]] = (float)(mv[i].cu / (double)mdim);
+        org[ax[1]] = (float)(mv[i].cv / (double)mdim);
+        org[ax[2]] = (float)((mv[i].slice - 2.0) / (double)mdim);
+        rgt[ax[0]] = (float)hw;   /* screen +x -> +u */
+        upv[ax[1]] = (float)-hh;  /* ndc +y (screen top) -> smaller v */
+        fwdv[ax[2]] = 1.0f;
+        memcpy(q.cam_origin, org, sizeof org);
+        memcpy(q.cam_right, rgt, sizeof rgt);
+        memcpy(q.cam_up, upv, sizeof upv);
+        memcpy(q.cam_forward, fwdv, sizeof fwdv);
+        q.slab_z0 = (float)mv[i].slice;
+        q.slab_depth = (uint32_t)mv_thick;
+        vp4[i] = q;
+      }
+      frc = r3d_frame_views(renderer, vp4, 4, &st);
+    } else {
+      frc = r3d_frame(renderer, &p, &st);
+    }
     bool measuring = !exit_frames || frame_index > warmup_frames;
     if (frc == 0 && measuring) {
       last_gpu_ns = st.gpu_ns;
@@ -1318,6 +1519,7 @@ int main(int argc, char **argv) {
   if (umbilicus_path && umbilicus.dirty)
     save_umbilicus(&umbilicus, umbilicus_path, annotation_status);
   r3d_umbilicus_free(&umbilicus);
+  if (multiview_path) r3d_tifxyz_free(&mv_seg);
   free(prof_samples);
   r3d_destroy(renderer);
   SDL_DestroyWindow(win);
