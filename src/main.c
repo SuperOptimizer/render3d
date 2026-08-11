@@ -1593,7 +1593,7 @@ int main(int argc, char **argv) {
       printf("mode: %u\n", mode);
     }
     bool z_navigated = false;
-    if (umbilicus_path) {
+    if (umbilicus_path && vslab_mode) { /* multiview panes own their wheel */
       int old_annotation_z = annotation_z;
       int64_t nz = annotation_z;
       nz += in.zdelta;
