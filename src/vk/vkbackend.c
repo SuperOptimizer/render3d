@@ -3270,6 +3270,36 @@ void r3d_bricks_params(const r3d_renderer *r, r3d_frame_params *p) {
                     (r->bricks_identity ? 0x10000u : 0u);
 }
 
+int r3d_bricks_overlay_switch(r3d_renderer *r, const char *lod_root) {
+  if (!r->ink_active) return r3d_bricks_overlay(r, lod_root);
+  if (strcmp(r->ink_root, lod_root) == 0) return 0;
+  /* drain the async decode job — its worker reads the overlay readers */
+  pthread_mutex_lock(&r->bs.mu);
+  while (r->bs.job_state == 1 || r->bs.job_state == 2)
+    pthread_cond_wait(&r->bs.cv, &r->bs.mu);
+  pthread_mutex_unlock(&r->bs.mu);
+  for (uint32_t i = 0; i < r->bricks_nreaders; i++)
+    if (r->ink_readers[i].open) c5d_shard_close_reader(&r->ink_readers[i].sr);
+  free(r->ink_readers);
+  r->ink_readers = NULL;
+  vkDeviceWaitIdle(r->vk.dev); /* the atlas is bound to in-flight frames */
+  r3d_vkimage_destroy(&r->vk, &r->ink_atlas);
+  r->ink_active = false;
+  r->ink_root[0] = 0;
+  int rc = r3d_bricks_overlay(r, lod_root);
+  if (rc == 0 && r->sv.active) { /* the surfvol taps the overlay atlas too:
+                                  * rebind and force a full window re-bake */
+    r3d_vkcomp_bind_image(&r->vk, &r->sv.comp, 5, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                          r->ink_atlas.view, r->samp_vol, VK_IMAGE_LAYOUT_GENERAL);
+    r->sv.step = 0.0f;
+    r->sv.dirty = false;
+    r->sv.prog_row = UINT32_MAX;
+    r->sv.baked = false;
+    r->sv.shift_pending = false;
+  }
+  return rc;
+}
+
 int r3d_bricks_overlay(r3d_renderer *r, const char *lod_root) {
   if (!r->bricks_lod || !r->bs.cpu_decode || r->ink_active) {
     fprintf(stderr, "bricks: overlay needs an active CPU-decode LOD manifest\n");

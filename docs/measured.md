@@ -1387,3 +1387,24 @@ where the curve intersects each pane's [slice, slice+thickness] slab
 curve's z-range); scrub-speed slider (0.25-200 vox/notch, log) for
 Shift+wheel and R/F; placing a point optionally refocuses all panes like
 Ctrl+click (toggle, default on); panel section is a collapsing header.
+
+## 2026-08-11 — surface-prediction overlays + switchable overlay trees
+
+The bucket publishes surface predictions for our 2.4um volume
+(representations/predictions/surfaces/...-recto-2um-ps256-L0-th0.45.zarr:
+geometry-identical, u8, 256^3 chunks, 6 levels — the ink-3d pattern; the
+m7-L2 variant is L2-native/192-chunk and skipped). Bootstrapped
+cache/PHercParis4-surf-lod in 11 s (coarsest + source.json; fine levels
+demand-stream like the CT). --overlay is now repeatable (up to 8 trees)
+with radio buttons in a new "overlay" panel section; switching calls
+r3d_bricks_overlay_switch: drain the async decode job (its worker reads
+the overlay readers), close readers, device-idle, recreate the atlas via
+the normal begin path, rebind the surfvol overlay tap and force a full
+window re-bake. Measured ~2.4-2.7 s per switch (coarsest backfill; seed
+cache serves repeats), 0 decode failures across switches. Overlay tint is
+palette-keyed via overlay_flags bits 8+ (ink green, surface cyan — tree
+name heuristic).
+
+Panel reorganized into collapsing headers: rendering, views (default
+open), overlay, umbilicus, surfaces, streaming, quality, plus the existing
+transform/profile. All 5 suites green.

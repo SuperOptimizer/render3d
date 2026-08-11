@@ -1120,7 +1120,10 @@ int main(int argc, char **argv) {
   const char *umbilicus_path = NULL;
   const char *multiview_path = NULL; /* tifxyz dir: vc3d-style 2x2 viewer */
   const char *seg_store_path = NULL; /* segpack store: draw ALL surfaces */
-  const char *overlay_path = NULL;   /* second c5d LOD root (ink predictions) */
+  const char *overlay_path = NULL;   /* active overlay c5d LOD root */
+  const char *overlay_paths[8];      /* all --overlay trees (ink, surface preds...) */
+  uint32_t n_overlays = 0;
+  int overlay_sel = 0;
   bool od_browse = false;            /* start with the open-data browser window */
   int sv_w = 2048, sv_h = 2048, sv_l = 96; /* flattened surface-volume window */
   int annotation_prefetch = 5; /* annotation steps ahead; one slot is kept behind */
@@ -1172,7 +1175,9 @@ int main(int argc, char **argv) {
     }
     if (i < argc - 1 && strcmp(argv[i], "--umbilicus") == 0) umbilicus_path = argv[i + 1];
     if (i < argc - 1 && strcmp(argv[i], "--multiview") == 0) multiview_path = argv[i + 1];
-    if (i < argc - 1 && strcmp(argv[i], "--overlay") == 0) overlay_path = argv[i + 1];
+    if (i < argc - 1 && strcmp(argv[i], "--overlay") == 0 &&
+        n_overlays < sizeof overlay_paths / sizeof *overlay_paths)
+      overlay_paths[n_overlays++] = argv[i + 1];
     if (i < argc - 1 && strcmp(argv[i], "--segments") == 0) seg_store_path = argv[i + 1];
     if (strcmp(argv[i], "--browse") == 0) od_browse = true;
     if (i < argc - 3 && strcmp(argv[i], "--surfvol") == 0) {
@@ -1295,7 +1300,7 @@ int main(int argc, char **argv) {
     od_swap = false;
     bricks_path = od_next_bricks;
     multiview_path = od_next_seg[0] ? od_next_seg : NULL;
-    overlay_path = NULL; /* browser-opened datasets have no overlay tree yet */
+    n_overlays = 0; /* browser-opened datasets have no overlay tree yet */
     umbilicus_path = NULL;
     vslab_mode = false;
     clip_mode = false;
@@ -1348,6 +1353,7 @@ int main(int argc, char **argv) {
     if (brick_z > (int)brick_shape[2] - brick_depth)
       brick_z = (int)brick_shape[2] - brick_depth;
     mode = R3D_MODE_FULL;
+    if (n_overlays) overlay_path = overlay_paths[0];
     if (overlay_path && r3d_bricks_overlay(renderer, overlay_path) != 0)
       return EXIT_FAILURE;
   }
@@ -2269,26 +2275,28 @@ int main(int argc, char **argv) {
     if (!multiview_path)
       igText("%.0f fps   gpu %.2f ms", (double)fps_smooth, (double)last_gpu_ns / 1e6);
     if (igButton("data browser", (ImVec2){0, 0})) od_window = true;
-    int m = (int)mode;
-    if (igCombo_Str("mode", &m, "full\0mip\0depth\0heatmap\0raydir\0flat\0", 6))
-      mode = (uint32_t)m;
-    int prev_cm = cam_mode;
-    igCombo_Str("camera", &cam_mode, "orbit\0fly\0", 2);
-    if (cam_mode == CAM_ORBIT && prev_cm == CAM_FLY)
-      r3d_camera_orbit_set(&cam, v3(0.5f, 0.5f, 0.5f), 2.0f);
-    int t = (int)tf_idx;
-    if (igCombo_Str("transfer fn", &t, "gray\0scroll\0high-pass\0", 3)) {
-      tf_idx = (uint32_t)t;
-      r3d_tf tfp;
-      uint8_t lut[256][4];
-      r3d_tf_preset(tf_idx, &tfp);
-      r3d_tf_build(&tfp, lut);
-      r3d_set_transfer(renderer, lut);
-      tf_min_v = tf_min_visible(lut);
+    if (igCollapsingHeader_TreeNodeFlags("rendering", 0)) {
+      int m = (int)mode;
+      if (igCombo_Str("mode", &m, "full\0mip\0depth\0heatmap\0raydir\0flat\0", 6))
+        mode = (uint32_t)m;
+      int prev_cm = cam_mode;
+      igCombo_Str("camera", &cam_mode, "orbit\0fly\0", 2);
+      if (cam_mode == CAM_ORBIT && prev_cm == CAM_FLY)
+        r3d_camera_orbit_set(&cam, v3(0.5f, 0.5f, 0.5f), 2.0f);
+      int t = (int)tf_idx;
+      if (igCombo_Str("transfer fn", &t, "gray\0scroll\0high-pass\0", 3)) {
+        tf_idx = (uint32_t)t;
+        r3d_tf tfp;
+        uint8_t lut[256][4];
+        r3d_tf_preset(tf_idx, &tfp);
+        r3d_tf_build(&tfp, lut);
+        r3d_set_transfer(renderer, lut);
+        tf_min_v = tf_min_visible(lut);
+      }
+      igSliderFloat("step (voxels)", &step_voxels, 0.25f, 4.0f, "%.2f", 0);
+      igSliderFloat("density", &density, 0.1f, 8.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
+      igSliderFloat("low cut", &low_cut, 0.0f, 255.0f, "%.0f", 0);
     }
-    igSliderFloat("step (voxels)", &step_voxels, 0.25f, 4.0f, "%.2f", 0);
-    igSliderFloat("density", &density, 0.1f, 8.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
-    igSliderFloat("low cut", &low_cut, 0.0f, 255.0f, "%.0f", 0);
     if (slab_wz) {
       igSliderInt("depth (voxels)", &slab_depth, 2, (int)slab_wz, "%d", 0);
       int z0i = (int)slab_z0;
@@ -2407,66 +2415,68 @@ int main(int argc, char **argv) {
       }
       if (multiview_path) {
         igSeparator();
-        static const char *mv_name[4] = {"segment", "XY", "XZ", "YZ"};
-        for (int i = 0; i < 4; i++) {
-          bool vis = (mv_visible >> i) & 1u;
-          if (i) igSameLine(0, 8);
-          if (igCheckbox(mv_name[i], &vis))
-            mv_visible = vis ? mv_visible | (1u << i) : mv_visible & ~(1u << i);
-        }
-        if (mv_solo >= 0) {
-          igSameLine(0, 12);
-          igTextDisabled("solo: %s (Space restores)", mv_name[mv_solo]);
-        }
-        igText("multiview focus  x %.0f  y %.0f  z %.0f", mv_focus[0], mv_focus[1],
-               mv_focus[2]);
-        if (mv_aligned) /* side panes scrub offsets from the focus */
-          igText("XY z %.0f | segA %+.0f | segB %+.0f", mv[R3D_MV_XY].slice,
-                 mv[R3D_MV_XZ].slice, mv[R3D_MV_YZ].slice);
-        else
-          igText("XY z %.0f | XZ y %.0f | YZ x %.0f", mv[R3D_MV_XY].slice,
-                 mv[R3D_MV_XZ].slice, mv[R3D_MV_YZ].slice);
-        int th = mv_thick;
-        if (igSliderInt("slice thickness", &th, 1, 128, "%d", 0)) mv_thick = th;
-        igSliderFloat("scrub speed", &mv_scrub, 0.25f, 200.0f, "%.2f vox/notch",
-                      ImGuiSliderFlags_Logarithmic);
-        bool alg = mv_aligned;
-        if (igCheckbox("segment-aligned planes", &alg)) {
-          mv_aligned = alg;
-          if (mv_aligned) {
-            uint32_t ij[2];
-            if (mv_nearest_surface(&mv_seg, mv_focus, ij)) {
-              mv_align_ij[0] = ij[0];
-              mv_align_ij[1] = ij[1];
+    if (igCollapsingHeader_TreeNodeFlags("views", ImGuiTreeNodeFlags_DefaultOpen)) {
+          static const char *mv_name[4] = {"segment", "XY", "XZ", "YZ"};
+          for (int i = 0; i < 4; i++) {
+            bool vis = (mv_visible >> i) & 1u;
+            if (i) igSameLine(0, 8);
+            if (igCheckbox(mv_name[i], &vis))
+              mv_visible = vis ? mv_visible | (1u << i) : mv_visible & ~(1u << i);
+          }
+          if (mv_solo >= 0) {
+            igSameLine(0, 12);
+            igTextDisabled("solo: %s (Space restores)", mv_name[mv_solo]);
+          }
+          igText("multiview focus  x %.0f  y %.0f  z %.0f", mv_focus[0], mv_focus[1],
+                 mv_focus[2]);
+          if (mv_aligned) /* side panes scrub offsets from the focus */
+            igText("XY z %.0f | segA %+.0f | segB %+.0f", mv[R3D_MV_XY].slice,
+                   mv[R3D_MV_XZ].slice, mv[R3D_MV_YZ].slice);
+          else
+            igText("XY z %.0f | XZ y %.0f | YZ x %.0f", mv[R3D_MV_XY].slice,
+                   mv[R3D_MV_XZ].slice, mv[R3D_MV_YZ].slice);
+          int th = mv_thick;
+          if (igSliderInt("slice thickness", &th, 1, 128, "%d", 0)) mv_thick = th;
+          igSliderFloat("scrub speed", &mv_scrub, 0.25f, 200.0f, "%.2f vox/notch",
+                        ImGuiSliderFlags_Logarithmic);
+          bool alg = mv_aligned;
+          if (igCheckbox("segment-aligned planes", &alg)) {
+            mv_aligned = alg;
+            if (mv_aligned) {
+              uint32_t ij[2];
+              if (mv_nearest_surface(&mv_seg, mv_focus, ij)) {
+                mv_align_ij[0] = ij[0];
+                mv_align_ij[1] = ij[1];
+              }
+              if (!mv_seg_align(&mv_seg, mv_normals, mv_focus, mv_align_ij, mv_theta, mv_pb,
+                                mv_po))
+                mv_aligned = false; /* no usable surface normal near the focus */
             }
-            if (!mv_seg_align(&mv_seg, mv_normals, mv_focus, mv_align_ij, mv_theta, mv_pb,
-                              mv_po))
-              mv_aligned = false; /* no usable surface normal near the focus */
+            if (!mv_aligned) mv_axis_reset(mv_pb, mv_po);
+            for (int i = R3D_MV_XZ; i <= R3D_MV_YZ; i++) {
+              double fu, fv, fs;
+              r3d_mv_w2b(mv_pb[i], mv_po[i], mv_focus, &fu, &fv, &fs);
+              mv[i].cu = fu;
+              mv[i].cv = fv;
+              mv[i].slice = fs;
+            }
+            mv_basis_gen++;
           }
-          if (!mv_aligned) mv_axis_reset(mv_pb, mv_po);
-          for (int i = R3D_MV_XZ; i <= R3D_MV_YZ; i++) {
-            double fu, fv, fs;
-            r3d_mv_w2b(mv_pb[i], mv_po[i], mv_focus, &fu, &fv, &fs);
-            mv[i].cu = fu;
-            mv[i].cv = fv;
-            mv[i].slice = fs;
+          if (mv_aligned &&
+              igSliderFloat("plane rotation", &mv_theta, 0.0f, 360.0f, "%.0f deg", 0) &&
+              mv_seg_align(&mv_seg, mv_normals, mv_focus, mv_align_ij, mv_theta, mv_pb,
+                           mv_po)) {
+            for (int i = R3D_MV_XZ; i <= R3D_MV_YZ; i++) {
+              mv[i].cu = mv[i].cv = 0.0; /* frames rotate about the focus */
+              mv[i].slice = 0.0;
+            }
+            mv_basis_gen++;
           }
-          mv_basis_gen++;
-        }
-        if (mv_aligned &&
-            igSliderFloat("plane rotation", &mv_theta, 0.0f, 360.0f, "%.0f deg", 0) &&
-            mv_seg_align(&mv_seg, mv_normals, mv_focus, mv_align_ij, mv_theta, mv_pb,
-                         mv_po)) {
-          for (int i = R3D_MV_XZ; i <= R3D_MV_YZ; i++) {
-            mv[i].cu = mv[i].cv = 0.0; /* frames rotate about the focus */
-            mv[i].slice = 0.0;
-          }
-          mv_basis_gen++;
-        }
-        float zo = (float)mv[R3D_MV_SEG].slice;
-        if (igSliderFloat("segment offset", &zo, -64.0f, 64.0f, "%.0f vox", 0))
-          mv[R3D_MV_SEG].slice = (double)zo;
-        igCheckbox("stretch heatmap", &mv_stretch);
+          float zo = (float)mv[R3D_MV_SEG].slice;
+          if (igSliderFloat("segment offset", &zo, -64.0f, 64.0f, "%.0f vox", 0))
+            mv[R3D_MV_SEG].slice = (double)zo;
+          igCheckbox("stretch heatmap", &mv_stretch);
+    }
         if (umbilicus_path &&
             igCollapsingHeader_TreeNodeFlags("umbilicus", ImGuiTreeNodeFlags_DefaultOpen)) {
           igText("%zu point%s", umbilicus.count, umbilicus.count == 1 ? "" : "s");
@@ -2530,83 +2540,104 @@ int main(int argc, char **argv) {
         }
         igTextDisabled("segment %ux%u  %llu valid points", mv_seg.w, mv_seg.h,
                        (unsigned long long)mv_seg.nvalid);
-        if (sgc.open) {
-          pthread_mutex_lock(&sgc.mu);
-          uint32_t ready = 0;
-          for (uint32_t si = 0; si < sgc.st.n; si++)
-            if (sgc.ent[si].state == SGC_READY) ready++;
-          igText("segment store: %u surfaces  %u cached (%zu MB)", sgc.st.n, ready,
-                 sgc.bytes >> 20);
-          igText("plane hits  XY %u  XZ %u  YZ %u", sgc_nhits[R3D_MV_XY],
-                 sgc_nhits[R3D_MV_XZ], sgc_nhits[R3D_MV_YZ]);
-          if (sgc_near_focus[0] != mv_focus[0] || sgc_near_focus[1] != mv_focus[1] ||
-              sgc_near_focus[2] != mv_focus[2]) {
-            memcpy(sgc_near_focus, mv_focus, sizeof sgc_near_focus);
-            sgc_nnear = r3d_segstore_near_query(&sgc.st, mv_focus, 300.0, sgc_near, 6);
-            if (sgc_nnear > 6) sgc_nnear = 6;
-          }
-          bool act_pending = sgc.act_req != UINT32_MAX || sgc.act_busy;
-          if (act_pending) igTextDisabled("activating...");
-          else igTextDisabled("near focus (click to activate):");
-          for (uint32_t k = 0; k < sgc_nnear; k++) {
-            uint32_t si = sgc_near[k];
-            bool cur = strcmp(sgc.st.segs[si].name, sgc_active) == 0;
-            char lbl[112];
-            float ovf = sgc.ov_active != UINT32_MAX ? sgc.ov[si] : 0.0f;
-            if (cur)
-              snprintf(lbl, sizeof lbl, "  %.64s (active)", sgc.st.segs[si].name);
-            else if (ovf > 0.02f)
-              snprintf(lbl, sizeof lbl, "  %.64s  ov %.0f%%", sgc.st.segs[si].name,
-                       (double)ovf * 100.0);
-            else
-              snprintf(lbl, sizeof lbl, "  %.64s", sgc.st.segs[si].name);
-            if (igSelectable_Bool(lbl, cur, 0, (ImVec2){0, 0}) && !cur && !act_pending &&
-                sgc.act_ready == UINT32_MAX) {
-              sgc.act_req = si;
-              pthread_cond_signal(&sgc.cv);
+    if (sgc.open && igCollapsingHeader_TreeNodeFlags("surfaces", 0)) {
+          {
+            pthread_mutex_lock(&sgc.mu);
+            uint32_t ready = 0;
+            for (uint32_t si = 0; si < sgc.st.n; si++)
+              if (sgc.ent[si].state == SGC_READY) ready++;
+            igText("segment store: %u surfaces  %u cached (%zu MB)", sgc.st.n, ready,
+                   sgc.bytes >> 20);
+            igText("plane hits  XY %u  XZ %u  YZ %u", sgc_nhits[R3D_MV_XY],
+                   sgc_nhits[R3D_MV_XZ], sgc_nhits[R3D_MV_YZ]);
+            if (sgc_near_focus[0] != mv_focus[0] || sgc_near_focus[1] != mv_focus[1] ||
+                sgc_near_focus[2] != mv_focus[2]) {
+              memcpy(sgc_near_focus, mv_focus, sizeof sgc_near_focus);
+              sgc_nnear = r3d_segstore_near_query(&sgc.st, mv_focus, 300.0, sgc_near, 6);
+              if (sgc_nnear > 6) sgc_nnear = 6;
             }
-          }
-          if (igCollapsingHeader_TreeNodeFlags("all surfaces", 0))
-            for (uint32_t si = 0; si < sgc.st.n; si++) {
+            bool act_pending = sgc.act_req != UINT32_MAX || sgc.act_busy;
+            if (act_pending) igTextDisabled("activating...");
+            else igTextDisabled("near focus (click to activate):");
+            for (uint32_t k = 0; k < sgc_nnear; k++) {
+              uint32_t si = sgc_near[k];
               bool cur = strcmp(sgc.st.segs[si].name, sgc_active) == 0;
-              char lbl[96];
-              snprintf(lbl, sizeof lbl, "%.64s##s%u", sgc.st.segs[si].name, si);
+              char lbl[112];
+              float ovf = sgc.ov_active != UINT32_MAX ? sgc.ov[si] : 0.0f;
+              if (cur)
+                snprintf(lbl, sizeof lbl, "  %.64s (active)", sgc.st.segs[si].name);
+              else if (ovf > 0.02f)
+                snprintf(lbl, sizeof lbl, "  %.64s  ov %.0f%%", sgc.st.segs[si].name,
+                         (double)ovf * 100.0);
+              else
+                snprintf(lbl, sizeof lbl, "  %.64s", sgc.st.segs[si].name);
               if (igSelectable_Bool(lbl, cur, 0, (ImVec2){0, 0}) && !cur && !act_pending &&
                   sgc.act_ready == UINT32_MAX) {
                 sgc.act_req = si;
                 pthread_cond_signal(&sgc.cv);
               }
             }
-          pthread_mutex_unlock(&sgc.mu);
+            if (igCollapsingHeader_TreeNodeFlags("all surfaces", 0))
+              for (uint32_t si = 0; si < sgc.st.n; si++) {
+                bool cur = strcmp(sgc.st.segs[si].name, sgc_active) == 0;
+                char lbl[96];
+                snprintf(lbl, sizeof lbl, "%.64s##s%u", sgc.st.segs[si].name, si);
+                if (igSelectable_Bool(lbl, cur, 0, (ImVec2){0, 0}) && !cur && !act_pending &&
+                    sgc.act_ready == UINT32_MAX) {
+                  sgc.act_req = si;
+                  pthread_cond_signal(&sgc.cv);
+                }
+              }
+            pthread_mutex_unlock(&sgc.mu);
+          }
+    }
+      }
+    if (overlay_path && igCollapsingHeader_TreeNodeFlags("overlay", 0)) {
+        {
+          igCheckbox("overlay", &overlay_show);
+          igSameLine(0, 10);
+          igSetNextItemWidth(140);
+          igSliderFloat("gain", &overlay_gain, 0.25f, 8.0f, "%.2f",
+                        ImGuiSliderFlags_Logarithmic);
+          if (n_overlays > 1) {
+            for (uint32_t k = 0; k < n_overlays; k++) {
+              const char *sl_ = strrchr(overlay_paths[k], '/');
+              char lbl[96];
+              snprintf(lbl, sizeof lbl, "%.80s##ov%u", sl_ ? sl_ + 1 : overlay_paths[k], k);
+              bool cur = (int)k == overlay_sel;
+              if (igRadioButton_Bool(lbl, cur) && !cur &&
+                  r3d_bricks_overlay_switch(renderer, overlay_paths[k]) == 0) {
+                overlay_sel = (int)k;
+                overlay_path = overlay_paths[k];
+              }
+            }
+          }
         }
-      }
-      if (overlay_path) {
-        igCheckbox("ink overlay", &overlay_show);
-        igSameLine(0, 10);
-        igSetNextItemWidth(140);
-        igSliderFloat("gain", &overlay_gain, 0.25f, 8.0f, "%.2f",
-                      ImGuiSliderFlags_Logarithmic);
-      }
-      igText("bricks: hot %u/%u slots  warm %u (%.0f/%llu MB)%s", bst.hot, bst.hot_cap,
-             bst.warm_bricks, (double)bst.warm_bytes / 1048576.0,
-             (unsigned long long)(bst.warm_cap >> 20), bst.inflight ? "  streaming..." : "");
-      if (bst.net_pending || bst.net_fetched)
-        igText("net ingest: %u pending  %llu chunks fetched  %llu bricks cached",
-               bst.net_pending, (unsigned long long)bst.net_fetched,
-               (unsigned long long)bst.net_encoded);
-      if (bst.nlevels > 1)
-        igText("wanted L0..L%u: %u %u %u %u %u %u %u %u", bst.nlevels - 1u,
-               bst.lod_wanted[0], bst.lod_wanted[1], bst.lod_wanted[2], bst.lod_wanted[3],
-               bst.lod_wanted[4], bst.lod_wanted[5], bst.lod_wanted[6], bst.lod_wanted[7]);
     }
-    igSliderFloat("lod bias", &lod_bias, -2.0f, 4.0f, "%.2f", 0);
-    int qp = quality_policy;
-    if (igCombo_Str("quality", &qp, "full\0interactive\0fast\0\0", 3)) {
-      quality_policy = qp;
-      adaptive_res = quality_policy != 0;
-      r3d_set_quality(renderer, quality_policy == 2 ? R3D_QUALITY_FAST : R3D_QUALITY_FULL);
+    if (igCollapsingHeader_TreeNodeFlags("streaming", 0)) {
+        igText("bricks: hot %u/%u slots  warm %u (%.0f/%llu MB)%s", bst.hot, bst.hot_cap,
+               bst.warm_bricks, (double)bst.warm_bytes / 1048576.0,
+               (unsigned long long)(bst.warm_cap >> 20), bst.inflight ? "  streaming..." : "");
+        if (bst.net_pending || bst.net_fetched)
+          igText("net ingest: %u pending  %llu chunks fetched  %llu bricks cached",
+                 bst.net_pending, (unsigned long long)bst.net_fetched,
+                 (unsigned long long)bst.net_encoded);
+        if (bst.nlevels > 1)
+          igText("wanted L0..L%u: %u %u %u %u %u %u %u %u", bst.nlevels - 1u,
+                 bst.lod_wanted[0], bst.lod_wanted[1], bst.lod_wanted[2], bst.lod_wanted[3],
+                 bst.lod_wanted[4], bst.lod_wanted[5], bst.lod_wanted[6], bst.lod_wanted[7]);
     }
-    igCheckbox("half-res while moving", &adaptive_res);
+    }
+    if (igCollapsingHeader_TreeNodeFlags("quality", 0)) {
+      igSliderFloat("lod bias", &lod_bias, -2.0f, 4.0f, "%.2f", 0);
+      int qp = quality_policy;
+      if (igCombo_Str("quality", &qp, "full\0interactive\0fast\0\0", 3)) {
+        quality_policy = qp;
+        adaptive_res = quality_policy != 0;
+        r3d_set_quality(renderer, quality_policy == 2 ? R3D_QUALITY_FAST : R3D_QUALITY_FULL);
+      }
+      igCheckbox("half-res while moving", &adaptive_res);
+    }
     if (igCollapsingHeader_TreeNodeFlags("transform", 0)) {
       float vt[3] = {vol_t.x, vol_t.y, vol_t.z};
       if (igDragFloat3("volume pos", vt, 0.002f, -4.0f, 4.0f, "%.3f", 0))
@@ -2934,7 +2965,8 @@ int main(int argc, char **argv) {
         .threshold = low_cut / 255.0f,
         .skip_gate = fmaxf(low_cut, tf_min_v - 0.5f) / 255.0f,
         .overlay_gain = overlay_gain,
-        .overlay_flags = overlay_path && overlay_show ? 1u : 0u,
+        .overlay_flags = (overlay_path && overlay_show ? 1u : 0u) |
+                         (overlay_path && !strstr(overlay_path, "ink") ? 256u : 0u),
     };
     memcpy(p.vol_r0, &vm.r0, 12);
     memcpy(p.vol_r1, &vm.r1, 12);

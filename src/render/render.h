@@ -54,6 +54,9 @@ int r3d_bricks_begin(r3d_renderer *r, const char *c5s_path, uint32_t pool_bpa, u
  * brick lands in the same slot of a parallel atlas (absent = 0). Call after
  * r3d_bricks_begin (CPU-decode LOD mode only); pass the LOD root directory. */
 int r3d_bricks_overlay(r3d_renderer *r, const char *lod_root);
+/* Swap the active overlay tree for another (drains the decode job, reopens
+ * readers + atlas, re-seeds resident bricks). No-op if already active. */
+int r3d_bricks_overlay_switch(r3d_renderer *r, const char *lod_root);
 /* Tear the whole bricks dataset family down (streamer, atlases, overlay,
  * net ingest, surf textures, surface volume) so a different dataset can be
  * opened with r3d_bricks_begin in the same session. */

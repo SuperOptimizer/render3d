@@ -30,7 +30,12 @@ import common;
 [[vk::binding(10, 0)]] Sampler3D<float> ink_atlas;
 
 bool overlay_on() { return (pc.overlay_flags & 1u) != 0u; }
-static const float3 INK_COLOR = float3(0.25, 1.0, 0.55); /* readable on sepia */
+/* overlay tint by palette id (overlay_flags bits 8+): 0 = ink green,
+ * 1 = surface-prediction cyan — both readable on sepia CT */
+float3 overlay_color() {
+  return ((pc.overlay_flags >> 8) & 0xffu) == 1u ? float3(0.3, 0.72, 1.0)
+                                                 : float3(0.25, 1.0, 0.55);
+}
 
 float bricks_fetch_ink(float3 slot_org, float3 bl_off, float lod, float inv_adim) {
   float inset = max(0.5 * exp2(lod), 0.5);
@@ -465,7 +470,7 @@ void main(uint3 tid: SV_DispatchThreadID) {
         }
       }
       if (overlay_on())
-        col = lerp(col, INK_COLOR, saturate(vk.g * pc.overlay_gain));
+        col = lerp(col, overlay_color(), saturate(vk.g * pc.overlay_gain));
       acc.rgb += (1.0 - acc.a) * a * col;
       acc.a += (1.0 - acc.a) * a;
       if (acc.a >= ALPHA_CUTOFF) break;
@@ -473,7 +478,7 @@ void main(uint3 tid: SV_DispatchThreadID) {
     float3 color = composite ? acc.rgb + (1.0 - acc.a) * bg.rgb
                              : float3(mip_max * pc.density);
     if (!composite && overlay_on())
-      color = lerp(color, INK_COLOR, saturate(ink_max * pc.overlay_gain));
+      color = lerp(color, overlay_color(), saturate(ink_max * pc.overlay_gain));
     out_image[opix] = float4(color, 1);
     return;
   }
@@ -788,7 +793,7 @@ void main(uint3 tid: SV_DispatchThreadID) {
         if (is_bricks() && bricks_is_lod() && overlay_on() && b_ok) {
           /* ink tint AFTER shading so predictions stay vivid over the paper */
           float k = bricks_fetch_ink(b_slot, b_bl, blod, b_inv) * pc.overlay_gain;
-          col = lerp(col, INK_COLOR, saturate(k));
+          col = lerp(col, overlay_color(), saturate(k));
         }
         acc.rgb += (1.0 - acc.a) * a * col;
         acc.a += (1.0 - acc.a) * a;
@@ -808,7 +813,7 @@ void main(uint3 tid: SV_DispatchThreadID) {
     color = acc.rgb + (1.0 - acc.a) * float3(0.02, 0.02, 0.03);
   } else { // MODE_MIP
     color = float3(mip_max * pc.density);
-    if (overlay_on()) color = lerp(color, INK_COLOR, saturate(ink_max * pc.overlay_gain));
+    if (overlay_on()) color = lerp(color, overlay_color(), saturate(ink_max * pc.overlay_gain));
   }
   out_image[opix] = float4(color, 1);
 }
