@@ -525,6 +525,33 @@ typedef struct sgc_line {
   bool valid;
 } sgc_line;
 
+/* linear interpolation of the umbilicus curve at z (clamped to the ends);
+ * false when no points exist */
+static bool umb_interp(const r3d_umbilicus *u, double z, double *x, double *y) {
+  if (u->count == 0) return false;
+  const r3d_umbilicus_point *p = u->points;
+  size_t n = u->count;
+  if (z <= p[0].z) {
+    *x = p[0].x;
+    *y = p[0].y;
+    return true;
+  }
+  if (z >= p[n - 1].z) {
+    *x = p[n - 1].x;
+    *y = p[n - 1].y;
+    return true;
+  }
+  for (size_t i = 1; i < n; i++)
+    if (p[i].z >= z) {
+      double dz = p[i].z - p[i - 1].z;
+      double t = dz > 0.0 ? (z - p[i - 1].z) / dz : 0.0;
+      *x = p[i - 1].x + (p[i].x - p[i - 1].x) * t;
+      *y = p[i - 1].y + (p[i].y - p[i - 1].y) * t;
+      return true;
+    }
+  return false;
+}
+
 /* first voxel value with nonzero TF alpha: below it, samples are invisible */
 static float tf_min_visible(const uint8_t lut[256][4]) {
   for (uint32_t i = 0; i < 256; i++)
@@ -1130,7 +1157,8 @@ int main(int argc, char **argv) {
         slab_wz = (uint32_t)atoi(argv[i + 1]);
     }
   }
-  if (umbilicus_path) {
+  if (umbilicus_path && !multiview_path) { /* multiview annotates in-place;
+                                            * standalone uses the vslab rig */
     vslab_mode = true;
     vsnx = PHERC1218_NX;
     vsny = PHERC1218_NY;
@@ -1317,6 +1345,9 @@ int main(int argc, char **argv) {
   /* flattened view: distortion heatmap (env enables it for headless shots,
    * like R3D_FORCE_HALF) */
   bool mv_stretch = getenv("R3D_MV_STRETCH") != NULL;
+  /* umbilicus editing in the plane panes: plain click places the point for
+   * its z (Shift+drag pans while on); off = clicks drag as usual */
+  bool mv_umb_edit = umbilicus_path && multiview_path;
   uint32_t mv_align_ij[2] = {0, 0}; /* surface grid point anchoring the frames */
   uint32_t mv_basis_gen = 0, mv_ol_gen[4] = {0, 0, 0, 0};
   for (int i = 0; i < 4; i++) r3d_mv_axis_basis(i, mv_pb[i]);
@@ -1550,7 +1581,9 @@ int main(int argc, char **argv) {
     mt_t[0] = r3d_now_ns();
     ImGuiIO *io = igGetIO_Nil(); /* Want* flags reflect last frame — fine */
     r3d_input_poll(&in, win, gui_event_hook, renderer, !io->WantCaptureMouse,
-                   cam_mode == CAM_FLY, umbilicus_path != NULL, multiview_path != NULL);
+                   cam_mode == CAM_FLY,
+                   umbilicus_path != NULL && (!multiview_path || mv_umb_edit),
+                   multiview_path != NULL);
     mt_t[1] = r3d_now_ns();
     if (io->WantCaptureKeyboard && !in.captured)
       in.move[0] = in.move[1] = in.move[2] = 0.0f;
@@ -1838,6 +1871,24 @@ int main(int argc, char **argv) {
         if (mv[i].slice < 0.0) mv[i].slice = 0.0;
         if (n && mv[i].slice > (double)n - 1.0) mv[i].slice = (double)n - 1.0;
       }
+      if (umbilicus_path && in.annotate_click && !in.click_ctrl) {
+        /* umbilicus point from ANY plane pane: the core can be ambiguous in
+         * one orientation and obvious in another. The click's 3D position
+         * keys the control point by its (rounded) z. */
+        int cu_ = r3d_mv_hit(mv, in.click_xy[0], in.click_xy[1]);
+        if (cu_ > 0) {
+          double uu, vv, W[3];
+          r3d_mv_unproject(&mv[cu_], in.click_xy[0], in.click_xy[1], &uu, &vv);
+          r3d_mv_b2w(mv_pb[cu_], mv_po[cu_], uu, vv, mv[cu_].slice, W);
+          for (int a = 0; a < 3; a++) {
+            if (W[a] < 0.0) W[a] = 0.0;
+            if (brick_shape[a] && W[a] > (double)brick_shape[a] - 1.0)
+              W[a] = (double)brick_shape[a] - 1.0;
+          }
+          if (r3d_umbilicus_set(&umbilicus, W[0], W[1], (double)llround(W[2])) == 0)
+            save_umbilicus(&umbilicus, umbilicus_path, annotation_status);
+        }
+      }
       if (in.annotate_click && in.click_ctrl) { /* Ctrl+click = set focus POI */
         int cv_ = r3d_mv_hit(mv, in.click_xy[0], in.click_xy[1]);
         bool focused = false, have_ij = false;
@@ -2066,7 +2117,7 @@ int main(int argc, char **argv) {
     r3d_camera_basis(&cam, (float)w / (float)h, &right, &up, &fwd);
     r3d_m3 vm = m3_ypr(vol_rot[0], vol_rot[1], vol_rot[2]);
 
-    if (umbilicus_path && in.annotate_click) {
+    if (umbilicus_path && vslab_mode && in.annotate_click) {
       int64_t origin[3] = {0, 0, vs_z0};
       r3d_vslab_get(renderer, origin, NULL);
       if (origin[0] < 0) origin[0] = 0;
@@ -2326,6 +2377,39 @@ int main(int argc, char **argv) {
         if (igSliderFloat("segment offset", &zo, -64.0f, 64.0f, "%.0f vox", 0))
           mv[R3D_MV_SEG].slice = (double)zo;
         igCheckbox("stretch heatmap", &mv_stretch);
+        if (umbilicus_path) {
+          igSeparator();
+          igText("umbilicus  %zu point%s", umbilicus.count,
+                 umbilicus.count == 1 ? "" : "s");
+          igCheckbox("edit (click places; Shift+drag pans)", &mv_umb_edit);
+          double curz = mv[R3D_MV_XY].slice;
+          if (igButton("< annotated", (ImVec2){0, 0})) {
+            for (size_t k = umbilicus.count; k > 0; k--)
+              if (umbilicus.points[k - 1].z < curz) {
+                mv[R3D_MV_XY].slice = umbilicus.points[k - 1].z;
+                mv[R3D_MV_XY].cu = umbilicus.points[k - 1].x;
+                mv[R3D_MV_XY].cv = umbilicus.points[k - 1].y;
+                break;
+              }
+          }
+          igSameLine(0, 8);
+          if (igButton("annotated >", (ImVec2){0, 0})) {
+            for (size_t k = 0; k < umbilicus.count; k++)
+              if (umbilicus.points[k].z > curz) {
+                mv[R3D_MV_XY].slice = umbilicus.points[k].z;
+                mv[R3D_MV_XY].cu = umbilicus.points[k].x;
+                mv[R3D_MV_XY].cv = umbilicus.points[k].y;
+                break;
+              }
+          }
+          igSameLine(0, 8);
+          const r3d_umbilicus_point *here =
+              r3d_umbilicus_find(&umbilicus, (double)llround(curz));
+          if (here && igButton("delete here", (ImVec2){0, 0}) &&
+              r3d_umbilicus_remove(&umbilicus, (double)llround(curz)))
+            save_umbilicus(&umbilicus, umbilicus_path, annotation_status);
+          if (annotation_status[0]) igTextDisabled("%s", annotation_status);
+        }
         igTextDisabled("segment %ux%u  %llu valid points", mv_seg.w, mv_seg.h,
                        (unsigned long long)mv_seg.nvalid);
         if (sgc.open) {
@@ -2442,7 +2526,7 @@ int main(int argc, char **argv) {
         igText("mt %-6s   %6.2f ms (max %6.1f)", mt_name[ph], mt_ema[ph] / 1e6,
                (double)mt_max[ph] / 1e6);
     }
-    if (umbilicus_path)
+    if (umbilicus_path && vslab_mode)
       igTextDisabled("click: set point | wheel, R/F: 1 slice\n"
                      "PgUp/PgDn: z step | Ctrl+click: set + advance\n"
                      "Shift+drag: pan | Shift+wheel: zoom | F12: shot");
@@ -2639,6 +2723,43 @@ int main(int argc, char **argv) {
         if (fx_ >= (float)mv[i].px && fx_ < (float)(mv[i].px + mv[i].pw) &&
             fy_ >= (float)mv[i].py && fy_ < (float)(mv[i].py + mv[i].ph))
           ImDrawList_AddCircle(draw, (ImVec2){fx_, fy_}, 10.0f, fc, 24, 2.0f);
+      }
+      if (umbilicus_path && umbilicus.count) {
+        /* umbilicus curve in every plane pane: connected control points
+         * (magenta) + a crosshair at the XY pane's current-z interpolation */
+        const ImU32 uc = 0xffff00ffu, ub = 0xff000000u;
+        for (int i = 1; i < 4; i++) {
+          if (!(mv_mask & (1u << i))) continue;
+          ImVec2 cmin = {(float)mv[i].px, (float)mv[i].py};
+          ImVec2 cmax = {(float)(mv[i].px + mv[i].pw), (float)(mv[i].py + mv[i].ph)};
+          ImDrawList_PushClipRect(draw, cmin, cmax, false);
+          ImVec2 prev = {0, 0};
+          for (size_t k = 0; k < umbilicus.count; k++) {
+            double P[3] = {umbilicus.points[k].x, umbilicus.points[k].y,
+                           umbilicus.points[k].z};
+            double fu, fv, fs;
+            r3d_mv_w2b(mv_pb[i], mv_po[i], P, &fu, &fv, &fs);
+            float sx_, sy_;
+            r3d_mv_project(&mv[i], fu, fv, &sx_, &sy_);
+            ImVec2 cur = {sx_, sy_};
+            if (k) ImDrawList_AddLine(draw, prev, cur, uc, 1.5f);
+            ImDrawList_AddCircleFilled(draw, cur, 3.5f, ub, 12);
+            ImDrawList_AddCircleFilled(draw, cur, 2.5f, uc, 12);
+            prev = cur;
+          }
+          if (i == R3D_MV_XY && !mv_aligned) {
+            double ux, uy;
+            if (umb_interp(&umbilicus, mv[i].slice, &ux, &uy)) {
+              double fu, fv, fs, P[3] = {ux, uy, mv[i].slice};
+              r3d_mv_w2b(mv_pb[i], mv_po[i], P, &fu, &fv, &fs);
+              float sx_, sy_;
+              r3d_mv_project(&mv[i], fu, fv, &sx_, &sy_);
+              ImDrawList_AddCircle(draw, (ImVec2){sx_, sy_}, 9.0f, ub, 24, 4.0f);
+              ImDrawList_AddCircle(draw, (ImVec2){sx_, sy_}, 9.0f, uc, 24, 2.0f);
+            }
+          }
+          ImDrawList_PopClipRect(draw);
+        }
       }
       if (mv_mask & 1u) { /* flattened view: mark the surface grid point
                            * anchoring the focus (nearest valid point) */

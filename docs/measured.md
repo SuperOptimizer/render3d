@@ -1359,3 +1359,18 @@ Also: the segment view's plane trace lines (orange/red/yellow) now
 recompute and draw even when the plane panes are collapsed or solo'd —
 they were gated on pane visibility, so SEG solo lost them. 2x2 regression
 run unchanged (0 failures), all 5 suites green.
+
+## 2026-08-11 — umbilicus annotation in the multiview panes
+
+--umbilicus <json> now composes with --multiview instead of forcing the
+PHerc1218 vslab rig. With editing on (panel checkbox, default on), a plain
+click in ANY plane pane places the control point for that click's
+(rounded) z — the core can be ambiguous in one orientation and obvious in
+another — and Shift+drag pans meanwhile; Ctrl+click stays the focus
+gesture. The curve draws in all three panes (magenta control points +
+connecting polyline, projected through each pane's frame so it works in
+segment-aligned mode too) with a crosshair at the XY pane's current-z
+interpolation (new umb_interp, clamped linear). Panel: point count, edit
+toggle, prev/next-annotated jumps (recenter XY on the point), delete-here,
+autosave on every set (same Villa/VC-compatible JSON writer as vslab
+mode). The vslab annotation workflow is untouched.
