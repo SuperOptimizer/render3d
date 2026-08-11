@@ -2640,6 +2640,15 @@ int main(int argc, char **argv) {
             fy_ >= (float)mv[i].py && fy_ < (float)(mv[i].py + mv[i].ph))
           ImDrawList_AddCircle(draw, (ImVec2){fx_, fy_}, 10.0f, fc, 24, 2.0f);
       }
+      if (mv_mask & 1u) { /* flattened view: mark the surface grid point
+                           * anchoring the focus (nearest valid point) */
+        const r3d_mview *sv = &mv[R3D_MV_SEG];
+        float fx_, fy_;
+        r3d_mv_project(sv, (double)mv_align_ij[0], (double)mv_align_ij[1], &fx_, &fy_);
+        if (fx_ >= (float)sv->px && fx_ < (float)(sv->px + sv->pw) && fy_ >= (float)sv->py &&
+            fy_ < (float)(sv->py + sv->ph))
+          ImDrawList_AddCircle(draw, (ImVec2){fx_, fy_}, 10.0f, fc, 24, 2.0f);
+      }
     }
 
     mt_t[3] = r3d_now_ns();
