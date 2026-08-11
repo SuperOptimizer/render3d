@@ -91,6 +91,14 @@ on the nearest surface point. Plane views draw the segment intersection curve
 (+ a translucent copy at the current normal offset); the segment view draws
 the three plane traces (orange XY / red XZ / yellow YZ).
 
+The **segment-aligned planes** checkbox reorients the two side panes to the
+surface normal at the focus (vc3d's seg-xz/seg-yz): both panes contain the
+normal with "up" pointing off the recto side, so the sheet lies edge-on and
+roughly horizontal, and their horizontals stay perpendicular — the rotation
+slider spins the pair around the normal. Scrubbing moves in signed offsets
+from the focus. Ctrl+click re-anchors the frames at the new focus; XY stays
+axis-aligned.
+
 Test data comes straight from the `vesuvius-challenge-open-data` S3 bucket
 (PHerc0172 pairs tifxyz segments with their exact source volume):
 

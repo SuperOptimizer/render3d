@@ -1184,3 +1184,35 @@ GPU total here: ~10 GiB of the ~15 GiB budget (2x 3.6 GiB atlases + 2.6 GB
 warm + 768 MB surfvol). CPU side stays implicit (per-brick bookkeeping ~1.4
 GB virtual; page cache covers seed.raw + shard mmaps). 900-frame scenario
 unchanged (frame max ~40 ms); all 5 suites green.
+
+## 2026-08-11 — segment-aligned plane views (vc3d seg-xz/seg-yz)
+
+The XZ/YZ panes can now reorient to the segment's local frame instead of the
+world axes ("segment-aligned planes" checkbox + rotation slider in the
+multiview panel). A plane view was generalized from two world axes to an
+orthonormal frame {u, v, n} + origin (mview.h r3d_mv_seg_frames et al.):
+both aligned panes contain the surface normal at the focus (screen up = +n,
+sheet edge-on and horizontal), horizontals are the grid tangent rotated
+theta and theta+90 around n, so the pair stays perpendicular and scrubbing
+one pane slides along the other's horizontal. Ctrl+click re-anchors the
+frames at the new focus (nearest surface point supplies the normal); frames
+fall back to world axes when no valid normal is within vc3d's 100-voxel
+tolerance.
+
+Decisions/mechanics:
+- Shader: R3D_VIEW_OBLIQUE clips the marched t-range along the (ortho) ray
+  instead of an axis-aligned box — equivalent for axis frames, correct for
+  any orientation; multiview now uses it for all three plane panes. The
+  axis-box clip path stays for the perspective bricks slice mode.
+- r3d_segtrace_basis: marching-squares overlays for arbitrary planes; the
+  row/tile skip bounds dot(p, n) from the per-axis boxes (sign-aware sum,
+  zero components skipped so empty +-inf boxes can't NaN). Axis form is now
+  a wrapper; unit tests cover shifted-origin equivalence and an oblique
+  45-degree normal against the synthetic surface.
+- Streaming: per-pane want-AABB from |basis| component extents around the
+  slab midpoint (superset of the visible oblique rect).
+
+Verified on the GP banner: aligned panes render sheets horizontal at the
+focus (screenshots), gpu ~4.2 ms vs ~5.0 axis-aligned at 1080p (fewer
+sheet-parallel empty rays), 0 decode failures, all 5 suites green (gpu
+conformance covers the shader change).

@@ -238,6 +238,36 @@ static void test_mview(void) {
   double u1, w1;
   r3d_mv_unproject(&v[1], 400.0f, 300.0f, &u1, &w1);
   CHECK(fabs(u0 - u1) < 1e-9 && fabs(w0 - w1) < 1e-9 && v[1].zoom == 2.0);
+
+  /* segment-aligned frames: orthonormal, both contain -n as screen-down,
+   * pane normals are each other's horizontals, world<->frame round-trips */
+  double n[3] = {0.36, 0.48, 0.8}, tref[3] = {1.0, 0.2, -0.1};
+  double ba[3][3], bb[3][3];
+  CHECK(r3d_mv_seg_frames(n, tref, 0.7, ba, bb) == 0);
+  for (int f = 0; f < 2; f++) {
+    double(*b)[3] = f ? bb : ba;
+    for (int r = 0; r < 3; r++) {
+      double l = b[r][0] * b[r][0] + b[r][1] * b[r][1] + b[r][2] * b[r][2];
+      CHECK(fabs(l - 1.0) < 1e-12);
+      for (int r2 = r + 1; r2 < 3; r2++)
+        CHECK(fabs(b[r][0] * b[r2][0] + b[r][1] * b[r2][1] + b[r][2] * b[r2][2]) < 1e-12);
+    }
+    /* screen down = -n */
+    CHECK(fabs(b[1][0] * n[0] + b[1][1] * n[1] + b[1][2] * n[2] + 1.0) < 1e-9);
+  }
+  for (int c = 0; c < 3; c++) {
+    CHECK(fabs(ba[2][c] - bb[0][c]) < 1e-12); /* nA = uB */
+    CHECK(fabs(bb[2][c] + ba[0][c]) < 1e-12); /* nB = -uA */
+  }
+  double o[3] = {10.0, 20.0, 30.0}, p3[3], ru, rv, rs;
+  r3d_mv_b2w(ba, o, 3.0, -4.0, 5.0, p3);
+  r3d_mv_w2b(ba, o, p3, &ru, &rv, &rs);
+  CHECK(fabs(ru - 3.0) < 1e-9 && fabs(rv + 4.0) < 1e-9 && fabs(rs - 5.0) < 1e-9);
+  /* degenerate tref (parallel to n) still yields a valid frame */
+  double tpar[3] = {0.36, 0.48, 0.8};
+  CHECK(r3d_mv_seg_frames(n, tpar, 0.0, ba, bb) == 0);
+  double l0 = ba[0][0] * ba[0][0] + ba[0][1] * ba[0][1] + ba[0][2] * ba[0][2];
+  CHECK(fabs(l0 - 1.0) < 1e-12);
 }
 
 typedef struct tr_acc {
@@ -325,6 +355,36 @@ static void test_tifxyz(void) {
   CHECK(fabsf(acc2.gi_min - acc.gi_min) < 1e-6f && fabsf(acc2.wu_max - acc.wu_max) < 1e-6f);
   tr_acc acc3 = {0, 1e9f, -1e9f, 1e9f, -1e9f};
   CHECK(r3d_segtrace(&s, &rows, NULL, 0.0f, 2, 0, 1, 9000.0, tr_emit, &acc3) == 0);
+
+  /* arbitrary-basis segtrace: a unit-axis basis with a shifted origin must
+   * reproduce the axis trace with (u, slice) offset by the origin */
+  {
+    double org[3] = {100.0, 0.0, 3000.0};
+    double bu[3] = {1, 0, 0}, bv[3] = {0, 1, 0}, bn[3] = {0, 0, 1};
+    tr_acc accb = {0, 1e9f, -1e9f, 1e9f, -1e9f};
+    uint32_t nb = r3d_segtrace_basis(&s, &rows, NULL, 0.0f, org, bu, bv, bn, 1.6, tr_emit,
+                                     &accb);
+    CHECK(nb == nseg);
+    CHECK(fabsf(accb.gi_min - acc.gi_min) < 1e-4f);
+    CHECK(fabsf(accb.wu_min - (acc.wu_min - 100.0f)) < 1e-3f);
+  }
+  /* oblique basis: plane normal (1,0,1)/sqrt2 crosses the synthetic surface
+   * (x = 100+20i, z = 3000+0.25i) at i = 6.4 for the matching slice; the
+   * multi-axis dot bounds must not skip any crossing rows */
+  {
+    double rt = sqrt(0.5);
+    double org[3] = {0, 0, 0};
+    double bu[3] = {rt, 0, -rt}, bv[3] = {0, 1, 0}, bn[3] = {rt, 0, rt};
+    double slice = (3100.0 + 20.25 * 6.4) * rt;
+    tr_acc acco = {0, 1e9f, -1e9f, 1e9f, -1e9f};
+    uint32_t no_ = r3d_segtrace_basis(&s, &rows, NULL, 0.0f, org, bu, bv, bn, slice,
+                                      tr_emit, &acco);
+    tr_acc acco2 = {0, 1e9f, -1e9f, 1e9f, -1e9f};
+    uint32_t no2 = r3d_segtrace_basis(&s, NULL, NULL, 0.0f, org, bu, bv, bn, slice,
+                                      tr_emit, &acco2);
+    CHECK(no_ == H - 2 && no2 == no_); /* row/tile skipping changes nothing */
+    CHECK(acco.gi_min > 6.35f && acco.gi_max < 6.45f);
+  }
   r3d_segrows_free(&rows);
   CHECK(rows.mn == NULL);
 

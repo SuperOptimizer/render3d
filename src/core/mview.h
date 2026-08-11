@@ -10,6 +10,7 @@
 #ifndef R3D_MVIEW_H
 #define R3D_MVIEW_H
 
+#include <math.h>
 #include <stdint.h>
 
 enum { R3D_MV_SEG = 0, R3D_MV_XY = 1, R3D_MV_XZ = 2, R3D_MV_YZ = 3 };
@@ -114,6 +115,78 @@ static inline void r3d_mv_zoom(r3d_mview *v, float x, float y, double factor,
   v->cu = u - ((double)x - ((double)v->px + (double)v->pw * 0.5)) / nz;
   v->cv = w - ((double)y - ((double)v->py + (double)v->ph * 0.5)) / nz;
   v->zoom = nz;
+}
+
+/* --- plane bases: a plane view is really an orthonormal frame {u, v, n}
+ * (rows of b) plus a world origin o. cu/cv/slice are coordinates in that
+ * frame, so world = o + u*cu + v*cv + n*slice. Axis views use unit axes with
+ * o = 0 (frame coords == world coords, the historical behavior); segment-
+ * aligned views build frames from the surface normal at the focus. --- */
+
+static inline void r3d_mv_axis_basis(int view, double b[3][3]) {
+  const uint8_t *ax = r3d_mv_axes[view];
+  for (int r = 0; r < 3; r++)
+    for (int c = 0; c < 3; c++) b[r][c] = 0.0;
+  b[0][ax[0]] = 1.0;
+  b[1][ax[1]] = 1.0;
+  b[2][ax[2]] = 1.0;
+}
+
+/* frame coords (u right, v down, s along the plane normal) -> world voxels */
+static inline void r3d_mv_b2w(const double b[3][3], const double o[3], double u, double v,
+                              double s, double out[3]) {
+  for (int a = 0; a < 3; a++) out[a] = o[a] + b[0][a] * u + b[1][a] * v + b[2][a] * s;
+}
+
+/* world voxels -> frame coords (b orthonormal, so the inverse is the dot) */
+static inline void r3d_mv_w2b(const double b[3][3], const double o[3], const double p[3],
+                              double *u, double *v, double *s) {
+  double d[3] = {p[0] - o[0], p[1] - o[1], p[2] - o[2]};
+  *u = b[0][0] * d[0] + b[0][1] * d[1] + b[0][2] * d[2];
+  *v = b[1][0] * d[0] + b[1][1] * d[1] + b[1][2] * d[2];
+  *s = b[2][0] * d[0] + b[2][1] * d[1] + b[2][2] * d[2];
+}
+
+/* Segment-aligned frames for the two side panes: both planes contain the
+ * surface normal (screen up = +n, so the sheet lies roughly horizontal and
+ * "above the sheet" matches positive segment offset), and their horizontals
+ * are tref -- projected off n -- rotated by theta and theta+90deg around n.
+ * Scrubbing pane A slides along pane B's horizontal and vice versa (the
+ * panes stay perpendicular, vc3d's seg-xz/seg-yz behavior). Returns 0 on
+ * success, -1 if n is degenerate; a degenerate tref falls back to the world
+ * axis least aligned with n. */
+static inline int r3d_mv_seg_frames(const double n[3], const double tref[3], double theta,
+                                    double ba[3][3], double bb[3][3]) {
+  double nl = sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+  if (nl < 1e-6) return -1;
+  double nu[3] = {n[0] / nl, n[1] / nl, n[2] / nl};
+  double d = tref[0] * nu[0] + tref[1] * nu[1] + tref[2] * nu[2];
+  double t[3] = {tref[0] - d * nu[0], tref[1] - d * nu[1], tref[2] - d * nu[2]};
+  double tl = sqrt(t[0] * t[0] + t[1] * t[1] + t[2] * t[2]);
+  if (tl < 1e-6) {
+    int a = fabs(nu[0]) <= fabs(nu[1]) ? (fabs(nu[0]) <= fabs(nu[2]) ? 0 : 2)
+                                       : (fabs(nu[1]) <= fabs(nu[2]) ? 1 : 2);
+    for (int c = 0; c < 3; c++) t[c] = (c == a ? 1.0 : 0.0) - nu[a] * nu[c];
+    tl = sqrt(t[0] * t[0] + t[1] * t[1] + t[2] * t[2]);
+  }
+  for (int c = 0; c < 3; c++) t[c] /= tl;
+  double w[3] = {nu[1] * t[2] - nu[2] * t[1], nu[2] * t[0] - nu[0] * t[2],
+                 nu[0] * t[1] - nu[1] * t[0]}; /* n x t */
+  double cs = cos(theta), sn = sin(theta);
+  double t1[3], t2[3];
+  for (int c = 0; c < 3; c++) t1[c] = t[c] * cs + w[c] * sn;
+  t2[0] = nu[1] * t1[2] - nu[2] * t1[1]; /* n x t1 */
+  t2[1] = nu[2] * t1[0] - nu[0] * t1[2];
+  t2[2] = nu[0] * t1[1] - nu[1] * t1[0];
+  for (int c = 0; c < 3; c++) {
+    ba[0][c] = t1[c];  /* pane A: u = t1, v = -n (screen down), n = u x v = t2 */
+    ba[1][c] = -nu[c];
+    ba[2][c] = t2[c];
+    bb[0][c] = t2[c];  /* pane B: u = t2, v = -n, n = -t1 */
+    bb[1][c] = -nu[c];
+    bb[2][c] = -t1[c];
+  }
+  return 0;
 }
 
 #endif /* R3D_MVIEW_H */

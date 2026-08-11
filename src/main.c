@@ -258,6 +258,62 @@ static int mv_build_grids(const r3d_tifxyz *s, float **coords_out, float **norma
   return 0;
 }
 
+/* nearest valid surface grid point to a world position (coarse step-2 scan);
+ * true when it's within vc3d's 100-voxel focus tolerance */
+static bool mv_nearest_surface(const r3d_tifxyz *s, const double f[3], uint32_t out_ij[2]) {
+  double best = 1e30;
+  uint32_t bi = 0, bj = 0;
+  for (uint32_t gj = 0; gj < s->h; gj += 2)
+    for (uint32_t gi = 0; gi < s->w; gi += 2) {
+      const float *sp = r3d_tifxyz_at(s, gi, gj);
+      if (!r3d_tifxyz_valid(sp)) continue;
+      double dx = (double)sp[0] - f[0], dy = (double)sp[1] - f[1], dz = (double)sp[2] - f[2];
+      double d2 = dx * dx + dy * dy + dz * dz;
+      if (d2 < best) {
+        best = d2;
+        bi = gi;
+        bj = gj;
+      }
+    }
+  out_ij[0] = bi;
+  out_ij[1] = bj;
+  return best < 100.0 * 100.0;
+}
+
+/* Rebuild the segment-aligned frames for the XZ/YZ panes around surface grid
+ * point ij: normal from the per-vertex normal grid, reference tangent = the
+ * grid +i direction, origins at the focus. False (bases untouched) when the
+ * normal is degenerate. */
+static bool mv_seg_align(const r3d_tifxyz *s, const float *normals, const double focus[3],
+                         const uint32_t ij[2], float theta_deg, double pb[4][3][3],
+                         double po[4][3]) {
+  size_t k = ((size_t)ij[1] * s->w + ij[0]) * 4;
+  double n[3] = {(double)normals[k], (double)normals[k + 1], (double)normals[k + 2]};
+  uint32_t i0 = ij[0] > 0 ? ij[0] - 1 : ij[0];
+  uint32_t i1 = ij[0] + 1 < s->w ? ij[0] + 1 : ij[0];
+  const float *pa = r3d_tifxyz_at(s, i0, ij[1]);
+  const float *pb_ = r3d_tifxyz_at(s, i1, ij[1]);
+  const float *pc_ = r3d_tifxyz_at(s, ij[0], ij[1]);
+  if (!r3d_tifxyz_valid(pa)) pa = pc_;
+  if (!r3d_tifxyz_valid(pb_)) pb_ = pc_;
+  double tref[3] = {(double)pb_[0] - (double)pa[0], (double)pb_[1] - (double)pa[1],
+                    (double)pb_[2] - (double)pa[2]};
+  double ba[3][3], bb[3][3];
+  if (r3d_mv_seg_frames(n, tref, (double)theta_deg * 0.017453292519943295, ba, bb) != 0)
+    return false;
+  memcpy(pb[R3D_MV_XZ], ba, sizeof ba);
+  memcpy(pb[R3D_MV_YZ], bb, sizeof bb);
+  for (int a = 0; a < 3; a++) po[R3D_MV_XZ][a] = po[R3D_MV_YZ][a] = focus[a];
+  return true;
+}
+
+static void mv_axis_reset(double pb[4][3][3], double po[4][3]) {
+  for (int i = R3D_MV_XZ; i <= R3D_MV_YZ; i++) {
+    r3d_mv_axis_basis(i, pb[i]);
+    for (int a = 0; a < 3; a++) po[i][a] = 0.0;
+  }
+}
+
 /* first voxel value with nonzero TF alpha: below it, samples are invisible */
 static float tf_min_visible(const uint8_t lut[256][4]) {
   for (uint32_t i = 0; i < 256; i++)
@@ -1041,6 +1097,13 @@ int main(int argc, char **argv) {
   double mv_ol_slice[4] = {1e30, 1e30, 1e30, 1e30};
   double mv_ol_zoff = 1e30;
   r3d_segrows mv_rows = {0}; /* per-row coord bounds: segtrace row skipping */
+  double mv_pb[4][3][3]; /* per-view plane frames (rows u, v, n) + origins */
+  double mv_po[4][3] = {{0}};
+  bool mv_aligned = false; /* XZ/YZ panes follow the segment normal */
+  float mv_theta = 0.0f;   /* aligned-pane rotation around the normal (deg) */
+  uint32_t mv_align_ij[2] = {0, 0}; /* surface grid point anchoring the frames */
+  uint32_t mv_basis_gen = 0, mv_ol_gen[4] = {0, 0, 0, 0};
+  for (int i = 0; i < 4; i++) r3d_mv_axis_basis(i, mv_pb[i]);
   if (multiview_path) {
     if (!bricks_path || !brick_is_lod) {
       fprintf(stderr, "--multiview needs --bricks with a LOD manifest\n");
@@ -1052,6 +1115,8 @@ int main(int argc, char **argv) {
     SDL_PumpEvents();
     for (int a = 0; a < 3; a++)
       mv_focus[a] = ((double)mv_seg.bbox[0][a] + (double)mv_seg.bbox[1][a]) * 0.5;
+    mv_align_ij[0] = mv_seg.w / 2;
+    mv_align_ij[1] = mv_seg.h / 2;
     const float *mc = r3d_tifxyz_at(&mv_seg, mv_seg.w / 2, mv_seg.h / 2);
     if (r3d_tifxyz_valid(mc)) /* center the focus ON the sheet when possible */
       for (int a = 0; a < 3; a++) mv_focus[a] = (double)mc[a];
@@ -1444,13 +1509,21 @@ int main(int argc, char **argv) {
       if (mv[R3D_MV_SEG].slice < -512.0) mv[R3D_MV_SEG].slice = -512.0;
       if (mv[R3D_MV_SEG].slice > 512.0) mv[R3D_MV_SEG].slice = 512.0;
       for (int i = 1; i < 4; i++) { /* plane slices clamp to the volume */
+        if (mv_aligned && i >= R3D_MV_XZ) {
+          /* frame offset from the focus, not a world coordinate: keep it
+           * within the volume diagonal so the pane can always scrub back */
+          double lim = (double)brick_shape[0] + brick_shape[1] + brick_shape[2];
+          if (mv[i].slice < -lim) mv[i].slice = -lim;
+          if (mv[i].slice > lim) mv[i].slice = lim;
+          continue;
+        }
         uint32_t n = brick_shape[r3d_mv_axes[i][2]];
         if (mv[i].slice < 0.0) mv[i].slice = 0.0;
         if (n && mv[i].slice > (double)n - 1.0) mv[i].slice = (double)n - 1.0;
       }
       if (in.annotate_click && in.click_ctrl) { /* Ctrl+click = set focus POI */
         int cv_ = r3d_mv_hit(mv, in.click_xy[0], in.click_xy[1]);
-        bool focused = false;
+        bool focused = false, have_ij = false;
         if (cv_ == R3D_MV_SEG) {
           /* focus at the surface point under the cursor (CPU bilinear tap) */
           double gu, gv;
@@ -1471,36 +1544,16 @@ int main(int argc, char **argv) {
                 mv_focus[a] = ((double)q00[a] * (1 - fx_) + (double)q10[a] * fx_) * (1 - fy_) +
                               ((double)q01[a] * (1 - fx_) + (double)q11[a] * fx_) * fy_;
               focused = true;
+              have_ij = true; /* the clicked cell anchors the aligned frames */
+              mv_align_ij[0] = fx_ < 0.5 ? gi : gi + 1;
+              mv_align_ij[1] = fy_ < 0.5 ? gj : gj + 1;
             }
           }
         } else if (cv_ > 0) {
-          const uint8_t *ax = r3d_mv_axes[cv_];
           double u, vq;
           r3d_mv_unproject(&mv[cv_], in.click_xy[0], in.click_xy[1], &u, &vq);
-          mv_focus[ax[0]] = u;
-          mv_focus[ax[1]] = vq;
-          mv_focus[ax[2]] = mv[cv_].slice;
+          r3d_mv_b2w(mv_pb[cv_], mv_po[cv_], u, vq, mv[cv_].slice, mv_focus);
           focused = true;
-          /* recenter the segment view on the surface point nearest the focus */
-          double best = 1e30;
-          uint32_t bi = 0, bj = 0;
-          for (uint32_t gj = 0; gj < mv_seg.h; gj += 2)
-            for (uint32_t gi = 0; gi < mv_seg.w; gi += 2) {
-              const float *sp = r3d_tifxyz_at(&mv_seg, gi, gj);
-              if (!r3d_tifxyz_valid(sp)) continue;
-              double dx = (double)sp[0] - mv_focus[0], dy = (double)sp[1] - mv_focus[1],
-                     dz = (double)sp[2] - mv_focus[2];
-              double d2 = dx * dx + dy * dy + dz * dz;
-              if (d2 < best) {
-                best = d2;
-                bi = gi;
-                bj = gj;
-              }
-            }
-          if (best < 100.0 * 100.0) { /* vc3d tolerance: 100 voxels */
-            mv[R3D_MV_SEG].cu = (double)bi;
-            mv[R3D_MV_SEG].cv = (double)bj;
-          }
         }
         if (focused) {
           for (int a = 0; a < 3; a++) { /* clamp into the volume */
@@ -1508,11 +1561,29 @@ int main(int argc, char **argv) {
             if (brick_shape[a] && mv_focus[a] > (double)brick_shape[a] - 1.0)
               mv_focus[a] = (double)brick_shape[a] - 1.0;
           }
+          if (!have_ij) {
+            /* recenter the segment view on the surface point nearest the
+             * focus (vc3d 100-voxel tolerance); it also anchors the frames */
+            uint32_t ij[2];
+            if (mv_nearest_surface(&mv_seg, mv_focus, ij)) {
+              mv_align_ij[0] = ij[0];
+              mv_align_ij[1] = ij[1];
+              mv[R3D_MV_SEG].cu = (double)ij[0];
+              mv[R3D_MV_SEG].cv = (double)ij[1];
+            }
+          }
+          if (mv_aligned) {
+            if (!mv_seg_align(&mv_seg, mv_normals, mv_focus, mv_align_ij, mv_theta, mv_pb,
+                              mv_po))
+              mv_axis_reset(mv_pb, mv_po);
+            mv_basis_gen++;
+          }
           for (int i = 1; i < 4; i++) { /* recenter planes through the focus */
-            const uint8_t *a2 = r3d_mv_axes[i];
-            mv[i].cu = mv_focus[a2[0]];
-            mv[i].cv = mv_focus[a2[1]];
-            mv[i].slice = mv_focus[a2[2]];
+            double fu, fv, fs;
+            r3d_mv_w2b(mv_pb[i], mv_po[i], mv_focus, &fu, &fv, &fs);
+            mv[i].cu = fu;
+            mv[i].cv = fv;
+            mv[i].slice = fs;
           }
         }
       }
@@ -1893,10 +1964,47 @@ int main(int argc, char **argv) {
         }
         igText("multiview focus  x %.0f  y %.0f  z %.0f", mv_focus[0], mv_focus[1],
                mv_focus[2]);
-        igText("XY z %.0f | XZ y %.0f | YZ x %.0f", mv[R3D_MV_XY].slice,
-               mv[R3D_MV_XZ].slice, mv[R3D_MV_YZ].slice);
+        if (mv_aligned) /* side panes scrub offsets from the focus */
+          igText("XY z %.0f | segA %+.0f | segB %+.0f", mv[R3D_MV_XY].slice,
+                 mv[R3D_MV_XZ].slice, mv[R3D_MV_YZ].slice);
+        else
+          igText("XY z %.0f | XZ y %.0f | YZ x %.0f", mv[R3D_MV_XY].slice,
+                 mv[R3D_MV_XZ].slice, mv[R3D_MV_YZ].slice);
         int th = mv_thick;
         if (igSliderInt("slice thickness", &th, 1, 128, "%d", 0)) mv_thick = th;
+        bool alg = mv_aligned;
+        if (igCheckbox("segment-aligned planes", &alg)) {
+          mv_aligned = alg;
+          if (mv_aligned) {
+            uint32_t ij[2];
+            if (mv_nearest_surface(&mv_seg, mv_focus, ij)) {
+              mv_align_ij[0] = ij[0];
+              mv_align_ij[1] = ij[1];
+            }
+            if (!mv_seg_align(&mv_seg, mv_normals, mv_focus, mv_align_ij, mv_theta, mv_pb,
+                              mv_po))
+              mv_aligned = false; /* no usable surface normal near the focus */
+          }
+          if (!mv_aligned) mv_axis_reset(mv_pb, mv_po);
+          for (int i = R3D_MV_XZ; i <= R3D_MV_YZ; i++) {
+            double fu, fv, fs;
+            r3d_mv_w2b(mv_pb[i], mv_po[i], mv_focus, &fu, &fv, &fs);
+            mv[i].cu = fu;
+            mv[i].cv = fv;
+            mv[i].slice = fs;
+          }
+          mv_basis_gen++;
+        }
+        if (mv_aligned &&
+            igSliderFloat("plane rotation", &mv_theta, 0.0f, 360.0f, "%.0f deg", 0) &&
+            mv_seg_align(&mv_seg, mv_normals, mv_focus, mv_align_ij, mv_theta, mv_pb,
+                         mv_po)) {
+          for (int i = R3D_MV_XZ; i <= R3D_MV_YZ; i++) {
+            mv[i].cu = mv[i].cv = 0.0; /* frames rotate about the focus */
+            mv[i].slice = 0.0;
+          }
+          mv_basis_gen++;
+        }
         float zo = (float)mv[R3D_MV_SEG].slice;
         if (igSliderFloat("segment offset", &zo, -64.0f, 64.0f, "%.0f vox", 0))
           mv[R3D_MV_SEG].slice = (double)zo;
@@ -2015,19 +2123,22 @@ int main(int argc, char **argv) {
       double zoff = mv[R3D_MV_SEG].slice;
       for (int i = 1; i < 4; i++) {
         if (!(mv_mask & (1u << i))) continue; /* hidden plane: no recompute */
-        const uint8_t *ax = r3d_mv_axes[i];
-        if (mv_ol_slice[i] != mv[i].slice) {
+        bool stale = mv_ol_slice[i] != mv[i].slice || mv_ol_gen[i] != mv_basis_gen;
+        if (stale) {
           mv_ol[i].n = 0;
-          r3d_segtrace(&mv_seg, &mv_rows, NULL, 0.0f, ax[2], ax[0], ax[1], mv[i].slice,
-                       mv_lines_emit, &mv_ol[i]);
+          r3d_segtrace_basis(&mv_seg, &mv_rows, NULL, 0.0f, mv_po[i], mv_pb[i][0],
+                             mv_pb[i][1], mv_pb[i][2], mv[i].slice, mv_lines_emit,
+                             &mv_ol[i]);
         }
-        if (mv_ol_slice[i] != mv[i].slice || mv_ol_zoff != zoff) {
+        if (stale || mv_ol_zoff != zoff) {
           mv_ol_off[i].n = 0;
           if (zoff != 0.0)
-            r3d_segtrace(&mv_seg, &mv_rows, mv_normals, (float)zoff, ax[2], ax[0], ax[1],
-                         mv[i].slice, mv_lines_emit, &mv_ol_off[i]);
+            r3d_segtrace_basis(&mv_seg, &mv_rows, mv_normals, (float)zoff, mv_po[i],
+                               mv_pb[i][0], mv_pb[i][1], mv_pb[i][2], mv[i].slice,
+                               mv_lines_emit, &mv_ol_off[i]);
         }
         mv_ol_slice[i] = mv[i].slice;
+        mv_ol_gen[i] = mv_basis_gen;
       }
       mv_ol_zoff = zoff;
 
@@ -2071,9 +2182,10 @@ int main(int argc, char **argv) {
       }
       for (int i = 1; i < 4; i++) {
         if (!(mv_mask & (1u << i))) continue;
-        const uint8_t *ax = r3d_mv_axes[i];
+        double fu, fv, fs;
+        r3d_mv_w2b(mv_pb[i], mv_po[i], mv_focus, &fu, &fv, &fs);
         float fx_, fy_;
-        r3d_mv_project(&mv[i], mv_focus[ax[0]], mv_focus[ax[1]], &fx_, &fy_);
+        r3d_mv_project(&mv[i], fu, fv, &fx_, &fy_);
         if (fx_ >= (float)mv[i].px && fx_ < (float)(mv[i].px + mv[i].pw) &&
             fy_ >= (float)mv[i].py && fy_ < (float)(mv[i].py + mv[i].ph))
           ImDrawList_AddCircle(draw, (ImVec2){fx_, fy_}, 10.0f, fc, 24, 2.0f);
@@ -2217,21 +2329,20 @@ int main(int argc, char **argv) {
           }
           for (int i = 1; i < 4; i++) {
             if (!(mv_mask & (1u << i))) continue; /* collapsed: no streaming */
-            const uint8_t *ax = r3d_mv_axes[i];
             double hw = (double)mv[i].pw * 0.5 / mv[i].zoom;
             double hh = (double)mv[i].ph * 0.5 / mv[i].zoom;
             double th = (double)mv_thick;
-            double wlo[3], whi[3];
-            wlo[ax[0]] = mv[i].cu - hw;
-            whi[ax[0]] = mv[i].cu + hw;
-            wlo[ax[1]] = mv[i].cv - hh;
-            whi[ax[1]] = mv[i].cv + hh;
-            wlo[ax[2]] = mv[i].slice - 1.0;
-            whi[ax[2]] = mv[i].slice + th + 1.0;
+            /* world AABB of the visible rect + slab: frame center at the
+             * slab midpoint, per-axis extents from the |basis| components */
+            double ctr[3];
+            r3d_mv_b2w(mv_pb[i], mv_po[i], mv[i].cu, mv[i].cv, mv[i].slice + th * 0.5,
+                       ctr);
             float lo[3], hi[3];
             for (int a = 0; a < 3; a++) {
-              lo[a] = (float)(wlo[a] / (double)mdim);
-              hi[a] = (float)(whi[a] / (double)mdim);
+              double he = hw * fabs(mv_pb[i][0][a]) + hh * fabs(mv_pb[i][1][a]) +
+                          (th * 0.5 + 1.0) * fabs(mv_pb[i][2][a]);
+              lo[a] = (float)((ctr[a] - he) / (double)mdim);
+              hi[a] = (float)((ctr[a] + he) / (double)mdim);
             }
             float vpp = (float)(1.0 / (mv[i].zoom * (double)mdim)) * exp2f(lod_bias);
             r3d_bricks_stream_box(renderer, lo, hi, vpp, p.skip_gate);
@@ -2275,12 +2386,10 @@ int main(int argc, char **argv) {
       uint32_t mdim = brick_shape[0];
       for (int a = 1; a < 3; a++)
         if (brick_shape[a] > mdim) mdim = brick_shape[a];
-      static const uint32_t axis_code[3] = {1u, 2u, 0u}; /* world axis -> view_flags code */
       r3d_frame_params vp4[4];
       uint32_t nvp = 0;
       for (int i = 0; i < 4; i++) {
         if (!(mv_mask & (1u << i))) continue; /* collapsed: no dispatch at all */
-        const uint8_t *ax = r3d_mv_axes[i];
         r3d_frame_params q = p;
         q.viewport[0] = (uint32_t)mv[i].pw;
         q.viewport[1] = (uint32_t)mv[i].ph;
@@ -2303,21 +2412,22 @@ int main(int argc, char **argv) {
           vp4[nvp++] = q;
           continue;
         }
-        q.view_flags = R3D_VIEW_ORTHO | R3D_VIEW_AXIS(axis_code[ax[2]]);
-        double hw = (double)mv[i].pw * 0.5 / mv[i].zoom / (double)mdim;
-        double hh = (double)mv[i].ph * 0.5 / mv[i].zoom / (double)mdim;
-        float org[3], rgt[3] = {0, 0, 0}, upv[3] = {0, 0, 0}, fwdv[3] = {0, 0, 0};
-        org[ax[0]] = (float)(mv[i].cu / (double)mdim);
-        org[ax[1]] = (float)(mv[i].cv / (double)mdim);
-        org[ax[2]] = (float)((mv[i].slice - 2.0) / (double)mdim);
-        rgt[ax[0]] = (float)hw;   /* screen +x -> +u */
-        upv[ax[1]] = (float)-hh;  /* ndc +y (screen top) -> smaller v */
-        fwdv[ax[2]] = 1.0f;
-        memcpy(q.cam_origin, org, sizeof org);
-        memcpy(q.cam_right, rgt, sizeof rgt);
-        memcpy(q.cam_up, upv, sizeof upv);
-        memcpy(q.cam_forward, fwdv, sizeof fwdv);
-        q.slab_z0 = (float)mv[i].slice;
+        /* ortho camera from the view frame: origin 2 voxels before the slab
+         * near face along the plane normal, half-extent vectors along u/v;
+         * the slab clip rides the ray (oblique), which for axis frames is
+         * identical to the old per-axis box clip */
+        q.view_flags = R3D_VIEW_ORTHO | R3D_VIEW_OBLIQUE;
+        double hw = (double)mv[i].pw * 0.5 / mv[i].zoom;
+        double hh = (double)mv[i].ph * 0.5 / mv[i].zoom;
+        double og[3];
+        r3d_mv_b2w(mv_pb[i], mv_po[i], mv[i].cu, mv[i].cv, mv[i].slice - 2.0, og);
+        for (int a = 0; a < 3; a++) {
+          q.cam_origin[a] = (float)(og[a] / (double)mdim);
+          q.cam_right[a] = (float)(mv_pb[i][0][a] * hw / (double)mdim); /* +x -> +u */
+          q.cam_up[a] = (float)(-mv_pb[i][1][a] * hh / (double)mdim);   /* ndc +y -> -v */
+          q.cam_forward[a] = (float)mv_pb[i][2][a];
+        }
+        q.slab_z0 = 2.0f; /* voxels from the ray origin to the slab near face */
         q.slab_depth = (uint32_t)mv_thick;
         vp4[nvp++] = q;
       }

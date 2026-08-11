@@ -76,7 +76,9 @@ typedef struct r3d_frame_params {
   /* multi-view: offscreen pixel origin of this viewport (x | y<<16) */
   uint32_t view_org;
   /* bit 0: orthographic rays (cam_right/up lengths = half-extents in box
-   * units, cam_forward unit); bits 8..9: bricks slab-clip axis 0=z 1=x 2=y */
+   * units, cam_forward unit); bit 2: clip the slab along the ray instead of
+   * a world axis (slab_z0 = voxels from the ray origin to the slab near
+   * face); bits 8..9: bricks slab-clip axis 0=z 1=x 2=y */
   uint32_t view_flags;
   /* overlay volume (ink predictions): bit 0 of flags enables the tint,
    * gain scales the overlay value before it drives the blend */
@@ -87,6 +89,7 @@ static_assert(sizeof(r3d_frame_params) == 248, "must mirror shader FrameParams")
 
 #define R3D_VIEW_ORTHO 1u
 #define R3D_VIEW_SURF 2u /* flattened tifxyz segment view (needs r3d_surf_begin) */
+#define R3D_VIEW_OBLIQUE 4u /* slab clip along the ray, not a world axis */
 #define R3D_VIEW_AXIS(a) ((uint32_t)(a) << 8) /* 0=z 1=x 2=y */
 #define R3D_MAX_VIEWS 4u
 

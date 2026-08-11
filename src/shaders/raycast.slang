@@ -497,15 +497,24 @@ void main(uint3 tid: SV_DispatchThreadID) {
   dir = to_volume_dir(dir);
 
   float3 box_lo = float3(0), box_hi = ext;
+  float t_lo = 0.0, t_hi = 1e30;
   if (is_bricks() && bricks_is_lod() && pc.slab_depth > 0u) {
     float md = float(max(page[1], max(page[2], page[3])));
-    uint axc = (pc.view_flags >> 8) & 3u; /* 0=z 1=x 2=y */
-    int a = axc == 1u ? 0 : (axc == 2u ? 1 : 2);
-    box_lo[a] = clamp(pc.slab_z0 / md, 0.0, ext[a]);
-    box_hi[a] = clamp((pc.slab_z0 + float(pc.slab_depth)) / md, box_lo[a], ext[a]);
+    if ((pc.view_flags & 4u) != 0u) {
+      /* oblique slab (segment-aligned plane views): the slab is perpendicular
+       * to the ray, so clip the marched t range directly; slab_z0 = voxels
+       * from the ray origin to the near face */
+      t_lo = pc.slab_z0 / md;
+      t_hi = (pc.slab_z0 + float(pc.slab_depth)) / md;
+    } else {
+      uint axc = (pc.view_flags >> 8) & 3u; /* 0=z 1=x 2=y */
+      int a = axc == 1u ? 0 : (axc == 2u ? 1 : 2);
+      box_lo[a] = clamp(pc.slab_z0 / md, 0.0, ext[a]);
+      box_hi[a] = clamp((pc.slab_z0 + float(pc.slab_depth)) / md, box_lo[a], ext[a]);
+    }
   }
   float2 hit = box_hit(ro, dir, box_lo, box_hi);
-  float tn = max(hit.x, 0.0), tf_ = hit.y;
+  float tn = max(hit.x, t_lo), tf_ = min(hit.y, t_hi);
   if (tn >= tf_) {
     out_image[opix] = float4(0.02, 0.02, 0.03, 1); // background
     return;

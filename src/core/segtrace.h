@@ -42,4 +42,15 @@ uint32_t r3d_segtrace(const r3d_tifxyz *s, const r3d_segrows *rows, const float 
                       float zoff, int axis_n, int axis_u, int axis_v, double slice,
                       r3d_segtrace_emit emit, void *ud);
 
+/* Arbitrary-plane form (segment-aligned views): the plane's frame is an
+ * orthonormal basis {bu, bv, bn} at world origin `org`; the traced plane is
+ * dot(p - org, bn) == slice and segments are emitted in frame (u,v) coords.
+ * Row/tile skipping bounds dot(p, bn) from the per-axis boxes, so it works
+ * for any orientation (bn unit keeps the |zoff| margin valid). The axis form
+ * above is the unit-basis special case. */
+uint32_t r3d_segtrace_basis(const r3d_tifxyz *s, const r3d_segrows *rows,
+                            const float *normals_rgba, float zoff, const double org[3],
+                            const double bu[3], const double bv[3], const double bn[3],
+                            double slice, r3d_segtrace_emit emit, void *ud);
+
 #endif /* R3D_SEGTRACE_H */
