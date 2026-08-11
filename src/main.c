@@ -2408,6 +2408,19 @@ int main(int argc, char **argv) {
           if (here && igButton("delete here", (ImVec2){0, 0}) &&
               r3d_umbilicus_remove(&umbilicus, (double)llround(curz)))
             save_umbilicus(&umbilicus, umbilicus_path, annotation_status);
+          if (igButton("start fresh (move to .bak)", (ImVec2){0, 0})) {
+            char bak[1360];
+            snprintf(bak, sizeof bak, "%s.bak", umbilicus_path);
+            if (rename(umbilicus_path, bak) == 0 || errno == ENOENT) {
+              r3d_umbilicus_free(&umbilicus);
+              r3d_umbilicus_init(&umbilicus);
+              snprintf(annotation_status, sizeof annotation_status,
+                       "cleared; previous saved as %s", bak);
+            } else {
+              snprintf(annotation_status, sizeof annotation_status, "backup failed: %s",
+                       strerror(errno));
+            }
+          }
           if (annotation_status[0]) igTextDisabled("%s", annotation_status);
         }
         igTextDisabled("segment %ux%u  %llu valid points", mv_seg.w, mv_seg.h,
