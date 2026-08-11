@@ -556,6 +556,19 @@ typedef struct umb_snap {
 } umb_snap;
 #define UMB_UNDO_MAX 64u
 
+static void umb_snap_clear(umb_snap *st, uint32_t *n) {
+  while (*n) free(st[--(*n)].pts);
+}
+
+/* replace the point set with a snapshot (consumes it; re-inserting via set
+ * keeps the sorted invariant) */
+static void umb_snap_apply(r3d_umbilicus *u, umb_snap s) {
+  u->count = 0;
+  for (size_t k = 0; k < s.count; k++)
+    r3d_umbilicus_set(u, s.pts[k].x, s.pts[k].y, s.pts[k].z);
+  free(s.pts);
+}
+
 static void umb_undo_push(umb_snap *st, uint32_t *n, const r3d_umbilicus *u) {
   if (*n == UMB_UNDO_MAX) { /* full: the oldest snapshot falls off */
     free(st[0].pts);
@@ -1368,8 +1381,8 @@ int main(int argc, char **argv) {
   /* umbilicus editing in the plane panes: plain click places the point for
    * its z (Shift+drag pans while on); off = clicks drag as usual */
   bool mv_umb_edit = umbilicus_path && multiview_path;
-  umb_snap mv_umb_undo[UMB_UNDO_MAX];
-  uint32_t mv_umb_undo_n = 0;
+  umb_snap mv_umb_undo[UMB_UNDO_MAX], mv_umb_redo[UMB_UNDO_MAX];
+  uint32_t mv_umb_undo_n = 0, mv_umb_redo_n = 0;
   uint32_t mv_align_ij[2] = {0, 0}; /* surface grid point anchoring the frames */
   uint32_t mv_basis_gen = 0, mv_ol_gen[4] = {0, 0, 0, 0};
   for (int i = 0; i < 4; i++) r3d_mv_axis_basis(i, mv_pb[i]);
@@ -1908,20 +1921,26 @@ int main(int argc, char **argv) {
               W[a] = (double)brick_shape[a] - 1.0;
           }
           umb_undo_push(mv_umb_undo, &mv_umb_undo_n, &umbilicus);
+          umb_snap_clear(mv_umb_redo, &mv_umb_redo_n); /* a new edit forks */
           if (r3d_umbilicus_set(&umbilicus, W[0], W[1], (double)llround(W[2])) == 0)
             save_umbilicus(&umbilicus, umbilicus_path, annotation_status);
         }
       }
       if (umbilicus_path && mv_umb_edit && in.undo && !io->WantCaptureKeyboard &&
-          mv_umb_undo_n) { /* Ctrl+Z: restore the previous point set */
-        umb_snap s = mv_umb_undo[--mv_umb_undo_n];
-        umbilicus.count = 0; /* re-inserting keeps the sorted invariant */
-        for (size_t k = 0; k < s.count; k++)
-          r3d_umbilicus_set(&umbilicus, s.pts[k].x, s.pts[k].y, s.pts[k].z);
-        free(s.pts);
+          mv_umb_undo_n) { /* Ctrl+Z: back to the previous point set */
+        umb_undo_push(mv_umb_redo, &mv_umb_redo_n, &umbilicus);
+        umb_snap_apply(&umbilicus, mv_umb_undo[--mv_umb_undo_n]);
         save_umbilicus(&umbilicus, umbilicus_path, annotation_status);
-        snprintf(annotation_status, sizeof annotation_status, "undo (%u step%s left)",
-                 mv_umb_undo_n, mv_umb_undo_n == 1 ? "" : "s");
+        snprintf(annotation_status, sizeof annotation_status, "undo (%u back, %u fwd)",
+                 mv_umb_undo_n, mv_umb_redo_n);
+      }
+      if (umbilicus_path && mv_umb_edit && in.redo && !io->WantCaptureKeyboard &&
+          mv_umb_redo_n) { /* Ctrl+Shift+Z: forward again */
+        umb_undo_push(mv_umb_undo, &mv_umb_undo_n, &umbilicus);
+        umb_snap_apply(&umbilicus, mv_umb_redo[--mv_umb_redo_n]);
+        save_umbilicus(&umbilicus, umbilicus_path, annotation_status);
+        snprintf(annotation_status, sizeof annotation_status, "redo (%u back, %u fwd)",
+                 mv_umb_undo_n, mv_umb_redo_n);
       }
       if (in.annotate_click && in.click_ctrl) { /* Ctrl+click = set focus POI */
         int cv_ = r3d_mv_hit(mv, in.click_xy[0], in.click_xy[1]);
@@ -2415,7 +2434,7 @@ int main(int argc, char **argv) {
           igSeparator();
           igText("umbilicus  %zu point%s", umbilicus.count,
                  umbilicus.count == 1 ? "" : "s");
-          igCheckbox("edit (U places at cursor, Ctrl+Z undoes)", &mv_umb_edit);
+          igCheckbox("edit (U places; Ctrl+Z / Ctrl+Shift+Z)", &mv_umb_edit);
           double curz = mv[R3D_MV_XY].slice;
           if (igButton("< annotated", (ImVec2){0, 0})) {
             for (size_t k = umbilicus.count; k > 0; k--)
@@ -2441,6 +2460,7 @@ int main(int argc, char **argv) {
               r3d_umbilicus_find(&umbilicus, (double)llround(curz));
           if (here && igButton("delete here", (ImVec2){0, 0})) {
             umb_undo_push(mv_umb_undo, &mv_umb_undo_n, &umbilicus);
+            umb_snap_clear(mv_umb_redo, &mv_umb_redo_n);
             if (r3d_umbilicus_remove(&umbilicus, (double)llround(curz)))
               save_umbilicus(&umbilicus, umbilicus_path, annotation_status);
           }
@@ -2448,6 +2468,7 @@ int main(int argc, char **argv) {
             char bak[1360];
             snprintf(bak, sizeof bak, "%s.bak", umbilicus_path);
             umb_undo_push(mv_umb_undo, &mv_umb_undo_n, &umbilicus);
+            umb_snap_clear(mv_umb_redo, &mv_umb_redo_n);
             if (rename(umbilicus_path, bak) == 0 || errno == ENOENT) {
               r3d_umbilicus_free(&umbilicus);
               r3d_umbilicus_init(&umbilicus);
@@ -3204,6 +3225,8 @@ int main(int argc, char **argv) {
     r3d_tifxyz_free(&mv_seg);
     r3d_segrows_free(&mv_rows);
     free(mv_normals);
+    umb_snap_clear(mv_umb_undo, &mv_umb_undo_n);
+    umb_snap_clear(mv_umb_redo, &mv_umb_redo_n);
     if (sgc.open) {
       pthread_mutex_lock(&sgc.mu);
       uint32_t ready = 0;
