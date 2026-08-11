@@ -1382,7 +1382,8 @@ int main(int argc, char **argv) {
   /* umbilicus editing in the plane panes: plain click places the point for
    * its z (Shift+drag pans while on); off = clicks drag as usual */
   bool mv_umb_edit = umbilicus_path && multiview_path;
-  bool mv_umb_refocus = true; /* U also recenters all panes on the point */
+  uint32_t mv_umb_refoc = 0xfu; /* which panes recenter on placement (bit
+                                 * per view: seg/XY/XZ/YZ); 0 = none */
   bool mv_umb_adv = false;  /* after placing, step the pane along its normal
                              * by the scrub-speed amount */
   bool mv_umb_back = false; /* ... in the negative direction */
@@ -1929,15 +1930,17 @@ int main(int argc, char **argv) {
           umb_snap_clear(mv_umb_redo, &mv_umb_redo_n); /* a new edit forks */
           if (r3d_umbilicus_set(&umbilicus, W[0], W[1], (double)llround(W[2])) == 0)
             save_umbilicus(&umbilicus, umbilicus_path, annotation_status);
-          /* optionally recenter every pane on it, like Ctrl+click */
-          if (!mv_umb_refocus) goto umb_placed;
+          /* recenter the selected panes on it, like Ctrl+click */
+          if (!mv_umb_refoc) goto umb_placed;
           memcpy(mv_focus, W, sizeof mv_focus);
           uint32_t ij[2];
           if (mv_nearest_surface(&mv_seg, mv_focus, ij)) {
             mv_align_ij[0] = ij[0];
             mv_align_ij[1] = ij[1];
-            mv[R3D_MV_SEG].cu = (double)ij[0];
-            mv[R3D_MV_SEG].cv = (double)ij[1];
+            if (mv_umb_refoc & 1u) {
+              mv[R3D_MV_SEG].cu = (double)ij[0];
+              mv[R3D_MV_SEG].cv = (double)ij[1];
+            }
           }
           if (mv_aligned) {
             if (!mv_seg_align(&mv_seg, mv_normals, mv_focus, mv_align_ij, mv_theta, mv_pb,
@@ -1946,6 +1949,7 @@ int main(int argc, char **argv) {
             mv_basis_gen++;
           }
           for (int i = 1; i < 4; i++) {
+            if (!(mv_umb_refoc & (1u << i))) continue;
             double fu, fv, fs;
             r3d_mv_w2b(mv_pb[i], mv_po[i], mv_focus, &fu, &fv, &fs);
             mv[i].cu = fu;
@@ -2467,7 +2471,14 @@ int main(int argc, char **argv) {
             igCollapsingHeader_TreeNodeFlags("umbilicus", ImGuiTreeNodeFlags_DefaultOpen)) {
           igText("%zu point%s", umbilicus.count, umbilicus.count == 1 ? "" : "s");
           igCheckbox("edit (U places; Ctrl+Z / Ctrl+Shift+Z)", &mv_umb_edit);
-          igCheckbox("refocus panes on placement", &mv_umb_refocus);
+          igText("recenter on place:");
+          static const char *umb_rf_name[4] = {"seg##urf", "XY##urf", "XZ##urf", "YZ##urf"};
+          for (int rf = 0; rf < 4; rf++) {
+            igSameLine(0, 8);
+            bool on = (mv_umb_refoc >> rf) & 1u;
+            if (igCheckbox(umb_rf_name[rf], &on))
+              mv_umb_refoc = on ? mv_umb_refoc | (1u << rf) : mv_umb_refoc & ~(1u << rf);
+          }
           igCheckbox("advance after placing (by scrub speed)", &mv_umb_adv);
           igSameLine(0, 10);
           igCheckbox("backwards", &mv_umb_back);
