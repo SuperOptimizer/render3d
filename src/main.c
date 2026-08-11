@@ -1383,6 +1383,9 @@ int main(int argc, char **argv) {
    * its z (Shift+drag pans while on); off = clicks drag as usual */
   bool mv_umb_edit = umbilicus_path && multiview_path;
   bool mv_umb_refocus = true; /* U also recenters all panes on the point */
+  bool mv_umb_adv = false;  /* after placing, step the pane along its normal */
+  bool mv_umb_back = false; /* ... in the negative direction */
+  int mv_umb_step = 100;    /* voxels per auto-advance */
   umb_snap mv_umb_undo[UMB_UNDO_MAX], mv_umb_redo[UMB_UNDO_MAX];
   uint32_t mv_umb_undo_n = 0, mv_umb_redo_n = 0;
   uint32_t mv_align_ij[2] = {0, 0}; /* surface grid point anchoring the frames */
@@ -1950,6 +1953,8 @@ int main(int argc, char **argv) {
             mv[i].slice = fs;
           }
         umb_placed:;
+          if (mv_umb_adv) /* step the placement pane to the next slice */
+            mv[cu_].slice += (mv_umb_back ? -1.0 : 1.0) * (double)mv_umb_step;
         }
       }
       if (umbilicus_path && mv_umb_edit && in.undo && !io->WantCaptureKeyboard &&
@@ -2463,6 +2468,13 @@ int main(int argc, char **argv) {
           igText("%zu point%s", umbilicus.count, umbilicus.count == 1 ? "" : "s");
           igCheckbox("edit (U places; Ctrl+Z / Ctrl+Shift+Z)", &mv_umb_edit);
           igCheckbox("refocus panes on placement", &mv_umb_refocus);
+          igCheckbox("advance after placing", &mv_umb_adv);
+          igSameLine(0, 10);
+          igCheckbox("backwards", &mv_umb_back);
+          igSetNextItemWidth(120);
+          if (igInputInt("advance step (vox)", &mv_umb_step, 10, 100, 0) &&
+              mv_umb_step < 1)
+            mv_umb_step = 1;
           double curz = mv[R3D_MV_XY].slice;
           if (igButton("< annotated", (ImVec2){0, 0})) {
             for (size_t k = umbilicus.count; k > 0; k--)
