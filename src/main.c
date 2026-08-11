@@ -1925,6 +1925,28 @@ int main(int argc, char **argv) {
           umb_snap_clear(mv_umb_redo, &mv_umb_redo_n); /* a new edit forks */
           if (r3d_umbilicus_set(&umbilicus, W[0], W[1], (double)llround(W[2])) == 0)
             save_umbilicus(&umbilicus, umbilicus_path, annotation_status);
+          /* recenter every pane on the new point, exactly like Ctrl+click */
+          memcpy(mv_focus, W, sizeof mv_focus);
+          uint32_t ij[2];
+          if (mv_nearest_surface(&mv_seg, mv_focus, ij)) {
+            mv_align_ij[0] = ij[0];
+            mv_align_ij[1] = ij[1];
+            mv[R3D_MV_SEG].cu = (double)ij[0];
+            mv[R3D_MV_SEG].cv = (double)ij[1];
+          }
+          if (mv_aligned) {
+            if (!mv_seg_align(&mv_seg, mv_normals, mv_focus, mv_align_ij, mv_theta, mv_pb,
+                              mv_po))
+              mv_axis_reset(mv_pb, mv_po);
+            mv_basis_gen++;
+          }
+          for (int i = 1; i < 4; i++) {
+            double fu, fv, fs;
+            r3d_mv_w2b(mv_pb[i], mv_po[i], mv_focus, &fu, &fv, &fs);
+            mv[i].cu = fu;
+            mv[i].cv = fv;
+            mv[i].slice = fs;
+          }
         }
       }
       if (umbilicus_path && mv_umb_edit && in.undo && !io->WantCaptureKeyboard &&
