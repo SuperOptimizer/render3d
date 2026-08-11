@@ -1371,6 +1371,7 @@ int main(int argc, char **argv) {
   uint64_t mv_sv_decoded = 0; /* residency-driven surfvol rebuild bookkeeping */
   int mv_sv_cool = 0;
   uint32_t mv_visible = 0xfu; /* per-view visibility; collapsed views cost nothing */
+  uint32_t mv_ov_mask = 0xfu; /* which panes display the overlay tint */
   int mv_solo = -1;           /* Space on a hovered view maximizes it */
   bool mv_panel_open = true;  /* docked left panel; collapses to a slim bar */
   mv_lines mv_ol[4] = {0}, mv_ol_off[4] = {0}; /* intersection polylines */
@@ -2599,6 +2600,16 @@ int main(int argc, char **argv) {
           igSetNextItemWidth(140);
           igSliderFloat("gain", &overlay_gain, 0.25f, 8.0f, "%.2f",
                         ImGuiSliderFlags_Logarithmic);
+          if (multiview_path) {
+            igText("show in:");
+            static const char *ov_pane[4] = {"seg##ovp", "XY##ovp", "XZ##ovp", "YZ##ovp"};
+            for (int op = 0; op < 4; op++) {
+              igSameLine(0, 8);
+              bool on = (mv_ov_mask >> op) & 1u;
+              if (igCheckbox(ov_pane[op], &on))
+                mv_ov_mask = on ? mv_ov_mask | (1u << op) : mv_ov_mask & ~(1u << op);
+            }
+          }
           if (n_overlays > 1) {
             for (uint32_t k = 0; k < n_overlays; k++) {
               const char *sl_ = strrchr(overlay_paths[k], '/');
@@ -3152,6 +3163,7 @@ int main(int argc, char **argv) {
         q.viewport[0] = (uint32_t)mv[i].pw;
         q.viewport[1] = (uint32_t)mv[i].ph;
         q.view_org = (uint32_t)mv[i].px | ((uint32_t)mv[i].py << 16);
+        if (!(mv_ov_mask & (1u << i))) q.overlay_flags &= ~1u; /* pane opts out */
         if (i == R3D_MV_SEG) {
           /* flattened segment: raycast the surface-volume window. Camera in
            * FLATTENED VOXELS (grid / scale); window mapping from the backend. */
