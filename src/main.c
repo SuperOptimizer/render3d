@@ -1378,6 +1378,7 @@ int main(int argc, char **argv) {
   /* flattened view: distortion heatmap (env enables it for headless shots,
    * like R3D_FORCE_HALF) */
   bool mv_stretch = getenv("R3D_MV_STRETCH") != NULL;
+  float mv_scrub = 1.0f; /* z-scrub sensitivity: voxels per wheel notch / R,F */
   /* umbilicus editing in the plane panes: plain click places the point for
    * its z (Shift+drag pans while on); off = clicks drag as usual */
   bool mv_umb_edit = umbilicus_path && multiview_path;
@@ -1877,7 +1878,7 @@ int main(int argc, char **argv) {
       if (hover >= 0 && in.wheel != 0.0f && !io->WantCaptureMouse) {
         r3d_mview *hv = &mv[hover];
         if (in.wheel_shift) { /* scrub the slice along the view normal */
-          hv->slice += (double)(in.wheel > 0.0f ? 1 : -1);
+          hv->slice += (double)(in.wheel > 0.0f ? 1 : -1) * (double)mv_scrub;
         } else {
           /* max zoom ~10 screen pixels per source voxel; the segment view's
            * zoom unit is a grid step (1/scale voxels), so scale its cap */
@@ -1888,7 +1889,7 @@ int main(int argc, char **argv) {
         in.wheel = 0.0f;
       }
       if (hover >= 0 && (in.zdelta || in.zpage))
-        mv[hover].slice += (double)(in.zdelta + in.zpage * 10);
+        mv[hover].slice += (double)(in.zdelta + in.zpage * 10) * (double)mv_scrub;
       /* SEG slice = normal offset, symmetric around the sheet */
       if (mv[R3D_MV_SEG].slice < -512.0) mv[R3D_MV_SEG].slice = -512.0;
       if (mv[R3D_MV_SEG].slice > 512.0) mv[R3D_MV_SEG].slice = 512.0;
@@ -2393,6 +2394,8 @@ int main(int argc, char **argv) {
                  mv[R3D_MV_XZ].slice, mv[R3D_MV_YZ].slice);
         int th = mv_thick;
         if (igSliderInt("slice thickness", &th, 1, 128, "%d", 0)) mv_thick = th;
+        igSliderFloat("scrub speed", &mv_scrub, 0.25f, 200.0f, "%.2f vox/notch",
+                      ImGuiSliderFlags_Logarithmic);
         bool alg = mv_aligned;
         if (igCheckbox("segment-aligned planes", &alg)) {
           mv_aligned = alg;
