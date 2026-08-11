@@ -26,6 +26,7 @@ typedef struct r3d_input {
   bool wheel_shift;  /* Shift held during any wheel event this frame */
   bool view_toggle;  /* Space pressed (multiview: solo/restore hovered view) */
   bool umb_place;    /* U pressed (umbilicus edit: place point at cursor) */
+  bool undo;         /* Ctrl+Z pressed */
   bool annotate_click; /* uncaptured LMB press in annotation mode */
   bool click_ctrl;     /* Ctrl was held for annotate_click */
   float click_xy[2];   /* window pixel coordinates of annotate_click */
