@@ -23,7 +23,10 @@ echo "$(date +%T) fetching $total segments of $SCROLL onto $VOL" >> "$LOG"
 done_n=0
 fail_n=0
 while read -r seg; do
-  name="$seg-on-$VOL.tifxyz"
+  # variant dirs are named by the segment's timestamp id, which is the dir
+  # name up to the first dash (suffixed dirs like <id>-w046-052_jordi)
+  id=${seg%%-*}
+  name="$id-on-$VOL.tifxyz"
   if [ -e "$STORE/$name.tfx" ]; then
     done_n=$((done_n + 1))
     continue

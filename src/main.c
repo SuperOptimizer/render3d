@@ -1362,7 +1362,7 @@ int main(int argc, char **argv) {
   if (seg_store_path && !multiview_path)
     fprintf(stderr, "--segments needs --multiview; ignoring the store\n");
   if (seg_store_path && multiview_path) {
-    if (sgc_open(&sgc, seg_store_path, (size_t)768 << 20) != 0) {
+    if (sgc_open(&sgc, seg_store_path, (size_t)1536 << 20) != 0) {
       fprintf(stderr, "--segments: failed to open store %s\n", seg_store_path);
       return EXIT_FAILURE;
     }
