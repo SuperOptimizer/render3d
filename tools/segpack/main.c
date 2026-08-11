@@ -33,8 +33,8 @@ int main(int argc, char **argv) {
     else if (!store) store = argv[i];
     else if (ndirs < sizeof dirs / sizeof *dirs) dirs[ndirs++] = argv[i];
   }
-  if (!store || ndirs == 0) {
-    fprintf(stderr, "usage: segpack <store-dir> [-q <log2q>] [--force] <tifxyz-dir>...\n");
+  if (!store) { /* zero dirs = refresh the manifest from existing .tfx */
+    fprintf(stderr, "usage: segpack <store-dir> [-q <log2q>] [--force] [<tifxyz-dir>...]\n");
     return EXIT_FAILURE;
   }
   mkdir(store, 0755); /* fine if it exists */

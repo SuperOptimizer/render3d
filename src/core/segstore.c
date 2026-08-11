@@ -1,5 +1,6 @@
 #include "core/segstore.h"
 
+#include <dirent.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -96,9 +97,101 @@ static void sgs_tiles_build(const r3d_tifxyz *s, const float bbox[2][3], r3d_seg
   }
 }
 
+/* encode s decimated by stride into path (skipped if it already exists and
+ * !force); the decimated grid keeps exact source points so quantization
+ * error never compounds across tiers */
+static int sgs_encode_grid(const r3d_tifxyz *s, uint32_t stride, const uint8_t *meta,
+                           size_t meta_len, int log2q, const char *path, bool force) {
+  if (!force) {
+    FILE *probe = fopen(path, "rb");
+    if (probe) {
+      fclose(probe);
+      return 0;
+    }
+  }
+  uint32_t w = (s->w + stride - 1) / stride, h = (s->h + stride - 1) / stride;
+  uint64_t np = (uint64_t)w * h;
+  float *planes = malloc(np * 3 * sizeof *planes);
+  if (!planes) return -1;
+  c5d_tifxyz ct = {.w = w, .h = h, .meta = (uint8_t *)meta, .meta_len = meta_len};
+  for (uint64_t a = 0; a < 3; a++) ct.plane[a] = planes + a * np;
+  for (uint32_t j = 0; j < h; j++)
+    for (uint32_t i = 0; i < w; i++) {
+      const float *p = s->xyz + ((uint64_t)(j * stride) * s->w + (uint64_t)i * stride) * 3;
+      uint64_t k = (uint64_t)j * w + i;
+      ct.plane[0][k] = p[0];
+      ct.plane[1][k] = p[1];
+      ct.plane[2][k] = p[2];
+    }
+  uint8_t *enc = NULL;
+  size_t enc_n = 0;
+  int rc = c5d_tifxyz_encode(&ct, log2q, &enc, &enc_n);
+  if (rc == 0) rc = sgs_write_file(path, enc, enc_n);
+  free(enc);
+  free(planes);
+  return rc;
+}
+
+/* decode a .tfx into an owned r3d_tifxyz; sx/sy parsed from the carried
+ * meta.json ("scale": [sx, sy]) */
+static int sgs_decode_tfx(const char *path, r3d_tifxyz *out) {
+  size_t enc_n = 0;
+  uint8_t *enc = sgs_read_file(path, &enc_n);
+  if (!enc) return -1;
+  c5d_tifxyz ct;
+  int rc = c5d_tifxyz_decode(enc, enc_n, &ct);
+  free(enc);
+  if (rc != 0) return -1;
+  memset(out, 0, sizeof *out);
+  out->w = ct.w;
+  out->h = ct.h;
+  out->sx = out->sy = 0.05f;
+  if (ct.meta && ct.meta_len) {
+    char *mz = malloc(ct.meta_len + 1);
+    if (mz) {
+      memcpy(mz, ct.meta, ct.meta_len);
+      mz[ct.meta_len] = 0;
+      const char *sc = strstr(mz, "\"scale\"");
+      double a = 0.0, b = 0.0;
+      if (sc && sscanf(sc, "\"scale\"%*[^0-9.-]%lf%*[^0-9.-]%lf", &a, &b) == 2 && a > 0.0 &&
+          b > 0.0) {
+        out->sx = (float)a;
+        out->sy = (float)b;
+      }
+      free(mz);
+    }
+  }
+  uint64_t np = (uint64_t)ct.w * ct.h;
+  out->xyz = malloc(np * 3 * sizeof *out->xyz);
+  if (!out->xyz) {
+    c5d_tifxyz_free(&ct);
+    return -1;
+  }
+  float bb[2][3] = {{1e30f, 1e30f, 1e30f}, {-1e30f, -1e30f, -1e30f}};
+  uint64_t nvalid = 0;
+  for (uint64_t k = 0; k < np; k++) {
+    float *q = out->xyz + k * 3;
+    q[0] = ct.plane[0][k];
+    q[1] = ct.plane[1][k];
+    q[2] = ct.plane[2][k];
+    if (q[0] != -1.0f) {
+      nvalid++;
+      for (int a = 0; a < 3; a++) {
+        if (q[a] < bb[0][a]) bb[0][a] = q[a];
+        if (q[a] > bb[1][a]) bb[1][a] = q[a];
+      }
+    }
+  }
+  memcpy(out->bbox, bb, sizeof bb);
+  out->nvalid = nvalid;
+  c5d_tifxyz_free(&ct);
+  return 0;
+}
+
 int r3d_segstore_build(const char *store_dir, const char *const *dirs, uint32_t ndirs,
                        int log2q, bool force) {
-  r3d_segmeta *segs = calloc(ndirs ? ndirs : 1, sizeof *segs);
+  uint32_t segs_cap = ndirs ? ndirs : 4;
+  r3d_segmeta *segs = calloc(segs_cap, sizeof *segs);
   r3d_segtile *tiles = NULL;
   uint64_t ntiles = 0, tiles_cap = 0;
   uint32_t n = 0;
@@ -140,51 +233,107 @@ int r3d_segstore_build(const char *store_dir, const char *const *dirs, uint32_t 
     sgs_tiles_build(&s, m->bbox, tiles + ntiles, m->tw, m->th);
     ntiles += nt;
 
-    char path[600];
+    char path[600], p4[600], mpath[600];
     snprintf(path, sizeof path, "%s/%s.tfx", store_dir, m->name);
-    FILE *probe = force ? NULL : fopen(path, "rb");
-    if (probe) {
-      fclose(probe); /* reuse the existing encode */
-    } else {
-      /* de-interleave into codec planes; render3d's loader already
-       * normalized invalids to exact (-1,-1,-1) incl. the z<=0 rule */
-      uint64_t np = (uint64_t)s.w * s.h;
-      c5d_tifxyz ct = {.w = s.w, .h = s.h};
-      float *planes = malloc(np * 3 * sizeof *planes);
-      char mpath[600];
-      snprintf(mpath, sizeof mpath, "%s/meta.json", dirs[d]);
-      size_t meta_len = 0;
-      uint8_t *meta = sgs_read_file(mpath, &meta_len);
-      if (!planes) {
-        free(meta);
-        free(tiles);
-        free(segs);
-        r3d_tifxyz_free(&s);
-        return -1;
-      }
-      for (int a = 0; a < 3; a++) ct.plane[a] = planes + (uint64_t)a * np;
-      for (uint64_t k = 0; k < np; k++)
-        for (uint64_t a = 0; a < 3; a++) ct.plane[a][k] = s.xyz[k * 3 + a];
-      ct.meta = meta;
-      ct.meta_len = meta_len;
-      uint8_t *enc = NULL;
-      size_t enc_n = 0;
-      int rc = c5d_tifxyz_encode(&ct, log2q, &enc, &enc_n);
-      if (rc == 0) rc = sgs_write_file(path, enc, enc_n);
-      free(enc);
-      free(planes);
-      free(meta);
-      if (rc != 0) {
-        fprintf(stderr, "segstore: encode failed for %s\n", dirs[d]);
-        free(tiles);
-        free(segs);
-        r3d_tifxyz_free(&s);
-        return -1;
-      }
-    }
+    snprintf(p4, sizeof p4, "%s/%s.tfx4", store_dir, m->name);
+    snprintf(mpath, sizeof mpath, "%s/meta.json", dirs[d]);
+    size_t meta_len = 0;
+    uint8_t *meta = sgs_read_file(mpath, &meta_len);
+    /* full-res + stride-4 tier (fast overview decodes); the loader already
+     * normalized invalids to exact (-1,-1,-1) incl. the z<=0 rule */
+    int rc = sgs_encode_grid(&s, 1, meta, meta_len, log2q, path, force);
+    if (rc == 0) rc = sgs_encode_grid(&s, 4, meta, meta_len, log2q, p4, force);
+    free(meta);
     r3d_tifxyz_free(&s);
+    if (rc != 0) {
+      fprintf(stderr, "segstore: encode failed for %s\n", dirs[d]);
+      free(tiles);
+      free(segs);
+      return -1;
+    }
     n++;
   }
+  /* store segments whose source dirs weren't given this run: keep them,
+   * reusing the previous manifest entry when possible (so packed sources
+   * can be deleted), else rebuild the entry from the .tfx itself */
+  r3d_segstore old;
+  bool have_old = r3d_segstore_open(&old, store_dir) == 0;
+  DIR *dp = opendir(store_dir);
+  struct dirent *de;
+  while (dp && (de = readdir(dp)) != NULL) {
+    size_t nl = strlen(de->d_name);
+    if (nl < 5 || nl - 4 >= R3D_SEGSTORE_NAME || strcmp(de->d_name + nl - 4, ".tfx") != 0)
+      continue;
+    char name[R3D_SEGSTORE_NAME];
+    memcpy(name, de->d_name, nl - 4);
+    name[nl - 4] = 0;
+    bool seen = false;
+    for (uint32_t i = 0; i < n && !seen; i++) seen = strcmp(segs[i].name, name) == 0;
+    if (seen) continue;
+    if (n == segs_cap) {
+      segs_cap *= 2;
+      r3d_segmeta *ns = realloc(segs, (size_t)segs_cap * sizeof *ns);
+      if (!ns) break;
+      segs = ns;
+    }
+    r3d_segmeta *m = &segs[n];
+    uint32_t oi = UINT32_MAX;
+    if (have_old)
+      for (uint32_t i = 0; i < old.n && oi == UINT32_MAX; i++)
+        if (strcmp(old.segs[i].name, name) == 0) oi = i;
+    uint64_t nt = 0;
+    r3d_tifxyz s = {0};
+    char p4[600];
+    snprintf(p4, sizeof p4, "%s/%s.tfx4", store_dir, name);
+    FILE *pf = fopen(p4, "rb");
+    bool have4 = pf != NULL;
+    if (pf) fclose(pf);
+    bool decoded = false;
+    if (oi == UINT32_MAX || !have4) { /* need the grid: entry rebuild or
+                                       * tier backfill */
+      char path[600];
+      snprintf(path, sizeof path, "%s/%s", store_dir, de->d_name);
+      if (sgs_decode_tfx(path, &s) != 0 || s.nvalid == 0) {
+        fprintf(stderr, "segstore: skipping stale %s\n", de->d_name);
+        r3d_tifxyz_free(&s);
+        continue;
+      }
+      decoded = true;
+      if (!have4) sgs_encode_grid(&s, 4, NULL, 0, log2q, p4, false);
+    }
+    if (oi == UINT32_MAX) {
+      memset(m, 0, sizeof *m);
+      snprintf(m->name, sizeof m->name, "%s", name);
+      m->w = s.w;
+      m->h = s.h;
+      m->sx = s.sx;
+      m->sy = s.sy;
+      memcpy(m->bbox, s.bbox, sizeof m->bbox);
+      m->nvalid = s.nvalid;
+      m->tw = (s.w + R3D_SEGSTORE_TILE - 1) / R3D_SEGSTORE_TILE;
+      m->th = (s.h + R3D_SEGSTORE_TILE - 1) / R3D_SEGSTORE_TILE;
+    } else {
+      *m = old.segs[oi];
+    }
+    nt = (uint64_t)m->tw * m->th;
+    if (ntiles + nt > tiles_cap) {
+      tiles_cap = (ntiles + nt) * 2;
+      r3d_segtile *nt2 = realloc(tiles, tiles_cap * sizeof *nt2);
+      if (!nt2) {
+        r3d_tifxyz_free(&s);
+        break;
+      }
+      tiles = nt2;
+    }
+    if (oi == UINT32_MAX) sgs_tiles_build(&s, m->bbox, tiles + ntiles, m->tw, m->th);
+    else memcpy(tiles + ntiles, old.tiles + old.segs[oi].tile_ofs, nt * sizeof *tiles);
+    if (decoded) r3d_tifxyz_free(&s);
+    m->tile_ofs = ntiles;
+    ntiles += nt;
+    n++;
+  }
+  if (dp) closedir(dp);
+  if (have_old) r3d_segstore_close(&old);
   /* manifest: header + metas + tile array, one atomic write */
   struct sgs_hdr hdr = {.count = n, .tile = R3D_SEGSTORE_TILE, .ntiles = ntiles};
   memcpy(hdr.magic, SGS_MAGIC, 8);
@@ -253,8 +402,23 @@ void r3d_segstore_close(r3d_segstore *st) {
 int r3d_segstore_load(const r3d_segstore *st, uint32_t i, uint32_t stride, r3d_tifxyz *out) {
   if (i >= st->n || stride == 0) return -1;
   const r3d_segmeta *m = &st->segs[i];
+  /* stride-4 tier: strides divisible by 4 decode the 16x-smaller .tfx4
+   * (same source points, so results match the full decode decimated) */
+  uint32_t eff = stride, sw = m->w, sh = m->h;
   char path[600];
-  snprintf(path, sizeof path, "%s/%s.tfx", st->dir, m->name);
+  bool tier4 = false;
+  if (stride % 4 == 0) {
+    snprintf(path, sizeof path, "%s/%s.tfx4", st->dir, m->name);
+    FILE *probe = fopen(path, "rb");
+    if (probe) {
+      fclose(probe);
+      tier4 = true;
+      eff = stride / 4;
+      sw = (m->w + 3) / 4;
+      sh = (m->h + 3) / 4;
+    }
+  }
+  if (!tier4) snprintf(path, sizeof path, "%s/%s.tfx", st->dir, m->name);
   size_t enc_n = 0;
   uint8_t *enc = sgs_read_file(path, &enc_n);
   if (!enc) return -1;
@@ -262,7 +426,7 @@ int r3d_segstore_load(const r3d_segstore *st, uint32_t i, uint32_t stride, r3d_t
   int rc = c5d_tifxyz_decode(enc, enc_n, &ct);
   free(enc);
   if (rc != 0) return -1;
-  if (ct.w != m->w || ct.h != m->h) {
+  if (ct.w != sw || ct.h != sh) {
     c5d_tifxyz_free(&ct);
     return -1;
   }
@@ -280,7 +444,7 @@ int r3d_segstore_load(const r3d_segstore *st, uint32_t i, uint32_t stride, r3d_t
   uint64_t nvalid = 0;
   for (uint32_t j = 0; j < out->h; j++)
     for (uint32_t ii = 0; ii < out->w; ii++) {
-      uint64_t src = (uint64_t)(j * stride) * m->w + (uint64_t)ii * stride;
+      uint64_t src = (uint64_t)(j * eff) * sw + (uint64_t)ii * eff;
       float *q = out->xyz + ((uint64_t)j * out->w + ii) * 3;
       q[0] = ct.plane[0][src];
       q[1] = ct.plane[1][src];

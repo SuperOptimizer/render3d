@@ -1286,3 +1286,17 @@ off-thread, gui-phase catch-up max 60.8 ms while re-traces amortize, steady
 state back to ~2 ms. Verified headless via a temporary frame-150 activation
 hook (removed): swap log line + screenshot show the new banner in the
 flattened pane with ink overlay and recentered planes. All 5 suites green.
+
+## 2026-08-11 — segstore: incremental packs + persistent stride-4 tier
+
+r3d_segstore_build is now incremental: segments already in the store whose
+source dirs aren't given are kept by copying their previous manifest entry
+(or rebuilt from the .tfx itself, scale parsed from the carried meta.json)
+— so packed tifxyz sources can be deleted, bounding fetch-all disk use to
+one segment at a time. Each pack also writes <name>.tfx4, the same grid
+pre-decimated by 4 (exact source points, so tier decode == full decode
+subsampled — unit-tested); r3d_segstore_load with stride divisible by 4
+decodes the 16x-smaller tier, cutting overview decodes from decode-bound
+~200-800 ms to tens of ms per segment. tools/fetch_segments.sh streams a
+whole scroll: list bucket -> curl the 4 files -> segpack -> delete source,
+resumable (skips existing .tfx).

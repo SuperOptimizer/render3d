@@ -444,6 +444,21 @@ static void test_tifxyz(void) {
   CHECK(r3d_segtrace(&s2, NULL, NULL, 0.0f, 2, 0, 1, 3001.6, tr_emit, &accd) > 0);
   CHECK(accd.wu_min > 227.0f && accd.wu_max < 229.0f); /* crossing near x=228 */
   r3d_tifxyz_free(&s2);
+  /* stride-4 load rides the .tfx4 tier and must equal the full decode
+   * subsampled (lossless store, same source points) */
+  r3d_tifxyz s4;
+  CHECK(r3d_segstore_load(&st, 0, 4, &s4) == 0);
+  CHECK(s4.w == (W + 3) / 4 && s4.h == (H + 3) / 4);
+  const float *d40 = r3d_tifxyz_at(&s4, 1, 1); /* source point (4,4) */
+  CHECK(d40[0] == 180.0f && d40[1] == 280.0f);
+  r3d_tifxyz_free(&s4);
+  /* incremental rebuild with NO source dirs keeps the packed segment via
+   * the manifest (sources deletable after packing) */
+  CHECK(r3d_segstore_build(sdir, NULL, 0, -1, false) == 1); /* kept via manifest */
+  r3d_segstore st2;
+  CHECK(r3d_segstore_open(&st2, sdir) == 0);
+  CHECK(st2.n == 1 && st2.segs[0].w == W && st2.segs[0].nvalid == W * H - 2);
+  r3d_segstore_close(&st2);
   r3d_segstore_close(&st);
   CHECK(st.segs == NULL);
   {
@@ -452,6 +467,8 @@ static void test_tifxyz(void) {
     unlink(spath);
     const char *base = strrchr(dir, '/') + 1;
     snprintf(spath, sizeof spath, "%s/%s.tfx", sdir, base);
+    unlink(spath);
+    snprintf(spath, sizeof spath, "%s/%s.tfx4", sdir, base);
     unlink(spath);
     rmdir(sdir);
   }
