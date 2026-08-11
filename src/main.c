@@ -341,6 +341,13 @@ typedef struct sgcache {
   bool quit, open;
   size_t bytes, budget;
   uint64_t tick;
+  /* activation: the worker prepares a full-res grid + GPU grid arrays for
+   * one segment; the GUI thread applies the swap when act_ready is set */
+  uint32_t act_req, act_ready; /* UINT32_MAX = none */
+  bool act_busy;
+  r3d_tifxyz act_s;
+  r3d_segrows act_rows;
+  float *act_coords, *act_normals;
 } sgcache;
 
 static size_t sgc_ent_bytes(const sgc_ent *e) {
@@ -365,10 +372,38 @@ static void sgc_evict_lru(sgcache *c, uint32_t keep) { /* mu held */
   }
 }
 
+static int mv_build_grids(const r3d_tifxyz *s, float **coords_out, float **normals_out);
+
 static void *sgc_worker(void *ud) {
   sgcache *c = ud;
   pthread_mutex_lock(&c->mu);
   while (!c->quit) {
+    if (c->act_req != UINT32_MAX && c->act_ready == UINT32_MAX) {
+      uint32_t ai = c->act_req;
+      c->act_req = UINT32_MAX;
+      c->act_busy = true;
+      pthread_mutex_unlock(&c->mu);
+      r3d_tifxyz s;
+      r3d_segrows rows = {0};
+      float *co = NULL, *no = NULL;
+      int ok = r3d_segstore_load(&c->st, ai, 1, &s) == 0;
+      if (ok && (r3d_segrows_build(&s, &rows) != 0 || mv_build_grids(&s, &co, &no) != 0)) {
+        r3d_tifxyz_free(&s);
+        r3d_segrows_free(&rows);
+        ok = 0;
+      }
+      pthread_mutex_lock(&c->mu);
+      if (ok) {
+        c->act_s = s;
+        c->act_rows = rows;
+        c->act_coords = co;
+        c->act_normals = no;
+        c->act_ready = ai;
+      } else {
+        c->act_busy = false;
+      }
+      continue;
+    }
     if (c->qn == 0) {
       pthread_cond_wait(&c->cv, &c->mu);
       continue;
@@ -400,6 +435,7 @@ static void *sgc_worker(void *ud) {
 
 static int sgc_open(sgcache *c, const char *store_dir, size_t budget) {
   memset(c, 0, sizeof *c);
+  c->act_req = c->act_ready = UINT32_MAX;
   if (r3d_segstore_open(&c->st, store_dir) != 0) return -1;
   c->ent = calloc(c->st.n ? c->st.n : 1, sizeof *c->ent);
   c->queue = malloc((c->st.n ? c->st.n : 1) * sizeof *c->queue);
@@ -430,6 +466,12 @@ static void sgc_close(sgcache *c) {
   pthread_cond_signal(&c->cv);
   pthread_mutex_unlock(&c->mu);
   pthread_join(c->th, NULL);
+  if (c->act_ready != UINT32_MAX) {
+    r3d_tifxyz_free(&c->act_s);
+    r3d_segrows_free(&c->act_rows);
+    free(c->act_coords);
+    free(c->act_normals);
+  }
   for (uint32_t i = 0; i < c->st.n; i++)
     if (c->ent[i].state == SGC_READY) {
       r3d_tifxyz_free(&c->ent[i].s);
@@ -1613,6 +1655,65 @@ int main(int argc, char **argv) {
       continue;
     }
 
+    if (sgc.open) { /* apply a finished activation: swap the flattened view
+       * to the worker-prepared segment (decode/grids were built off-thread;
+       * only the GPU upload happens here) */
+      pthread_mutex_lock(&sgc.mu);
+      if (sgc.act_ready != UINT32_MAX) {
+        uint32_t ai = sgc.act_ready;
+        r3d_tifxyz ns = sgc.act_s;
+        r3d_segrows nr = sgc.act_rows;
+        float *co = sgc.act_coords, *no = sgc.act_normals;
+        sgc.act_ready = UINT32_MAX;
+        sgc.act_busy = false;
+        sgc.act_coords = sgc.act_normals = NULL;
+        pthread_mutex_unlock(&sgc.mu);
+        if (r3d_surf_swap(renderer, ns.w, ns.h, co, no, ns.sx, ns.sy) == 0) {
+          r3d_tifxyz_free(&mv_seg);
+          r3d_segrows_free(&mv_rows);
+          free(mv_normals);
+          mv_seg = ns;
+          mv_rows = nr;
+          mv_normals = no;
+          snprintf(sgc_active, sizeof sgc_active, "%s", sgc.st.segs[ai].name);
+          mv[R3D_MV_SEG].cu = (double)mv_seg.w * 0.5;
+          mv[R3D_MV_SEG].cv = (double)mv_seg.h * 0.5;
+          for (int i = 0; i < 4; i++) {
+            mv_ol[i].n = 0;
+            mv_ol_off[i].n = 0;
+            mv_ol_slice[i] = 1e30;
+          }
+          mv_ol_zoff = 1e30;
+          const float *mc2 = r3d_tifxyz_at(&mv_seg, mv_seg.w / 2, mv_seg.h / 2);
+          if (r3d_tifxyz_valid(mc2))
+            for (int a = 0; a < 3; a++) mv_focus[a] = (double)mc2[a];
+          mv_align_ij[0] = mv_seg.w / 2;
+          mv_align_ij[1] = mv_seg.h / 2;
+          if (mv_aligned) {
+            if (!mv_seg_align(&mv_seg, mv_normals, mv_focus, mv_align_ij, mv_theta, mv_pb,
+                              mv_po))
+              mv_axis_reset(mv_pb, mv_po);
+          }
+          mv_basis_gen++; /* re-trace every cached overlay against the swap */
+          for (int i = 1; i < 4; i++) { /* recenter planes on the new focus */
+            double fu, fv, fs;
+            r3d_mv_w2b(mv_pb[i], mv_po[i], mv_focus, &fu, &fv, &fs);
+            mv[i].cu = fu;
+            mv[i].cv = fv;
+            mv[i].slice = fs;
+          }
+          printf("activated segment %s (%ux%u)\n", sgc_active, mv_seg.w, mv_seg.h);
+        } else {
+          r3d_tifxyz_free(&ns);
+          r3d_segrows_free(&nr);
+          free(no);
+          fprintf(stderr, "segment activation failed (surf grid swap)\n");
+        }
+        free(co);
+      } else {
+        pthread_mutex_unlock(&sgc.mu);
+      }
+    }
     uint32_t mv_mask = mv_solo >= 0 ? 1u << mv_solo : (mv_visible ? mv_visible : 0xfu);
     int mv_panel_w = multiview_path ? (mv_panel_open ? 360 : 26) : 0;
     if (mv_panel_w >= w) mv_panel_w = 0;
@@ -2201,8 +2302,32 @@ int main(int argc, char **argv) {
             sgc_nnear = r3d_segstore_near_query(&sgc.st, mv_focus, 300.0, sgc_near, 6);
             if (sgc_nnear > 6) sgc_nnear = 6;
           }
-          for (uint32_t k = 0; k < sgc_nnear; k++)
-            igTextDisabled("  near focus: %s", sgc.st.segs[sgc_near[k]].name);
+          bool act_pending = sgc.act_req != UINT32_MAX || sgc.act_busy;
+          if (act_pending) igTextDisabled("activating...");
+          else igTextDisabled("near focus (click to activate):");
+          for (uint32_t k = 0; k < sgc_nnear; k++) {
+            uint32_t si = sgc_near[k];
+            bool cur = strcmp(sgc.st.segs[si].name, sgc_active) == 0;
+            char lbl[96];
+            snprintf(lbl, sizeof lbl, "  %.64s%s", sgc.st.segs[si].name,
+                     cur ? " (active)" : "");
+            if (igSelectable_Bool(lbl, cur, 0, (ImVec2){0, 0}) && !cur && !act_pending &&
+                sgc.act_ready == UINT32_MAX) {
+              sgc.act_req = si;
+              pthread_cond_signal(&sgc.cv);
+            }
+          }
+          if (igCollapsingHeader_TreeNodeFlags("all surfaces", 0))
+            for (uint32_t si = 0; si < sgc.st.n; si++) {
+              bool cur = strcmp(sgc.st.segs[si].name, sgc_active) == 0;
+              char lbl[96];
+              snprintf(lbl, sizeof lbl, "%.64s##s%u", sgc.st.segs[si].name, si);
+              if (igSelectable_Bool(lbl, cur, 0, (ImVec2){0, 0}) && !cur && !act_pending &&
+                  sgc.act_ready == UINT32_MAX) {
+                sgc.act_req = si;
+                pthread_cond_signal(&sgc.cv);
+              }
+            }
           pthread_mutex_unlock(&sgc.mu);
         }
       }

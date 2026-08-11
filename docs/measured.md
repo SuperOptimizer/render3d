@@ -1265,3 +1265,24 @@ hit each pane, 57 MB cached after the initial burst, gui phase 2.2 ms avg /
 frame max 32.7 ms, all 5 suites green. Exit line reports cache/hit/trace
 stats for headless verification (ImGui overlays don't land in --shot
 captures, which read the offscreen image).
+
+## 2026-08-11 — activate any store surface from the panel (in-place swap)
+
+Clicking a surface in the multiview panel (near-focus list or "all
+surfaces") makes it the active flattened segment without restarting the
+app. The corpus worker decodes the full-res grid and builds segrows +
+coords/normals grids off-thread; the GUI thread then calls the new
+r3d_surf_swap (device-idle, recreate + upload the two RGBA32F grid images,
+rewrite bindings 7/8, rebind the surfvol taps and reset its window state so
+the next _window call fully rebakes at the new segment's scale — the 768 MB
+window texture itself survives). The viewer swaps mv_seg/rows/normals,
+re-anchors the focus and aligned frames on the new segment's center, and
+recenters the planes; the old active segment becomes a dimmed overlay.
+
+Measured (gp -> 8508x2248 od segment, 19M points): apply hitch 405 ms in
+one frame (vkDeviceWaitIdle + 2x306 MB grid uploads; user-triggered and
+rare — acceptable, noted for a staged-upload follow-up), decode+grids fully
+off-thread, gui-phase catch-up max 60.8 ms while re-traces amortize, steady
+state back to ~2 ms. Verified headless via a temporary frame-150 activation
+hook (removed): swap log line + screenshot show the new banner in the
+flattened pane with ink overlay and recentered planes. All 5 suites green.

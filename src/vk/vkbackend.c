@@ -1265,6 +1265,48 @@ int r3d_surf_begin(r3d_renderer *r, uint32_t w, uint32_t h, const float *coords_
   return 0;
 }
 
+int r3d_surf_swap(r3d_renderer *r, uint32_t w, uint32_t h, const float *coords_rgba,
+                  const float *normals_rgba, float sx, float sy) {
+  if (!r->surf_active || !w || !h || !coords_rgba || !normals_rgba) return -1;
+  /* rare, user-triggered: idle the device so the old grid images retire */
+  vkDeviceWaitIdle(r->vk.dev);
+  r3d_vkimage_destroy(&r->vk, &r->surf_coords);
+  r3d_vkimage_destroy(&r->vk, &r->surf_normals);
+  VkExtent3D e = {w, h, 1};
+  VkDeviceSize n = (VkDeviceSize)w * h * 4 * sizeof(float);
+  if (r3d_vkimage_create(&r->vk, VK_FORMAT_R32G32B32A32_SFLOAT, e, 1,
+                         VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                         &r->surf_coords) != 0 ||
+      r3d_vkimage_create(&r->vk, VK_FORMAT_R32G32B32A32_SFLOAT, e, 1,
+                         VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                         &r->surf_normals) != 0)
+    return -1;
+  if (upload_small_image(r, &r->surf_coords, coords_rgba, n) != 0 ||
+      upload_small_image(r, &r->surf_normals, normals_rgba, n) != 0)
+    return -1;
+  write_image_dset(r, 7, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, r->surf_coords.view, VK_NULL_HANDLE,
+                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+  write_image_dset(r, 8, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, r->surf_normals.view, VK_NULL_HANDLE,
+                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+  if (r->sv.active) { /* window texture survives; rebind the grid taps and
+                       * force the next _window call to rebake everything */
+    r3d_vkcomp_bind_image(&r->vk, &r->sv.comp, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                          r->surf_coords.view, r->samp_near,
+                          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    r3d_vkcomp_bind_image(&r->vk, &r->sv.comp, 2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                          r->surf_normals.view, r->samp_near,
+                          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    r->sv.sx = sx;
+    r->sv.sy = sy;
+    r->sv.step = 0.0f;
+    r->sv.dirty = false;
+    r->sv.prog_row = UINT32_MAX;
+    r->sv.baked = false;
+    r->sv.shift_pending = false;
+  }
+  return 0;
+}
+
 /* rows per progressive surfvol re-bake dispatch (2048x128x96 ~= 5 ms GPU) */
 #define SV_PROG_ROWS 128u
 

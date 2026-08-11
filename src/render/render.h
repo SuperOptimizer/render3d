@@ -142,6 +142,11 @@ void r3d_vslab_prefetch_get(r3d_renderer *r, r3d_vslab_prefetch_stats *st);
  * volume at coords + normal * zoff (see FrameParams reuse in the shader). */
 int r3d_surf_begin(r3d_renderer *r, uint32_t w, uint32_t h, const float *coords_rgba,
                    const float *normals_rgba);
+/* Replace the active surf grids with another segment's (device-idles; the
+ * surfvol window keeps its texture, takes the new scale, and fully rebakes
+ * on the next _window call). */
+int r3d_surf_swap(r3d_renderer *r, uint32_t w, uint32_t h, const float *coords_rgba,
+                  const float *normals_rgba, float sx, float sy);
 
 /* Flattened surface volume: a w x h x layers R8 3D window over flattened
  * segment space, GPU-resampled from the bricks cache along the per-vertex
