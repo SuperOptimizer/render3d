@@ -2642,7 +2642,7 @@ int main(int argc, char **argv) {
     if (igCollapsingHeader_TreeNodeFlags("quality", 0)) {
       igSliderFloat("lod bias", &lod_bias, -2.0f, 4.0f, "%.2f", 0);
       int qp = quality_policy;
-      if (igCombo_Str("quality", &qp, "full\0interactive\0fast\0\0", 3)) {
+      if (igCombo_Str("policy##quality", &qp, "full\0interactive\0fast\0\0", 3)) {
         quality_policy = qp;
         adaptive_res = quality_policy != 0;
         r3d_set_quality(renderer, quality_policy == 2 ? R3D_QUALITY_FAST : R3D_QUALITY_FULL);
