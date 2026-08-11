@@ -142,6 +142,15 @@ struct r3d_renderer {
      * 1 = .c5b on disk, 2 = definitively absent/air. The render thread
      * never touches the filesystem — it consults this map. */
     _Atomic uint8_t *have;
+    /* second source: the overlay tree (url2[0] != 0 = active). Same id
+     * space (geometry-identical), own chunk layout, cache root and map;
+     * queue entries carry the source in bit 63. */
+    char url2[1024], root2[1280];
+    uint32_t chsz2[BR_LOD_MAX];
+    bool raw2[BR_LOD_MAX];
+    float q02;
+    _Atomic uint8_t *have2;
+    _Atomic uint64_t fetched2;
   } ni;
   r3d_brlod_level bricks_lev[BR_LOD_MAX];
   r3d_brlod_reader *bricks_readers;
@@ -183,7 +192,9 @@ struct r3d_renderer {
     uint64_t warm_cap, warm_bytes;
     uint32_t warm_bricks;
     uint32_t *warm_off, *warm_len, *warm_use; /* per brick; off UINT32_MAX = absent */
-    uint32_t *warm_list, warm_list_cap; /* brick ids currently warm (LRU scan set) */
+    uint32_t *warm_list, warm_list_cap;
+    uint8_t *ink_missing;     /* per-slot: overlay zero-filled, awaiting net */
+    uint64_t ink_fetch_seen;  /* ni.fetched2 at the last repair pass */ /* brick ids currently warm (LRU scan set) */
     struct wfnode { uint32_t off, len; } *wfree; /* offset-sorted free list */
     uint32_t nwf, cwf;
     VkCommandPool upload_pool;
@@ -873,6 +884,7 @@ static void bricks_teardown(r3d_renderer *r) {
     pthread_cond_destroy(&r->ni.cv);
   }
   free((void *)r->ni.have);
+  free((void *)r->ni.have2);
   if (r->vk.dev) r3d_vkctx_device_wait_idle(&r->vk);
   if (r->bs.upload_pool) vkDestroyCommandPool(r->vk.dev, r->bs.upload_pool, NULL);
   if (r->c5d) r3d_vkc5d_destroy(r->c5d);
@@ -917,6 +929,7 @@ static void bricks_teardown(r3d_renderer *r) {
   free(r->bs.warm_use);
   free(r->bs.warm_list);
   free(r->bs.wfree);
+  free(r->bs.ink_missing);
   memset(&r->bs, 0, sizeof r->bs);
   memset(&r->ni, 0, sizeof r->ni);
   r3d_vkimage_destroy(&r->vk, &r->surf_coords);
@@ -1898,9 +1911,10 @@ static void brlod_locate(r3d_renderer *r, uint32_t b, uint32_t *li, uint32_t *bx
   *bz = local / (lv->bx * lv->by);
 }
 
-static void ni_brick_path(r3d_renderer *r, char path[1400], uint32_t li, uint32_t bz,
-                          uint32_t by, uint32_t bx) {
-  snprintf(path, 1400, "%s/bricks/L%u/%u_%u_%u.c5b", r->bricks_root, li, bz, by, bx);
+static void ni_brick_path(r3d_renderer *r, char path[1400], int nsrc, uint32_t li,
+                          uint32_t bz, uint32_t by, uint32_t bx) {
+  snprintf(path, 1400, "%s/bricks/L%u/%u_%u_%u.c5b", nsrc ? r->ni.root2 : r->bricks_root,
+           li, bz, by, bx);
 }
 
 static const uint8_t *bricks_source_blob(r3d_renderer *r, uint32_t b, size_t *n) {
@@ -1911,11 +1925,11 @@ static const uint8_t *bricks_source_blob(r3d_renderer *r, uint32_t b, size_t *n)
 /* Load a net-ingested brick blob from its cache file (WORKER THREAD ONLY —
  * the render thread never performs file IO; it selects these bricks via the
  * ni.have map and the worker resolves them here). malloc'd result. */
-static uint8_t *ni_load_brick(r3d_renderer *r, uint32_t b, size_t *n) {
+static uint8_t *ni_load_brick(r3d_renderer *r, uint32_t b, size_t *n, int nsrc) {
   uint32_t li, bx, by, bz;
   brlod_locate(r, b, &li, &bx, &by, &bz);
   char path[1400];
-  ni_brick_path(r, path, li, bz, by, bx);
+  ni_brick_path(r, path, nsrc, li, bz, by, bx);
   FILE *f = fopen(path, "rb");
   if (!f) return NULL;
   fseek(f, 0, SEEK_END);
@@ -1939,14 +1953,16 @@ static uint8_t *ni_load_brick(r3d_renderer *r, uint32_t b, size_t *n) {
 /* Enqueue the zarr chunk that owns brick b (dedup against queue+inflight).
  * Returns true while the brick may still arrive (queued/inflight/back-off),
  * false when the cache says the brick is definitively absent upstream. */
-static bool bricks_net_request(r3d_renderer *r, uint32_t b) {
-  if (!r->ni.active) return false;
-  if (atomic_load(&r->ni.have[b]) == 2u) return false; /* definitively absent */
+static bool bricks_net_request(r3d_renderer *r, uint32_t b, int nsrc) {
+  if (!r->ni.active || (nsrc && !r->ni.url2[0])) return false;
+  _Atomic uint8_t *hv = nsrc ? r->ni.have2 : r->ni.have;
+  if (atomic_load(&hv[b]) == 2u) return false; /* definitively absent */
   uint32_t li, bx, by, bz;
   brlod_locate(r, b, &li, &bx, &by, &bz);
-  uint32_t cb = r->ni.chsz[li] / BR_SLOT_DIM; /* bricks per chunk axis */
-  uint64_t id = ((uint64_t)li << 48) | ((uint64_t)(bz / cb) << 32) |
-                ((uint64_t)(by / cb) << 16) | (uint64_t)(bx / cb);
+  uint32_t cb = (nsrc ? r->ni.chsz2[li] : r->ni.chsz[li]) / BR_SLOT_DIM;
+  uint64_t id = ((uint64_t)nsrc << 63) | ((uint64_t)li << 48) |
+                ((uint64_t)(bz / cb) << 32) | ((uint64_t)(by / cb) << 16) |
+                (uint64_t)(bx / cb);
   pthread_mutex_lock(&r->ni.mu);
   int fq = -1;
   for (uint32_t i = 0; i < r->ni.qn && fq < 0; i++)
@@ -2039,9 +2055,11 @@ static void *ni_worker(void *arg) {
     if (r->ni.nin < 8u) r->ni.inflight[r->ni.nin++] = id;
     pthread_mutex_unlock(&r->ni.mu);
 
-    uint32_t li = (uint32_t)(id >> 48), cz = (uint32_t)(id >> 32) & 0xffffu,
+    int nsrc = (int)(id >> 63);
+    uint32_t li = (uint32_t)(id >> 48) & 0x3fffu, cz = (uint32_t)(id >> 32) & 0xffffu,
              cy = (uint32_t)(id >> 16) & 0xffffu, cx = (uint32_t)id & 0xffffu;
-    uint32_t chsz = r->ni.chsz[li], cb = chsz / BR_SLOT_DIM;
+    _Atomic uint8_t *hvm = nsrc ? r->ni.have2 : r->ni.have;
+    uint32_t chsz = nsrc ? r->ni.chsz2[li] : r->ni.chsz[li], cb = chsz / BR_SLOT_DIM;
     size_t chunk_bytes = (size_t)chsz * chsz * chsz;
     { /* cache files from an earlier session? publish them without fetching */
       const r3d_brlod_level *lv = &r->bricks_lev[li];
@@ -2052,13 +2070,13 @@ static void *ni_worker(void *arg) {
             uint32_t bz = cz * cb + sz_, by = cy * cb + sy, bx = cx * cb + sx;
             if (bx >= lv->bx || by >= lv->by || bz >= lv->bz) continue;
             char path[1400];
-            ni_brick_path(r, path, li, bz, by, bx);
+            ni_brick_path(r, path, nsrc, li, bz, by, bx);
             struct stat st;
             if (stat(path, &st) != 0) {
               all_known = false;
               break;
             }
-            atomic_store(&r->ni.have[lv->page_off + (bz * lv->by + by) * lv->bx + bx],
+            atomic_store(&hvm[lv->page_off + (bz * lv->by + by) * lv->bx + bx],
                          st.st_size ? 1u : 2u);
           }
       if (all_known) {
@@ -2073,7 +2091,8 @@ static void *ni_worker(void *arg) {
       }
     }
     char url[1400];
-    snprintf(url, sizeof url, "%s/%u/%u/%u/%u", r->ni.url, li, cz, cy, cx);
+    snprintf(url, sizeof url, "%s/%u/%u/%u/%u", nsrc ? r->ni.url2 : r->ni.url, li, cz, cy,
+             cx);
     long code = 0;
     CURLcode crc = CURLE_OK;
     for (int attempt = 0; attempt < 4; attempt++) {
@@ -2099,7 +2118,7 @@ static void *ni_worker(void *arg) {
     bool have = crc == CURLE_OK && code == 200;
     if (crc == CURLE_OK && code == 404) atomic_fetch_add(&r->ni.absent_chunks, 1);
     if (have) {
-      atomic_fetch_add(&r->ni.fetched, 1);
+      atomic_fetch_add(nsrc ? &r->ni.fetched2 : &r->ni.fetched, 1);
       if (chunk_cap < chunk_bytes) {
         uint8_t *nc = realloc(chunk, chunk_bytes);
         if (nc) {
@@ -2110,7 +2129,7 @@ static void *ni_worker(void *arg) {
       }
     }
     if (have) {
-      if (r->ni.raw[li]) {
+      if (nsrc ? r->ni.raw2[li] : r->ni.raw[li]) {
         have = buf.n == chunk_bytes;
         if (have) memcpy(chunk, buf.p, chunk_bytes);
       } else {
@@ -2124,12 +2143,13 @@ static void *ni_worker(void *arg) {
     }
     if (crc == CURLE_OK && (code == 200 || code == 404)) {
       const r3d_brlod_level *lv = &r->bricks_lev[li];
+      const char *rt = nsrc ? r->ni.root2 : r->bricks_root;
       char dir[1360];
-      snprintf(dir, sizeof dir, "%s/bricks", r->bricks_root);
+      snprintf(dir, sizeof dir, "%s/bricks", rt);
       mkdir(dir, 0755);
-      snprintf(dir, sizeof dir, "%s/bricks/L%u", r->bricks_root, li);
+      snprintf(dir, sizeof dir, "%s/bricks/L%u", rt, li);
       mkdir(dir, 0755);
-      float q = r->ni.q0 / (float)(1u << (li < 3u ? li : 3u));
+      float q = (nsrc ? r->ni.q02 : r->ni.q0) / (float)(1u << (li < 3u ? li : 3u));
       if (q < 0.25f) q = 0.25f;
       for (uint32_t sz_ = 0; sz_ < cb; sz_++)
         for (uint32_t sy = 0; sy < cb; sy++)
@@ -2137,10 +2157,10 @@ static void *ni_worker(void *arg) {
             uint32_t bz = cz * cb + sz_, by = cy * cb + sy, bx = cx * cb + sx;
             if (bx >= lv->bx || by >= lv->by || bz >= lv->bz) continue;
             char path[1400];
-            ni_brick_path(r, path, li, bz, by, bx);
+            ni_brick_path(r, path, nsrc, li, bz, by, bx);
             struct stat st;
             if (stat(path, &st) == 0) { /* already cached by an earlier run */
-              atomic_store(&r->ni.have[lv->page_off + (bz * lv->by + by) * lv->bx + bx],
+              atomic_store(&hvm[lv->page_off + (bz * lv->by + by) * lv->bx + bx],
                            st.st_size ? 1u : 2u);
               continue;
             }
@@ -2164,7 +2184,7 @@ static void *ni_worker(void *arg) {
             uint32_t gb = lv->page_off + (bz * lv->by + by) * lv->bx + bx;
             if (zero) {
               ni_write_file(path, NULL, 0); /* empty marker = air/absent */
-              atomic_store(&r->ni.have[gb], 2u);
+              atomic_store(&hvm[gb], 2u);
               continue;
             }
             c5d_brick_params bp = c5d_brick_defaults(1.0f);
@@ -2173,7 +2193,7 @@ static void *ni_worker(void *arg) {
             size_t en = 0;
             if (c5d_brick_encode(&bp, raw, BR_SLOT_DIM, &enc, &en) == 0) {
               ni_write_file(path, enc, en);
-              atomic_store(&r->ni.have[gb], 1u);
+              atomic_store(&hvm[gb], 1u);
               atomic_fetch_add(&r->ni.encoded, 1);
               free(enc);
             }
@@ -2524,6 +2544,7 @@ struct brdec {
   uint8_t *maxes;  /* optional per-brick max out */
   bool zero_on_fail; /* overlay semantics: absent/failed brick = zeros */
   bool ni_fallback;
+  int ni_src; /* net-ingest cache to fall back on (0 = CT, 1 = overlay) */
   uint32_t n;
   _Atomic uint32_t next;
   _Atomic int rc;
@@ -2539,7 +2560,7 @@ static void *brdec_worker(void *arg) {
     size_t bn = j->it[i].bn;
     uint8_t *owned = NULL;
     if (!blob && j->ni_fallback) {
-      owned = ni_load_brick(j->r, j->it[i].b, &bn);
+      owned = ni_load_brick(j->r, j->it[i].b, &bn, j->ni_src);
       blob = owned;
     }
     int rc = blob ? c5d_brick_decode(blob, bn, dst, BR_SLOT_DIM) : -1;
@@ -2602,7 +2623,15 @@ static int bricks_decode_batch(r3d_renderer *r, uint32_t n) {
       items[i].bn = bn;
       items[i].b = r->bs.sel_b[i];
     }
-    struct brdec ijob = {.r = r, .it = items, .raw = raw, .zero_on_fail = true, .n = n};
+    for (uint32_t i = 0; i < n; i++)
+      if (!items[i].blob && r->ni.url2[0]) { /* absent locally: demand-fetch
+             * from the overlay source; the repair pass fills the slot when
+             * the chunk lands */
+        bricks_net_request(r, r->bs.sel_b[i], 1);
+        if (r->bs.ink_missing) r->bs.ink_missing[r->bs.sel_slot[i]] = 1;
+      }
+    struct brdec ijob = {.r = r, .it = items, .raw = raw, .zero_on_fail = true,
+                         .ni_fallback = r->ni.url2[0] != 0, .ni_src = 1, .n = n};
     brdec_run(&ijob);
     memcpy(r->bs.raw_stage.mapped, raw, (size_t)n * BR_RAW_BYTES);
     if (bricks_upload_raw(r, &r->ink_atlas, r->bs.sel_slot, n) != 0) return -1;
@@ -3270,6 +3299,56 @@ void r3d_bricks_params(const r3d_renderer *r, r3d_frame_params *p) {
                     (r->bricks_identity ? 0x10000u : 0u);
 }
 
+/* Arm the overlay tree as the second net-ingest source when it carries a
+ * source.json (same parse as the CT tree's). Requires the fetcher pool to
+ * already be up (CT source present). */
+static void ni_overlay_source(r3d_renderer *r) {
+  r->ni.url2[0] = 0;
+  if (!r->ni.active) return;
+  char sp[1360];
+  snprintf(sp, sizeof sp, "%s/source.json", r->ink_root);
+  FILE *sf = fopen(sp, "r");
+  if (!sf) return;
+  char sj[8192] = {0};
+  size_t sn = fread(sj, 1, sizeof sj - 1, sf);
+  fclose(sf);
+  (void)sn;
+  const char *u = strstr(sj, "\"url\": \"");
+  const char *q = strstr(sj, "\"quality\": ");
+  bool ok = u && q && strstr(sj, "render3d.c5d-source.v1");
+  if (!ok) return;
+  u += 8;
+  const char *ue = strchr(u, '"');
+  if (!ue || (size_t)(ue - u) >= sizeof r->ni.url2) return;
+  memcpy(r->ni.url2, u, (size_t)(ue - u));
+  r->ni.url2[ue - u] = 0;
+  r->ni.q02 = strtof(q + 11, NULL);
+  const char *lp = sj;
+  for (uint32_t l = 0; l < r->bricks_nlev; l++) {
+    lp = strstr(lp, "\"chunk\": ");
+    if (!lp) {
+      r->ni.url2[0] = 0;
+      return;
+    }
+    r->ni.chsz2[l] = (uint32_t)strtoul(lp + 9, NULL, 10);
+    const char *rp = strstr(lp, "\"raw\": ");
+    r->ni.raw2[l] = rp && strncmp(rp + 7, "true", 4) == 0;
+    if (r->ni.chsz2[l] < BR_SLOT_DIM || r->ni.chsz2[l] % BR_SLOT_DIM != 0) {
+      r->ni.url2[0] = 0;
+      return;
+    }
+    lp += 9;
+  }
+  snprintf(r->ni.root2, sizeof r->ni.root2, "%s", r->ink_root);
+  if (!r->ni.have2) r->ni.have2 = calloc(r->bs.nb, 1);
+  else memset((void *)r->ni.have2, 0, r->bs.nb);
+  if (!r->bs.ink_missing) r->bs.ink_missing = calloc(r->bs.nslots, 1);
+  else memset(r->bs.ink_missing, 0, r->bs.nslots);
+  r->bs.ink_fetch_seen = 0;
+  if (!r->ni.have2) r->ni.url2[0] = 0;
+  printf("bricks: overlay net ingest active (%s)\n", r->ni.url2);
+}
+
 int r3d_bricks_overlay_switch(r3d_renderer *r, const char *lod_root) {
   if (!r->ink_active) return r3d_bricks_overlay(r, lod_root);
   if (strcmp(r->ink_root, lod_root) == 0) return 0;
@@ -3278,6 +3357,24 @@ int r3d_bricks_overlay_switch(r3d_renderer *r, const char *lod_root) {
   while (r->bs.job_state == 1 || r->bs.job_state == 2)
     pthread_cond_wait(&r->bs.cv, &r->bs.mu);
   pthread_mutex_unlock(&r->bs.mu);
+  if (r->ni.active) { /* retire the old tree's fetches: purge queued overlay
+       * chunks and let in-flight ones finish (they write the old cache) */
+    r->ni.url2[0] = 0;
+    for (;;) {
+      pthread_mutex_lock(&r->ni.mu);
+      uint32_t w = 0;
+      for (uint32_t i = 0; i < r->ni.qn; i++)
+        if (!(r->ni.queue[i] >> 63)) r->ni.queue[w++] = r->ni.queue[i];
+      if (r->ni.qins > w) r->ni.qins = w;
+      r->ni.qn = w;
+      bool busy = false;
+      for (uint32_t i = 0; i < r->ni.nin; i++) busy = busy || (r->ni.inflight[i] >> 63);
+      pthread_mutex_unlock(&r->ni.mu);
+      if (!busy) break;
+      struct timespec ts = {0, 20000000};
+      nanosleep(&ts, NULL);
+    }
+  }
   for (uint32_t i = 0; i < r->bricks_nreaders; i++)
     if (r->ink_readers[i].open) c5d_shard_close_reader(&r->ink_readers[i].sr);
   free(r->ink_readers);
@@ -3378,6 +3475,7 @@ int r3d_bricks_overlay(r3d_renderer *r, const char *lod_root) {
       fclose(scf);
       free(ents);
       if (ok) {
+        ni_overlay_source(r);
         printf("bricks: overlay %s active (%u bricks from seed.raw, %.0f ms)\n", lod_root,
                filled, (double)(now_ns() - t0) / 1e6);
         return 0;
@@ -3460,6 +3558,7 @@ int r3d_bricks_overlay(r3d_renderer *r, const char *lod_root) {
     if (!wok || rename(wtmp, wfin) != 0) unlink(wtmp);
   }
   free(wents);
+  ni_overlay_source(r);
   printf("bricks: overlay %s active (%u resident bricks backfilled, %.0f ms)\n", lod_root,
          filled, (double)(now_ns() - t0) / 1e6);
   return 0;
@@ -3476,6 +3575,36 @@ void r3d_bricks_shape(const r3d_renderer *r, uint32_t shape[3]) {
   shape[0] = r->bricks_nx;
   shape[1] = r->bricks_ny;
   shape[2] = r->bricks_nz;
+}
+
+/* Fill resident slots whose overlay decode zero-filled while the chunk was
+ * still upstream; runs on the render thread with the decode job idle, a
+ * batch per fetch event. */
+static void bricks_ink_repair(r3d_renderer *r) {
+  uint32_t sel[BR_MAX_BATCH], nb_ = 0;
+  struct brdec_item items[BR_MAX_BATCH];
+  for (uint32_t s = 0; s < r->bs.nslots && nb_ < BR_MAX_BATCH; s++) {
+    if (!r->bs.ink_missing[s]) continue;
+    uint32_t b = r->bs.slot_brick[s];
+    if (b == BR_INVALID) {
+      r->bs.ink_missing[s] = 0;
+      continue;
+    }
+    uint8_t hv = atomic_load(&r->ni.have2[b]);
+    if (hv == 0u) continue; /* still fetching */
+    r->bs.ink_missing[s] = 0;
+    if (hv == 2u) continue; /* definitively absent: zeros are correct */
+    items[nb_].blob = NULL;  /* the decode worker resolves the cache file */
+    items[nb_].bn = 0;
+    items[nb_].b = b;
+    sel[nb_++] = s;
+  }
+  if (!nb_) return;
+  struct brdec job = {.r = r, .it = items, .raw = r->bs.raw_host, .zero_on_fail = true,
+                      .ni_fallback = true, .ni_src = 1, .n = nb_};
+  brdec_run(&job);
+  memcpy(r->bs.raw_stage.mapped, r->bs.raw_host, (size_t)nb_ * BR_RAW_BYTES);
+  bricks_upload_raw(r, &r->ink_atlas, sel, nb_);
 }
 
 bool r3d_bricks_stream_begin(r3d_renderer *r) {
@@ -3520,6 +3649,13 @@ bool r3d_bricks_stream_begin(r3d_renderer *r) {
     return false;
   }
   pthread_mutex_unlock(&r->bs.mu);
+  if (r->ink_active && r->bs.ink_missing && r->ni.url2[0]) {
+    uint64_t f2 = atomic_load(&r->ni.fetched2);
+    if (f2 != r->bs.ink_fetch_seen) {
+      r->bs.ink_fetch_seen = f2;
+      bricks_ink_repair(r); /* overlay chunks landed: fill waiting slots */
+    }
+  }
   r->bs.frame++;
   memset(r->bs.lod_wanted, 0, sizeof r->bs.lod_wanted);
   r->bs.stream_open = true;
@@ -3754,7 +3890,7 @@ void r3d_bricks_stream_submit(r3d_renderer *r, uint32_t budget) {
     if (!blob && !from_cache) {
       /* not in any local tier: net-ingest it (stays a candidate until the
        * fetch pool caches it), or mark definitively absent */
-      if (!bricks_net_request(r, b)) r->bs.brick_maxk[b] = 0;
+      if (!bricks_net_request(r, b, 0)) r->bs.brick_maxk[b] = 0;
       continue;
     }
     uint32_t s = bricks_pick_slot(r);

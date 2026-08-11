@@ -1408,3 +1408,17 @@ name heuristic).
 Panel reorganized into collapsing headers: rendering, views (default
 open), overlay, umbilicus, surfaces, streaming, quality, plus the existing
 transform/profile. All 5 suites green.
+
+## 2026-08-11 — overlays stream/transcode/cache on demand like the CT
+
+Overlays always followed the CT's LODs (slot-parallel atlas), but misses
+were zero-filled: only pre-ingested overlay data ever showed. The net
+ingest now carries a second source: the overlay tree's source.json arms
+url2/root2/chunk-geometry/have2 (queue entries carry the source in bit
+63; shared fetcher pool and priority rules), the overlay decode pass
+requests missing bricks and marks their slots, and a repair pass on the
+render thread (per fetch event, decode job idle) re-decodes waiting slots
+from the freshly cached .c5b files and re-uploads them. Overlay switches
+purge queued old-tree chunks and let in-flight ones finish. Measured:
+surface-prediction overlay grew its cache 60 MB -> 2.9 GB in one 600-frame
+run with 0 decode failures; all 5 suites green.
