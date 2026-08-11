@@ -1581,8 +1581,7 @@ int main(int argc, char **argv) {
     mt_t[0] = r3d_now_ns();
     ImGuiIO *io = igGetIO_Nil(); /* Want* flags reflect last frame — fine */
     r3d_input_poll(&in, win, gui_event_hook, renderer, !io->WantCaptureMouse,
-                   cam_mode == CAM_FLY,
-                   umbilicus_path != NULL && (!multiview_path || mv_umb_edit),
+                   cam_mode == CAM_FLY, umbilicus_path != NULL && !multiview_path,
                    multiview_path != NULL);
     mt_t[1] = r3d_now_ns();
     if (io->WantCaptureKeyboard && !in.captured)
@@ -1871,14 +1870,15 @@ int main(int argc, char **argv) {
         if (mv[i].slice < 0.0) mv[i].slice = 0.0;
         if (n && mv[i].slice > (double)n - 1.0) mv[i].slice = (double)n - 1.0;
       }
-      if (umbilicus_path && in.annotate_click && !in.click_ctrl) {
-        /* umbilicus point from ANY plane pane: the core can be ambiguous in
-         * one orientation and obvious in another. The click's 3D position
-         * keys the control point by its (rounded) z. */
-        int cu_ = r3d_mv_hit(mv, in.click_xy[0], in.click_xy[1]);
+      if (umbilicus_path && mv_umb_edit && in.umb_place && !io->WantCaptureKeyboard) {
+        /* U places the umbilicus point at the cursor, in ANY plane pane —
+         * the core can be ambiguous in one orientation and obvious in
+         * another. Keyed by the position's (rounded) z; mouse buttons keep
+         * their normal pan/zoom roles. */
+        int cu_ = r3d_mv_hit(mv, in.mouse_xy[0], in.mouse_xy[1]);
         if (cu_ > 0) {
           double uu, vv, W[3];
-          r3d_mv_unproject(&mv[cu_], in.click_xy[0], in.click_xy[1], &uu, &vv);
+          r3d_mv_unproject(&mv[cu_], in.mouse_xy[0], in.mouse_xy[1], &uu, &vv);
           r3d_mv_b2w(mv_pb[cu_], mv_po[cu_], uu, vv, mv[cu_].slice, W);
           for (int a = 0; a < 3; a++) {
             if (W[a] < 0.0) W[a] = 0.0;
@@ -2381,7 +2381,7 @@ int main(int argc, char **argv) {
           igSeparator();
           igText("umbilicus  %zu point%s", umbilicus.count,
                  umbilicus.count == 1 ? "" : "s");
-          igCheckbox("edit (click places; Shift+drag pans)", &mv_umb_edit);
+          igCheckbox("edit (U places a point at the cursor)", &mv_umb_edit);
           double curz = mv[R3D_MV_XY].slice;
           if (igButton("< annotated", (ImVec2){0, 0})) {
             for (size_t k = umbilicus.count; k > 0; k--)
@@ -2533,7 +2533,8 @@ int main(int argc, char **argv) {
     else if (multiview_path)
       igTextDisabled("drag: pan view | wheel: zoom | Shift+wheel: slice\n"
                      "R/F: slice | Ctrl+click: set focus | F12: shot\n"
-                     "Space: solo hovered view | checkboxes hide views");
+                     "Space: solo hovered view | checkboxes hide views%s",
+                     umbilicus_path ? "\nU: place umbilicus point at cursor" : "");
     else if (cam_mode == CAM_ORBIT)
       igTextDisabled("drag orbit | shift+drag pan cam | ctrl+drag move vol\n"
                      "ctrl+shift+drag rot vol | wheel zoom | WASD pan | F12 shot");

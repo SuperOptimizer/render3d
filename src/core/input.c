@@ -17,6 +17,7 @@ void r3d_input_poll(r3d_input *in, SDL_Window *win,
   in->zdelta = 0;
   in->zpage = 0;
   in->view_toggle = false;
+  in->umb_place = false;
   in->annotate_click = false;
   in->click_ctrl = false;
 
@@ -87,6 +88,7 @@ void r3d_input_poll(r3d_input *in, SDL_Window *win,
         break;
       case SDLK_F12: in->screenshot = true; break;
       case SDLK_SPACE: in->view_toggle = true; break;
+      case SDLK_U: in->umb_place = true; break;
       case SDLK_TAB: in->mode_delta = 1; break;
       case SDLK_T: in->tf_delta = 1; break;
       case SDLK_LEFTBRACKET: in->step_scale = 1.25f; break;
