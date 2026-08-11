@@ -5137,7 +5137,14 @@ int r3d_frame_views(r3d_renderer *r, const r3d_frame_params *views, uint32_t nvi
   /* offscreen -> GENERAL for compute write. Multi-view layouts may leave
    * uncovered regions (side panel strip), so clear the image first there;
    * single view overwrites every pixel. */
-  if (nviews > 1) {
+  /* A single view anchored at the origin is the classic path: render into
+   * the top-left region, blit upscales (adaptive resolution). Any view with
+   * a nonzero origin (multiview — including a SOLO pane beside the panel)
+   * must render in place and blit the whole offscreen 1:1, or the blit
+   * would stretch the pane across the window and shear it off the ImGui
+   * overlays. */
+  bool region_upscale = nviews == 1 && views[0].view_org == 0;
+  if (!region_upscale) {
     r3d_vk_image_barrier(cmd, r->offscreen.img, VK_IMAGE_LAYOUT_UNDEFINED,
                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                          VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0,
@@ -5203,7 +5210,7 @@ int r3d_frame_views(r3d_renderer *r, const r3d_frame_params *views, uint32_t nvi
                             1, &ubo_offset);
     vkCmdDispatch(cmd, (vw + wgx - 1) / wgx, (vh + wgy - 1) / wgy, 1);
   }
-  if (nviews > 1) { /* views cover the drawable; blit is identity */
+  if (!region_upscale) { /* views render in place; blit is identity */
     rw = r->offscreen.extent.width;
     rh = r->offscreen.extent.height;
   }

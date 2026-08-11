@@ -1343,3 +1343,19 @@ source.json next to manifest.json (copied from the od bootstrap tree for
 PHercParis4-lod) — without it, regions outside the tiered shards read as
 permanently absent instead of demand-fetching (256 MB of bricks pulled
 interactively in the first session with it enabled).
+
+## 2026-08-11 — solo pane rendered through the adaptive-res blit (fix)
+
+Space-solo made a multiview pane the frame's ONLY view, and r3d_frame_views
+treated every nviews==1 submission as the classic single-view path: blit
+offscreen (0,0)-(viewport) stretched to the whole window. A solo pane
+renders at view_org (panel_w, 0) with the panel-shrunk width, so the blit
+sampled the wrong rect and upscaled ~1493->1853 px — the CT image sheared
+right/stretched under the (correct) ImGui overlays, converging toward the
+cursor as you zoomed. The adaptive path is now gated on view_org == 0
+(true for real single-view frames, never for panes beside the panel);
+anything else renders in place and blits 1:1 with the multiview clear.
+Also: the segment view's plane trace lines (orange/red/yellow) now
+recompute and draw even when the plane panes are collapsed or solo'd —
+they were gated on pane visibility, so SEG solo lost them. 2x2 regression
+run unchanged (0 failures), all 5 suites green.

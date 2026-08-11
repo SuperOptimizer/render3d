@@ -2489,7 +2489,9 @@ int main(int argc, char **argv) {
       /* recompute intersection polylines only when their inputs move */
       double zoff = mv[R3D_MV_SEG].slice;
       for (int i = 1; i < 4; i++) {
-        if (!(mv_mask & (1u << i))) continue; /* hidden plane: no recompute */
+        /* recompute when the pane is visible OR the segment view is (its
+         * plane trace lines draw there even with the pane collapsed/solo) */
+        if (!(mv_mask & (1u << i)) && !(mv_mask & 1u)) continue;
         bool stale = mv_ol_slice[i] != mv[i].slice || mv_ol_gen[i] != mv_basis_gen;
         if (stale) {
           mv_ol[i].n = 0;
@@ -2612,9 +2614,9 @@ int main(int argc, char **argv) {
         ImVec2 cmin = {(float)sv->px, (float)sv->py};
         ImVec2 cmax = {(float)(sv->px + sv->pw), (float)(sv->py + sv->ph)};
         ImDrawList_PushClipRect(draw, cmin, cmax, false);
-        for (int i = 1; i < 4; i++)
-          if (mv_mask & (1u << i))
-            mv_draw_lines(draw, sv, mv_ol[i].g, mv_ol[i].n, trace_col[i], 1.4f, 1.0f);
+        for (int i = 1; i < 4; i++) /* even for collapsed panes: the slices
+                                     * still exist and the lines orient you */
+          mv_draw_lines(draw, sv, mv_ol[i].g, mv_ol[i].n, trace_col[i], 1.4f, 1.0f);
         ImDrawList_PopClipRect(draw);
       }
       for (int i = 1; i < 4; i++) { /* pane borders around visible views */
