@@ -531,14 +531,11 @@ static bool umb_interp(const r3d_umbilicus *u, double z, double *x, double *y) {
   if (u->count == 0) return false;
   const r3d_umbilicus_point *p = u->points;
   size_t n = u->count;
-  if (z <= p[0].z) {
+  if (z < p[0].z || z > p[n - 1].z) return false; /* no clamped extension:
+                        * outside the curve's z-range there IS no umbilicus */
+  if (z == p[0].z) {
     *x = p[0].x;
     *y = p[0].y;
-    return true;
-  }
-  if (z >= p[n - 1].z) {
-    *x = p[n - 1].x;
-    *y = p[n - 1].y;
     return true;
   }
   for (size_t i = 1; i < n; i++)
@@ -2787,19 +2784,46 @@ int main(int argc, char **argv) {
           ImVec2 cmin = {(float)mv[i].px, (float)mv[i].py};
           ImVec2 cmax = {(float)(mv[i].px + mv[i].pw), (float)(mv[i].py + mv[i].ph)};
           ImDrawList_PushClipRect(draw, cmin, cmax, false);
-          ImVec2 prev = {0, 0};
+          /* only what actually intersects this pane's slab draws: clip each
+           * curve segment to fs in [slice, slice+thickness] along the pane
+           * normal, and markers to points inside it */
+          double lo = mv[i].slice, hi = lo + (double)mv_thick;
+          double pu = 0.0, pv = 0.0, pf = 0.0;
           for (size_t k = 0; k < umbilicus.count; k++) {
             double P[3] = {umbilicus.points[k].x, umbilicus.points[k].y,
                            umbilicus.points[k].z};
             double fu, fv, fs;
             r3d_mv_w2b(mv_pb[i], mv_po[i], P, &fu, &fv, &fs);
-            float sx_, sy_;
-            r3d_mv_project(&mv[i], fu, fv, &sx_, &sy_);
-            ImVec2 cur = {sx_, sy_};
-            if (k) ImDrawList_AddLine(draw, prev, cur, uc, 1.5f);
-            ImDrawList_AddCircleFilled(draw, cur, 3.5f, ub, 12);
-            ImDrawList_AddCircleFilled(draw, cur, 2.5f, uc, 12);
-            prev = cur;
+            if (k) { /* parametric slab clip of the segment prev -> cur */
+              double ct0 = 0.0, ct1 = 1.0;
+              if (pf == fs) {
+                if (pf < lo || pf > hi) ct0 = 1.0;
+              } else {
+                double ta = (lo - pf) / (fs - pf), tb = (hi - pf) / (fs - pf);
+                if (ta > tb) {
+                  double tt = ta;
+                  ta = tb;
+                  tb = tt;
+                }
+                if (ta > ct0) ct0 = ta;
+                if (tb < ct1) ct1 = tb;
+              }
+              if (ct0 < ct1) {
+                float ax, ay, bx, by;
+                r3d_mv_project(&mv[i], pu + (fu - pu) * ct0, pv + (fv - pv) * ct0, &ax, &ay);
+                r3d_mv_project(&mv[i], pu + (fu - pu) * ct1, pv + (fv - pv) * ct1, &bx, &by);
+                ImDrawList_AddLine(draw, (ImVec2){ax, ay}, (ImVec2){bx, by}, uc, 1.5f);
+              }
+            }
+            if (fs >= lo && fs <= hi) {
+              float sx_, sy_;
+              r3d_mv_project(&mv[i], fu, fv, &sx_, &sy_);
+              ImDrawList_AddCircleFilled(draw, (ImVec2){sx_, sy_}, 3.5f, ub, 12);
+              ImDrawList_AddCircleFilled(draw, (ImVec2){sx_, sy_}, 2.5f, uc, 12);
+            }
+            pu = fu;
+            pv = fv;
+            pf = fs;
           }
           if (i == R3D_MV_XY && !mv_aligned) {
             double ux, uy;
