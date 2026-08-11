@@ -2595,7 +2595,7 @@ int main(int argc, char **argv) {
       }
     if (overlay_path && igCollapsingHeader_TreeNodeFlags("overlay", 0)) {
         {
-          igCheckbox("overlay", &overlay_show);
+          igCheckbox("show##ovshow", &overlay_show);
           igSameLine(0, 10);
           igSetNextItemWidth(140);
           igSliderFloat("gain", &overlay_gain, 0.25f, 8.0f, "%.2f",
