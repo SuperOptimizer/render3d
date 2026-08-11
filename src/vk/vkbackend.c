@@ -132,6 +132,9 @@ struct r3d_renderer {
     pthread_cond_t cv;
     uint64_t queue[256];   /* chunk ids: level<<48 | z<<32 | y<<16 | x */
     uint32_t qn;
+    uint32_t qins; /* insertion cursor: reset each pump pass so the newest
+                    * view's chunks jump ahead of the older backlog while
+                    * keeping the pass's own nearest-first order */
     uint64_t inflight[8];  /* chunks being fetched right now */
     uint32_t nin;
     _Atomic uint64_t fetched, absent_chunks, encoded;
@@ -1945,11 +1948,24 @@ static bool bricks_net_request(r3d_renderer *r, uint32_t b) {
   uint64_t id = ((uint64_t)li << 48) | ((uint64_t)(bz / cb) << 32) |
                 ((uint64_t)(by / cb) << 16) | (uint64_t)(bx / cb);
   pthread_mutex_lock(&r->ni.mu);
-  bool known = false;
-  for (uint32_t i = 0; i < r->ni.qn && !known; i++) known = r->ni.queue[i] == id;
+  int fq = -1;
+  for (uint32_t i = 0; i < r->ni.qn && fq < 0; i++)
+    if (r->ni.queue[i] == id) fq = (int)i;
+  bool known = fq >= 0;
   for (uint32_t i = 0; i < r->ni.nin && !known; i++) known = r->ni.inflight[i] == id;
-  if (!known && r->ni.qn < 256u) {
-    r->ni.queue[r->ni.qn++] = id;
+  if (fq >= (int)r->ni.qins) { /* backlog entry re-requested: promote it into
+                                * the current pass's head block */
+    memmove(r->ni.queue + r->ni.qins + 1, r->ni.queue + r->ni.qins,
+            ((uint32_t)fq - r->ni.qins) * sizeof id);
+    r->ni.queue[r->ni.qins++] = id;
+  }
+  if (!known) {
+    if (r->ni.qn >= 256u) r->ni.qn = 255u; /* full: the stalest tail drops */
+    if (r->ni.qins > r->ni.qn) r->ni.qins = r->ni.qn;
+    memmove(r->ni.queue + r->ni.qins + 1, r->ni.queue + r->ni.qins,
+            (r->ni.qn - r->ni.qins) * sizeof id);
+    r->ni.queue[r->ni.qins++] = id;
+    r->ni.qn++;
     pthread_cond_signal(&r->ni.cv);
   }
   pthread_mutex_unlock(&r->ni.mu);
@@ -2017,8 +2033,9 @@ static void *ni_worker(void *arg) {
       pthread_mutex_unlock(&r->ni.mu);
       break;
     }
-    uint64_t id = r->ni.queue[0]; /* nearest-first order from the pick loop */
+    uint64_t id = r->ni.queue[0]; /* newest pass first, nearest-first within */
     memmove(r->ni.queue, r->ni.queue + 1, --r->ni.qn * sizeof id);
+    if (r->ni.qins) r->ni.qins--;
     if (r->ni.nin < 8u) r->ni.inflight[r->ni.nin++] = id;
     pthread_mutex_unlock(&r->ni.mu);
 
@@ -3436,6 +3453,12 @@ bool r3d_bricks_stream_begin(r3d_renderer *r) {
   r->bs.ncand_pending = 0;
   r->bs.stream_open = false;
   if (!r->bs.active) return false;
+  if (r->ni.active) { /* this pass's fetches go to the queue head; in-flight
+                       * transfers always run to completion */
+    pthread_mutex_lock(&r->ni.mu);
+    r->ni.qins = 0;
+    pthread_mutex_unlock(&r->ni.mu);
+  }
   pthread_mutex_lock(&r->bs.mu);
   if (r->bs.job_state == 3) {
     uint64_t timeline = r->timeline_value;

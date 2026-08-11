@@ -1329,3 +1329,17 @@ New QC features (user-picked from the vc3d gap list):
   and at most 48 draw; corpus polylines collapse at 3 px (vs 1 px for the
   active segment). gui phase 8.5 -> 6.7 ms avg at full corpus; projected-
   polyline caching noted as the next lever. All 5 suites green.
+
+## 2026-08-11 — net-ingest queue: newest view first
+
+Chunk fetch requests used to append to the queue, so after a pan/zoom the
+previous viewpoint's backlog (up to 256 chunks) downloaded before anything
+under the cursor. Requests now insert at a cursor that resets to the queue
+head each pump pass: the current view's chunks fetch first (keeping the
+pass's own nearest-first order), re-requested backlog entries promote into
+the head block, the stalest tail entry drops when the queue is full, and
+in-flight transfers are never cancelled. Also: tiered ingests want a
+source.json next to manifest.json (copied from the od bootstrap tree for
+PHercParis4-lod) — without it, regions outside the tiered shards read as
+permanently absent instead of demand-fetching (256 MB of bricks pulled
+interactively in the first session with it enabled).
