@@ -1374,3 +1374,16 @@ interpolation (new umb_interp, clamped linear). Panel: point count, edit
 toggle, prev/next-annotated jumps (recenter XY on the point), delete-here,
 autosave on every set (same Villa/VC-compatible JSON writer as vslab
 mode). The vslab annotation workflow is untouched.
+
+## 2026-08-11 — umbilicus annotation UX round (user-driven)
+
+Interaction iterations after using the mode for real: U places at the
+cursor instead of plain click (clicks keep pan/zoom; the vslab z-nav block
+was also eating non-shift wheel under --umbilicus and is now vslab-gated);
+Ctrl+Z / Ctrl+Shift+Z snapshot undo/redo (64 deep, new edits clear redo);
+start-fresh button renames the JSON to .bak and clears; overlays draw only
+where the curve intersects each pane's [slice, slice+thickness] slab
+(parametric segment clip; the XY crosshair no longer extends past the
+curve's z-range); scrub-speed slider (0.25-200 vox/notch, log) for
+Shift+wheel and R/F; placing a point optionally refocuses all panes like
+Ctrl+click (toggle, default on); panel section is a collapsing header.
