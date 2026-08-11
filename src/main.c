@@ -1382,6 +1382,7 @@ int main(int argc, char **argv) {
   /* umbilicus editing in the plane panes: plain click places the point for
    * its z (Shift+drag pans while on); off = clicks drag as usual */
   bool mv_umb_edit = umbilicus_path && multiview_path;
+  bool mv_umb_refocus = true; /* U also recenters all panes on the point */
   umb_snap mv_umb_undo[UMB_UNDO_MAX], mv_umb_redo[UMB_UNDO_MAX];
   uint32_t mv_umb_undo_n = 0, mv_umb_redo_n = 0;
   uint32_t mv_align_ij[2] = {0, 0}; /* surface grid point anchoring the frames */
@@ -1925,7 +1926,8 @@ int main(int argc, char **argv) {
           umb_snap_clear(mv_umb_redo, &mv_umb_redo_n); /* a new edit forks */
           if (r3d_umbilicus_set(&umbilicus, W[0], W[1], (double)llround(W[2])) == 0)
             save_umbilicus(&umbilicus, umbilicus_path, annotation_status);
-          /* recenter every pane on the new point, exactly like Ctrl+click */
+          /* optionally recenter every pane on it, like Ctrl+click */
+          if (!mv_umb_refocus) goto umb_placed;
           memcpy(mv_focus, W, sizeof mv_focus);
           uint32_t ij[2];
           if (mv_nearest_surface(&mv_seg, mv_focus, ij)) {
@@ -1947,6 +1949,7 @@ int main(int argc, char **argv) {
             mv[i].cv = fv;
             mv[i].slice = fs;
           }
+        umb_placed:;
         }
       }
       if (umbilicus_path && mv_umb_edit && in.undo && !io->WantCaptureKeyboard &&
@@ -2455,11 +2458,11 @@ int main(int argc, char **argv) {
         if (igSliderFloat("segment offset", &zo, -64.0f, 64.0f, "%.0f vox", 0))
           mv[R3D_MV_SEG].slice = (double)zo;
         igCheckbox("stretch heatmap", &mv_stretch);
-        if (umbilicus_path) {
-          igSeparator();
-          igText("umbilicus  %zu point%s", umbilicus.count,
-                 umbilicus.count == 1 ? "" : "s");
+        if (umbilicus_path &&
+            igCollapsingHeader_TreeNodeFlags("umbilicus", ImGuiTreeNodeFlags_DefaultOpen)) {
+          igText("%zu point%s", umbilicus.count, umbilicus.count == 1 ? "" : "s");
           igCheckbox("edit (U places; Ctrl+Z / Ctrl+Shift+Z)", &mv_umb_edit);
+          igCheckbox("refocus panes on placement", &mv_umb_refocus);
           double curz = mv[R3D_MV_XY].slice;
           if (igButton("< annotated", (ImVec2){0, 0})) {
             for (size_t k = umbilicus.count; k > 0; k--)
