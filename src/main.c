@@ -19,6 +19,7 @@
 #include "core/input.h"
 #include "core/mview.h"
 #include "core/screenshot.h"
+#include "core/segstore.h"
 #include "core/segtrace.h"
 #include "core/stats.h"
 #include "core/tifxyz.h"
@@ -313,6 +314,149 @@ static void mv_axis_reset(double pb[4][3][3], double po[4][3]) {
     for (int a = 0; a < 3; a++) po[i][a] = 0.0;
   }
 }
+
+/* ---- multi-segment corpus (--segments <store-dir>): a background worker
+ * decodes decimated grids + row bounds into a RAM-budgeted cache; the GUI
+ * thread only queries the store's tile index and traces cached grids, so
+ * disk/decode never touches the frame loop. ---- */
+enum { SGC_EMPTY = 0, SGC_QUEUED, SGC_READY, SGC_FAILED };
+
+typedef struct sgc_ent {
+  r3d_tifxyz s;      /* decimated grid (stride SGC_STRIDE) */
+  r3d_segrows rows;  /* trace-skipping bounds for it */
+  int state;         /* SGC_*; all access under mu */
+  uint64_t last_use; /* LRU tick */
+} sgc_ent;
+
+#define SGC_STRIDE 4u
+
+typedef struct sgcache {
+  r3d_segstore st;
+  sgc_ent *ent; /* [st.n] */
+  pthread_t th;
+  pthread_mutex_t mu;
+  pthread_cond_t cv;
+  uint32_t *queue;
+  uint32_t qn, qcap;
+  bool quit, open;
+  size_t bytes, budget;
+  uint64_t tick;
+} sgcache;
+
+static size_t sgc_ent_bytes(const sgc_ent *e) {
+  return (size_t)e->s.w * e->s.h * 3 * sizeof(float) +
+         ((size_t)e->rows.h * 3 + (size_t)e->rows.tw * e->rows.th * 3) * 2 * sizeof(float);
+}
+
+static void sgc_evict_lru(sgcache *c, uint32_t keep) { /* mu held */
+  while (c->bytes > c->budget) {
+    uint32_t victim = UINT32_MAX;
+    uint64_t oldest = UINT64_MAX;
+    for (uint32_t i = 0; i < c->st.n; i++)
+      if (c->ent[i].state == SGC_READY && i != keep && c->ent[i].last_use < oldest) {
+        oldest = c->ent[i].last_use;
+        victim = i;
+      }
+    if (victim == UINT32_MAX) return;
+    c->bytes -= sgc_ent_bytes(&c->ent[victim]);
+    r3d_tifxyz_free(&c->ent[victim].s);
+    r3d_segrows_free(&c->ent[victim].rows);
+    c->ent[victim].state = SGC_EMPTY;
+  }
+}
+
+static void *sgc_worker(void *ud) {
+  sgcache *c = ud;
+  pthread_mutex_lock(&c->mu);
+  while (!c->quit) {
+    if (c->qn == 0) {
+      pthread_cond_wait(&c->cv, &c->mu);
+      continue;
+    }
+    uint32_t i = c->queue[--c->qn];
+    pthread_mutex_unlock(&c->mu);
+    r3d_tifxyz s;
+    r3d_segrows rows = {0};
+    int ok = r3d_segstore_load(&c->st, i, SGC_STRIDE, &s) == 0;
+    if (ok && r3d_segrows_build(&s, &rows) != 0) {
+      r3d_tifxyz_free(&s);
+      ok = 0;
+    }
+    pthread_mutex_lock(&c->mu);
+    if (ok) {
+      c->ent[i].s = s;
+      c->ent[i].rows = rows;
+      c->ent[i].state = SGC_READY;
+      c->ent[i].last_use = ++c->tick;
+      c->bytes += sgc_ent_bytes(&c->ent[i]);
+      sgc_evict_lru(c, i);
+    } else {
+      c->ent[i].state = SGC_FAILED;
+    }
+  }
+  pthread_mutex_unlock(&c->mu);
+  return NULL;
+}
+
+static int sgc_open(sgcache *c, const char *store_dir, size_t budget) {
+  memset(c, 0, sizeof *c);
+  if (r3d_segstore_open(&c->st, store_dir) != 0) return -1;
+  c->ent = calloc(c->st.n ? c->st.n : 1, sizeof *c->ent);
+  c->queue = malloc((c->st.n ? c->st.n : 1) * sizeof *c->queue);
+  if (!c->ent || !c->queue) {
+    free(c->ent);
+    free(c->queue);
+    r3d_segstore_close(&c->st);
+    return -1;
+  }
+  c->qcap = c->st.n;
+  c->budget = budget;
+  pthread_mutex_init(&c->mu, NULL);
+  pthread_cond_init(&c->cv, NULL);
+  if (pthread_create(&c->th, NULL, sgc_worker, c) != 0) {
+    free(c->ent);
+    free(c->queue);
+    r3d_segstore_close(&c->st);
+    return -1;
+  }
+  c->open = true;
+  return 0;
+}
+
+static void sgc_close(sgcache *c) {
+  if (!c->open) return;
+  pthread_mutex_lock(&c->mu);
+  c->quit = true;
+  pthread_cond_signal(&c->cv);
+  pthread_mutex_unlock(&c->mu);
+  pthread_join(c->th, NULL);
+  for (uint32_t i = 0; i < c->st.n; i++)
+    if (c->ent[i].state == SGC_READY) {
+      r3d_tifxyz_free(&c->ent[i].s);
+      r3d_segrows_free(&c->ent[i].rows);
+    }
+  free(c->ent);
+  free(c->queue);
+  pthread_mutex_destroy(&c->mu);
+  pthread_cond_destroy(&c->cv);
+  r3d_segstore_close(&c->st);
+  c->open = false;
+}
+
+static void sgc_request(sgcache *c, uint32_t i) { /* mu held */
+  if (c->ent[i].state != SGC_EMPTY || c->qn >= c->qcap) return;
+  c->ent[i].state = SGC_QUEUED;
+  c->queue[c->qn++] = i;
+  pthread_cond_signal(&c->cv);
+}
+
+/* per-(plane view, segment) cached overlay polyline */
+typedef struct sgc_line {
+  mv_lines l;
+  double slice;
+  uint32_t gen;
+  bool valid;
+} sgc_line;
 
 /* first voxel value with nonzero TF alpha: below it, samples are invisible */
 static float tf_min_visible(const uint8_t lut[256][4]) {
@@ -848,6 +992,7 @@ int main(int argc, char **argv) {
   const char *vscache = "band", *vsurl = NULL;
   const char *umbilicus_path = NULL;
   const char *multiview_path = NULL; /* tifxyz dir: vc3d-style 2x2 viewer */
+  const char *seg_store_path = NULL; /* segpack store: draw ALL surfaces */
   const char *overlay_path = NULL;   /* second c5d LOD root (ink predictions) */
   bool od_browse = false;            /* start with the open-data browser window */
   int sv_w = 2048, sv_h = 2048, sv_l = 96; /* flattened surface-volume window */
@@ -901,6 +1046,7 @@ int main(int argc, char **argv) {
     if (i < argc - 1 && strcmp(argv[i], "--umbilicus") == 0) umbilicus_path = argv[i + 1];
     if (i < argc - 1 && strcmp(argv[i], "--multiview") == 0) multiview_path = argv[i + 1];
     if (i < argc - 1 && strcmp(argv[i], "--overlay") == 0) overlay_path = argv[i + 1];
+    if (i < argc - 1 && strcmp(argv[i], "--segments") == 0) seg_store_path = argv[i + 1];
     if (strcmp(argv[i], "--browse") == 0) od_browse = true;
     if (i < argc - 3 && strcmp(argv[i], "--surfvol") == 0) {
       sv_w = atoi(argv[i + 1]);
@@ -1157,6 +1303,36 @@ int main(int argc, char **argv) {
       fprintf(stderr, "multiview: surface-volume window init failed\n");
       return EXIT_FAILURE;
     }
+  }
+
+  /* segment corpus: index + background decode cache + per-view polyline
+   * caches; the frame loop only queries and traces, never decodes */
+  sgcache sgc = {0};
+  sgc_line *sgc_ln[4] = {NULL, NULL, NULL, NULL};
+  uint32_t sgc_hits[4][128];
+  uint32_t sgc_nhits[4] = {0, 0, 0, 0};
+  double sgc_key_slice[4] = {1e30, 1e30, 1e30, 1e30};
+  uint32_t sgc_key_gen[4] = {UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX};
+  char sgc_active[R3D_SEGSTORE_NAME] = {0};
+  double sgc_near_focus[3] = {1e30, 1e30, 1e30};
+  uint32_t sgc_near[6];
+  uint32_t sgc_nnear = 0;
+  if (seg_store_path && !multiview_path)
+    fprintf(stderr, "--segments needs --multiview; ignoring the store\n");
+  if (seg_store_path && multiview_path) {
+    if (sgc_open(&sgc, seg_store_path, (size_t)768 << 20) != 0) {
+      fprintf(stderr, "--segments: failed to open store %s\n", seg_store_path);
+      return EXIT_FAILURE;
+    }
+    for (int i = 1; i < 4; i++) {
+      sgc_ln[i] = calloc(sgc.st.n ? sgc.st.n : 1, sizeof *sgc_ln[i]);
+      if (!sgc_ln[i]) return EXIT_FAILURE;
+    }
+    /* the active (flattened) segment draws in full color already */
+    const char *sl_ = strrchr(multiview_path, '/');
+    snprintf(sgc_active, sizeof sgc_active, "%s", sl_ && sl_[1] ? sl_ + 1 : multiview_path);
+    printf("segments: %u surfaces, %llu index tiles from %s\n", sgc.st.n,
+           (unsigned long long)sgc.st.ntiles, seg_store_path);
   }
 
   int64_t vs_z0 = umbilicus_path ? annotation_z0(annotation_z, vsnz, (uint32_t)vsd)
@@ -2010,6 +2186,25 @@ int main(int argc, char **argv) {
           mv[R3D_MV_SEG].slice = (double)zo;
         igTextDisabled("segment %ux%u  %llu valid points", mv_seg.w, mv_seg.h,
                        (unsigned long long)mv_seg.nvalid);
+        if (sgc.open) {
+          pthread_mutex_lock(&sgc.mu);
+          uint32_t ready = 0;
+          for (uint32_t si = 0; si < sgc.st.n; si++)
+            if (sgc.ent[si].state == SGC_READY) ready++;
+          igText("segment store: %u surfaces  %u cached (%zu MB)", sgc.st.n, ready,
+                 sgc.bytes >> 20);
+          igText("plane hits  XY %u  XZ %u  YZ %u", sgc_nhits[R3D_MV_XY],
+                 sgc_nhits[R3D_MV_XZ], sgc_nhits[R3D_MV_YZ]);
+          if (sgc_near_focus[0] != mv_focus[0] || sgc_near_focus[1] != mv_focus[1] ||
+              sgc_near_focus[2] != mv_focus[2]) {
+            memcpy(sgc_near_focus, mv_focus, sizeof sgc_near_focus);
+            sgc_nnear = r3d_segstore_near_query(&sgc.st, mv_focus, 300.0, sgc_near, 6);
+            if (sgc_nnear > 6) sgc_nnear = 6;
+          }
+          for (uint32_t k = 0; k < sgc_nnear; k++)
+            igTextDisabled("  near focus: %s", sgc.st.segs[sgc_near[k]].name);
+          pthread_mutex_unlock(&sgc.mu);
+        }
       }
       if (overlay_path) {
         igCheckbox("ink overlay", &overlay_show);
@@ -2150,6 +2345,57 @@ int main(int argc, char **argv) {
       /* plane trace colors on the segment view (vc3d): XY orange, XZ red,
        * YZ yellow */
       const ImU32 trace_col[4] = {0, 0xff008cffu, 0xff0000ffu, 0xff00ffffu};
+      if (sgc.open) { /* corpus surfaces: dimmed intersection polylines under
+         * the active segment's curve. Queries hit only the tile index;
+         * grids come from the worker's cache (missing ones get queued) and
+         * at most a few re-traces run per frame to amortize slice scrubs. */
+        const ImU32 dim_col = 0x505a5a5au;
+        pthread_mutex_lock(&sgc.mu);
+        int traces = 0;
+        for (int i = 1; i < 4; i++) {
+          if (!(mv_mask & (1u << i))) continue;
+          const double *bn = mv_pb[i][2];
+          double sl = mv[i].slice + bn[0] * mv_po[i][0] + bn[1] * mv_po[i][1] +
+                      bn[2] * mv_po[i][2];
+          if (sgc_key_slice[i] != sl || sgc_key_gen[i] != mv_basis_gen) {
+            sgc_key_slice[i] = sl;
+            sgc_key_gen[i] = mv_basis_gen;
+            sgc_nhits[i] = r3d_segstore_plane_query(&sgc.st, bn, sl, 1.0, NULL, NULL,
+                                                    sgc_hits[i], 128);
+            if (sgc_nhits[i] > 128) sgc_nhits[i] = 128;
+          }
+          ImVec2 cmin = {(float)mv[i].px, (float)mv[i].py};
+          ImVec2 cmax = {(float)(mv[i].px + mv[i].pw), (float)(mv[i].py + mv[i].ph)};
+          ImDrawList_PushClipRect(draw, cmin, cmax, false);
+          for (uint32_t k = 0; k < sgc_nhits[i]; k++) {
+            uint32_t si = sgc_hits[i][k];
+            if (strcmp(sgc.st.segs[si].name, sgc_active) == 0) continue;
+            sgc_ent *e = &sgc.ent[si];
+            if (e->state == SGC_EMPTY) {
+              sgc_request(&sgc, si);
+              continue;
+            }
+            sgc_line *ln = &sgc_ln[i][si];
+            if (e->state == SGC_READY &&
+                (!ln->valid || ln->slice != mv[i].slice || ln->gen != mv_basis_gen) &&
+                traces < 2) {
+              traces++;
+              ln->l.n = 0;
+              r3d_segtrace_basis(&e->s, &e->rows, NULL, 0.0f, mv_po[i], mv_pb[i][0],
+                                 mv_pb[i][1], mv_pb[i][2], mv[i].slice, mv_lines_emit,
+                                 &ln->l);
+              ln->slice = mv[i].slice;
+              ln->gen = mv_basis_gen;
+              ln->valid = true;
+              e->last_use = ++sgc.tick;
+            }
+            if (ln->valid && ln->slice == mv[i].slice && ln->gen == mv_basis_gen)
+              mv_draw_lines(draw, &mv[i], ln->l.w, ln->l.n, dim_col, 1.0f);
+          }
+          ImDrawList_PopClipRect(draw);
+        }
+        pthread_mutex_unlock(&sgc.mu);
+      }
       for (int i = 1; i < 4; i++) { /* segment curve on each plane view */
         if (!(mv_mask & (1u << i))) continue;
         ImVec2 cmin = {(float)mv[i].px, (float)mv[i].py};
@@ -2546,6 +2792,31 @@ int main(int argc, char **argv) {
     r3d_tifxyz_free(&mv_seg);
     r3d_segrows_free(&mv_rows);
     free(mv_normals);
+    if (sgc.open) {
+      pthread_mutex_lock(&sgc.mu);
+      uint32_t ready = 0;
+      uint64_t lines = 0;
+      for (uint32_t si = 0; si < sgc.st.n; si++)
+        if (sgc.ent[si].state == SGC_READY) ready++;
+      for (int i = 1; i < 4; i++)
+        for (uint32_t si = 0; si < sgc.st.n; si++)
+          if (sgc_ln[i][si].valid) lines += sgc_ln[i][si].l.n;
+      printf("segments: %u/%u cached (%zu MB), hits XY %u XZ %u YZ %u, %llu overlay "
+             "segments traced\n",
+             ready, sgc.st.n, sgc.bytes >> 20, sgc_nhits[R3D_MV_XY], sgc_nhits[R3D_MV_XZ],
+             sgc_nhits[R3D_MV_YZ], (unsigned long long)lines);
+      pthread_mutex_unlock(&sgc.mu);
+    }
+    for (int i = 1; i < 4; i++) {
+      if (!sgc_ln[i]) continue;
+      for (uint32_t si = 0; si < sgc.st.n; si++) {
+        free(sgc_ln[i][si].l.w);
+        free(sgc_ln[i][si].l.g);
+      }
+      free(sgc_ln[i]);
+      sgc_ln[i] = NULL;
+    }
+    sgc_close(&sgc);
     for (int i = 0; i < 4; i++) {
       free(mv_ol[i].w);
       free(mv_ol[i].g);

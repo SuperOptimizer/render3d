@@ -99,6 +99,15 @@ slider spins the pair around the normal. Scrubbing moves in signed offsets
 from the focus. Ctrl+click re-anchors the frames at the new focus; XY stays
 axis-aligned.
 
+**Whole-corpus surfaces**: pack a scroll's tifxyz segments with
+`segpack <store-dir> [-q log2q] <tifxyz-dir>...` (c5d-compressed `.tfx`
+grids + a manifest with per-tile AABBs), then add `--segments <store-dir>`:
+every surface crossing a plane view draws as a dimmed polyline under the
+active segment's curve. The frame loop only queries the tile index; a
+background worker decodes decimated grids into a RAM-budgeted LRU cache,
+and the panel lists cache state, per-plane hit counts, and the surfaces
+nearest the focus.
+
 Test data comes straight from the `vesuvius-challenge-open-data` S3 bucket
 (PHerc0172 pairs tifxyz segments with their exact source volume):
 

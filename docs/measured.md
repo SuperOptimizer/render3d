@@ -1243,3 +1243,25 @@ max error; ~17x incl. uncompressed sources), pack 7.8 s. 328k index tiles =
 3.9 MB manifest. Plane query 331 us; full gp decode 237 ms, stride-4 201 ms
 (decode-bound). Lossless mode round-trips bit-exact vs r3d_tifxyz_load
 (unit-tested, incl. oblique-plane and near queries + decimated segtrace).
+
+## 2026-08-11 — multiview draws the whole segment corpus (--segments)
+
+The 2x2 viewer now overlays every store surface crossing a plane view as a
+dimmed polyline under the active segment's curve (works in axis and
+segment-aligned modes — the query normal is the pane's frame normal).
+Mechanics: per pane, a (slice, basis-generation) key gates one
+r3d_segstore_plane_query (~0.3 ms on the 4-segment/328k-tile store); hits
+whose decimated grid isn't cached are queued to a background worker
+(pthread, decode stride 4 + segrows build off-thread — the frame loop never
+decodes); at most 2 re-traces run per frame to amortize slice scrubs, and
+traced polylines persist per (pane, segment) so scrubbing back is free.
+Cache is LRU-evicted against a 768 MB budget; the active segment is never
+decoded (it already renders full-res). Panel: cache state, per-plane hit
+counts, nearest-to-focus surfaces (near_query on focus change).
+
+Measured (gp active + three 2.4um od segments, 400 frames): all 4 surfaces
+hit each pane, 57 MB cached after the initial burst, gui phase 2.2 ms avg /
+13.7 max (trace catch-up; was 24.6 at 4 traces/frame, budget lowered to 2),
+frame max 32.7 ms, all 5 suites green. Exit line reports cache/hit/trace
+stats for headless verification (ImGui overlays don't land in --shot
+captures, which read the offscreen image).
