@@ -1216,3 +1216,30 @@ Verified on the GP banner: aligned panes render sheets horizontal at the
 focus (screenshots), gpu ~4.2 ms vs ~5.0 axis-aligned at 1080p (fewer
 sheet-parallel empty rays), 0 decode failures, all 5 suites green (gpu
 conformance covers the shader change).
+
+## 2026-08-11 — segment store: c5d-compressed corpus + tile spatial index
+
+Groundwork for multi-segment viewing (all of a scroll's surfaces at once,
+bigger than RAM). c5d pin bumped d094007 -> 84274f8, which brings the c5d
+tifxyz surface codec (masked parallelogram predictor + static rANS; lossless
+bit-exact f32 ~2.75x, quantized 2^-q voxel steps up to ~12x) and a turnip
+encode_tokenize miscompile fix; gpu conformance suite validates the new rev.
+
+New src/core/segstore.{h,c} + tools/segpack: a store directory holds one
+.tfx per segment plus segments.r3ds — a binary manifest that doubles as the
+spatial index (per-segment world AABB, then a u16-quantized AABB per 16x16
+grid tile, quantized over the segment bbox; floor/ceil so dequantized boxes
+only grow). Two-level queries (segment bbox -> tile scan with the sign-aware
+dot-range straddle test from segtrace) answer "which segments cross this
+plane / sit near this POI" without touching compressed data — the vc3d
+SurfacePatchIndex idea (R-tree over grid tiles) flattened into rebuild-from-
+arrays C. r3d_segstore_load decodes with an optional power-of-two stride
+(decimated grids for overview polylines; scale rescales so segtrace works
+unchanged).
+
+Measured (4 real PHercParis4 segments: gp 1820x2530 + three 2.4um od
+downloads up to 9196x3744): 988 MB tifxyz -> 59 MB store at q=2 (1/4-voxel
+max error; ~17x incl. uncompressed sources), pack 7.8 s. 328k index tiles =
+3.9 MB manifest. Plane query 331 us; full gp decode 237 ms, stride-4 201 ms
+(decode-bound). Lossless mode round-trips bit-exact vs r3d_tifxyz_load
+(unit-tested, incl. oblique-plane and near queries + decimated segtrace).

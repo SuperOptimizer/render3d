@@ -13,6 +13,7 @@
 #include "core/slab.h"
 #include "core/stats.h"
 #include "core/mview.h"
+#include "core/segstore.h"
 #include "core/segtrace.h"
 #include "core/tifxyz.h"
 #include "core/umbilicus.h"
@@ -392,6 +393,69 @@ static void test_tifxyz(void) {
   CHECK(s.xyz == NULL);
 
   /* cleanup */
+  /* segment store: pack the synthetic dir (lossless), reopen, query, load */
+  char sdir[] = "/tmp/r3d_test_segstore_XXXXXX";
+  CHECK(mkdtemp(sdir) != NULL);
+  const char *sdirs[1] = {dir};
+  CHECK(r3d_segstore_build(sdir, sdirs, 1, -1, false) == 1);
+  r3d_segstore st;
+  CHECK(r3d_segstore_open(&st, sdir) == 0);
+  CHECK(st.n == 1 && st.segs[0].w == W && st.segs[0].h == H);
+  CHECK(st.segs[0].nvalid == W * H - 2);
+  CHECK(st.segs[0].bbox[0][0] == 100.0f && st.segs[0].bbox[1][1] == 200.0f + 20.0f * (H - 1));
+  /* plane queries against the index alone: the z = 3001.6 plane crosses,
+   * z = 9000 and an out-of-box ROI miss */
+  double bnz[3] = {0, 0, 1}, roi_lo[3] = {0, 0, 0}, roi_hi[3] = {1e4, 1e4, 1e4};
+  uint32_t qhit[4];
+  CHECK(r3d_segstore_plane_query(&st, bnz, 3001.6, 0.0, roi_lo, roi_hi, qhit, 4) == 1);
+  CHECK(qhit[0] == 0);
+  CHECK(r3d_segstore_plane_query(&st, bnz, 9000.0, 0.0, NULL, NULL, NULL, 0) == 0);
+  double far_lo[3] = {5000, 5000, 0}, far_hi[3] = {6000, 6000, 1e4};
+  CHECK(r3d_segstore_plane_query(&st, bnz, 3001.6, 0.0, far_lo, far_hi, NULL, 0) == 0);
+  /* oblique plane through the surface (multi-axis tile dot bounds) */
+  double rt2 = sqrt(0.5);
+  double bno[3] = {rt2, 0, rt2};
+  CHECK(r3d_segstore_plane_query(&st, bno, (3100.0 + 20.25 * 6.4) * rt2, 0.0, NULL, NULL,
+                                 NULL, 0) == 1);
+  /* near query: on-surface point hits, a far point misses */
+  double np_[3] = {140.0, 220.0, 3000.5}, farp[3] = {9000.0, 9000.0, 9000.0};
+  CHECK(r3d_segstore_near_query(&st, np_, 10.0, qhit, 4) == 1 && qhit[0] == 0);
+  CHECK(r3d_segstore_near_query(&st, farp, 100.0, NULL, 0) == 0);
+  /* lossless load round-trips bit-exact vs the direct tifxyz load */
+  r3d_tifxyz sl;
+  CHECK(r3d_segstore_load(&st, 0, 1, &sl) == 0);
+  CHECK(sl.w == W && sl.h == H && sl.nvalid == W * H - 2);
+  {
+    r3d_tifxyz ref;
+    CHECK(r3d_tifxyz_load(&ref, dir) == 0);
+    CHECK(memcmp(sl.xyz, ref.xyz, (size_t)W * H * 3 * sizeof(float)) == 0);
+    CHECK(sl.sx == ref.sx && sl.sy == ref.sy);
+    r3d_tifxyz_free(&ref);
+  }
+  r3d_tifxyz_free(&sl);
+  /* decimated load: every 2nd point, halved scale, segtrace still works */
+  r3d_tifxyz s2;
+  CHECK(r3d_segstore_load(&st, 0, 2, &s2) == 0);
+  CHECK(s2.w == (W + 1) / 2 && s2.h == (H + 1) / 2);
+  CHECK(fabsf(s2.sx - 0.05f / 2.0f) < 1e-7f);
+  const float *d00 = r3d_tifxyz_at(&s2, 1, 1); /* source point (2,2) */
+  CHECK(d00[0] == 140.0f && d00[1] == 240.0f);
+  tr_acc accd = {0, 1e9f, -1e9f, 1e9f, -1e9f};
+  CHECK(r3d_segtrace(&s2, NULL, NULL, 0.0f, 2, 0, 1, 3001.6, tr_emit, &accd) > 0);
+  CHECK(accd.wu_min > 227.0f && accd.wu_max < 229.0f); /* crossing near x=228 */
+  r3d_tifxyz_free(&s2);
+  r3d_segstore_close(&st);
+  CHECK(st.segs == NULL);
+  {
+    char spath[350];
+    snprintf(spath, sizeof spath, "%s/segments.r3ds", sdir);
+    unlink(spath);
+    const char *base = strrchr(dir, '/') + 1;
+    snprintf(spath, sizeof spath, "%s/%s.tfx", sdir, base);
+    unlink(spath);
+    rmdir(sdir);
+  }
+
   static const char *nm[4] = {"x.tif", "y.tif", "z.tif", "meta.json"};
   for (int i = 0; i < 4; i++) {
     snprintf(path, sizeof path, "%s/%s", dir, nm[i]);

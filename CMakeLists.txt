@@ -56,6 +56,7 @@ add_library(r3d_core STATIC
   src/core/input.c
   src/core/tifxyz.c
   src/core/segtrace.c
+  src/core/segstore.c
   src/core/odbrowse.c
   src/core/screenshot.c)
 target_include_directories(r3d_core PUBLIC src)
@@ -68,7 +69,7 @@ target_link_libraries(r3d_core PRIVATE r3d_warnings r3d_sanitize
 # random sibling working tree previously produced hangs and quiet corruption,
 # so normal builds fetch one audited revision.  R3D_C5D_DIR remains available
 # for c5d development, but is revision-checked unless explicitly overridden.
-set(R3D_C5D_PIN "d09400711b5bc10dfd1075404e96edeb64c58893")
+set(R3D_C5D_PIN "84274f8998d0ab614a78488c68e76312b8e50c1e")
 set(R3D_C5D_DIR "" CACHE PATH "Override the pinned c5d checkout")
 option(R3D_ALLOW_UNPINNED_C5D "Allow an R3D_C5D_DIR revision other than R3D_C5D_PIN" OFF)
 if(NOT R3D_C5D_DIR)
@@ -114,13 +115,15 @@ add_library(r3d_c5d STATIC
   ${R3D_C5D_DIR}/src/brick.c
   ${R3D_C5D_DIR}/src/gpu/host_entropy.c
   ${R3D_C5D_DIR}/src/shard.c
-  ${R3D_C5D_DIR}/src/cache.c)
+  ${R3D_C5D_DIR}/src/cache.c
+  ${R3D_C5D_DIR}/src/tifxyz.c)
 target_include_directories(r3d_c5d SYSTEM PUBLIC ${R3D_C5D_DIR}/src)
 target_compile_options(r3d_c5d PRIVATE -ffast-math -fno-math-errno -O3)
 target_compile_definitions(r3d_c5d PUBLIC
   R3D_C5D_REV="${R3D_C5D_REV}"
   R3D_C5D_GPU_ABI=20260806)
 target_link_libraries(r3d_c5d PUBLIC m Threads::Threads PRIVATE r3d_sanitize)
+target_link_libraries(r3d_core PUBLIC r3d_c5d) # segstore uses the tifxyz codec
 
 # --- shard store: vendored dct3d codec + zarr-v3 shard reader ---
 if(NOT EXISTS "${CMAKE_SOURCE_DIR}/tools/3ddct/dct3d.c")
@@ -200,6 +203,8 @@ add_executable(mkvol tools/mkvol/main.c)
 target_link_libraries(mkvol PRIVATE m r3d_warnings r3d_sanitize)
 add_executable(tifxyz-transform tools/tifxyz-transform/main.c)
 target_link_libraries(tifxyz-transform PRIVATE r3d_core m r3d_warnings r3d_sanitize)
+add_executable(segpack tools/segpack/main.c)
+target_link_libraries(segpack PRIVATE r3d_core r3d_warnings r3d_sanitize)
 add_executable(zarr2c5d tools/zarr2c5d/main.c)
 target_link_libraries(zarr2c5d PRIVATE r3d_core r3d_c5d ${BLOSC_LIB} CURL::libcurl
                                        r3d_warnings r3d_sanitize)
