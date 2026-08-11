@@ -1447,6 +1447,10 @@ void r3d_surfvol_params(const r3d_renderer *r, r3d_frame_params *p) {
   p->slab_wz = r->sv.L;
   p->slab_grid = r->sv.nback;
   p->max_mip = r->sv.zoff0;
+  /* surf views ignore the model transform, so vol_tx/ty carry the tifxyz
+   * grid scale (cells per voxel) for the stretch heatmap's grid taps */
+  p->vol_tx = r->sv.sx;
+  p->vol_ty = r->sv.sy;
 }
 
 int r3d_set_transfer(r3d_renderer *r, const uint8_t rgba[256][4]) {

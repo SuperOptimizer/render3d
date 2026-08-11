@@ -1300,3 +1300,32 @@ decodes the 16x-smaller tier, cutting overview decodes from decode-bound
 ~200-800 ms to tens of ms per segment. tools/fetch_segments.sh streams a
 whole scroll: list bucket -> curl the 4 files -> segpack -> delete source,
 resumable (skips existing .tfx).
+
+## 2026-08-11 — whole-scroll corpus ingested + stretch heatmap + overlap QC
+
+Fetch-all completed: all 81 PHercParis4 segments (the -on-20260411134726-
+2.4um variants; dir names key by mesh id, fixed in fetch_segments.sh)
+packed into cache/PHercParis4-segstore — 82 surfaces incl. gp, 1.3 GB
+total (~25 GB of source tifxyz, deleted after packing), 6.65M index tiles
+(76 MB manifest), 0 failures. Viewer at full scale: 82 surfaces hit each
+pane, worker cache settles at ~47 ready / 666 MB (only drawn surfaces
+decode), frame 9.7 ms avg / 34.6 max.
+
+New QC features (user-picked from the vc3d gap list):
+- Stretch heatmap (R3D_VIEW_STRETCH, "stretch heatmap" checkbox or
+  R3D_MV_STRETCH=1): surf view colors each pixel by local flattening
+  distortion — coords-grid derivative length per cell vs the ideal 1/scale
+  voxels, log ratio at +-26% full scale, warm = stretched / cool =
+  compressed, luminance modulated by the CT. GP banner shows compression
+  concentrated along fold seams. vol_tx/ty carry the grid scale into surf
+  views (they ignore the model transform).
+- Overlap QC: r3d_segstore_overlap = fraction of one surface's index tiles
+  within ~8 voxels of another's (coarse 64^3 bitmap over the shared bbox,
+  index-only); the corpus worker recomputes overlap-vs-active on every
+  activation. Plane views tint overlapping polylines orange (>15%) / sand
+  (>2%); near-focus list shows ov %. Unit-tested (identical twin ~1.0,
+  +9000-voxel translate 0.0).
+- Draw scaling: pane hits sort nearest-first (bbox center vs pane center)
+  and at most 48 draw; corpus polylines collapse at 3 px (vs 1 px for the
+  active segment). gui phase 8.5 -> 6.7 ms avg at full corpus; projected-
+  polyline caching noted as the next lever. All 5 suites green.

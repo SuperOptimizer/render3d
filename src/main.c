@@ -150,7 +150,7 @@ static void mv_lines_emit(void *ud, float wu0, float wv0, float wu1, float wv1, 
  * every frame regardless of zoom (~25% of the render thread on the GP
  * banner). */
 static void mv_draw_lines(ImDrawList *draw, const r3d_mview *v, const float *seg, uint32_t n,
-                          ImU32 col, float thick) {
+                          ImU32 col, float thick, float collapse_px2) {
   static ImVec2 *pts;
   static uint32_t cap;
   if (!n) return;
@@ -199,7 +199,7 @@ static void mv_draw_lines(ImDrawList *draw, const r3d_mview *v, const float *seg
     float x, y;
     r3d_mv_project(v, (double)nu, (double)nv, &x, &y);
     float dx = x - pts[np - 1].x, dy = y - pts[np - 1].y;
-    if (np >= 2 && dx * dx + dy * dy < 1.0f)
+    if (np >= 2 && dx * dx + dy * dy < collapse_px2)
       pts[np - 1] = (ImVec2){x, y}; /* sub-pixel step: slide the chain tail */
     else
       pts[np++] = (ImVec2){x, y};
@@ -348,6 +348,10 @@ typedef struct sgcache {
   r3d_tifxyz act_s;
   r3d_segrows act_rows;
   float *act_coords, *act_normals;
+  /* overlap QC: ov[i] = fraction of surface i's tiles within ~8 voxels of
+   * the active surface (worker-computed from the tile index alone) */
+  float *ov;
+  uint32_t ov_active, ov_req;
 } sgcache;
 
 static size_t sgc_ent_bytes(const sgc_ent *e) {
@@ -404,6 +408,22 @@ static void *sgc_worker(void *ud) {
       }
       continue;
     }
+    if (c->ov_req != UINT32_MAX) {
+      uint32_t oi = c->ov_req;
+      c->ov_req = UINT32_MAX;
+      pthread_mutex_unlock(&c->mu);
+      float *tmp = malloc((c->st.n ? c->st.n : 1) * sizeof *tmp);
+      if (tmp)
+        for (uint32_t i = 0; i < c->st.n; i++)
+          tmp[i] = i == oi ? 0.0f : (float)r3d_segstore_overlap(&c->st, i, oi, 8.0);
+      pthread_mutex_lock(&c->mu);
+      if (tmp && c->ov) {
+        memcpy(c->ov, tmp, c->st.n * sizeof *c->ov);
+        c->ov_active = oi;
+      }
+      free(tmp);
+      continue;
+    }
     if (c->qn == 0) {
       pthread_cond_wait(&c->cv, &c->mu);
       continue;
@@ -436,12 +456,15 @@ static void *sgc_worker(void *ud) {
 static int sgc_open(sgcache *c, const char *store_dir, size_t budget) {
   memset(c, 0, sizeof *c);
   c->act_req = c->act_ready = UINT32_MAX;
+  c->ov_active = c->ov_req = UINT32_MAX;
   if (r3d_segstore_open(&c->st, store_dir) != 0) return -1;
   c->ent = calloc(c->st.n ? c->st.n : 1, sizeof *c->ent);
   c->queue = malloc((c->st.n ? c->st.n : 1) * sizeof *c->queue);
-  if (!c->ent || !c->queue) {
+  c->ov = calloc(c->st.n ? c->st.n : 1, sizeof *c->ov);
+  if (!c->ent || !c->queue || !c->ov) {
     free(c->ent);
     free(c->queue);
+    free(c->ov);
     r3d_segstore_close(&c->st);
     return -1;
   }
@@ -452,6 +475,7 @@ static int sgc_open(sgcache *c, const char *store_dir, size_t budget) {
   if (pthread_create(&c->th, NULL, sgc_worker, c) != 0) {
     free(c->ent);
     free(c->queue);
+    free(c->ov);
     r3d_segstore_close(&c->st);
     return -1;
   }
@@ -479,6 +503,7 @@ static void sgc_close(sgcache *c) {
     }
   free(c->ent);
   free(c->queue);
+  free(c->ov);
   pthread_mutex_destroy(&c->mu);
   pthread_cond_destroy(&c->cv);
   r3d_segstore_close(&c->st);
@@ -1289,6 +1314,9 @@ int main(int argc, char **argv) {
   double mv_po[4][3] = {{0}};
   bool mv_aligned = false; /* XZ/YZ panes follow the segment normal */
   float mv_theta = 0.0f;   /* aligned-pane rotation around the normal (deg) */
+  /* flattened view: distortion heatmap (env enables it for headless shots,
+   * like R3D_FORCE_HALF) */
+  bool mv_stretch = getenv("R3D_MV_STRETCH") != NULL;
   uint32_t mv_align_ij[2] = {0, 0}; /* surface grid point anchoring the frames */
   uint32_t mv_basis_gen = 0, mv_ol_gen[4] = {0, 0, 0, 0};
   for (int i = 0; i < 4; i++) r3d_mv_axis_basis(i, mv_pb[i]);
@@ -1375,6 +1403,14 @@ int main(int argc, char **argv) {
     snprintf(sgc_active, sizeof sgc_active, "%s", sl_ && sl_[1] ? sl_ + 1 : multiview_path);
     printf("segments: %u surfaces, %llu index tiles from %s\n", sgc.st.n,
            (unsigned long long)sgc.st.ntiles, seg_store_path);
+    for (uint32_t si = 0; si < sgc.st.n; si++) /* overlap-vs-active pass */
+      if (strcmp(sgc.st.segs[si].name, sgc_active) == 0) {
+        pthread_mutex_lock(&sgc.mu);
+        sgc.ov_req = si;
+        pthread_cond_signal(&sgc.cv);
+        pthread_mutex_unlock(&sgc.mu);
+        break;
+      }
   }
 
   int64_t vs_z0 = umbilicus_path ? annotation_z0(annotation_z, vsnz, (uint32_t)vsd)
@@ -1703,6 +1739,10 @@ int main(int argc, char **argv) {
             mv[i].slice = fs;
           }
           printf("activated segment %s (%ux%u)\n", sgc_active, mv_seg.w, mv_seg.h);
+          pthread_mutex_lock(&sgc.mu); /* refresh overlap-vs-active */
+          sgc.ov_req = ai;
+          pthread_cond_signal(&sgc.cv);
+          pthread_mutex_unlock(&sgc.mu);
         } else {
           r3d_tifxyz_free(&ns);
           r3d_segrows_free(&nr);
@@ -2285,6 +2325,7 @@ int main(int argc, char **argv) {
         float zo = (float)mv[R3D_MV_SEG].slice;
         if (igSliderFloat("segment offset", &zo, -64.0f, 64.0f, "%.0f vox", 0))
           mv[R3D_MV_SEG].slice = (double)zo;
+        igCheckbox("stretch heatmap", &mv_stretch);
         igTextDisabled("segment %ux%u  %llu valid points", mv_seg.w, mv_seg.h,
                        (unsigned long long)mv_seg.nvalid);
         if (sgc.open) {
@@ -2308,9 +2349,15 @@ int main(int argc, char **argv) {
           for (uint32_t k = 0; k < sgc_nnear; k++) {
             uint32_t si = sgc_near[k];
             bool cur = strcmp(sgc.st.segs[si].name, sgc_active) == 0;
-            char lbl[96];
-            snprintf(lbl, sizeof lbl, "  %.64s%s", sgc.st.segs[si].name,
-                     cur ? " (active)" : "");
+            char lbl[112];
+            float ovf = sgc.ov_active != UINT32_MAX ? sgc.ov[si] : 0.0f;
+            if (cur)
+              snprintf(lbl, sizeof lbl, "  %.64s (active)", sgc.st.segs[si].name);
+            else if (ovf > 0.02f)
+              snprintf(lbl, sizeof lbl, "  %.64s  ov %.0f%%", sgc.st.segs[si].name,
+                       (double)ovf * 100.0);
+            else
+              snprintf(lbl, sizeof lbl, "  %.64s", sgc.st.segs[si].name);
             if (igSelectable_Bool(lbl, cur, 0, (ImVec2){0, 0}) && !cur && !act_pending &&
                 sgc.act_ready == UINT32_MAX) {
               sgc.act_req = si;
@@ -2475,6 +2522,8 @@ int main(int argc, char **argv) {
          * grids come from the worker's cache (missing ones get queued) and
          * at most a few re-traces run per frame to amortize slice scrubs. */
         const ImU32 dim_col = 0x505a5a5au;
+        const ImU32 ov_hi = 0x783c8ce6u; /* heavy overlap with active: orange */
+        const ImU32 ov_lo = 0x5864b4d2u; /* light overlap: sand */
         pthread_mutex_lock(&sgc.mu);
         int traces = 0;
         for (int i = 1; i < 4; i++) {
@@ -2488,11 +2537,35 @@ int main(int argc, char **argv) {
             sgc_nhits[i] = r3d_segstore_plane_query(&sgc.st, bn, sl, 1.0, NULL, NULL,
                                                     sgc_hits[i], 128);
             if (sgc_nhits[i] > 128) sgc_nhits[i] = 128;
+            /* nearest-first by bbox center vs the pane center: zoomed-out
+             * panes cross the whole corpus, and drawing every polyline
+             * costs ~8 ms/frame — only the closest SGC_DRAW_MAX draw */
+            double pcw[3];
+            r3d_mv_b2w(mv_pb[i], mv_po[i], mv[i].cu, mv[i].cv, mv[i].slice, pcw);
+            for (uint32_t a2 = 1; a2 < sgc_nhits[i]; a2++)
+              for (uint32_t b2 = a2; b2 > 0; b2--) {
+                double da = 0.0, db = 0.0;
+                for (int c2 = 0; c2 < 3; c2++) {
+                  const r3d_segmeta *sa = &sgc.st.segs[sgc_hits[i][b2]];
+                  const r3d_segmeta *sb = &sgc.st.segs[sgc_hits[i][b2 - 1]];
+                  double ca =
+                      ((double)sa->bbox[0][c2] + (double)sa->bbox[1][c2]) * 0.5 - pcw[c2];
+                  double cb =
+                      ((double)sb->bbox[0][c2] + (double)sb->bbox[1][c2]) * 0.5 - pcw[c2];
+                  da += ca * ca;
+                  db += cb * cb;
+                }
+                if (da >= db) break;
+                uint32_t tswap = sgc_hits[i][b2];
+                sgc_hits[i][b2] = sgc_hits[i][b2 - 1];
+                sgc_hits[i][b2 - 1] = tswap;
+              }
           }
           ImVec2 cmin = {(float)mv[i].px, (float)mv[i].py};
           ImVec2 cmax = {(float)(mv[i].px + mv[i].pw), (float)(mv[i].py + mv[i].ph)};
           ImDrawList_PushClipRect(draw, cmin, cmax, false);
-          for (uint32_t k = 0; k < sgc_nhits[i]; k++) {
+          uint32_t draw_n = sgc_nhits[i] < 48 ? sgc_nhits[i] : 48;
+          for (uint32_t k = 0; k < draw_n; k++) {
             uint32_t si = sgc_hits[i][k];
             if (strcmp(sgc.st.segs[si].name, sgc_active) == 0) continue;
             sgc_ent *e = &sgc.ent[si];
@@ -2514,8 +2587,12 @@ int main(int argc, char **argv) {
               ln->valid = true;
               e->last_use = ++sgc.tick;
             }
-            if (ln->valid && ln->slice == mv[i].slice && ln->gen == mv_basis_gen)
-              mv_draw_lines(draw, &mv[i], ln->l.w, ln->l.n, dim_col, 1.0f);
+            if (ln->valid && ln->slice == mv[i].slice && ln->gen == mv_basis_gen) {
+              float ovf = sgc.ov_active != UINT32_MAX ? sgc.ov[si] : 0.0f;
+              ImU32 col = ovf > 0.15f ? ov_hi : (ovf > 0.02f ? ov_lo : dim_col);
+              /* corpus lines tolerate a 3 px collapse: half the tessellation */
+              mv_draw_lines(draw, &mv[i], ln->l.w, ln->l.n, col, 1.0f, 9.0f);
+            }
           }
           ImDrawList_PopClipRect(draw);
         }
@@ -2526,8 +2603,8 @@ int main(int argc, char **argv) {
         ImVec2 cmin = {(float)mv[i].px, (float)mv[i].py};
         ImVec2 cmax = {(float)(mv[i].px + mv[i].pw), (float)(mv[i].py + mv[i].ph)};
         ImDrawList_PushClipRect(draw, cmin, cmax, false);
-        mv_draw_lines(draw, &mv[i], mv_ol[i].w, mv_ol[i].n, seg_col, 1.6f);
-        mv_draw_lines(draw, &mv[i], mv_ol_off[i].w, mv_ol_off[i].n, seg_off_col, 1.0f);
+        mv_draw_lines(draw, &mv[i], mv_ol[i].w, mv_ol[i].n, seg_col, 1.6f, 1.0f);
+        mv_draw_lines(draw, &mv[i], mv_ol_off[i].w, mv_ol_off[i].n, seg_off_col, 1.0f, 1.0f);
         ImDrawList_PopClipRect(draw);
       }
       if (mv_mask & 1u) { /* plane trace lines on the flattened segment view */
@@ -2537,7 +2614,7 @@ int main(int argc, char **argv) {
         ImDrawList_PushClipRect(draw, cmin, cmax, false);
         for (int i = 1; i < 4; i++)
           if (mv_mask & (1u << i))
-            mv_draw_lines(draw, sv, mv_ol[i].g, mv_ol[i].n, trace_col[i], 1.4f);
+            mv_draw_lines(draw, sv, mv_ol[i].g, mv_ol[i].n, trace_col[i], 1.4f, 1.0f);
         ImDrawList_PopClipRect(draw);
       }
       for (int i = 1; i < 4; i++) { /* pane borders around visible views */
@@ -2768,7 +2845,7 @@ int main(int argc, char **argv) {
         if (i == R3D_MV_SEG) {
           /* flattened segment: raycast the surface-volume window. Camera in
            * FLATTENED VOXELS (grid / scale); window mapping from the backend. */
-          q.view_flags = R3D_VIEW_SURF;
+          q.view_flags = R3D_VIEW_SURF | (mv_stretch ? R3D_VIEW_STRETCH : 0u);
           q.cam_origin[0] = (float)(mv[i].cu / (double)mv_seg.sx);
           q.cam_origin[1] = (float)(mv[i].cv / (double)mv_seg.sy);
           q.cam_origin[2] = 0.0f;

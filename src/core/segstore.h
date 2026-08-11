@@ -68,4 +68,9 @@ uint32_t r3d_segstore_plane_query(const r3d_segstore *st, const double bn[3], do
 uint32_t r3d_segstore_near_query(const r3d_segstore *st, const double p[3], double radius,
                                  uint32_t *out, uint32_t cap);
 
+/* Fraction of a's occupied index tiles whose tol-dilated AABB touches any
+ * of b's tiles (coarse 64^3-cell approximation over the shared bbox —
+ * meant for duplicate/conflict QC, not exact geometry). */
+double r3d_segstore_overlap(const r3d_segstore *st, uint32_t a, uint32_t b, double tol);
+
 #endif /* R3D_SEGSTORE_H */

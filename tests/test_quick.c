@@ -459,6 +459,62 @@ static void test_tifxyz(void) {
   CHECK(r3d_segstore_open(&st2, sdir) == 0);
   CHECK(st2.n == 1 && st2.segs[0].w == W && st2.segs[0].nvalid == W * H - 2);
   r3d_segstore_close(&st2);
+  /* overlap QC: an identical twin overlaps ~fully; a +9000-voxel translate
+   * not at all */
+  {
+    char tdir[] = "/tmp/r3d_test_segtwin_XXXXXX", fdir[] = "/tmp/r3d_test_segfar_XXXXXX";
+    CHECK(mkdtemp(tdir) != NULL && mkdtemp(fdir) != NULL);
+    float fx[W * H];
+    for (uint32_t k = 0; k < W * H; k++) fx[k] = px[k] > 0.0f ? px[k] + 9000.0f : px[k];
+    static const char *pl[3] = {"x.tif", "y.tif", "z.tif"};
+    const float *tp[3] = {px, py, pz}, *fp[3] = {fx, py, pz};
+    char pp[350];
+    for (int a = 0; a < 3; a++) {
+      snprintf(pp, sizeof pp, "%s/%s", tdir, pl[a]);
+      tifxyz_write_plane(pp, tp[a], W, H);
+      snprintf(pp, sizeof pp, "%s/%s", fdir, pl[a]);
+      tifxyz_write_plane(pp, fp[a], W, H);
+    }
+    for (int d2 = 0; d2 < 2; d2++) {
+      snprintf(pp, sizeof pp, "%s/meta.json", d2 ? fdir : tdir);
+      FILE *mf = fopen(pp, "w");
+      CHECK(mf != NULL);
+      if (mf) {
+        fputs("{\"scale\": [0.05, 0.05]}\n", mf);
+        fclose(mf);
+      }
+    }
+    const char *nd[2] = {tdir, fdir};
+    CHECK(r3d_segstore_build(sdir, nd, 2, -1, false) == 3);
+    r3d_segstore st3;
+    CHECK(r3d_segstore_open(&st3, sdir) == 0 && st3.n == 3);
+    uint32_t orig = 0, twin = 0, far_ = 0;
+    for (uint32_t i = 0; i < 3; i++) {
+      if (strstr(st3.segs[i].name, "segtwin")) twin = i;
+      else if (strstr(st3.segs[i].name, "segfar")) far_ = i;
+      else orig = i;
+    }
+    CHECK(r3d_segstore_overlap(&st3, twin, orig, 8.0) > 0.9);
+    CHECK(r3d_segstore_overlap(&st3, far_, orig, 8.0) == 0.0);
+    for (uint32_t i = 0; i < 3; i++) { /* remove the twin/far store files */
+      if (i == orig) continue;
+      snprintf(pp, sizeof pp, "%s/%s.tfx", sdir, st3.segs[i].name);
+      unlink(pp);
+      snprintf(pp, sizeof pp, "%s/%s.tfx4", sdir, st3.segs[i].name);
+      unlink(pp);
+    }
+    r3d_segstore_close(&st3);
+    for (int d2 = 0; d2 < 2; d2++) {
+      const char *dd = d2 ? fdir : tdir;
+      for (int a = 0; a < 3; a++) {
+        snprintf(pp, sizeof pp, "%s/%s", dd, pl[a]);
+        unlink(pp);
+      }
+      snprintf(pp, sizeof pp, "%s/meta.json", dd);
+      unlink(pp);
+      rmdir(dd);
+    }
+  }
   r3d_segstore_close(&st);
   CHECK(st.segs == NULL);
   {

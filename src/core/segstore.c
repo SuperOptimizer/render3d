@@ -463,6 +463,66 @@ int r3d_segstore_load(const r3d_segstore *st, uint32_t i, uint32_t stride, r3d_t
   return 0;
 }
 
+static void sgs_tile_world(const r3d_segmeta *m, const r3d_segtile *t, double lo[3],
+                           double hi[3]);
+
+#define OV_GRID 64
+
+double r3d_segstore_overlap(const r3d_segstore *st, uint32_t a, uint32_t b, double tol) {
+  if (a >= st->n || b >= st->n || a == b) return 0.0;
+  const r3d_segmeta *ma = &st->segs[a], *mb = &st->segs[b];
+  /* shared bbox (tol-dilated); no intersection = no overlap */
+  double lo[3], hi[3];
+  for (int c = 0; c < 3; c++) {
+    lo[c] = fmax((double)ma->bbox[0][c], (double)mb->bbox[0][c]) - tol;
+    hi[c] = fmin((double)ma->bbox[1][c], (double)mb->bbox[1][c]) + tol;
+    if (lo[c] >= hi[c]) return 0.0;
+  }
+  double cell[3];
+  for (int c = 0; c < 3; c++) cell[c] = (hi[c] - lo[c]) / OV_GRID;
+  static _Thread_local uint8_t occ[OV_GRID * OV_GRID * OV_GRID / 8];
+  memset(occ, 0, sizeof occ);
+  const r3d_segtile *tb = st->tiles + mb->tile_ofs;
+  for (uint64_t t = 0; t < (uint64_t)mb->tw * mb->th; t++) {
+    if (tb[t].lo[0] > tb[t].hi[0]) continue;
+    double tlo[3], thi[3];
+    sgs_tile_world(mb, &tb[t], tlo, thi);
+    int c0[3], c1[3];
+    bool out = false;
+    for (int c = 0; c < 3; c++) {
+      c0[c] = (int)floor((tlo[c] - tol - lo[c]) / cell[c]);
+      c1[c] = (int)floor((thi[c] + tol - lo[c]) / cell[c]);
+      if (c0[c] < 0) c0[c] = 0;
+      if (c1[c] >= OV_GRID) c1[c] = OV_GRID - 1;
+      if (c0[c] > c1[c]) out = true;
+    }
+    if (out) continue;
+    for (int z = c0[2]; z <= c1[2]; z++)
+      for (int y = c0[1]; y <= c1[1]; y++)
+        for (int x = c0[0]; x <= c1[0]; x++) {
+          uint32_t k = (uint32_t)((z * OV_GRID + y) * OV_GRID + x);
+          occ[k >> 3] |= (uint8_t)(1u << (k & 7u));
+        }
+  }
+  const r3d_segtile *ta = st->tiles + ma->tile_ofs;
+  uint64_t total = 0, hit = 0;
+  for (uint64_t t = 0; t < (uint64_t)ma->tw * ma->th; t++) {
+    if (ta[t].lo[0] > ta[t].hi[0]) continue;
+    total++;
+    double tlo[3], thi[3];
+    sgs_tile_world(ma, &ta[t], tlo, thi);
+    double cx = (0.5 * (tlo[0] + thi[0]) - lo[0]) / cell[0];
+    double cy = (0.5 * (tlo[1] + thi[1]) - lo[1]) / cell[1];
+    double cz = (0.5 * (tlo[2] + thi[2]) - lo[2]) / cell[2];
+    if (cx < 0.0 || cy < 0.0 || cz < 0.0 || cx >= OV_GRID || cy >= OV_GRID ||
+        cz >= OV_GRID)
+      continue;
+    uint32_t k = (uint32_t)(((int)cz * OV_GRID + (int)cy) * OV_GRID + (int)cx);
+    if (occ[k >> 3] & (1u << (k & 7u))) hit++;
+  }
+  return total ? (double)hit / (double)total : 0.0;
+}
+
 /* bounds of dot(p, n) over box [lo, hi] */
 static void sgs_box_dot(const double lo[3], const double hi[3], const double bn[3],
                         double *dlo, double *dhi) {

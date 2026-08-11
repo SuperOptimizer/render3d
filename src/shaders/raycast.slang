@@ -398,6 +398,38 @@ void main(uint3 tid: SV_DispatchThreadID) {
       out_image[opix] = bg;
       return;
     }
+    if ((pc.view_flags & 8u) != 0u) {
+      /* flattening-distortion heatmap: local 3D step per grid cell vs the
+       * ideal 1/scale voxels — warm = stretched, cool = compressed, +-2x
+       * log range; luminance modulated by the CT at the surface so the
+       * sheet stays readable (vol_tx/ty carry the grid scale here) */
+      float2 g = fu * float2(pc.vol_tx, pc.vol_ty);
+      uint2 gd;
+      surf_coords.GetDimensions(gd.x, gd.y);
+      int2 gi = int2(clamp(g, float2(1.0), float2(gd) - 2.0));
+      float4 cu0 = surf_coords.Load(int3(gi - int2(1, 0), 0));
+      float4 cu1 = surf_coords.Load(int3(gi + int2(1, 0), 0));
+      float4 cv0 = surf_coords.Load(int3(gi - int2(0, 1), 0));
+      float4 cv1 = surf_coords.Load(int3(gi + int2(0, 1), 0));
+      if (min(min(cu0.w, cu1.w), min(cv0.w, cv1.w)) < 0.5) {
+        out_image[opix] = bg;
+        return;
+      }
+      float su = length(cu1.xyz - cu0.xyz) * 0.5 * pc.vol_tx;
+      float sv2 = length(cv1.xyz - cv0.xyz) * 0.5 * pc.vol_ty;
+      /* +-26% full-scale, perceptual-ish boost on small deviations so the
+       * map reads high-contrast instead of washed gray */
+      float x = clamp(log2(max(0.5 * (su + sv2), 1e-4)) / 0.35, -1.0, 1.0);
+      float m = pow(abs(x), 0.6);
+      float3 cold = float3(0.0, 0.35, 1.0), warm = float3(1.0, 0.15, 0.0);
+      float3 col = lerp(float3(0.95), x < 0.0 ? cold : warm, m);
+      float ct = flat_vol.SampleLevel(float3(txy, clamp(center, lo, hi)) *
+                                          float3(1.0 / pc.slab_nx, 1.0 / pc.slab_ny,
+                                                 1.0 / L),
+                                      0).r;
+      out_image[opix] = float4(col * (0.5 + 0.5 * ct), 1);
+      return;
+    }
     float dt = max(pc.step_voxels, 0.25); /* layers per step (1 layer = 1 texel) */
     float t = lo + hash12(tid.xy, pc.frame_index) * dt;
     float3 inv_dim = 1.0 / float3(pc.slab_nx, pc.slab_ny, L);
