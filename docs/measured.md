@@ -1549,3 +1549,17 @@ sample-heavy and hits the same brick repeatedly). Same seed: 7128 ->
 8413 points, seams gone (verified in the live seg-pane render);
 remaining straight-edged holes are absent prediction bricks, not
 geometry. All 5 suites green.
+
+## 2026-08-12 — tracer: sub-stepped sheet marching (grid step != jump)
+
+Clarified + fixed a real conflation: grid step was both the saved
+parameterization pitch AND the growth jump — a blind 20-voxel leap
+followed by a +-12 snap, which with sheets 10-30 voxels apart could lock
+onto the neighboring sheet and tear the grid (the residual starbursts).
+Growth now marches from each parent in ~3-voxel sub-steps, re-snapping
+with a +-4 search at each, so points slide ALONG their sheet across the
+full grid step; the wide +-12 search remains only for the initial seed.
+Relaxation snaps also narrowed to +-4. Grid step remains the saved
+resolution knob only. Seam-free contiguous surface on the test seed
+(~8k points); remaining holes are absent prediction bricks or real
+damage. All 5 suites green.

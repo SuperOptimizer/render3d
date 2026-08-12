@@ -64,11 +64,11 @@ static void tr_frame(const r3d_tracer *t, const double P[3], double nrm[3], doub
 /* snap P to the prediction ridge along the sheet normal; returns best value
  * (0..1). Weak confidence trusts the extrapolated position over the noisy
  * ridge max (continuous blend, no binary accept). */
-static double tr_snap(r3d_tracer *t, r3d_cpuvol *v, double P[3]) {
+static double tr_snap(r3d_tracer *t, r3d_cpuvol *v, double P[3], double search) {
   double nrm[3], tn[3];
   tr_frame(t, P, nrm, tn);
   double best = -1.0, bs = 0.0;
-  for (double s = -t->cfg.search; s <= t->cfg.search; s += 1.0) {
+  for (double s = -search; s <= search; s += 1.0) {
     double val = (double)r3d_cpuvol_at(v, t->cfg.level, P[0] + nrm[0] * s,
                                        P[1] + nrm[1] * s, P[2] + nrm[2] * s) /
                  255.0;
@@ -122,6 +122,28 @@ static bool tr_predict(r3d_tracer *t, int i, int j, int si, int sj, double out[3
   return true;
 }
 
+/* march from a parent position toward a target one grid step away in
+ * ~3-voxel sub-steps, re-snapping with a small search each time so the
+ * point slides ALONG its sheet instead of leaping across the gap to a
+ * neighboring one. Returns the final snap confidence. */
+static double tr_advance(r3d_tracer *t, r3d_cpuvol *v, const double from[3],
+                         const double target[3], double out[3]) {
+  double d[3] = {target[0] - from[0], target[1] - from[1], target[2] - from[2]};
+  double L = sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+  int n = (int)(L / 3.0) + 1;
+  memcpy(out, from, 3 * sizeof(double));
+  double val = 0.0;
+  for (int s2 = 0; s2 < n; s2++) {
+    for (int a = 0; a < 3; a++) out[a] += d[a] / n;
+    val = tr_snap(t, v, out, 4.0);
+    if (val < TR_FLOOR && s2 + 1 < n) { /* mid-gap: keep marching straight,
+                                         * the far side may pick it back up */
+      continue;
+    }
+  }
+  return val;
+}
+
 /* one confidence-weighted relaxation of cell (i,j): pull toward the
  * positions its SET neighbors expect, then re-snap */
 static void tr_relax_cell(r3d_tracer *t, r3d_cpuvol *vol, int i, int j) {
@@ -148,7 +170,7 @@ static void tr_relax_cell(r3d_tracer *t, r3d_cpuvol *vol, int i, int j) {
   const double *pc = t->pos + k * 3;
   double w = 0.25 + 0.55 * (1.0 - (double)t->conf[k]);
   for (int a = 0; a < 3; a++) P[a] = (1.0 - w) * pc[a] + w * avg[a] / na;
-  double val = tr_snap(t, vol, P);
+  double val = tr_snap(t, vol, P, 4.0);
   if (val >= TR_FLOOR) {
     pthread_mutex_lock(&t->mu);
     memcpy(t->pos + k * 3, P, sizeof P);
@@ -177,7 +199,7 @@ static void *tr_worker(void *ud) {
       /* locally-cached predictions may start at a coarser level: probe down */
       memcpy(sp, t->cfg.seed, 3 * sizeof(double));
       t->cfg.level = lv;
-      sv = tr_snap(t, &vol, sp);
+      sv = tr_snap(t, &vol, sp, t->cfg.search);
       if (sv >= (double)t->cfg.thresh) break;
     }
     pthread_mutex_lock(&t->mu);
@@ -203,23 +225,31 @@ static void *tr_worker(void *ud) {
         /* average the predictions of BOTH inward-adjacent parents: single-
          * parent chains never mix across the diagonals and leave starburst
          * seams radiating from the seed */
-        double P[3] = {0, 0, 0}, pr[3];
+        double P[3] = {0, 0, 0}, pr[3], mv3[3];
         int np = 0;
+        double vsum = 0.0;
         if (si && tr_predict(t, i, j, si, 0, pr)) {
-          for (int a = 0; a < 3; a++) P[a] += pr[a];
+          const double *pp = t->pos + ((size_t)j * t->W + (size_t)(i + si)) * 3;
+          vsum += tr_advance(t, &vol, pp, pr, mv3);
+          for (int a = 0; a < 3; a++) P[a] += mv3[a];
           np++;
         }
         if (sj && tr_predict(t, i, j, 0, sj, pr)) {
-          for (int a = 0; a < 3; a++) P[a] += pr[a];
+          const double *pp = t->pos + ((size_t)(j + sj) * t->W + (size_t)i) * 3;
+          vsum += tr_advance(t, &vol, pp, pr, mv3);
+          for (int a = 0; a < 3; a++) P[a] += mv3[a];
           np++;
         }
         if (!np && si && sj && tr_predict(t, i, j, si, sj, pr)) {
-          for (int a = 0; a < 3; a++) P[a] += pr[a]; /* corner fallback */
+          const double *pp = t->pos + ((size_t)(j + sj) * t->W + (size_t)(i + si)) * 3;
+          vsum += tr_advance(t, &vol, pp, pr, mv3); /* corner fallback */
+          for (int a = 0; a < 3; a++) P[a] += mv3[a];
           np++;
         }
         if (!np) continue;
         for (int a = 0; a < 3; a++) P[a] /= np;
-        double val = tr_snap(t, &vol, P);
+        double val = tr_snap(t, &vol, P, 4.0);
+        if (val < vsum / np) val = vsum / np; /* marched confidence counts */
         pthread_mutex_lock(&t->mu);
         if (val >= TR_FLOOR) {
           memcpy(t->pos + k * 3, P, sizeof P);
