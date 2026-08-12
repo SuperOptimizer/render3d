@@ -3159,6 +3159,7 @@ int main(int argc, char **argv) {
           if (ts.xyz) {
             float bb[2][3] = {{1e30f, 1e30f, 1e30f}, {-1e30f, -1e30f, -1e30f}};
             uint64_t nv = 0;
+            uint32_t gi0 = ts.w, gi1 = 0, gj0 = ts.h, gj1 = 0; /* grid bbox */
             for (size_t k = 0; k < (size_t)ts.w * ts.h; k++) {
               bool ok2 = mv_tr_st[k] == R3D_TR_SET && mv_tr_cf[k] >= mv_tr_thresh;
               for (int a = 0; a < 3; a++) {
@@ -3169,7 +3170,14 @@ int main(int argc, char **argv) {
                   if (vv2 > bb[1][a]) bb[1][a] = vv2;
                 }
               }
-              if (ok2) nv++;
+              if (ok2) {
+                nv++;
+                uint32_t gi = (uint32_t)(k % ts.w), gj = (uint32_t)(k / ts.w);
+                if (gi < gi0) gi0 = gi;
+                if (gi > gi1) gi1 = gi;
+                if (gj < gj0) gj0 = gj;
+                if (gj > gj1) gj1 = gj;
+              }
             }
             memcpy(ts.bbox, bb, sizeof bb);
             ts.nvalid = nv;
@@ -3191,10 +3199,19 @@ int main(int argc, char **argv) {
                 mv_ol_slice[oi2] = 1e30;
               }
               mv_ol_zoff = 1e30;
-              if (mv_tr_live_first) { /* frame the pane once, then hands off */
+              if (mv_tr_live_first || !mv_tr_done) {
+                /* keep the pane fitted to the growing patch; once growth
+                 * finishes the view is yours */
                 mv_tr_live_first = false;
-                mv[R3D_MV_SEG].cu = (double)ts.w * 0.5;
-                mv[R3D_MV_SEG].cv = (double)ts.h * 0.5;
+                double bw = (double)(gi1 - gi0) + 6.0, bh = (double)(gj1 - gj0) + 6.0;
+                mv[R3D_MV_SEG].cu = ((double)gi0 + gi1) * 0.5;
+                mv[R3D_MV_SEG].cv = ((double)gj0 + gj1) * 0.5;
+                double zx = (double)mv[R3D_MV_SEG].pw / bw;
+                double zy = (double)mv[R3D_MV_SEG].ph / bh;
+                double zf = zx < zy ? zx : zy;
+                double zmax2 = 10.0 / (double)mv_seg.sx;
+                if (zf > zmax2) zf = zmax2;
+                if (zf > 0.05) mv[R3D_MV_SEG].zoom = zf;
               }
             } else {
               r3d_tifxyz_free(&ts);
