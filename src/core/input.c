@@ -34,7 +34,15 @@ void r3d_input_poll(r3d_input *in, SDL_Window *win,
       in->resized = true;
       break;
     case SDL_EVENT_MOUSE_BUTTON_DOWN:
-      if (ev.button.button != SDL_BUTTON_LEFT || !allow_capture) break;
+      if (!allow_capture) break;
+      if (multiview_mode && ev.button.button == SDL_BUTTON_RIGHT) {
+        if (!in->dragging) { /* multiview pans with the RIGHT button */
+          SDL_SetWindowRelativeMouseMode(win, true);
+          in->dragging = true;
+        }
+        break;
+      }
+      if (ev.button.button != SDL_BUTTON_LEFT) break;
       if (multiview_mode && (SDL_GetModState() & SDL_KMOD_CTRL)) {
         in->annotate_click = true; /* focus gesture; plain LMB stays a drag */
         in->click_ctrl = true;
@@ -52,13 +60,15 @@ void r3d_input_poll(r3d_input *in, SDL_Window *win,
       if (fly_mode && !in->captured) {
         SDL_SetWindowRelativeMouseMode(win, true);
         in->captured = true;
-      } else if (!fly_mode && !in->dragging) {
+      } else if (!fly_mode && !multiview_mode && !in->dragging) {
         SDL_SetWindowRelativeMouseMode(win, true); /* endless drag, hidden cursor */
         in->dragging = true;
       }
       break;
     case SDL_EVENT_MOUSE_BUTTON_UP:
-      if (ev.button.button == SDL_BUTTON_LEFT && in->dragging) {
+      if ((ev.button.button == SDL_BUTTON_LEFT ||
+           (multiview_mode && ev.button.button == SDL_BUTTON_RIGHT)) &&
+          in->dragging) {
         SDL_SetWindowRelativeMouseMode(win, false);
         in->dragging = false;
       }

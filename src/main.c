@@ -2691,7 +2691,7 @@ int main(int argc, char **argv) {
                      "PgUp/PgDn: z step | Ctrl+click: set + advance\n"
                      "Shift+drag: pan | Shift+wheel: zoom | F12: shot");
     else if (multiview_path)
-      igTextDisabled("drag: pan view | wheel: zoom | Shift+wheel: slice\n"
+      igTextDisabled("right-drag: pan view | wheel: zoom | Shift+wheel: slice\n"
                      "R/F: slice | Ctrl+click: set focus | F12: shot\n"
                      "Space: solo hovered view | checkboxes hide views%s",
                      umbilicus_path ? "\nU: place umbilicus point at cursor" : "");
