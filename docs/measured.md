@@ -1521,3 +1521,16 @@ you pick the quality bar after seeing the patch, and can re-save at a
 different bar without re-tracing. Same GP seed: 4784 -> 7128 points at
 60 rings (growth no longer stalls at brief prediction dips). All 5
 suites green.
+
+## 2026-08-12 — the growing trace renders live in the segment viewer
+
+"live in segment view" (tracer section, default on): while the trace
+grows, the grid swaps into the active surf machinery every 400 ms (tiny
+RGBA32F uploads; the surfvol rebakes progressively), so the flattened
+pane shows the actual CT of the surface expanding ring by ring — not
+just the orange point preview. The active segment becomes "(tracing)";
+save + activate persists it as before. Confidence cutoff applies live:
+sub-cutoff cells render as holes, so sliding it during/after growth
+shows exactly what the saved segment would keep. Verified headless: seg
+pane shot shows the grown patch's fiber texture with confidence gaps;
+0 decode failures. All 5 suites green.

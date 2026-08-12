@@ -1493,6 +1493,9 @@ int main(int argc, char **argv) {
   uint32_t mv_tr_ring = 0, mv_tr_nset = 0;
   float mv_tr_step = 20.0f, mv_tr_thresh = 0.35f;
   int mv_tr_rings = 60, mv_tr_nsaved = 0;
+  bool mv_tr_live = true;      /* render the growing grid in the seg pane */
+  uint64_t mv_tr_live_ns = 0;  /* last live swap (throttle) */
+  bool mv_tr_live_first = true;
   double sgc_near_focus[3] = {1e30, 1e30, 1e30};
   uint32_t sgc_near[6];
   uint32_t sgc_nnear = 0;
@@ -2810,6 +2813,7 @@ int main(int argc, char **argv) {
       igSliderFloat("confidence cutoff", &mv_tr_thresh, 0.05f, 0.9f, "%.2f", 0);
       igTextDisabled("growth is continuous; the cutoff masks display + save");
       igSliderInt("max rings", &mv_tr_rings, 8, 200, "%d", 0);
+      igCheckbox("live in segment view", &mv_tr_live);
       if (!mv_tr_active) {
         if (igButton("seed at focus", (ImVec2){0, 0})) {
           r3d_tracer_cfg tc = {.seed = {mv_focus[0], mv_focus[1], mv_focus[2]},
@@ -2826,6 +2830,7 @@ int main(int argc, char **argv) {
             mv_tr_st = calloc((size_t)mv_tr.W * mv_tr.H, 1);
             mv_tr_cf = calloc((size_t)mv_tr.W * mv_tr.H, sizeof *mv_tr_cf);
             mv_tr_gen = 0;
+            mv_tr_live_first = true;
             mv_tr_active = mv_tr_pos && mv_tr_st && mv_tr_cf;
           }
         }
@@ -3141,6 +3146,64 @@ int main(int argc, char **argv) {
       if (g != mv_tr_gen && mv_tr_pos) {
         r3d_tracer_snapshot(&mv_tr, mv_tr_pos, mv_tr_st, mv_tr_cf, NULL, NULL, NULL);
         mv_tr_gen = g;
+        uint64_t now2 = r3d_now_ns();
+        if (mv_tr_live && mv_tr_nset > 8 &&
+            (now2 - mv_tr_live_ns > 400000000ull || mv_tr_done)) {
+          /* live growth in the segment pane: swap the trace grid into the
+           * active surf machinery (tiny grids — the upload is trivial; the
+           * surfvol rebakes progressively) */
+          mv_tr_live_ns = now2;
+          r3d_tifxyz ts = {.w = mv_tr.W, .h = mv_tr.H};
+          ts.sx = ts.sy = (float)(1.0 / mv_tr.cfg.step);
+          ts.xyz = malloc((size_t)ts.w * ts.h * 3 * sizeof *ts.xyz);
+          if (ts.xyz) {
+            float bb[2][3] = {{1e30f, 1e30f, 1e30f}, {-1e30f, -1e30f, -1e30f}};
+            uint64_t nv = 0;
+            for (size_t k = 0; k < (size_t)ts.w * ts.h; k++) {
+              bool ok2 = mv_tr_st[k] == R3D_TR_SET && mv_tr_cf[k] >= mv_tr_thresh;
+              for (int a = 0; a < 3; a++) {
+                float vv2 = ok2 ? (float)mv_tr_pos[k * 3 + (size_t)a] : -1.0f;
+                ts.xyz[k * 3 + (size_t)a] = vv2;
+                if (ok2) {
+                  if (vv2 < bb[0][a]) bb[0][a] = vv2;
+                  if (vv2 > bb[1][a]) bb[1][a] = vv2;
+                }
+              }
+              if (ok2) nv++;
+            }
+            memcpy(ts.bbox, bb, sizeof bb);
+            ts.nvalid = nv;
+            float *tco = NULL, *tno = NULL;
+            r3d_segrows trr = {0};
+            if (nv > 8 && r3d_segrows_build(&ts, &trr) == 0 &&
+                mv_build_grids(&ts, &tco, &tno) == 0 &&
+                r3d_surf_swap(renderer, ts.w, ts.h, tco, tno, ts.sx, ts.sy) == 0) {
+              r3d_tifxyz_free(&mv_seg);
+              r3d_segrows_free(&mv_rows);
+              free(mv_normals);
+              mv_seg = ts;
+              mv_rows = trr;
+              mv_normals = tno;
+              snprintf(sgc_active, sizeof sgc_active, "(tracing)");
+              for (int oi2 = 0; oi2 < 4; oi2++) {
+                mv_ol[oi2].n = 0;
+                mv_ol_off[oi2].n = 0;
+                mv_ol_slice[oi2] = 1e30;
+              }
+              mv_ol_zoff = 1e30;
+              if (mv_tr_live_first) { /* frame the pane once, then hands off */
+                mv_tr_live_first = false;
+                mv[R3D_MV_SEG].cu = (double)ts.w * 0.5;
+                mv[R3D_MV_SEG].cv = (double)ts.h * 0.5;
+              }
+            } else {
+              r3d_tifxyz_free(&ts);
+              r3d_segrows_free(&trr);
+              free(tno);
+            }
+            free(tco);
+          }
+        }
       }
     }
     if (multiview_path) { /* overlays: intersections, focus marker, borders */
