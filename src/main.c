@@ -2005,6 +2005,7 @@ int main(int argc, char **argv) {
               mv_axis_reset(mv_pb, mv_po);
             mv_basis_gen++;
           }
+          memcpy(mv_crop_c, mv_focus, sizeof mv_crop_c); /* 3D crop follows */
           for (int i = 1; i < 4; i++) {
             if (!(mv_umb_refoc & (1u << i))) continue;
             double fu, fv, fs;
@@ -2969,7 +2970,84 @@ int main(int argc, char **argv) {
          * (magenta) + a crosshair at the XY pane's current-z interpolation */
         const ImU32 uc = 0xffff00ffu, ub = 0xff000000u;
         for (int i = 1; i < 4; i++) {
-          if (!(mv_mask & (1u << i)) || MV_IS3D(i)) continue;
+          if (!(mv_mask & (1u << i))) continue;
+          if (MV_IS3D(i)) {
+            if (mv_crop_e <= 0.0f) continue;
+            /* the curve inside the crop cube, through the pane's camera
+             * (recomputed here exactly as the frame build does) */
+            uint32_t md3 = brick_shape[0];
+            for (int a = 1; a < 3; a++)
+              if (brick_shape[a] > md3) md3 = brick_shape[a];
+            double eb3 = (double)mv_crop_e / md3;
+            r3d_camera_orbit_set(&cam,
+                                 v3((float)(mv_crop_c[0] / md3), (float)(mv_crop_c[1] / md3),
+                                    (float)(mv_crop_c[2] / md3)),
+                                 (float)(eb3 * (double)mv_crop_fit));
+            r3d_v3 c_r, c_u, c_f;
+            r3d_camera_basis(&cam, (float)mv[i].pw / (float)(mv[i].ph ? mv[i].ph : 1),
+                             &c_r, &c_u, &c_f);
+            float lr = v3_len(c_r), lu = v3_len(c_u);
+            r3d_v3 rn = v3_scale(c_r, lr > 0 ? 1.0f / lr : 0.0f);
+            r3d_v3 un = v3_scale(c_u, lu > 0 ? 1.0f / lu : 0.0f);
+            double half3 = (double)mv_crop_e * 0.5;
+            ImVec2 cmin = {(float)mv[i].px, (float)mv[i].py};
+            ImVec2 cmax = {(float)(mv[i].px + mv[i].pw), (float)(mv[i].py + mv[i].ph)};
+            ImDrawList_PushClipRect(draw, cmin, cmax, false);
+            for (size_t k = 0; k < umbilicus.count; k++) {
+              /* clip segment k-1 -> k to the cube */
+              ImVec2 s0 = {0, 0}, s1 = {0, 0};
+              bool seg_ok = false;
+              if (k > 0) {
+                double ct0 = 0.0, ct1 = 1.0;
+                const r3d_umbilicus_point *pa = &umbilicus.points[k - 1];
+                const r3d_umbilicus_point *pb = &umbilicus.points[k];
+                double pav[3] = {pa->x, pa->y, pa->z}, pbv[3] = {pb->x, pb->y, pb->z};
+                for (int a = 0; a < 3 && ct0 < ct1; a++) {
+                  double lo = mv_crop_c[a] - half3, hi = mv_crop_c[a] + half3;
+                  double va = pav[a], vb = pbv[a];
+                  if (va == vb) {
+                    if (va < lo || va > hi) ct0 = 1.0;
+                  } else {
+                    double ta = (lo - va) / (vb - va), tb = (hi - va) / (vb - va);
+                    if (ta > tb) {
+                      double tt = ta;
+                      ta = tb;
+                      tb = tt;
+                    }
+                    if (ta > ct0) ct0 = ta;
+                    if (tb < ct1) ct1 = tb;
+                  }
+                }
+                if (ct0 < ct1) {
+                  seg_ok = true;
+                  for (int e2 = 0; e2 < 2; e2++) {
+                    double tt = e2 ? ct1 : ct0;
+                    r3d_v3 P = v3((float)((pav[0] + (pbv[0] - pav[0]) * tt) / md3),
+                                  (float)((pav[1] + (pbv[1] - pav[1]) * tt) / md3),
+                                  (float)((pav[2] + (pbv[2] - pav[2]) * tt) / md3));
+                    r3d_v3 d = v3_sub(P, cam.pos);
+                    float zf = v3_dot(d, c_f);
+                    if (zf < 1e-5f) {
+                      seg_ok = false;
+                      break;
+                    }
+                    float nx = v3_dot(d, rn) / (zf * (lr > 0 ? lr : 1));
+                    float ny = v3_dot(d, un) / (zf * (lu > 0 ? lu : 1));
+                    ImVec2 sp = {(float)mv[i].px + (nx * 0.5f + 0.5f) * (float)mv[i].pw,
+                                 (float)mv[i].py + (0.5f - ny * 0.5f) * (float)mv[i].ph};
+                    if (e2) s1 = sp;
+                    else s0 = sp;
+                  }
+                }
+              }
+              if (seg_ok) {
+                ImDrawList_AddLine(draw, s0, s1, 0xff000000u, 3.5f);
+                ImDrawList_AddLine(draw, s0, s1, 0xffff00ffu, 1.8f);
+              }
+            }
+            ImDrawList_PopClipRect(draw);
+            continue;
+          }
           ImVec2 cmin = {(float)mv[i].px, (float)mv[i].py};
           ImVec2 cmax = {(float)(mv[i].px + mv[i].pw), (float)(mv[i].py + mv[i].ph)};
           ImDrawList_PushClipRect(draw, cmin, cmax, false);
