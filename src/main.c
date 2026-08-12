@@ -1382,7 +1382,8 @@ int main(int argc, char **argv) {
    * orbits around it, the camera keeps a fixed framing distance, and
    * Ctrl+click focus recenters it */
   double mv_crop_c[3] = {0, 0, 0}; /* cube center, world voxels */
-  float mv_crop_e = 0.0f;          /* cube edge, voxels; 0 = init to full */
+  float mv_crop_d[3] = {0, 0, 0};  /* box extents, voxels; 0 = init to full.
+                                    * GUI sliders make it any rectangle */
   float mv_crop_fit = 2.1f;        /* camera distance in cube edges
                                     * (Shift+wheel zooms the cube itself) */
   bool mv_vol_cam_init = false;
@@ -1911,24 +1912,25 @@ int main(int argc, char **argv) {
           mv_crop_fit *= powf(0.92f, in.wheel);
           if (mv_crop_fit < 0.6f) mv_crop_fit = 0.6f;
           if (mv_crop_fit > 8.0f) mv_crop_fit = 8.0f;
-        } else if (mv_crop_e > 0.0f) { /* wheel: crop tighter/looser */
-          mv_crop_e *= powf(0.9f, in.wheel);
-          uint32_t me = brick_shape[0];
-          for (int a = 1; a < 3; a++)
-            if (brick_shape[a] > me) me = brick_shape[a];
-          if (mv_crop_e < 128.0f) mv_crop_e = 128.0f;
-          if (me && mv_crop_e > (float)me) mv_crop_e = (float)me;
+        } else if (mv_crop_d[0] > 0.0f) { /* wheel: crop tighter/looser,
+                                            * all axes in proportion */
+          float sc = powf(0.9f, in.wheel);
+          for (int a = 0; a < 3; a++) {
+            mv_crop_d[a] *= sc;
+            if (mv_crop_d[a] < 32.0f) mv_crop_d[a] = 32.0f;
+            if (brick_shape[a] && mv_crop_d[a] > (float)brick_shape[a])
+              mv_crop_d[a] = (float)brick_shape[a];
+          }
         }
         in.wheel = 0.0f;
       }
-      if (hover >= 0 && MV_IS3D(hover) && mv_crop_e > 0.0f &&
+      if (hover >= 0 && MV_IS3D(hover) && mv_crop_d[0] > 0.0f &&
           (in.adelta[0] || in.adelta[1] || in.zpage) && !io->WantCaptureKeyboard) {
         /* arrows pan the crop through the volume (x/y), PgUp/PgDn along z;
-         * step = 5% of the cube edge, so travel scales with zoom */
-        double stp = (double)mv_crop_e * 0.05;
-        mv_crop_c[0] += in.adelta[0] * stp;
-        mv_crop_c[1] += in.adelta[1] * stp;
-        mv_crop_c[2] += in.zpage * stp;
+         * step = 5% of that axis's extent, so travel scales with zoom */
+        mv_crop_c[0] += in.adelta[0] * (double)mv_crop_d[0] * 0.05;
+        mv_crop_c[1] += in.adelta[1] * (double)mv_crop_d[1] * 0.05;
+        mv_crop_c[2] += in.zpage * (double)mv_crop_d[2] * 0.05;
         in.zpage = 0; /* consumed: not a slice page */
         for (int a = 0; a < 3; a++) {
           if (mv_crop_c[a] < 0.0) mv_crop_c[a] = 0.0;
@@ -2038,14 +2040,16 @@ int main(int argc, char **argv) {
       if (in.annotate_click && in.click_ctrl) { /* Ctrl+click = set focus POI */
         int cv_ = r3d_mv_hit(mv, in.click_xy[0], in.click_xy[1]);
         bool focused = false, have_ij = false;
-        if (MV_IS3D(cv_) && mv_crop_e > 0.0f) {
+        if (MV_IS3D(cv_) && mv_crop_d[0] > 0.0f) {
           /* 3D pane: the click ray meets the view-facing plane through the
            * crop center — lateral pick at the cube's depth (iterate from a
            * plane view for exact depth) */
           uint32_t md3 = brick_shape[0];
           for (int a = 1; a < 3; a++)
             if (brick_shape[a] > md3) md3 = brick_shape[a];
-          double eb3 = (double)mv_crop_e / md3;
+          float mde = mv_crop_d[0] > mv_crop_d[1] ? mv_crop_d[0] : mv_crop_d[1];
+          if (mv_crop_d[2] > mde) mde = mv_crop_d[2];
+          double eb3 = (double)mde / md3;
           r3d_camera_orbit_set(&cam,
                                v3((float)(mv_crop_c[0] / md3), (float)(mv_crop_c[1] / md3),
                                   (float)(mv_crop_c[2] / md3)),
@@ -2061,8 +2065,8 @@ int main(int argc, char **argv) {
             float tt = v3_dot(v3_sub(cam.target, cam.pos), c_f) / dz;
             r3d_v3 P = v3_add(cam.pos, v3_scale(dir, tt));
             double W3[3] = {(double)P.x * md3, (double)P.y * md3, (double)P.z * md3};
-            double half3 = (double)mv_crop_e * 0.5;
-            for (int a = 0; a < 3; a++) { /* stay within the cube */
+            for (int a = 0; a < 3; a++) { /* stay within the box */
+              double half3 = (double)mv_crop_d[a] * 0.5;
               if (W3[a] < mv_crop_c[a] - half3) W3[a] = mv_crop_c[a] - half3;
               if (W3[a] > mv_crop_c[a] + half3) W3[a] = mv_crop_c[a] + half3;
               mv_focus[a] = W3[a];
@@ -2527,6 +2531,18 @@ int main(int argc, char **argv) {
           if (igSliderInt("slice thickness", &th, 1, 128, "%d", 0)) mv_thick = th;
           igSliderFloat("scrub speed", &mv_scrub, 0.25f, 200.0f, "%.2f vox/notch",
                         ImGuiSliderFlags_Logarithmic);
+          if (mv_pane_kind[0] == 2 || mv_pane_kind[1] == 2) {
+            static const char *cl[3] = {"crop x (vox)", "crop y (vox)", "crop z (vox)"};
+            for (int a = 0; a < 3; a++) {
+              float cv2 = mv_crop_d[a];
+              igSetNextItemWidth(180);
+              if (igSliderFloat(cl[a], &cv2, 32.0f,
+                                brick_shape[a] ? (float)brick_shape[a] : 65536.0f, "%.0f",
+                                ImGuiSliderFlags_Logarithmic) &&
+                  cv2 >= 32.0f)
+                mv_crop_d[a] = cv2;
+            }
+          }
           static const char *pane_lbl[2] = {"bottom-left##pk", "bottom-right##pk"};
           for (int pk = 0; pk < 2; pk++) {
             int kv = mv_pane_kind[pk];
@@ -3006,13 +3022,15 @@ int main(int argc, char **argv) {
         for (int i = 1; i < 4; i++) {
           if (!(mv_mask & (1u << i))) continue;
           if (MV_IS3D(i)) {
-            if (mv_crop_e <= 0.0f) continue;
-            /* the curve inside the crop cube, through the pane's camera
+            if (mv_crop_d[0] <= 0.0f) continue;
+            /* the curve inside the crop box, through the pane's camera
              * (recomputed here exactly as the frame build does) */
             uint32_t md3 = brick_shape[0];
             for (int a = 1; a < 3; a++)
               if (brick_shape[a] > md3) md3 = brick_shape[a];
-            double eb3 = (double)mv_crop_e / md3;
+            float mde = mv_crop_d[0] > mv_crop_d[1] ? mv_crop_d[0] : mv_crop_d[1];
+            if (mv_crop_d[2] > mde) mde = mv_crop_d[2];
+            double eb3 = (double)mde / md3;
             r3d_camera_orbit_set(&cam,
                                  v3((float)(mv_crop_c[0] / md3), (float)(mv_crop_c[1] / md3),
                                     (float)(mv_crop_c[2] / md3)),
@@ -3023,7 +3041,8 @@ int main(int argc, char **argv) {
             float lr = v3_len(c_r), lu = v3_len(c_u);
             r3d_v3 rn = v3_scale(c_r, lr > 0 ? 1.0f / lr : 0.0f);
             r3d_v3 un = v3_scale(c_u, lu > 0 ? 1.0f / lu : 0.0f);
-            double half3 = (double)mv_crop_e * 0.5;
+            double half3v[3] = {(double)mv_crop_d[0] * 0.5, (double)mv_crop_d[1] * 0.5,
+                                (double)mv_crop_d[2] * 0.5};
             ImVec2 cmin = {(float)mv[i].px, (float)mv[i].py};
             ImVec2 cmax = {(float)(mv[i].px + mv[i].pw), (float)(mv[i].py + mv[i].ph)};
             ImDrawList_PushClipRect(draw, cmin, cmax, false);
@@ -3037,7 +3056,7 @@ int main(int argc, char **argv) {
                 const r3d_umbilicus_point *pb = &umbilicus.points[k];
                 double pav[3] = {pa->x, pa->y, pa->z}, pbv[3] = {pb->x, pb->y, pb->z};
                 for (int a = 0; a < 3 && ct0 < ct1; a++) {
-                  double lo = mv_crop_c[a] - half3, hi = mv_crop_c[a] + half3;
+                  double lo = mv_crop_c[a] - half3v[a], hi = mv_crop_c[a] + half3v[a];
                   double va = pav[a], vb = pbv[a];
                   if (va == vb) {
                     if (va < lo || va > hi) ct0 = 1.0;
@@ -3292,19 +3311,20 @@ int main(int argc, char **argv) {
             if (MV_IS3D(i)) { /* volumetric pane: stream exactly the crop
                * cube; LOD = crop edge over pane pixels (the zoom IS the
                * crop, so the request stays bounded at every zoom) */
-              if (mv_crop_e <= 0.0f) continue; /* first frame inits it */
-              double half = (double)mv_crop_e * 0.55; /* small refit margin */
+              if (mv_crop_d[0] <= 0.0f) continue; /* first frame inits it */
               float lo3[3], hi3[3];
-              for (int a = 0; a < 3; a++) {
+              for (int a = 0; a < 3; a++) { /* small refit margin per axis */
+                double half = (double)mv_crop_d[a] * 0.55;
                 lo3[a] = (float)((mv_crop_c[a] - half) / mdim);
                 hi3[a] = (float)((mv_crop_c[a] + half) / mdim);
               }
               int pmin = mv[i].pw < mv[i].ph ? mv[i].pw : mv[i].ph;
               /* stream_box wants BOX units per pixel (like the plane views'
                * 1/(zoom*mdim)), so voxels-per-pixel divides by mdim */
-              float vpp3 =
-                  (float)((double)mv_crop_e / (double)(pmin > 0 ? pmin : 1) / mdim) *
-                  exp2f(lod_bias);
+              float mde = mv_crop_d[0] > mv_crop_d[1] ? mv_crop_d[0] : mv_crop_d[1];
+              if (mv_crop_d[2] > mde) mde = mv_crop_d[2];
+              float vpp3 = (float)((double)mde / (double)(pmin > 0 ? pmin : 1) / mdim) *
+                           exp2f(lod_bias);
               r3d_bricks_stream_box(renderer, lo3, hi3, vpp3, p.skip_gate);
               continue;
             }
@@ -3399,15 +3419,28 @@ int main(int argc, char **argv) {
             for (int a = 0; a < 3; a++) mv_crop_c[a] = (double)brick_shape[a] * 0.5;
             mv_vol_cam_init = true;
           }
-          if (mv_crop_e <= 0.0f) {
-            uint32_t me = brick_shape[0];
-            for (int a = 1; a < 3; a++)
-              if (brick_shape[a] > me) me = brick_shape[a];
-            mv_crop_e = (float)me; /* start: the whole scroll, coarse */
+          if (mv_crop_d[0] <= 0.0f)
+            for (int a = 0; a < 3; a++) /* start: the whole scroll, coarse */
+              mv_crop_d[a] = (float)brick_shape[a];
+          if (getenv("R3D_3D_CROP")) { /* "e" or "x,y,z" */
+            const char *cs = getenv("R3D_3D_CROP");
+            char *ce = NULL;
+            for (int a = 0; a < 3; a++) {
+              float cv2 = strtof(cs, &ce);
+              if (ce == cs) break;
+              mv_crop_d[a] = cv2;
+              if (*ce != ',') {
+                if (a == 0)
+                  for (int b2 = 1; b2 < 3; b2++) mv_crop_d[b2] = cv2;
+                break;
+              }
+              cs = ce + 1;
+            }
           }
-          if (getenv("R3D_3D_CROP")) mv_crop_e = strtof(getenv("R3D_3D_CROP"), NULL);
-          /* the camera frames the cube from a fixed relative distance */
-          double eb = (double)mv_crop_e / mdim; /* edge, box units */
+          /* the camera frames the box from a fixed relative distance */
+          float mde = mv_crop_d[0] > mv_crop_d[1] ? mv_crop_d[0] : mv_crop_d[1];
+          if (mv_crop_d[2] > mde) mde = mv_crop_d[2];
+          double eb = (double)mde / mdim; /* largest extent, box units */
           r3d_camera_orbit_set(&cam,
                                v3((float)(mv_crop_c[0] / mdim), (float)(mv_crop_c[1] / mdim),
                                   (float)(mv_crop_c[2] / mdim)),
@@ -3422,11 +3455,13 @@ int main(int argc, char **argv) {
           memcpy(q.cam_up, &vu, 12);
           memcpy(q.cam_forward, &vf, 12);
           q.view_flags = R3D_VIEW_CROP; /* perspective, clipped to the cube */
-          double half = (double)mv_crop_e * 0.5;
-          q.slab_x0 = (float)(mv_crop_c[0] - half);
-          q.slab_y0 = (float)(mv_crop_c[1] - half);
-          q.slab_z0 = (float)(mv_crop_c[2] - half);
-          q.slab_depth = (uint32_t)mv_crop_e;
+          q.slab_x0 = (float)(mv_crop_c[0] - (double)mv_crop_d[0] * 0.5);
+          q.slab_y0 = (float)(mv_crop_c[1] - (double)mv_crop_d[1] * 0.5);
+          q.slab_z0 = (float)(mv_crop_c[2] - (double)mv_crop_d[2] * 0.5);
+          q.slab_px = mv_crop_d[0]; /* per-axis extents for the box clip */
+          q.slab_py = mv_crop_d[1];
+          q.slab_nx = mv_crop_d[2];
+          q.slab_depth = (uint32_t)mde;
           if (getenv("R3D_3D_MODE")) q.mode = (uint32_t)atoi(getenv("R3D_3D_MODE"));
           if (getenv("R3D_3D_BIAS")) q.lod_bias = strtof(getenv("R3D_3D_BIAS"), NULL);
           vp4[nvp++] = q;

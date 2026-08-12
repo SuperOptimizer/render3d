@@ -539,11 +539,11 @@ void main(uint3 tid: SV_DispatchThreadID) {
   float3 box_lo = float3(0), box_hi = ext;
   float t_lo = 0.0, t_hi = 1e30;
   if (is_bricks() && bricks_is_lod() && (pc.view_flags & 16u) != 0u) {
-    /* zoom-crop cube (3D volumetric pane): march only the cube of edge
-     * slab_depth voxels at slab_x0/y0/z0 — the visible extract */
+    /* zoom-crop box (3D volumetric pane): march only the box at
+     * slab_x0/y0/z0 with per-axis extents slab_px/py/nx voxels */
     float md = float(max(page[1], max(page[2], page[3])));
     float3 clo = float3(pc.slab_x0, pc.slab_y0, pc.slab_z0) / md;
-    float3 chi = clo + float(pc.slab_depth) / md;
+    float3 chi = clo + float3(pc.slab_px, pc.slab_py, pc.slab_nx) / md;
     box_lo = clamp(clo, float3(0), ext);
     box_hi = clamp(chi, box_lo, ext);
   } else if (is_bricks() && bricks_is_lod() && pc.slab_depth > 0u) {

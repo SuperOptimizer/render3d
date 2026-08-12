@@ -1473,3 +1473,14 @@ Measured on the 4-pane layout with the 3D pane in MIP at a 1024 crop:
 raycast 5.38 -> 4.56 ms total, i.e. roughly 2x on the MIP pane itself;
 the win grows with pane size and crop density since interior rays skip
 brick-by-brick after the bright outer wrap. All 5 suites green.
+
+## 2026-08-12 — 3D crop is a per-axis box (GUI sliders)
+
+The zoom-crop is now a rectangular box: crop x/y/z sliders (log, 32 vox
+.. that axis's shape) appear in the views section when a 3D pane is
+active; wheel still scales all three proportionally, arrows/PgUpDn step
+5% of their own axis, camera frames the largest extent, and the shader
+clip takes per-axis extents (slab_px/py/nx carry them — free floats in
+bricks views). R3D_3D_CROP accepts "e" or "x,y,z" for headless work;
+verified with a 3000x3000x400 slab render and the 1024^3 cube regression.
+All 5 suites green.
