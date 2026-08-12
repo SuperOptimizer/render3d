@@ -1534,3 +1534,18 @@ sub-cutoff cells render as holes, so sliding it during/after growth
 shows exactly what the saved segment would keep. Verified headless: seg
 pane shot shows the grown patch's fiber texture with confidence gaps;
 0 decode failures. All 5 suites green.
+
+## 2026-08-12 — tracer: starburst seams fixed (two-parent growth)
+
+User-reported diagonal discontinuities radiating from the seed: the
+Chebyshev-ring growth inherited each new cell from a single inward
+parent, so quadrant chains never mixed across the +-45deg lines and
+their accumulated drift met in visible seams. New cells now average the
+predictions of BOTH inward-adjacent parents (linear continuation when
+grandparents exist), relaxation runs two passes over a 3-ring band
+behind the frontier, and a full-disc pass every 8 rings bleeds out
+residual drift. cpuvol gained a last-brick memo (the relax load is
+sample-heavy and hits the same brick repeatedly). Same seed: 7128 ->
+8413 points, seams gone (verified in the live seg-pane render);
+remaining straight-edged holes are absent prediction bricks, not
+geometry. All 5 suites green.

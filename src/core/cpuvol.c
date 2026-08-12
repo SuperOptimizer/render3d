@@ -99,12 +99,19 @@ void r3d_cpuvol_close(r3d_cpuvol *v) {
 static const uint8_t *cv_brick(r3d_cpuvol *v, uint32_t li, uint32_t bx, uint32_t by,
                                uint32_t bz) {
   uint64_t key = ((uint64_t)li << 60) | ((uint64_t)bz << 40) | ((uint64_t)by << 20) | bx;
+  static _Thread_local uint64_t memo_key = UINT64_MAX;
+  static _Thread_local const uint8_t *memo_ptr = NULL;
+  static _Thread_local const r3d_cpuvol *memo_vol = NULL;
+  if (key == memo_key && v == memo_vol) return memo_ptr; /* hot path */
   uint32_t victim = 0;
   uint64_t oldest = UINT64_MAX;
   for (uint32_t s = 0; s < v->nslots; s++) {
     if (v->keys[s] == key) {
       v->use[s] = ++v->tick;
-      return v->slabs + (size_t)s * CV_RAW;
+      memo_key = key;
+      memo_ptr = v->slabs + (size_t)s * CV_RAW;
+      memo_vol = v;
+      return memo_ptr;
     }
     if (v->use[s] < oldest) {
       oldest = v->use[s];
@@ -160,6 +167,9 @@ static const uint8_t *cv_brick(r3d_cpuvol *v, uint32_t li, uint32_t bx, uint32_t
                          * cheaply (file stat), no point caching zeros */
   v->keys[victim] = key;
   v->use[victim] = ++v->tick;
+  memo_key = key;
+  memo_ptr = dst;
+  memo_vol = v;
   return dst;
 }
 

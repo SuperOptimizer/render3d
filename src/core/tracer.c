@@ -98,7 +98,67 @@ static inline double *tr_p(r3d_tracer *t, uint32_t i, uint32_t j) {
   return t->pos + ((size_t)j * t->W + i) * 3;
 }
 
+/* predicted position of cell (i,j) from its parent one step along one grid
+ * axis: linear continuation when the grandparent exists, else a frame step */
+static bool tr_predict(r3d_tracer *t, int i, int j, int si, int sj, double out[3]) {
+  int pi = i + si, pj = j + sj;
+  if (pi < 0 || pj < 0 || pi >= (int)t->W || pj >= (int)t->H) return false;
+  size_t k1 = (size_t)pj * t->W + (size_t)pi;
+  if (t->state[k1] != R3D_TR_SET) return false;
+  const double *p1 = t->pos + k1 * 3;
+  int gi = i + 2 * si, gj = j + 2 * sj;
+  if (gi >= 0 && gj >= 0 && gi < (int)t->W && gj < (int)t->H) {
+    size_t k2 = (size_t)gj * t->W + (size_t)gi;
+    if (t->state[k2] == R3D_TR_SET) {
+      const double *p2 = t->pos + k2 * 3;
+      for (int a = 0; a < 3; a++) out[a] = 2.0 * p1[a] - p2[a];
+      return true;
+    }
+  }
+  double nrm[3], tn[3];
+  tr_frame(t, p1, nrm, tn);
+  for (int a = 0; a < 3; a++)
+    out[a] = p1[a] + (tn[a] * -si + (a == 2 ? (double)-sj : 0.0)) * t->cfg.step;
+  return true;
+}
+
+/* one confidence-weighted relaxation of cell (i,j): pull toward the
+ * positions its SET neighbors expect, then re-snap */
+static void tr_relax_cell(r3d_tracer *t, r3d_cpuvol *vol, int i, int j) {
+  size_t k = (size_t)j * t->W + (size_t)i;
+  if (t->state[k] != R3D_TR_SET) return;
+  double avg[3] = {0, 0, 0};
+  int na = 0;
+  static const int off[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+  for (int o = 0; o < 4; o++) {
+    int ii = i + off[o][0], jj = j + off[o][1];
+    if (ii < 0 || jj < 0 || ii >= (int)t->W || jj >= (int)t->H) continue;
+    size_t kk = (size_t)jj * t->W + (size_t)ii;
+    if (t->state[kk] != R3D_TR_SET) continue;
+    double nrm[3], tn[3];
+    const double *pn = t->pos + kk * 3;
+    tr_frame(t, pn, nrm, tn);
+    for (int a = 0; a < 3; a++)
+      avg[a] += pn[a] -
+                (tn[a] * off[o][0] + (a == 2 ? (double)off[o][1] : 0.0)) * t->cfg.step;
+    na++;
+  }
+  if (na < 2) return;
+  double P[3];
+  const double *pc = t->pos + k * 3;
+  double w = 0.25 + 0.55 * (1.0 - (double)t->conf[k]);
+  for (int a = 0; a < 3; a++) P[a] = (1.0 - w) * pc[a] + w * avg[a] / na;
+  double val = tr_snap(t, vol, P);
+  if (val >= TR_FLOOR) {
+    pthread_mutex_lock(&t->mu);
+    memcpy(t->pos + k * 3, P, sizeof P);
+    t->conf[k] = (float)val;
+    pthread_mutex_unlock(&t->mu);
+  }
+}
+
 static void *tr_worker(void *ud) {
+
   r3d_tracer *t = ud;
   r3d_cpuvol vol;
   if (r3d_cpuvol_open(&vol, t->root, 96) != 0) {
@@ -131,91 +191,67 @@ static void *tr_worker(void *ud) {
 
   for (uint32_t R = 1; R <= t->cfg.max_ring && !dead && !t->quit; R++) {
     uint32_t grew = 0;
-    /* ring cells at Chebyshev radius R, then one relaxation pass */
-    for (int pass = 0; pass < 2 && !t->quit; pass++) {
+    for (int dj = -(int)R; dj <= (int)R; dj++)
+      for (int di = -(int)R; di <= (int)R; di++) {
+        if (abs(di) != (int)R && abs(dj) != (int)R) continue;
+        int i = (int)c + di, j = (int)c + dj;
+        if (i < 0 || j < 0 || i >= (int)t->W || j >= (int)t->H) continue;
+        size_t k = (size_t)j * t->W + (size_t)i;
+        if (t->state[k] != R3D_TR_EMPTY) continue;
+        int si = di > 0 ? -1 : (di < 0 ? 1 : 0);
+        int sj = dj > 0 ? -1 : (dj < 0 ? 1 : 0);
+        /* average the predictions of BOTH inward-adjacent parents: single-
+         * parent chains never mix across the diagonals and leave starburst
+         * seams radiating from the seed */
+        double P[3] = {0, 0, 0}, pr[3];
+        int np = 0;
+        if (si && tr_predict(t, i, j, si, 0, pr)) {
+          for (int a = 0; a < 3; a++) P[a] += pr[a];
+          np++;
+        }
+        if (sj && tr_predict(t, i, j, 0, sj, pr)) {
+          for (int a = 0; a < 3; a++) P[a] += pr[a];
+          np++;
+        }
+        if (!np && si && sj && tr_predict(t, i, j, si, sj, pr)) {
+          for (int a = 0; a < 3; a++) P[a] += pr[a]; /* corner fallback */
+          np++;
+        }
+        if (!np) continue;
+        for (int a = 0; a < 3; a++) P[a] /= np;
+        double val = tr_snap(t, &vol, P);
+        pthread_mutex_lock(&t->mu);
+        if (val >= TR_FLOOR) {
+          memcpy(t->pos + k * 3, P, sizeof P);
+          t->state[k] = R3D_TR_SET;
+          t->conf[k] = (float)val;
+          t->nset++;
+          grew++;
+        } else {
+          t->state[k] = R3D_TR_FAIL;
+          t->conf[k] = (float)(val > 0.0 ? val : 0.0);
+        }
+        pthread_mutex_unlock(&t->mu);
+      }
+    /* relaxation: two passes over the band behind the frontier, plus a
+     * full-disc pass every 8 rings to bleed out accumulated drift */
+    uint32_t r0 = R > 3 ? R - 3 : 1;
+    for (int it2 = 0; it2 < 2 && !t->quit; it2++)
       for (int dj = -(int)R; dj <= (int)R; dj++)
         for (int di = -(int)R; di <= (int)R; di++) {
-          if (abs(di) != (int)R && abs(dj) != (int)R) continue;
+          uint32_t cr = (uint32_t)(abs(di) > abs(dj) ? abs(di) : abs(dj));
+          if (cr < r0 || cr > R) continue;
           int i = (int)c + di, j = (int)c + dj;
           if (i < 0 || j < 0 || i >= (int)t->W || j >= (int)t->H) continue;
-          size_t k = (size_t)j * t->W + (size_t)i;
-          if (pass == 0) { /* grow: extrapolate from inward neighbors */
-            if (t->state[k] != R3D_TR_EMPTY) continue;
-            int si = di > 0 ? -1 : (di < 0 ? 1 : 0);
-            int sj = dj > 0 ? -1 : (dj < 0 ? 1 : 0);
-            size_t k1 = (size_t)(j + sj) * t->W + (size_t)(i + si);
-            if (t->state[k1] != R3D_TR_SET) continue;
-            double P[3];
-            size_t k2 = (size_t)(j + 2 * sj) * t->W + (size_t)(i + 2 * si);
-            const double *p1 = t->pos + k1 * 3;
-            if (abs(di) <= (int)R - 2 || abs(dj) <= (int)R - 2 ||
-                (i + 2 * si >= 0 && j + 2 * sj >= 0 && i + 2 * si < (int)t->W &&
-                 j + 2 * sj < (int)t->H && t->state[k2] == R3D_TR_SET)) {
-              const double *p2 = t->pos + k2 * 3;
-              bool lin = i + 2 * si >= 0 && j + 2 * sj >= 0 && i + 2 * si < (int)t->W &&
-                         j + 2 * sj < (int)t->H && t->state[k2] == R3D_TR_SET;
-              if (lin) {
-                for (int a = 0; a < 3; a++) P[a] = 2.0 * p1[a] - p2[a];
-              } else {
-                double nrm[3], tn[3];
-                tr_frame(t, p1, nrm, tn);
-                for (int a = 0; a < 3; a++)
-                  P[a] = p1[a] + (tn[a] * -si + (a == 2 ? (double)-sj : 0.0)) * t->cfg.step;
-              }
-            } else {
-              double nrm[3], tn[3];
-              tr_frame(t, p1, nrm, tn);
-              for (int a = 0; a < 3; a++)
-                P[a] = p1[a] + (tn[a] * -si + (a == 2 ? (double)-sj : 0.0)) * t->cfg.step;
-            }
-            double val = tr_snap(t, &vol, P);
-            pthread_mutex_lock(&t->mu);
-            if (val >= TR_FLOOR) {
-              memcpy(t->pos + k * 3, P, sizeof P);
-              t->state[k] = R3D_TR_SET;
-              t->conf[k] = (float)val;
-              t->nset++;
-              grew++;
-            } else {
-              t->state[k] = R3D_TR_FAIL;
-              t->conf[k] = (float)(val > 0.0 ? val : 0.0);
-            }
-            pthread_mutex_unlock(&t->mu);
-          } else { /* relax: average toward neighbors, re-snap */
-            if (t->state[k] != R3D_TR_SET) continue;
-            double avg[3] = {0, 0, 0};
-            int na = 0;
-            static const int off[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
-            for (int o = 0; o < 4; o++) {
-              int ii = i + off[o][0], jj = j + off[o][1];
-              if (ii < 0 || jj < 0 || ii >= (int)t->W || jj >= (int)t->H) continue;
-              size_t kk = (size_t)jj * t->W + (size_t)ii;
-              if (t->state[kk] != R3D_TR_SET) continue;
-              /* expected position of THIS cell from that neighbor */
-              double nrm[3], tn[3];
-              const double *pn = t->pos + kk * 3;
-              tr_frame(t, pn, nrm, tn);
-              for (int a = 0; a < 3; a++)
-                avg[a] += pn[a] - (tn[a] * off[o][0] + (a == 2 ? (double)off[o][1] : 0.0)) *
-                                      t->cfg.step;
-              na++;
-            }
-            if (na < 2) continue;
-            double P[3];
-            const double *pc = t->pos + k * 3;
-            /* weak vertices lean on their neighbors, strong ones hold */
-            double w = 0.25 + 0.55 * (1.0 - (double)t->conf[k]);
-            for (int a = 0; a < 3; a++) P[a] = (1.0 - w) * pc[a] + w * avg[a] / na;
-            double val = tr_snap(t, &vol, P);
-            if (val >= TR_FLOOR) {
-              pthread_mutex_lock(&t->mu);
-              memcpy(t->pos + k * 3, P, sizeof P);
-              t->conf[k] = (float)val;
-              pthread_mutex_unlock(&t->mu);
-            }
-          }
+          tr_relax_cell(t, &vol, i, j);
         }
-    }
+    if ((R % 8u == 0u || R == t->cfg.max_ring) && !t->quit)
+      for (int dj = -(int)R; dj <= (int)R; dj++)
+        for (int di = -(int)R; di <= (int)R; di++) {
+          int i = (int)c + di, j = (int)c + dj;
+          if (i < 0 || j < 0 || i >= (int)t->W || j >= (int)t->H) continue;
+          tr_relax_cell(t, &vol, i, j);
+        }
     pthread_mutex_lock(&t->mu);
     t->ring = R;
     t->gen++;
