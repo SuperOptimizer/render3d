@@ -2724,7 +2724,7 @@ int main(int argc, char **argv) {
           }
         }
         igSameLine(0, 8);
-        if (mv_tr_nset > 8 && igButton("save + add to store", (ImVec2){0, 0})) {
+        if (mv_tr_nset > 8 && igButton("save + activate", (ImVec2){0, 0})) {
           r3d_tracer_stop(&mv_tr);
           char td[256];
           snprintf(td, sizeof td, "cache/traced/trace-%d-%u", ++mv_tr_nsaved,
@@ -2757,6 +2757,24 @@ int main(int argc, char **argv) {
                   memcpy(sgc_near_focus,
                          (double[3]){1e30, 1e30, 1e30}, sizeof sgc_near_focus);
                   printf("tracer: %s added to the store (%u surfaces)\n", td, sgc.st.n);
+                  const char *tb = strrchr(td, '/');
+                  tb = tb ? tb + 1 : td;
+                  pthread_mutex_lock(&sgc.mu); /* make it the ACTIVE surface:
+                     * the grown segment replaces the flattened view */
+                  for (uint32_t si = 0; si < sgc.st.n; si++)
+                    if (strcmp(sgc.st.segs[si].name, tb) == 0) {
+                      sgc.act_req = si;
+                      pthread_cond_signal(&sgc.cv);
+                      break;
+                    }
+                  pthread_mutex_unlock(&sgc.mu);
+                  /* the orange preview served its purpose */
+                  r3d_tracer_free(&mv_tr);
+                  free(mv_tr_pos);
+                  free(mv_tr_st);
+                  mv_tr_pos = NULL;
+                  mv_tr_st = NULL;
+                  mv_tr_active = false;
                 }
               }
             }
