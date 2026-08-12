@@ -1383,6 +1383,8 @@ int main(int argc, char **argv) {
    * Ctrl+click focus recenters it */
   double mv_crop_c[3] = {0, 0, 0}; /* cube center, world voxels */
   float mv_crop_e = 0.0f;          /* cube edge, voxels; 0 = init to full */
+  float mv_crop_fit = 2.1f;        /* camera distance in cube edges
+                                    * (Shift+wheel zooms the cube itself) */
   bool mv_vol_cam_init = false;
 #define MV_KIND(i) ((i) == 2 ? mv_pane_kind[0] : (i) == 3 ? mv_pane_kind[1] : -1)
 #define MV_IS3D(i) (MV_KIND(i) == 2)
@@ -1905,7 +1907,11 @@ int main(int argc, char **argv) {
         dv->cv -= (double)in.look[1] / dv->zoom;
       }
       if (hover >= 0 && MV_IS3D(hover) && in.wheel != 0.0f && !io->WantCaptureMouse) {
-        if (mv_crop_e > 0.0f) { /* zoom = crop tighter, not move the camera */
+        if (in.wheel_shift) { /* Shift+wheel: zoom the cube on screen */
+          mv_crop_fit *= powf(0.92f, in.wheel);
+          if (mv_crop_fit < 0.6f) mv_crop_fit = 0.6f;
+          if (mv_crop_fit > 8.0f) mv_crop_fit = 8.0f;
+        } else if (mv_crop_e > 0.0f) { /* wheel: crop tighter/looser */
           mv_crop_e *= powf(0.9f, in.wheel);
           uint32_t me = brick_shape[0];
           for (int a = 1; a < 3; a++)
@@ -1914,6 +1920,21 @@ int main(int argc, char **argv) {
           if (me && mv_crop_e > (float)me) mv_crop_e = (float)me;
         }
         in.wheel = 0.0f;
+      }
+      if (hover >= 0 && MV_IS3D(hover) && mv_crop_e > 0.0f &&
+          (in.adelta[0] || in.adelta[1] || in.zpage) && !io->WantCaptureKeyboard) {
+        /* arrows pan the crop through the volume (x/y), PgUp/PgDn along z;
+         * step = 5% of the cube edge, so travel scales with zoom */
+        double stp = (double)mv_crop_e * 0.05;
+        mv_crop_c[0] += in.adelta[0] * stp;
+        mv_crop_c[1] += in.adelta[1] * stp;
+        mv_crop_c[2] += in.zpage * stp;
+        in.zpage = 0; /* consumed: not a slice page */
+        for (int a = 0; a < 3; a++) {
+          if (mv_crop_c[a] < 0.0) mv_crop_c[a] = 0.0;
+          if (brick_shape[a] && mv_crop_c[a] > (double)brick_shape[a])
+            mv_crop_c[a] = (double)brick_shape[a];
+        }
       }
       if (hover >= 0 && in.wheel != 0.0f && !io->WantCaptureMouse) {
         r3d_mview *hv = &mv[hover];
@@ -2749,7 +2770,8 @@ int main(int argc, char **argv) {
     else if (multiview_path)
       igTextDisabled("right-drag: pan view | wheel: zoom | Shift+wheel: slice\n"
                      "R/F: slice | Ctrl+click: set focus | F12: shot\n"
-                     "Space: solo hovered view | checkboxes hide views%s",
+                     "Space: solo hovered view | checkboxes hide views\n"
+                     "3D pane: wheel crop | Shift+wheel zoom | arrows/PgUpDn move%s",
                      umbilicus_path ? "\nU: place umbilicus point at cursor" : "");
     else if (cam_mode == CAM_ORBIT)
       igTextDisabled("drag orbit | shift+drag pan cam | ctrl+drag move vol\n"
@@ -3277,7 +3299,7 @@ int main(int argc, char **argv) {
           r3d_camera_orbit_set(&cam,
                                v3((float)(mv_crop_c[0] / mdim), (float)(mv_crop_c[1] / mdim),
                                   (float)(mv_crop_c[2] / mdim)),
-                               (float)(eb * 2.1));
+                               (float)(eb * (double)mv_crop_fit));
           r3d_v3 vr, vu, vf;
           r3d_camera_basis(&cam, (float)mv[i].pw / (float)(mv[i].ph ? mv[i].ph : 1), &vr,
                            &vu, &vf);

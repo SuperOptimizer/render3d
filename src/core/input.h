@@ -22,6 +22,7 @@ typedef struct r3d_input {
   float lod_delta;   /* '-'/'=' adjust lod bias by ∓0.25 */
   int zdelta;        /* slab window scroll in slices: R/F = ±1 (repeats) */
   int zpage;         /* slab window scroll in pages: PgUp/PgDn = ±1 */
+  int adelta[2];     /* arrow keys: x (left/right), y (up/down); repeats */
   float wheel;       /* scroll this frame (+away from user) */
   bool wheel_shift;  /* Shift held during any wheel event this frame */
   bool view_toggle;  /* Space pressed (multiview: solo/restore hovered view) */
