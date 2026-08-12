@@ -1484,3 +1484,27 @@ clip takes per-axis extents (slab_px/py/nx carry them — free floats in
 bricks views). R3D_3D_CROP accepts "e" or "x,y,z" for headless work;
 verified with a 3000x3000x400 slab render and the 1024^3 cube regression.
 All 5 suites green.
+
+## 2026-08-12 — surface tracer: grow a new segment from a seed, live
+
+The vc3d grow-from-seed idea, reimplemented for render3d: a quad grid
+expands ring by ring from a seed point over a surface-prediction volume.
+New src/core/cpuvol (CPU sampler over any c5d LOD tree: manifest + shards
++ net-ingested .c5b, brick-decode LRU — worker-thread consumers only) and
+src/core/tracer (pthread grower: vertices extrapolate from inward
+neighbors, snap to the prediction ridge along the sheet normal — radial
+from the umbilicus, the spiral prior — then one relaxation pass per ring
+pulls the grid toward step-consistent spacing; auto-falls to coarser
+levels when fine predictions aren't local yet). The viewer's "tracer"
+panel section: seed at focus, step/threshold/ring sliders, live orange
+point cloud in all panes incl. the 3D crop box, and "save + add to
+store" — writes a tifxyz (scale = 1/step) and segpacks it into the open
+corpus, which reopens in place so the new segment immediately draws as
+an overlay and can be activated like any other.
+
+Measured (GP center seed, L1 predictions, step 20, thresh 0.35, 60
+rings): 4784-point patch in ~6 s of background growth; saved 121x121
+tifxyz; segpack accepted it (83rd store surface, bbox consistent with
+GP). Verification is numeric (241 snapshot points in the XY slab) — the
+overlay itself is ImGui and invisible to --shot, a trap now noted twice
+in this ledger. All 5 suites green.

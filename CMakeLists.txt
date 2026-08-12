@@ -57,6 +57,8 @@ add_library(r3d_core STATIC
   src/core/tifxyz.c
   src/core/segtrace.c
   src/core/segstore.c
+  src/core/cpuvol.c
+  src/core/tracer.c
   src/core/odbrowse.c
   src/core/screenshot.c)
 target_include_directories(r3d_core PUBLIC src)
