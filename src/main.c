@@ -2680,6 +2680,43 @@ int main(int argc, char **argv) {
         }
         igTextDisabled("segment %ux%u  %llu valid points", mv_seg.w, mv_seg.h,
                        (unsigned long long)mv_seg.nvalid);
+        igSameLine(0, 10);
+        if (mv_seg.nvalid && igButton("close##seg", (ImVec2){0, 0})) {
+          /* swap in an empty segment: the flattened pane goes blank and no
+           * active-segment overlays draw — a clean slate for the tracer */
+          r3d_tifxyz es = {.w = 2, .h = 2, .sx = 0.05f, .sy = 0.05f};
+          es.xyz = malloc(2 * 2 * 3 * sizeof *es.xyz);
+          float *eco = NULL, *eno = NULL;
+          r3d_segrows er = {0};
+          if (es.xyz) {
+            for (int k = 0; k < 12; k++) es.xyz[k] = -1.0f;
+            memcpy(es.bbox[0], (float[3]){0, 0, 0}, sizeof es.bbox[0]);
+            memcpy(es.bbox[1], (float[3]){0, 0, 0}, sizeof es.bbox[1]);
+          }
+          if (es.xyz && r3d_segrows_build(&es, &er) == 0 &&
+              mv_build_grids(&es, &eco, &eno) == 0 &&
+              r3d_surf_swap(renderer, es.w, es.h, eco, eno, es.sx, es.sy) == 0) {
+            r3d_tifxyz_free(&mv_seg);
+            r3d_segrows_free(&mv_rows);
+            free(mv_normals);
+            mv_seg = es;
+            mv_rows = er;
+            mv_normals = eno;
+            sgc_active[0] = 0;
+            for (int oi2 = 0; oi2 < 4; oi2++) {
+              mv_ol[oi2].n = 0;
+              mv_ol_off[oi2].n = 0;
+              mv_ol_slice[oi2] = 1e30;
+            }
+            mv_ol_zoff = 1e30;
+            printf("segment closed (empty active surface)\n");
+          } else {
+            r3d_tifxyz_free(&es);
+            r3d_segrows_free(&er);
+            free(eno);
+          }
+          free(eco);
+        }
     if (multiview_path && n_overlays &&
         igCollapsingHeader_TreeNodeFlags("tracer", 0)) {
       const char *pr = overlay_paths[overlay_sel];
