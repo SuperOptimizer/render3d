@@ -18,7 +18,11 @@ enum { R3D_TR_EMPTY = 0, R3D_TR_SET = 1, R3D_TR_FAIL = 2 };
 
 typedef struct r3d_tracer_cfg {
   double seed[3];   /* world voxels */
-  double step;      /* grid pitch, voxels (tifxyz scale = 1/step) */
+  double step;      /* grid pitch, voxels (tifxyz scale = 1/step; vc3d
+                     * convention is 20 = a 20x downscale) — saved
+                     * resolution ONLY, not the tracing stride */
+  double march;     /* tracing sub-step, voxels: how far a point moves
+                     * between ridge re-snaps while sliding along a sheet */
   float thresh;     /* confidence cutoff for SAVING/display, 0..1; growth
                      * itself only stops at a low fixed floor */
   uint32_t max_ring; /* grid radius, cells */

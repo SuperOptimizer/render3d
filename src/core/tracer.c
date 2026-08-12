@@ -130,12 +130,14 @@ static double tr_advance(r3d_tracer *t, r3d_cpuvol *v, const double from[3],
                          const double target[3], double out[3]) {
   double d[3] = {target[0] - from[0], target[1] - from[1], target[2] - from[2]};
   double L = sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
-  int n = (int)(L / 3.0) + 1;
+  double ms = t->cfg.march > 0.5 ? t->cfg.march : 3.0;
+  int n = (int)(L / ms) + 1;
   memcpy(out, from, 3 * sizeof(double));
   double val = 0.0;
   for (int s2 = 0; s2 < n; s2++) {
     for (int a = 0; a < 3; a++) out[a] += d[a] / n;
-    val = tr_snap(t, v, out, 4.0);
+    double sr = ms + 1.0 < 3.0 ? 3.0 : ms + 1.0;
+    val = tr_snap(t, v, out, sr);
     if (val < TR_FLOOR && s2 + 1 < n) { /* mid-gap: keep marching straight,
                                          * the far side may pick it back up */
       continue;
@@ -304,6 +306,8 @@ int r3d_tracer_start(r3d_tracer *t, const char *pred_root, const r3d_tracer_cfg 
   memset(t, 0, sizeof *t);
   t->cfg = *cfg;
   if (t->cfg.max_ring < 4) t->cfg.max_ring = 4;
+  if (t->cfg.march < 1.0) t->cfg.march = 3.0;
+  if (t->cfg.march > t->cfg.step) t->cfg.march = t->cfg.step;
   if (t->cfg.max_ring > 400) t->cfg.max_ring = 400;
   snprintf(t->root, sizeof t->root, "%s", pred_root);
   t->W = t->H = 2 * t->cfg.max_ring + 1;

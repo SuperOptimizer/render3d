@@ -1491,7 +1491,7 @@ int main(int argc, char **argv) {
   float *mv_tr_cf = NULL;
   uint64_t mv_tr_gen = 0;
   uint32_t mv_tr_ring = 0, mv_tr_nset = 0;
-  float mv_tr_step = 20.0f, mv_tr_thresh = 0.35f;
+  float mv_tr_step = 20.0f, mv_tr_thresh = 0.35f, mv_tr_march = 3.0f;
   int mv_tr_rings = 60, mv_tr_nsaved = 0;
   bool mv_tr_live = true;      /* render the growing grid in the seg pane */
   uint64_t mv_tr_live_ns = 0;  /* last live swap (throttle) */
@@ -2810,6 +2810,7 @@ int main(int argc, char **argv) {
       const char *prb = strrchr(pr, '/');
       igTextDisabled("predictions: %s", prb ? prb + 1 : pr);
       igSliderFloat("grid step (vox)", &mv_tr_step, 5.0f, 40.0f, "%.0f", 0);
+      igSliderFloat("snap distance (vox)", &mv_tr_march, 1.0f, 10.0f, "%.1f", 0);
       igSliderFloat("confidence cutoff", &mv_tr_thresh, 0.05f, 0.9f, "%.2f", 0);
       igTextDisabled("growth is continuous; the cutoff masks display + save");
       igSliderInt("max rings", &mv_tr_rings, 8, 200, "%d", 0);
@@ -2818,6 +2819,7 @@ int main(int argc, char **argv) {
         if (igButton("seed at focus", (ImVec2){0, 0})) {
           r3d_tracer_cfg tc = {.seed = {mv_focus[0], mv_focus[1], mv_focus[2]},
                                .step = (double)mv_tr_step,
+                               .march = (double)mv_tr_march,
                                .thresh = mv_tr_thresh,
                                .max_ring = (uint32_t)mv_tr_rings,
                                .level = 1,
@@ -3129,6 +3131,7 @@ int main(int argc, char **argv) {
         frame_index == 120) { /* headless: seed a trace at the focus */
       r3d_tracer_cfg tc = {.seed = {mv_focus[0], mv_focus[1], mv_focus[2]},
                            .step = (double)mv_tr_step,
+                           .march = (double)mv_tr_march,
                            .thresh = mv_tr_thresh,
                            .max_ring = (uint32_t)mv_tr_rings,
                            .level = 1,
