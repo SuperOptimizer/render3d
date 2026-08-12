@@ -677,7 +677,14 @@ void main(uint3 tid: SV_DispatchThreadID) {
        * fires; a ~4 LSB skip floor loses at most ~1% accumulated alpha per
        * skipped block (invisible) and restores cube-grade skipping */
       float bgate = max(occ_gate, 4.5 / 255.0);
-      if (v < bgate) {
+      if (pc.mode == MODE_MIP && !overlay_on() && bricks_is_lod() && b_ok &&
+          b_max <= mip_max) {
+        /* MIP early-out: this brick's max cannot raise the running max, so
+         * the whole brick skips — exact for the CT MIP (overlay-on keeps
+         * marching: ink can live where CT is dim) */
+        void_blk = true;
+        bsz = b_world_brick;
+      } else if (v < bgate) {
         if (bricks_is_lod()) {
           if (b_max < bgate) {
             void_blk = true;

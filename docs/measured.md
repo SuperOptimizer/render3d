@@ -1461,3 +1461,15 @@ full-volume crop shows the whole scroll. Env for headless: R3D_MV_3D,
 R3D_3D_CROP/MODE/BIAS/PITCH. Verified 2x2 screenshot: all four panes
 correct with the cube in-pane; a one-off mid-WM-resize capture artifact
 was chased and is not reproducible in steady state. All 5 suites green.
+
+## 2026-08-12 — MIP early-out for bricks LOD (3D pane)
+
+MIP mode had no early ray termination (composite stops at alpha cutoff;
+MIP marched every ray to the far face). Bricks store their max in the
+page-table byte, so a ray whose running max already meets a brick's max
+skips the entire brick — exact for the CT MIP. Overlay-on views keep
+marching (ink can live where CT is dim; the page byte is CT-only).
+Measured on the 4-pane layout with the 3D pane in MIP at a 1024 crop:
+raycast 5.38 -> 4.56 ms total, i.e. roughly 2x on the MIP pane itself;
+the win grows with pane size and crop density since interior rays skip
+brick-by-brick after the bright outer wrap. All 5 suites green.
