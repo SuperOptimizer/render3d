@@ -1578,3 +1578,21 @@ discontinuity; holes remain retryable via grow. Coverage held (~8.5k
 points on the test seed). Next tier if needed: global optimization over
 the whole grid (vc3d uses Ceres) and multi-hypothesis growth at
 ambiguous ridges. All 5 suites green.
+
+## 2026-08-12 — tracer: the flat-rows bug (grid-local normals)
+
+The user's persistent "discontinuities" survived every geometric QC
+because the GRID was perfect — and that was the tell. Numeric analysis
+of a saved trace: u-spacing median 20.7/p99 25.6 (clean) but u|dz|
+EXACTLY 0.0 — the cylindrical frame (radial normal, horizontal tangent)
+locked every grid row to constant z, so wherever the real sheet tilts,
+the row slid sideways onto the neighboring wrap's ridge at that z:
+smooth grid, wrong surface, torn texture in the flattened render. Fix:
+snap along the GRID-LOCAL normal (cross of the traced grid's own u/v
+tangents, oriented by the radial; radial only seeds/fallbacks), so z
+participates everywhere (grow, march, relax). After: u|dz| median 1.3 /
+p90 4.9 (rows follow the tilt), spacing still clean, coverage 8.8k.
+Confidence recalibrated (contrast factor 0.65+0.35c) since the first
+scaling pushed the distribution under the default cutoff. Lesson for
+the ledger: when QC says the grid is perfect and the render disagrees,
+the model constraint itself is the bug.
