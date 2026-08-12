@@ -1372,6 +1372,14 @@ int main(int argc, char **argv) {
   int mv_sv_cool = 0;
   uint32_t mv_visible = 0xfu; /* per-view visibility; collapsed views cost nothing */
   uint32_t mv_ov_mask = 0xfu; /* which panes display the overlay tint */
+  /* bottom panes pick from {XZ, YZ, 3D}: at most two of the three are live
+   * (XZ/YZ carry similar info on a cylinder; XY is the real z-stack) */
+  int mv_pane_kind[2] = {0, 1}; /* pane 2, pane 3: 0=XZ 1=YZ 2=3D volumetric */
+  if (getenv("R3D_MV_3D")) mv_pane_kind[1] = 2; /* headless-shot default, like
+                                                  * R3D_MV_STRETCH */
+  bool mv_vol_cam_init = false;
+#define MV_KIND(i) ((i) == 2 ? mv_pane_kind[0] : (i) == 3 ? mv_pane_kind[1] : -1)
+#define MV_IS3D(i) (MV_KIND(i) == 2)
   int mv_solo = -1;           /* Space on a hovered view maximizes it */
   bool mv_panel_open = true;  /* docked left panel; collapses to a slim bar */
   mv_lines mv_ol[4] = {0}, mv_ol_off[4] = {0}; /* intersection polylines */
@@ -1882,10 +1890,17 @@ int main(int argc, char **argv) {
       int hover = r3d_mv_hit(mv, in.mouse_xy[0], in.mouse_xy[1]);
       if (in.dragging && mv_drag_view < 0) mv_drag_view = hover;
       if (!in.dragging) mv_drag_view = -1;
-      if (mv_drag_view >= 0 && (in.look[0] != 0.0f || in.look[1] != 0.0f)) {
+      if (mv_drag_view >= 0 && MV_IS3D(mv_drag_view) &&
+          (in.look[0] != 0.0f || in.look[1] != 0.0f)) {
+        r3d_camera_orbit_drag(&cam, in.look[0] * 0.005f, in.look[1] * 0.005f);
+      } else if (mv_drag_view >= 0 && (in.look[0] != 0.0f || in.look[1] != 0.0f)) {
         r3d_mview *dv = &mv[mv_drag_view];
         dv->cu -= (double)in.look[0] / dv->zoom;
         dv->cv -= (double)in.look[1] / dv->zoom;
+      }
+      if (hover >= 0 && MV_IS3D(hover) && in.wheel != 0.0f && !io->WantCaptureMouse) {
+        r3d_camera_orbit_zoom(&cam, powf(0.9f, in.wheel));
+        in.wheel = 0.0f;
       }
       if (hover >= 0 && in.wheel != 0.0f && !io->WantCaptureMouse) {
         r3d_mview *hv = &mv[hover];
@@ -1906,6 +1921,7 @@ int main(int argc, char **argv) {
       if (mv[R3D_MV_SEG].slice < -512.0) mv[R3D_MV_SEG].slice = -512.0;
       if (mv[R3D_MV_SEG].slice > 512.0) mv[R3D_MV_SEG].slice = 512.0;
       for (int i = 1; i < 4; i++) { /* plane slices clamp to the volume */
+        if (MV_IS3D(i)) continue;
         if (mv_aligned && i >= R3D_MV_XZ) {
           /* frame offset from the focus, not a world coordinate: keep it
            * within the volume diagonal so the pane can always scrub back */
@@ -1924,7 +1940,7 @@ int main(int argc, char **argv) {
          * another. Keyed by the position's (rounded) z; mouse buttons keep
          * their normal pan/zoom roles. */
         int cu_ = r3d_mv_hit(mv, in.mouse_xy[0], in.mouse_xy[1]);
-        if (cu_ > 0) {
+        if (cu_ > 0 && !MV_IS3D(cu_)) {
           double uu, vv, W[3];
           r3d_mv_unproject(&mv[cu_], in.mouse_xy[0], in.mouse_xy[1], &uu, &vv);
           r3d_mv_b2w(mv_pb[cu_], mv_po[cu_], uu, vv, mv[cu_].slice, W);
@@ -1986,6 +2002,7 @@ int main(int argc, char **argv) {
       }
       if (in.annotate_click && in.click_ctrl) { /* Ctrl+click = set focus POI */
         int cv_ = r3d_mv_hit(mv, in.click_xy[0], in.click_xy[1]);
+        if (MV_IS3D(cv_)) cv_ = -1; /* the 3D pane has no plane to focus on */
         bool focused = false, have_ij = false;
         if (cv_ == R3D_MV_SEG) {
           /* focus at the surface point under the cursor (CPU bilinear tap) */
@@ -2440,6 +2457,31 @@ int main(int argc, char **argv) {
           if (igSliderInt("slice thickness", &th, 1, 128, "%d", 0)) mv_thick = th;
           igSliderFloat("scrub speed", &mv_scrub, 0.25f, 200.0f, "%.2f vox/notch",
                         ImGuiSliderFlags_Logarithmic);
+          static const char *pane_lbl[2] = {"bottom-left##pk", "bottom-right##pk"};
+          for (int pk = 0; pk < 2; pk++) {
+            int kv = mv_pane_kind[pk];
+            igSetNextItemWidth(140);
+            if (igCombo_Str(pane_lbl[pk], &kv, "XZ\0YZ\03D volume\0\0", 3) &&
+                kv != mv_pane_kind[pk]) {
+              if (mv_pane_kind[1 - pk] == kv) /* keep the three kinds on two
+                                               * panes distinct: swap */
+                mv_pane_kind[1 - pk] = mv_pane_kind[pk];
+              mv_pane_kind[pk] = kv;
+              for (int pp = 0; pp < 2; pp++) { /* rebuild plane frames */
+                int vi = 2 + pp;
+                if (mv_pane_kind[pp] == 2) continue;
+                r3d_mv_axis_basis(2 + mv_pane_kind[pp], mv_pb[vi]);
+                for (int a = 0; a < 3; a++) mv_po[vi][a] = 0.0;
+                double fu, fv, fs;
+                r3d_mv_w2b(mv_pb[vi], mv_po[vi], mv_focus, &fu, &fv, &fs);
+                mv[vi].cu = fu;
+                mv[vi].cv = fv;
+                mv[vi].slice = fs;
+              }
+              if (mv_aligned) mv_aligned = false; /* aligned pair owns 2+3 */
+              mv_basis_gen++;
+            }
+          }
           bool alg = mv_aligned;
           if (igCheckbox("segment-aligned planes", &alg)) {
             mv_aligned = alg;
@@ -2736,6 +2778,7 @@ int main(int argc, char **argv) {
       for (int i = 1; i < 4; i++) {
         /* recompute when the pane is visible OR the segment view is (its
          * plane trace lines draw there even with the pane collapsed/solo) */
+        if (MV_IS3D(i)) continue;
         if (!(mv_mask & (1u << i)) && !(mv_mask & 1u)) continue;
         bool stale = mv_ol_slice[i] != mv[i].slice || mv_ol_gen[i] != mv_basis_gen;
         if (stale) {
@@ -2774,7 +2817,7 @@ int main(int argc, char **argv) {
         pthread_mutex_lock(&sgc.mu);
         int traces = 0;
         for (int i = 1; i < 4; i++) {
-          if (!(mv_mask & (1u << i))) continue;
+          if (!(mv_mask & (1u << i)) || MV_IS3D(i)) continue;
           const double *bn = mv_pb[i][2];
           double sl = mv[i].slice + bn[0] * mv_po[i][0] + bn[1] * mv_po[i][1] +
                       bn[2] * mv_po[i][2];
@@ -2846,7 +2889,7 @@ int main(int argc, char **argv) {
         pthread_mutex_unlock(&sgc.mu);
       }
       for (int i = 1; i < 4; i++) { /* segment curve on each plane view */
-        if (!(mv_mask & (1u << i))) continue;
+        if (!(mv_mask & (1u << i)) || MV_IS3D(i)) continue;
         ImVec2 cmin = {(float)mv[i].px, (float)mv[i].py};
         ImVec2 cmax = {(float)(mv[i].px + mv[i].pw), (float)(mv[i].py + mv[i].ph)};
         ImDrawList_PushClipRect(draw, cmin, cmax, false);
@@ -2876,7 +2919,7 @@ int main(int argc, char **argv) {
                              1.0f);
       }
       for (int i = 1; i < 4; i++) {
-        if (!(mv_mask & (1u << i))) continue;
+        if (!(mv_mask & (1u << i)) || MV_IS3D(i)) continue;
         double fu, fv, fs;
         r3d_mv_w2b(mv_pb[i], mv_po[i], mv_focus, &fu, &fv, &fs);
         float fx_, fy_;
@@ -2890,7 +2933,7 @@ int main(int argc, char **argv) {
          * (magenta) + a crosshair at the XY pane's current-z interpolation */
         const ImU32 uc = 0xffff00ffu, ub = 0xff000000u;
         for (int i = 1; i < 4; i++) {
-          if (!(mv_mask & (1u << i))) continue;
+          if (!(mv_mask & (1u << i)) || MV_IS3D(i)) continue;
           ImVec2 cmin = {(float)mv[i].px, (float)mv[i].py};
           ImVec2 cmax = {(float)(mv[i].px + mv[i].pw), (float)(mv[i].py + mv[i].ph)};
           ImDrawList_PushClipRect(draw, cmin, cmax, false);
@@ -3098,6 +3141,25 @@ int main(int argc, char **argv) {
           }
           for (int i = 1; i < 4; i++) {
             if (!(mv_mask & (1u << i))) continue; /* collapsed: no streaming */
+            if (MV_IS3D(i)) { /* volumetric pane: stream a crop box around
+               * the orbit target — bounded even at close zoom, LOD from the
+               * pixel footprint at the target distance */
+              double half = (double)cam.dist * mdim * 0.7;
+              if (half < 256.0) half = 256.0;
+              if (half > 4096.0) half = 4096.0;
+              float lo3[3], hi3[3];
+              double tc[3] = {(double)cam.target.x, (double)cam.target.y,
+                              (double)cam.target.z};
+              for (int a = 0; a < 3; a++) {
+                lo3[a] = (float)(tc[a] - half / mdim);
+                hi3[a] = (float)(tc[a] + half / mdim);
+              }
+              float vpp3 = (float)(2.0 * tan((double)cam.fov_y * 0.5) * (double)cam.dist * mdim /
+                                   (double)(mv[i].ph ? mv[i].ph : 1)) *
+                           exp2f(lod_bias);
+              r3d_bricks_stream_box(renderer, lo3, hi3, vpp3, p.skip_gate);
+              continue;
+            }
             double hw = (double)mv[i].pw * 0.5 / mv[i].zoom;
             double hh = (double)mv[i].ph * 0.5 / mv[i].zoom;
             double th = (double)mv_thick;
@@ -3179,6 +3241,29 @@ int main(int argc, char **argv) {
           r3d_surfvol_params(renderer, &q);
           q.slab_z0 = (float)mv[i].slice; /* render-time normal offset (voxels) */
           q.slab_depth = (uint32_t)mv_thick; /* marched thickness (voxels) */
+          vp4[nvp++] = q;
+          continue;
+        }
+        if (MV_IS3D(i)) { /* whole-scroll volumetric orbit view */
+          if (!mv_vol_cam_init) {
+            float be3[3];
+            r3d_bricks_extent(renderer, be3);
+            r3d_camera_orbit_set(&cam, v3(be3[0] * 0.5f, be3[1] * 0.5f, be3[2] * 0.5f),
+                                 1.8f);
+            mv_vol_cam_init = true;
+          }
+          r3d_v3 vr, vu, vf;
+          r3d_camera_basis(&cam, (float)mv[i].pw / (float)(mv[i].ph ? mv[i].ph : 1), &vr,
+                           &vu, &vf);
+          q.cam_origin[0] = cam.pos.x;
+          q.cam_origin[1] = cam.pos.y;
+          q.cam_origin[2] = cam.pos.z;
+          memcpy(q.cam_right, &vr, 12);
+          memcpy(q.cam_up, &vu, 12);
+          memcpy(q.cam_forward, &vf, 12);
+          q.view_flags = 0;   /* perspective, LOD by ray cone */
+          q.slab_z0 = 0.0f;
+          q.slab_depth = 0u;  /* no slab clip: the full volume */
           vp4[nvp++] = q;
           continue;
         }
