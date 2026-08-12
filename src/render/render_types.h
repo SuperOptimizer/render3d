@@ -91,6 +91,8 @@ static_assert(sizeof(r3d_frame_params) == 248, "must mirror shader FrameParams")
 #define R3D_VIEW_SURF 2u /* flattened tifxyz segment view (needs r3d_surf_begin) */
 #define R3D_VIEW_OBLIQUE 4u /* slab clip along the ray, not a world axis */
 #define R3D_VIEW_STRETCH 8u /* surf view: flattening-distortion heatmap */
+#define R3D_VIEW_CROP 16u   /* bricks: clip to the cube at slab_x0/y0/z0,
+                             * edge slab_depth voxels (3D pane zoom-crop) */
 #define R3D_VIEW_AXIS(a) ((uint32_t)(a) << 8) /* 0=z 1=x 2=y */
 #define R3D_MAX_VIEWS 4u
 

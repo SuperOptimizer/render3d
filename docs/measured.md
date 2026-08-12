@@ -1443,3 +1443,21 @@ fix "still black" shots were my own crops using 1853x1131 coordinates on
 shot size before cropping). Diagnostics kept: R3D_MV_3D / R3D_3D_MODE /
 R3D_3D_BIAS / R3D_3D_PITCH / R3D_3D_DIST env overrides for headless work.
 All 5 suites green (gpu conformance covers the shader change).
+
+## 2026-08-12 — 3D pane: zoom-crop cube model
+
+The volumetric pane now works the way scroll inspection wants: a crop
+CUBE centered on the focus. Wheel shrinks/grows the cube edge (128 vox ..
+whole volume) instead of moving the camera — resolution rises as the cube
+shrinks because LOD follows the per-pixel footprint; right-drag orbits;
+the camera keeps a fixed framing distance (2.1x the cube edge); Ctrl+click
+focus recenters the cube. New R3D_VIEW_CROP clips marching to the cube
+(full 3D box clip via box_lo/hi), and streaming requests exactly the cube
+at edge/pane-pixels resolution — bounded at every zoom (the "max 1024^3"
+behavior emerges from pane pixel count). Fixed en route: stream_box takes
+BOX units per pixel, not voxels (the crop was streaming coarsest). At a
+1024-vox crop the pane shows L0 fiber detail (648 L0 bricks wanted);
+full-volume crop shows the whole scroll. Env for headless: R3D_MV_3D,
+R3D_3D_CROP/MODE/BIAS/PITCH. Verified 2x2 screenshot: all four panes
+correct with the cube in-pane; a one-off mid-WM-resize capture artifact
+was chased and is not reproducible in steady state. All 5 suites green.

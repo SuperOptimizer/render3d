@@ -1377,6 +1377,12 @@ int main(int argc, char **argv) {
   int mv_pane_kind[2] = {0, 1}; /* pane 2, pane 3: 0=XZ 1=YZ 2=3D volumetric */
   if (getenv("R3D_MV_3D")) mv_pane_kind[1] = 2; /* headless-shot default, like
                                                   * R3D_MV_STRETCH */
+  /* 3D pane = a zoom-crop cube: wheel shrinks/grows the cube edge (higher
+   * res as it shrinks — LOD follows the per-pixel footprint), right-drag
+   * orbits around it, the camera keeps a fixed framing distance, and
+   * Ctrl+click focus recenters it */
+  double mv_crop_c[3] = {0, 0, 0}; /* cube center, world voxels */
+  float mv_crop_e = 0.0f;          /* cube edge, voxels; 0 = init to full */
   bool mv_vol_cam_init = false;
 #define MV_KIND(i) ((i) == 2 ? mv_pane_kind[0] : (i) == 3 ? mv_pane_kind[1] : -1)
 #define MV_IS3D(i) (MV_KIND(i) == 2)
@@ -1899,7 +1905,14 @@ int main(int argc, char **argv) {
         dv->cv -= (double)in.look[1] / dv->zoom;
       }
       if (hover >= 0 && MV_IS3D(hover) && in.wheel != 0.0f && !io->WantCaptureMouse) {
-        r3d_camera_orbit_zoom(&cam, powf(0.9f, in.wheel));
+        if (mv_crop_e > 0.0f) { /* zoom = crop tighter, not move the camera */
+          mv_crop_e *= powf(0.9f, in.wheel);
+          uint32_t me = brick_shape[0];
+          for (int a = 1; a < 3; a++)
+            if (brick_shape[a] > me) me = brick_shape[a];
+          if (mv_crop_e < 128.0f) mv_crop_e = 128.0f;
+          if (me && mv_crop_e > (float)me) mv_crop_e = (float)me;
+        }
         in.wheel = 0.0f;
       }
       if (hover >= 0 && in.wheel != 0.0f && !io->WantCaptureMouse) {
@@ -2058,6 +2071,7 @@ int main(int argc, char **argv) {
               mv_axis_reset(mv_pb, mv_po);
             mv_basis_gen++;
           }
+          memcpy(mv_crop_c, mv_focus, sizeof mv_crop_c); /* 3D crop follows */
           for (int i = 1; i < 4; i++) { /* recenter planes through the focus */
             double fu, fv, fs;
             r3d_mv_w2b(mv_pb[i], mv_po[i], mv_focus, &fu, &fv, &fs);
@@ -3141,22 +3155,22 @@ int main(int argc, char **argv) {
           }
           for (int i = 1; i < 4; i++) {
             if (!(mv_mask & (1u << i))) continue; /* collapsed: no streaming */
-            if (MV_IS3D(i)) { /* volumetric pane: stream a crop box around
-               * the orbit target — bounded even at close zoom, LOD from the
-               * pixel footprint at the target distance */
-              double half = (double)cam.dist * mdim * 0.7;
-              if (half < 256.0) half = 256.0;
-              if (half > 4096.0) half = 4096.0;
+            if (MV_IS3D(i)) { /* volumetric pane: stream exactly the crop
+               * cube; LOD = crop edge over pane pixels (the zoom IS the
+               * crop, so the request stays bounded at every zoom) */
+              if (mv_crop_e <= 0.0f) continue; /* first frame inits it */
+              double half = (double)mv_crop_e * 0.55; /* small refit margin */
               float lo3[3], hi3[3];
-              double tc[3] = {(double)cam.target.x, (double)cam.target.y,
-                              (double)cam.target.z};
               for (int a = 0; a < 3; a++) {
-                lo3[a] = (float)(tc[a] - half / mdim);
-                hi3[a] = (float)(tc[a] + half / mdim);
+                lo3[a] = (float)((mv_crop_c[a] - half) / mdim);
+                hi3[a] = (float)((mv_crop_c[a] + half) / mdim);
               }
-              float vpp3 = (float)(2.0 * tan((double)cam.fov_y * 0.5) * (double)cam.dist * mdim /
-                                   (double)(mv[i].ph ? mv[i].ph : 1)) *
-                           exp2f(lod_bias);
+              int pmin = mv[i].pw < mv[i].ph ? mv[i].pw : mv[i].ph;
+              /* stream_box wants BOX units per pixel (like the plane views'
+               * 1/(zoom*mdim)), so voxels-per-pixel divides by mdim */
+              float vpp3 =
+                  (float)((double)mv_crop_e / (double)(pmin > 0 ? pmin : 1) / mdim) *
+                  exp2f(lod_bias);
               r3d_bricks_stream_box(renderer, lo3, hi3, vpp3, p.skip_gate);
               continue;
             }
@@ -3244,17 +3258,26 @@ int main(int argc, char **argv) {
           vp4[nvp++] = q;
           continue;
         }
-        if (MV_IS3D(i)) { /* whole-scroll volumetric orbit view */
+        if (MV_IS3D(i)) { /* zoom-crop volumetric view */
           if (!mv_vol_cam_init) {
-            float be3[3];
-            r3d_bricks_extent(renderer, be3);
             cam.pitch = getenv("R3D_3D_PITCH") ? strtof(getenv("R3D_3D_PITCH"), NULL)
                                                : 1.25f; /* side-on default */
-            r3d_camera_orbit_set(&cam, v3(be3[0] * 0.5f, be3[1] * 0.5f, be3[2] * 0.5f),
-                                 getenv("R3D_3D_DIST") ? strtof(getenv("R3D_3D_DIST"), NULL)
-                                                       : 1.5f);
+            for (int a = 0; a < 3; a++) mv_crop_c[a] = (double)brick_shape[a] * 0.5;
             mv_vol_cam_init = true;
           }
+          if (mv_crop_e <= 0.0f) {
+            uint32_t me = brick_shape[0];
+            for (int a = 1; a < 3; a++)
+              if (brick_shape[a] > me) me = brick_shape[a];
+            mv_crop_e = (float)me; /* start: the whole scroll, coarse */
+          }
+          if (getenv("R3D_3D_CROP")) mv_crop_e = strtof(getenv("R3D_3D_CROP"), NULL);
+          /* the camera frames the cube from a fixed relative distance */
+          double eb = (double)mv_crop_e / mdim; /* edge, box units */
+          r3d_camera_orbit_set(&cam,
+                               v3((float)(mv_crop_c[0] / mdim), (float)(mv_crop_c[1] / mdim),
+                                  (float)(mv_crop_c[2] / mdim)),
+                               (float)(eb * 2.1));
           r3d_v3 vr, vu, vf;
           r3d_camera_basis(&cam, (float)mv[i].pw / (float)(mv[i].ph ? mv[i].ph : 1), &vr,
                            &vu, &vf);
@@ -3264,9 +3287,12 @@ int main(int argc, char **argv) {
           memcpy(q.cam_right, &vr, 12);
           memcpy(q.cam_up, &vu, 12);
           memcpy(q.cam_forward, &vf, 12);
-          q.view_flags = 0;   /* perspective, LOD by ray cone */
-          q.slab_z0 = 0.0f;
-          q.slab_depth = 0u;  /* no slab clip: the full volume */
+          q.view_flags = R3D_VIEW_CROP; /* perspective, clipped to the cube */
+          double half = (double)mv_crop_e * 0.5;
+          q.slab_x0 = (float)(mv_crop_c[0] - half);
+          q.slab_y0 = (float)(mv_crop_c[1] - half);
+          q.slab_z0 = (float)(mv_crop_c[2] - half);
+          q.slab_depth = (uint32_t)mv_crop_e;
           if (getenv("R3D_3D_MODE")) q.mode = (uint32_t)atoi(getenv("R3D_3D_MODE"));
           if (getenv("R3D_3D_BIAS")) q.lod_bias = strtof(getenv("R3D_3D_BIAS"), NULL);
           vp4[nvp++] = q;
