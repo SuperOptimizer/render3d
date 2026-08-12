@@ -2760,6 +2760,22 @@ int main(int argc, char **argv) {
             mv_tr_active = false;
           }
         }
+        if (mv_tr_done && mv_tr_nset > 0) {
+          igSameLine(0, 8);
+          if (igButton("grow", (ImVec2){0, 0})) { /* extend by half again;
+             * failed cells retry (more predictions may be local now) */
+            r3d_tracer_stop(&mv_tr);
+            if (r3d_tracer_grow(&mv_tr, mv_tr.cfg.max_ring / 2 + 10) == 0) {
+              free(mv_tr_pos);
+              free(mv_tr_st);
+              mv_tr_pos = malloc((size_t)mv_tr.W * mv_tr.H * 3 * sizeof *mv_tr_pos);
+              mv_tr_st = calloc((size_t)mv_tr.W * mv_tr.H, 1);
+              mv_tr_gen = 0;
+              mv_tr_done = false;
+              if (!mv_tr_pos || !mv_tr_st) mv_tr_active = false;
+            }
+          }
+        }
         igSameLine(0, 8);
         if (mv_tr_nset > 8 && igButton("save + activate", (ImVec2){0, 0})) {
           r3d_tracer_stop(&mv_tr);

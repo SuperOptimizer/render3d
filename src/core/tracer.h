@@ -43,6 +43,11 @@ typedef struct r3d_tracer {
 int r3d_tracer_start(r3d_tracer *t, const char *pred_root, const r3d_tracer_cfg *cfg,
                      const r3d_umbilicus *umb);
 void r3d_tracer_stop(r3d_tracer *t); /* request stop + join; result kept */
+/* Enlarge a finished (stopped) trace by extra rings and restart growth:
+ * SET cells persist, FAILED cells get another chance (predictions may
+ * have streamed in since). Grid buffers reallocate — callers must refetch
+ * W/H before snapshotting. */
+int r3d_tracer_grow(r3d_tracer *t, uint32_t extra);
 void r3d_tracer_free(r3d_tracer *t);
 
 /* Copy the current grid into caller buffers (each may be NULL); returns the

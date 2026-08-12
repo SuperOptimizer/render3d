@@ -103,21 +103,25 @@ static void *tr_worker(void *ud) {
     return NULL;
   }
   uint32_t c = t->cfg.max_ring; /* seed cell */
-  double *sp = tr_p(t, c, c);
-  double sv = -1.0;
-  for (uint32_t lv = t->cfg.level; lv < t->cfg.level + 3 && lv < vol.nlev; lv++) {
-    /* locally-cached predictions may start at a coarser level: probe down */
-    memcpy(sp, t->cfg.seed, 3 * sizeof(double));
-    t->cfg.level = lv;
-    sv = tr_snap(t, &vol, sp);
-    if (sv >= (double)t->cfg.thresh) break;
+  bool dead = false;
+  if (t->state[(size_t)c * t->W + c] != R3D_TR_SET) { /* fresh start */
+    double *sp = tr_p(t, c, c);
+    double sv = -1.0;
+    for (uint32_t lv = t->cfg.level; lv < t->cfg.level + 3 && lv < vol.nlev; lv++) {
+      /* locally-cached predictions may start at a coarser level: probe down */
+      memcpy(sp, t->cfg.seed, 3 * sizeof(double));
+      t->cfg.level = lv;
+      sv = tr_snap(t, &vol, sp);
+      if (sv >= (double)t->cfg.thresh) break;
+    }
+    pthread_mutex_lock(&t->mu);
+    t->state[(size_t)c * t->W + c] =
+        sv >= (double)t->cfg.thresh ? R3D_TR_SET : R3D_TR_FAIL;
+    t->nset = sv >= (double)t->cfg.thresh ? 1u : 0u;
+    t->gen++;
+    dead = t->nset == 0;
+    pthread_mutex_unlock(&t->mu);
   }
-  pthread_mutex_lock(&t->mu);
-  t->state[(size_t)c * t->W + c] = sv >= (double)t->cfg.thresh ? R3D_TR_SET : R3D_TR_FAIL;
-  t->nset = sv >= (double)t->cfg.thresh ? 1u : 0u;
-  t->gen++;
-  bool dead = t->nset == 0;
-  pthread_mutex_unlock(&t->mu);
 
   for (uint32_t R = 1; R <= t->cfg.max_ring && !dead && !t->quit; R++) {
     uint32_t grew = 0;
@@ -241,6 +245,46 @@ int r3d_tracer_start(r3d_tracer *t, const char *pred_root, const r3d_tracer_cfg 
   if (pthread_create(&t->th, NULL, tr_worker, t) != 0) {
     pthread_mutex_destroy(&t->mu);
     r3d_tracer_free(t);
+    return -1;
+  }
+  return 0;
+}
+
+int r3d_tracer_grow(r3d_tracer *t, uint32_t extra) {
+  if (t->running || !t->pos || !extra) return -1;
+  uint32_t nr = t->cfg.max_ring + extra;
+  if (nr > 400) nr = 400;
+  if (nr == t->cfg.max_ring) return -1;
+  uint32_t NW = 2 * nr + 1, off = nr - t->cfg.max_ring;
+  double *np = calloc((size_t)NW * NW * 3, sizeof *np);
+  uint8_t *ns = calloc((size_t)NW * NW, 1);
+  if (!np || !ns) {
+    free(np);
+    free(ns);
+    return -1;
+  }
+  for (uint32_t j = 0; j < t->H; j++)
+    for (uint32_t i = 0; i < t->W; i++) {
+      size_t ok = (size_t)j * t->W + i;
+      size_t nk = (size_t)(j + off) * NW + (i + off);
+      if (t->state[ok] == R3D_TR_SET) { /* FAILED cells retry as EMPTY */
+        ns[nk] = R3D_TR_SET;
+        memcpy(np + nk * 3, t->pos + ok * 3, 3 * sizeof(double));
+      }
+    }
+  free(t->pos);
+  free(t->state);
+  t->pos = np;
+  t->state = ns;
+  t->W = t->H = NW;
+  t->cfg.max_ring = nr;
+  t->quit = false;
+  t->done = false;
+  t->ring = 0;
+  t->gen++;
+  t->running = true;
+  if (pthread_create(&t->th, NULL, tr_worker, t) != 0) {
+    t->running = false;
     return -1;
   }
   return 0;
