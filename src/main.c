@@ -1,6 +1,7 @@
 /* render3d — volumetric renderer for Vesuvius Challenge micro-CT volumes.
  * M1: SDL3 window + Vulkan compute raycaster (see spec/ and docs/measured.md). */
 #include <SDL3/SDL.h>
+#include <dirent.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1299,7 +1300,7 @@ int main(int argc, char **argv) {
   for (;;) {
   if (od_swap) {
     od_swap = false;
-    bricks_path = od_next_bricks;
+    bricks_path = od_next_bricks[0] ? od_next_bricks : NULL;
     multiview_path = od_next_seg[0] ? od_next_seg : NULL;
     n_overlays = 0; /* browser-opened datasets have no overlay tree yet */
     umbilicus_path = NULL;
@@ -2378,6 +2379,125 @@ int main(int argc, char **argv) {
     if (!multiview_path)
       igText("%.0f fps   gpu %.2f ms", (double)fps_smooth, (double)last_gpu_ns / 1e6);
     if (igButton("data browser", (ImVec2){0, 0})) od_window = true;
+    igSameLine(0, 8);
+    if (igButton("open segment", (ImVec2){0, 0})) igOpenPopup_Str("r3d_open_seg", 0);
+    igSameLine(0, 8);
+    if (multiview_path && mv_seg.nvalid && igButton("close segment", (ImVec2){0, 0})) {
+      /* swap in an empty segment: the flattened pane goes blank and no
+       * active-segment overlays draw — a clean slate for the tracer */
+      r3d_tifxyz es = {.w = 2, .h = 2, .sx = 0.05f, .sy = 0.05f};
+      es.xyz = malloc(2 * 2 * 3 * sizeof *es.xyz);
+      float *eco = NULL, *eno = NULL;
+      r3d_segrows er = {0};
+      if (es.xyz) {
+        for (int k = 0; k < 12; k++) es.xyz[k] = -1.0f;
+        memcpy(es.bbox[0], (float[3]){0, 0, 0}, sizeof es.bbox[0]);
+        memcpy(es.bbox[1], (float[3]){0, 0, 0}, sizeof es.bbox[1]);
+      }
+      if (es.xyz && r3d_segrows_build(&es, &er) == 0 &&
+          mv_build_grids(&es, &eco, &eno) == 0 &&
+          r3d_surf_swap(renderer, es.w, es.h, eco, eno, es.sx, es.sy) == 0) {
+        r3d_tifxyz_free(&mv_seg);
+        r3d_segrows_free(&mv_rows);
+        free(mv_normals);
+        mv_seg = es;
+        mv_rows = er;
+        mv_normals = eno;
+        sgc_active[0] = 0;
+        for (int oi2 = 0; oi2 < 4; oi2++) {
+          mv_ol[oi2].n = 0;
+          mv_ol_off[oi2].n = 0;
+          mv_ol_slice[oi2] = 1e30;
+        }
+        mv_ol_zoff = 1e30;
+        printf("segment closed (empty active surface)\n");
+      } else {
+        r3d_tifxyz_free(&es);
+        r3d_segrows_free(&er);
+        free(eno);
+      }
+      free(eco);
+    }
+    if (igButton("open volume", (ImVec2){0, 0})) igOpenPopup_Str("r3d_open_vol", 0);
+    igSameLine(0, 8);
+    if (bricks_path && igButton("close volume", (ImVec2){0, 0})) {
+      od_next_bricks[0] = 0; /* teardown to the blank (no-dataset) state */
+      od_next_seg[0] = 0;
+      od_swap = true;
+      running = false;
+    }
+    if (igBeginPopup("r3d_open_seg", 0)) {
+      if (sgc.open) {
+        for (uint32_t si = 0; si < sgc.st.n; si++) {
+          char lbl[96];
+          snprintf(lbl, sizeof lbl, "%.64s##os%u", sgc.st.segs[si].name, si);
+          if (igSelectable_Bool(lbl, false, 0, (ImVec2){0, 0})) {
+            pthread_mutex_lock(&sgc.mu);
+            if (sgc.act_req == UINT32_MAX && !sgc.act_busy) {
+              sgc.act_req = si;
+              pthread_cond_signal(&sgc.cv);
+            }
+            pthread_mutex_unlock(&sgc.mu);
+            igCloseCurrentPopup();
+          }
+        }
+      } else {
+        igTextDisabled("no segment store open (--segments <dir>)");
+      }
+      igEndPopup();
+    }
+    if (igBeginPopup("r3d_open_vol", 0)) {
+      static char vol_list[24][640];
+      static uint32_t vol_n = 0;
+      if (igIsWindowAppearing()) { /* rescan local volume trees */
+        vol_n = 0;
+        static const char *roots[2] = {"cache", "cache/od"};
+        for (int r0 = 0; r0 < 2 && vol_n < 24; r0++) {
+          DIR *dp0 = opendir(roots[r0]);
+          struct dirent *de0;
+          while (dp0 && (de0 = readdir(dp0)) != NULL && vol_n < 24) {
+            if (de0->d_name[0] == '.') continue;
+            char mp0[720];
+            snprintf(mp0, sizeof mp0, "%s/%s/manifest.json", roots[r0], de0->d_name);
+            FILE *mf0 = fopen(mp0, "rb");
+            if (!mf0 && r0 == 1) { /* od volumes nest one level deeper */
+              char sub[700];
+              snprintf(sub, sizeof sub, "%s/%s", roots[r0], de0->d_name);
+              DIR *dp1 = opendir(sub);
+              struct dirent *de1;
+              while (dp1 && (de1 = readdir(dp1)) != NULL && vol_n < 24) {
+                if (de1->d_name[0] == '.') continue;
+                snprintf(mp0, sizeof mp0, "%s/%s/manifest.json", sub, de1->d_name);
+                FILE *mf1 = fopen(mp0, "rb");
+                if (mf1) {
+                  fclose(mf1);
+                  snprintf(vol_list[vol_n++], sizeof vol_list[0], "%s", mp0);
+                }
+              }
+              if (dp1) closedir(dp1);
+            } else if (mf0) {
+              fclose(mf0);
+              snprintf(vol_list[vol_n++], sizeof vol_list[0], "%s", mp0);
+            }
+          }
+          if (dp0) closedir(dp0);
+        }
+      }
+      for (uint32_t vi = 0; vi < vol_n; vi++) {
+        char lbl[720];
+        snprintf(lbl, sizeof lbl, "%.640s##ov%u", vol_list[vi], vi);
+        if (igSelectable_Bool(lbl, false, 0, (ImVec2){0, 0})) {
+          snprintf(od_next_bricks, sizeof od_next_bricks, "%s", vol_list[vi]);
+          if (multiview_path)
+            snprintf(od_next_seg, sizeof od_next_seg, "%s", multiview_path);
+          od_swap = true;
+          running = false;
+          igCloseCurrentPopup();
+        }
+      }
+      if (!vol_n) igTextDisabled("no local volume trees under cache/");
+      igEndPopup();
+    }
     if (igCollapsingHeader_TreeNodeFlags("rendering", 0)) {
       int m = (int)mode;
       if (igCombo_Str("mode", &m, "full\0mip\0depth\0heatmap\0raydir\0flat\0", 6))
@@ -2680,43 +2800,6 @@ int main(int argc, char **argv) {
         }
         igTextDisabled("segment %ux%u  %llu valid points", mv_seg.w, mv_seg.h,
                        (unsigned long long)mv_seg.nvalid);
-        igSameLine(0, 10);
-        if (mv_seg.nvalid && igButton("close##seg", (ImVec2){0, 0})) {
-          /* swap in an empty segment: the flattened pane goes blank and no
-           * active-segment overlays draw — a clean slate for the tracer */
-          r3d_tifxyz es = {.w = 2, .h = 2, .sx = 0.05f, .sy = 0.05f};
-          es.xyz = malloc(2 * 2 * 3 * sizeof *es.xyz);
-          float *eco = NULL, *eno = NULL;
-          r3d_segrows er = {0};
-          if (es.xyz) {
-            for (int k = 0; k < 12; k++) es.xyz[k] = -1.0f;
-            memcpy(es.bbox[0], (float[3]){0, 0, 0}, sizeof es.bbox[0]);
-            memcpy(es.bbox[1], (float[3]){0, 0, 0}, sizeof es.bbox[1]);
-          }
-          if (es.xyz && r3d_segrows_build(&es, &er) == 0 &&
-              mv_build_grids(&es, &eco, &eno) == 0 &&
-              r3d_surf_swap(renderer, es.w, es.h, eco, eno, es.sx, es.sy) == 0) {
-            r3d_tifxyz_free(&mv_seg);
-            r3d_segrows_free(&mv_rows);
-            free(mv_normals);
-            mv_seg = es;
-            mv_rows = er;
-            mv_normals = eno;
-            sgc_active[0] = 0;
-            for (int oi2 = 0; oi2 < 4; oi2++) {
-              mv_ol[oi2].n = 0;
-              mv_ol_off[oi2].n = 0;
-              mv_ol_slice[oi2] = 1e30;
-            }
-            mv_ol_zoff = 1e30;
-            printf("segment closed (empty active surface)\n");
-          } else {
-            r3d_tifxyz_free(&es);
-            r3d_segrows_free(&er);
-            free(eno);
-          }
-          free(eco);
-        }
     if (multiview_path && n_overlays &&
         igCollapsingHeader_TreeNodeFlags("tracer", 0)) {
       const char *pr = overlay_paths[overlay_sel];
