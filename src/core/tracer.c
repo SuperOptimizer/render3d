@@ -91,7 +91,21 @@ static double tr_snap(r3d_tracer *t, r3d_cpuvol *v, double P[3], double search) 
   P[0] += nrm[0] * bs * trust;
   P[1] += nrm[1] * bs * trust;
   P[2] += nrm[2] * bs * trust;
-  return best;
+  if (best <= 0.0) return best;
+  /* ridge contrast: a point in the blur BETWEEN sheets has value but no
+   * valley on either side — those are the wrong-sheet captures. Scale
+   * confidence by how much the ridge stands above its surroundings. */
+  double off = 0.0;
+  for (int sgn = -1; sgn <= 1; sgn += 2) {
+    double ov = (double)r3d_cpuvol_at(v, t->cfg.level, P[0] + nrm[0] * 7.0 * sgn,
+                                      P[1] + nrm[1] * 7.0 * sgn,
+                                      P[2] + nrm[2] * 7.0 * sgn) /
+                255.0;
+    if (ov > off) off = ov;
+  }
+  double contrast = best > 1e-6 ? (best - off) / best : 0.0;
+  if (contrast < 0.0) contrast = 0.0;
+  return best * (0.45 + 0.55 * contrast);
 }
 
 static inline double *tr_p(r3d_tracer *t, uint32_t i, uint32_t j) {
@@ -144,6 +158,58 @@ static double tr_advance(r3d_tracer *t, r3d_cpuvol *v, const double from[3],
     }
   }
   return val;
+}
+
+/* quality control for cell (i,j): cut vertices that tore the grid —
+ * either far from where ALL their neighbors expect them (spacing), or
+ * with a winding-radius jump against both u-neighbors (wrap hop). An
+ * honest hole beats a committed discontinuity. */
+static void tr_qc_cell(r3d_tracer *t, int i, int j) {
+  size_t k = (size_t)j * t->W + (size_t)i;
+  if (t->state[k] != R3D_TR_SET) return;
+  const double *pc = t->pos + k * 3;
+  double cx, cy, rc = -1.0;
+  if (tr_umb(&t->umb, pc[2], &cx, &cy))
+    rc = sqrt((pc[0] - cx) * (pc[0] - cx) + (pc[1] - cy) * (pc[1] - cy));
+  double avg[3] = {0, 0, 0};
+  int na = 0, rbad = 0, ru = 0;
+  static const int off[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+  for (int o = 0; o < 4; o++) {
+    int ii = i + off[o][0], jj = j + off[o][1];
+    if (ii < 0 || jj < 0 || ii >= (int)t->W || jj >= (int)t->H) continue;
+    size_t kk = (size_t)jj * t->W + (size_t)ii;
+    if (t->state[kk] != R3D_TR_SET) continue;
+    double nrm[3], tn[3];
+    const double *pn = t->pos + kk * 3;
+    tr_frame(t, pn, nrm, tn);
+    for (int a = 0; a < 3; a++)
+      avg[a] += pn[a] -
+                (tn[a] * off[o][0] + (a == 2 ? (double)off[o][1] : 0.0)) * t->cfg.step;
+    na++;
+    if (off[o][1] == 0 && rc >= 0.0) { /* u-neighbor: winding radius check */
+      double nx2, ny2;
+      if (tr_umb(&t->umb, pn[2], &nx2, &ny2)) {
+        double rn2 = sqrt((pn[0] - nx2) * (pn[0] - nx2) + (pn[1] - ny2) * (pn[1] - ny2));
+        ru++;
+        if (fabs(rn2 - rc) > 10.0) rbad++;
+      }
+    }
+  }
+  if (na < 2) return;
+  double err = 0.0;
+  for (int a = 0; a < 3; a++) {
+    double d = pc[a] - avg[a] / na;
+    err += d * d;
+  }
+  bool tear = sqrt(err) > 0.6 * t->cfg.step;
+  bool hop = ru >= 2 && rbad == ru; /* radius jumps against every u-neighbor */
+  if (tear || hop) {
+    pthread_mutex_lock(&t->mu);
+    t->state[k] = R3D_TR_FAIL;
+    t->conf[k] *= 0.25f;
+    if (t->nset) t->nset--;
+    pthread_mutex_unlock(&t->mu);
+  }
 }
 
 /* one confidence-weighted relaxation of cell (i,j): pull toward the
@@ -277,6 +343,14 @@ static void *tr_worker(void *ud) {
           if (i < 0 || j < 0 || i >= (int)t->W || j >= (int)t->H) continue;
           tr_relax_cell(t, &vol, i, j);
         }
+    for (int dj = -(int)R; dj <= (int)R && !t->quit; dj++)
+      for (int di = -(int)R; di <= (int)R; di++) {
+        uint32_t cr = (uint32_t)(abs(di) > abs(dj) ? abs(di) : abs(dj));
+        if (cr < r0 || cr > R) continue;
+        int i = (int)c + di, j = (int)c + dj;
+        if (i < 0 || j < 0 || i >= (int)t->W || j >= (int)t->H) continue;
+        tr_qc_cell(t, i, j);
+      }
     if ((R % 8u == 0u || R == t->cfg.max_ring) && !t->quit)
       for (int dj = -(int)R; dj <= (int)R; dj++)
         for (int di = -(int)R; di <= (int)R; di++) {

@@ -1563,3 +1563,18 @@ Relaxation snaps also narrowed to +-4. Grid step remains the saved
 resolution knob only. Seam-free contiguous surface on the test seed
 (~8k points); remaining holes are absent prediction bricks or real
 damage. All 5 suites green.
+
+## 2026-08-12 — tracer quality metrics: contrast, spacing, winding radius
+
+Raw prediction value alone can't see wrong-sheet captures, so confidence
+now folds in RIDGE CONTRAST (value at the snap vs the higher of the two
++-7 vox off-ridge samples: points in the blur between sheets score near
+zero), and a per-ring QC pass actively CUTS tears instead of smoothing
+them: a vertex is demoted to FAIL when it sits > 0.6*step from where all
+its neighbors expect it (spacing tear) or when its umbilicus-radius
+jumps > 10 vox against every u-neighbor (wrap hop — the scroll-specific
+metric geometry can't fake). An honest hole beats a committed
+discontinuity; holes remain retryable via grow. Coverage held (~8.5k
+points on the test seed). Next tier if needed: global optimization over
+the whole grid (vc3d uses Ceres) and multi-hypothesis growth at
+ambiguous ridges. All 5 suites green.
