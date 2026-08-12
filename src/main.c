@@ -3248,9 +3248,11 @@ int main(int argc, char **argv) {
           if (!mv_vol_cam_init) {
             float be3[3];
             r3d_bricks_extent(renderer, be3);
-            cam.pitch = 1.25f; /* side-on: the scroll axis runs along z */
+            cam.pitch = getenv("R3D_3D_PITCH") ? strtof(getenv("R3D_3D_PITCH"), NULL)
+                                               : 1.25f; /* side-on default */
             r3d_camera_orbit_set(&cam, v3(be3[0] * 0.5f, be3[1] * 0.5f, be3[2] * 0.5f),
-                                 1.5f);
+                                 getenv("R3D_3D_DIST") ? strtof(getenv("R3D_3D_DIST"), NULL)
+                                                       : 1.5f);
             mv_vol_cam_init = true;
           }
           r3d_v3 vr, vu, vf;

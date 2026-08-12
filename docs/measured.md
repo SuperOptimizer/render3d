@@ -1422,3 +1422,24 @@ from the freshly cached .c5b files and re-uploads them. Overlay switches
 purge queued old-tree chunks and let in-flight ones finish. Measured:
 surface-prediction overlay grew its cache 60 MB -> 2.9 GB in one 600-frame
 run with 0 decode failures; all 5 suites green.
+
+## 2026-08-12 — 3D volumetric pane working (void-skip granularity fix)
+
+The whole-scroll black regions came from bricks_lod_locate's FAILED path:
+its world_brick stayed at the 1.0 init value, so the empty-space skip for
+rays entering through unresident air leapt a whole box unit — past the
+entire volume. Every slab mode masked this (rays start inside streamed
+coverage); whole-volume marching (--depth 0, new in the 3D pane) exposed
+it. Failed locates now skip ONE coarsest-level brick (128*2^(nlev-1)/
+maxdim). With that, --depth 0 renders the complete scroll on both the
+fully-local PHerc0172 tree and the tiered/net PHercParis4 tree, and the
+multiview 3D pane shows the whole scroll with overlays at 9.7 ms frames,
+0 decode failures.
+
+Debugging note for the ledger: two red herrings cost most of the session —
+the L5 page table was fine (547/1216 pinned, full scroll bbox), and post-
+fix "still black" shots were my own crops using 1853x1131 coordinates on
+1280x720 windows (the WM only sometimes tiles the window; always read the
+shot size before cropping). Diagnostics kept: R3D_MV_3D / R3D_3D_MODE /
+R3D_3D_BIAS / R3D_3D_PITCH / R3D_3D_DIST env overrides for headless work.
+All 5 suites green (gpu conformance covers the shader change).

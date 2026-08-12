@@ -120,10 +120,13 @@ BrickCtx bricks_lod_locate(float3 p, float lod) {
   c.slot_org = float3(0);
   c.atlas_lod = 0.0;
   c.grad_vox = 1.0;
-  c.world_brick = 1.0;
   uint nlev = page[0];
   float3 base_shape = float3(page[1], page[2], page[3]);
   float maxdim = max(base_shape.x, max(base_shape.y, base_shape.z));
+  /* failed locate = air at every probed level: the void-skip granularity is
+   * ONE COARSEST brick. (The old 1.0 init made rays entering through air
+   * leap a whole box unit — past the entire volume in full-volume views.) */
+  c.world_brick = BR_SLOT * float(1u << (nlev - 1u)) / maxdim;
   float3 base_v = clamp(p * maxdim, float3(0), max(base_shape - 0.001, float3(0)));
   int desired = int(clamp(floor(lod), 0.0, float(nlev - 1u)));
   uint abpa = pc.brick_mode & 0xffu;
