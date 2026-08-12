@@ -2815,6 +2815,9 @@ int main(int argc, char **argv) {
       igTextDisabled("growth is continuous; the cutoff masks display + save");
       igSliderInt("max rings", &mv_tr_rings, 8, 200, "%d", 0);
       igCheckbox("live in segment view", &mv_tr_live);
+      static bool mv_tr_fill = true;
+      igSameLine(0, 10);
+      igCheckbox("fill holes", &mv_tr_fill);
       if (!mv_tr_active) {
         if (igButton("seed at focus", (ImVec2){0, 0})) {
           r3d_tracer_cfg tc = {.seed = {mv_focus[0], mv_focus[1], mv_focus[2]},
@@ -2823,7 +2826,8 @@ int main(int argc, char **argv) {
                                .thresh = mv_tr_thresh,
                                .max_ring = (uint32_t)mv_tr_rings,
                                .level = 1,
-                               .search = 12.0};
+                               .search = 12.0,
+                               .fill = mv_tr_fill};
           if (r3d_tracer_start(&mv_tr, pr, &tc, &umbilicus) == 0) {
             free(mv_tr_pos);
             free(mv_tr_st);
@@ -3135,7 +3139,8 @@ int main(int argc, char **argv) {
                            .thresh = mv_tr_thresh,
                            .max_ring = (uint32_t)mv_tr_rings,
                            .level = 1,
-                           .search = 12.0};
+                           .search = 12.0,
+                           .fill = true};
       if (r3d_tracer_start(&mv_tr, overlay_paths[overlay_sel], &tc, &umbilicus) == 0) {
         mv_tr_pos = malloc((size_t)mv_tr.W * mv_tr.H * 3 * sizeof *mv_tr_pos);
         mv_tr_st = calloc((size_t)mv_tr.W * mv_tr.H, 1);

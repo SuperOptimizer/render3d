@@ -1596,3 +1596,13 @@ Confidence recalibrated (contrast factor 0.65+0.35c) since the first
 scaling pushed the distribution under the default cutoff. Lesson for
 the ledger: when QC says the grid is perfect and the render disagrees,
 the model constraint itself is the bug.
+
+## 2026-08-12 — tracer fill mode: always place a point
+
+"fill holes" (tracer panel, default on): prediction-dead cells take the
+smoothly continued position with honest low confidence instead of
+failing, and the QC pass re-seats tear/hop offenders onto the neighbor
+consensus instead of cutting them. The grid always completes (14641/
+14641 on the test seed); the confidence cutoff decides at display/save
+time what survives, so "no holes" and "only trusted surface" are the
+same trace at different slider positions. All 5 suites green.

@@ -263,9 +263,14 @@ static void tr_qc_cell(r3d_tracer *t, int i, int j) {
   bool hop = ru >= 2 && rbad == ru; /* radius jumps against every u-neighbor */
   if (tear || hop) {
     pthread_mutex_lock(&t->mu);
-    t->state[k] = R3D_TR_FAIL;
-    t->conf[k] *= 0.25f;
-    if (t->nset) t->nset--;
+    if (t->cfg.fill) { /* repair, don't cut: re-seat on the consensus */
+      for (int a = 0; a < 3; a++) t->pos[k * 3 + (size_t)a] = avg[a] / na;
+      t->conf[k] *= 0.25f;
+    } else {
+      t->state[k] = R3D_TR_FAIL;
+      t->conf[k] *= 0.25f;
+      if (t->nset) t->nset--;
+    }
     pthread_mutex_unlock(&t->mu);
   }
 }
@@ -382,10 +387,13 @@ static void *tr_worker(void *ud) {
         double val = tr_snap(t, &vol, P, 4.0, gn);
         if (val < vsum / np) val = vsum / np; /* marched confidence counts */
         pthread_mutex_lock(&t->mu);
-        if (val >= TR_FLOOR) {
+        if (val >= TR_FLOOR || t->cfg.fill) {
+          /* fill mode: even prediction-dead cells take the continued
+           * position — a complete grid with honest low confidence beats
+           * a hole; the save cutoff decides what survives */
           memcpy(t->pos + k * 3, P, sizeof P);
           t->state[k] = R3D_TR_SET;
-          t->conf[k] = (float)val;
+          t->conf[k] = (float)(val > 0.0 ? val : 0.0);
           t->nset++;
           grew++;
         } else {

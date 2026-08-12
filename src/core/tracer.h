@@ -28,6 +28,8 @@ typedef struct r3d_tracer_cfg {
   uint32_t max_ring; /* grid radius, cells */
   uint32_t level;   /* prediction pyramid level to sample */
   double search;    /* ridge-snap range along the normal, voxels */
+  bool fill;        /* no holes: weak cells take the smoothly continued
+                     * position (low confidence) instead of failing */
 } r3d_tracer_cfg;
 
 typedef struct r3d_tracer {
