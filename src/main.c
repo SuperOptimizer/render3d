@@ -2461,7 +2461,7 @@ int main(int argc, char **argv) {
           for (int pk = 0; pk < 2; pk++) {
             int kv = mv_pane_kind[pk];
             igSetNextItemWidth(140);
-            if (igCombo_Str(pane_lbl[pk], &kv, "XZ\0YZ\03D volume\0\0", 3) &&
+            if (igCombo_Str(pane_lbl[pk], &kv, "XZ\0YZ\0" "3D volume\0\0", 3) &&
                 kv != mv_pane_kind[pk]) {
               if (mv_pane_kind[1 - pk] == kv) /* keep the three kinds on two
                                                * panes distinct: swap */
