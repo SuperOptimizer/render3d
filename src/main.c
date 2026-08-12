@@ -1488,6 +1488,7 @@ int main(int argc, char **argv) {
   bool mv_tr_active = false, mv_tr_done = false;
   double *mv_tr_pos = NULL;
   uint8_t *mv_tr_st = NULL;
+  float *mv_tr_cf = NULL;
   uint64_t mv_tr_gen = 0;
   uint32_t mv_tr_ring = 0, mv_tr_nset = 0;
   float mv_tr_step = 20.0f, mv_tr_thresh = 0.35f;
@@ -2806,7 +2807,8 @@ int main(int argc, char **argv) {
       const char *prb = strrchr(pr, '/');
       igTextDisabled("predictions: %s", prb ? prb + 1 : pr);
       igSliderFloat("grid step (vox)", &mv_tr_step, 5.0f, 40.0f, "%.0f", 0);
-      igSliderFloat("accept threshold", &mv_tr_thresh, 0.05f, 0.9f, "%.2f", 0);
+      igSliderFloat("confidence cutoff", &mv_tr_thresh, 0.05f, 0.9f, "%.2f", 0);
+      igTextDisabled("growth is continuous; the cutoff masks display + save");
       igSliderInt("max rings", &mv_tr_rings, 8, 200, "%d", 0);
       if (!mv_tr_active) {
         if (igButton("seed at focus", (ImVec2){0, 0})) {
@@ -2819,10 +2821,12 @@ int main(int argc, char **argv) {
           if (r3d_tracer_start(&mv_tr, pr, &tc, &umbilicus) == 0) {
             free(mv_tr_pos);
             free(mv_tr_st);
+            free(mv_tr_cf);
             mv_tr_pos = malloc((size_t)mv_tr.W * mv_tr.H * 3 * sizeof *mv_tr_pos);
             mv_tr_st = calloc((size_t)mv_tr.W * mv_tr.H, 1);
+            mv_tr_cf = calloc((size_t)mv_tr.W * mv_tr.H, sizeof *mv_tr_cf);
             mv_tr_gen = 0;
-            mv_tr_active = mv_tr_pos && mv_tr_st;
+            mv_tr_active = mv_tr_pos && mv_tr_st && mv_tr_cf;
           }
         }
         igSameLine(0, 8);
@@ -2838,8 +2842,10 @@ int main(int argc, char **argv) {
             r3d_tracer_free(&mv_tr);
             free(mv_tr_pos);
             free(mv_tr_st);
+            free(mv_tr_cf);
             mv_tr_pos = NULL;
             mv_tr_st = NULL;
+            mv_tr_cf = NULL;
             mv_tr_active = false;
           }
         }
@@ -2851,11 +2857,13 @@ int main(int argc, char **argv) {
             if (r3d_tracer_grow(&mv_tr, mv_tr.cfg.max_ring / 2 + 10) == 0) {
               free(mv_tr_pos);
               free(mv_tr_st);
+              free(mv_tr_cf);
               mv_tr_pos = malloc((size_t)mv_tr.W * mv_tr.H * 3 * sizeof *mv_tr_pos);
               mv_tr_st = calloc((size_t)mv_tr.W * mv_tr.H, 1);
+              mv_tr_cf = calloc((size_t)mv_tr.W * mv_tr.H, sizeof *mv_tr_cf);
               mv_tr_gen = 0;
               mv_tr_done = false;
-              if (!mv_tr_pos || !mv_tr_st) mv_tr_active = false;
+              if (!mv_tr_pos || !mv_tr_st || !mv_tr_cf) mv_tr_active = false;
             }
           }
         }
@@ -2867,7 +2875,7 @@ int main(int argc, char **argv) {
                    (unsigned)mv_tr_nset);
           char mk[300];
           snprintf(mk, sizeof mk, "mkdir -p '%s'", td);
-          if (system(mk) == 0 && r3d_tracer_save(&mv_tr, td) == 0) {
+          if (system(mk) == 0 && r3d_tracer_save(&mv_tr, td, mv_tr_thresh) == 0) {
             printf("tracer: saved %s (%ux%u, %u pts)\n", td, mv_tr.W, mv_tr.H,
                    mv_tr_nset);
             if (sgc.open) { /* pack + reopen the corpus so it shows at once */
@@ -2908,8 +2916,10 @@ int main(int argc, char **argv) {
                   r3d_tracer_free(&mv_tr);
                   free(mv_tr_pos);
                   free(mv_tr_st);
+                  free(mv_tr_cf);
                   mv_tr_pos = NULL;
                   mv_tr_st = NULL;
+                  mv_tr_cf = NULL;
                   mv_tr_active = false;
                 }
               }
@@ -3121,14 +3131,15 @@ int main(int argc, char **argv) {
       if (r3d_tracer_start(&mv_tr, overlay_paths[overlay_sel], &tc, &umbilicus) == 0) {
         mv_tr_pos = malloc((size_t)mv_tr.W * mv_tr.H * 3 * sizeof *mv_tr_pos);
         mv_tr_st = calloc((size_t)mv_tr.W * mv_tr.H, 1);
-        mv_tr_active = mv_tr_pos && mv_tr_st;
+        mv_tr_cf = calloc((size_t)mv_tr.W * mv_tr.H, sizeof *mv_tr_cf);
+        mv_tr_active = mv_tr_pos && mv_tr_st && mv_tr_cf;
       }
     }
     if (mv_tr_active) { /* live tracer snapshot when it grew */
-      uint64_t g = r3d_tracer_snapshot(&mv_tr, NULL, NULL, &mv_tr_ring, &mv_tr_nset,
-                                       &mv_tr_done);
+      uint64_t g = r3d_tracer_snapshot(&mv_tr, NULL, NULL, NULL, &mv_tr_ring,
+                                       &mv_tr_nset, &mv_tr_done);
       if (g != mv_tr_gen && mv_tr_pos) {
-        r3d_tracer_snapshot(&mv_tr, mv_tr_pos, mv_tr_st, NULL, NULL, NULL);
+        r3d_tracer_snapshot(&mv_tr, mv_tr_pos, mv_tr_st, mv_tr_cf, NULL, NULL, NULL);
         mv_tr_gen = g;
       }
     }
@@ -3437,7 +3448,7 @@ int main(int argc, char **argv) {
         mv_tr_nsaved = 1;
         r3d_tracer_stop(&mv_tr);
         if (system("mkdir -p cache/traced/trace-test") == 0 &&
-            r3d_tracer_save(&mv_tr, "cache/traced/trace-test") == 0)
+            r3d_tracer_save(&mv_tr, "cache/traced/trace-test", mv_tr_thresh) == 0)
           printf("tracer: saved cache/traced/trace-test\n");
       }
       if (mv_tr_active && mv_tr_pos) { /* growing trace: orange points */
@@ -3470,7 +3481,7 @@ int main(int argc, char **argv) {
               for (uint32_t j = 0; j < TH; j += strd)
                 for (uint32_t ii = 0; ii < TW; ii += strd) {
                   size_t k = (size_t)j * TW + ii;
-                  if (mv_tr_st[k] != R3D_TR_SET) continue;
+                  if (mv_tr_st[k] != R3D_TR_SET || mv_tr_cf[k] < mv_tr_thresh) continue;
                   const double *P = mv_tr_pos + k * 3;
                   bool inb = true;
                   for (int a = 0; a < 3; a++)
@@ -3495,15 +3506,20 @@ int main(int argc, char **argv) {
             for (uint32_t j = 0; j < TH; j++)
               for (uint32_t ii = 0; ii < TW; ii++) {
                 size_t k = (size_t)j * TW + ii;
-                if (mv_tr_st[k] != R3D_TR_SET) continue;
+                if (mv_tr_st[k] != R3D_TR_SET || mv_tr_cf[k] < mv_tr_thresh * 0.5f)
+                  continue;
                 const double *P = mv_tr_pos + k * 3;
                 double fu, fv, fs;
                 r3d_mv_w2b(mv_pb[i], mv_po[i], P, &fu, &fv, &fs);
                 if (fs < lo || fs > hi) continue;
                 float sx_, sy_;
                 r3d_mv_project(&mv[i], fu, fv, &sx_, &sy_);
+                float cf2 = mv_tr_cf[k];
+                bool weak = cf2 < mv_tr_thresh;
+                ImU32 pc_ = weak ? 0x907070e0u /* weak: translucent red */
+                                 : tc_;
                 ImDrawList_AddCircleFilled(draw, (ImVec2){sx_, sy_}, 2.6f, tb_, 6);
-                ImDrawList_AddCircleFilled(draw, (ImVec2){sx_, sy_}, 1.8f, tc_, 6);
+                ImDrawList_AddCircleFilled(draw, (ImVec2){sx_, sy_}, 1.8f, pc_, 6);
               }
           }
           ImDrawList_PopClipRect(draw);
@@ -3983,6 +3999,7 @@ int main(int argc, char **argv) {
     }
     free(mv_tr_pos);
     free(mv_tr_st);
+    free(mv_tr_cf);
     sgc_close(&sgc);
     for (int i = 0; i < 4; i++) {
       free(mv_ol[i].w);

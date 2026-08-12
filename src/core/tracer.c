@@ -58,8 +58,12 @@ static void tr_frame(const r3d_tracer *t, const double P[3], double nrm[3], doub
   tan_[2] = 0.0;
 }
 
+#define TR_FLOOR 0.10 /* below this the sheet is truly gone: cell fails */
+#define TR_STRONG 0.45 /* full ridge trust above this confidence */
+
 /* snap P to the prediction ridge along the sheet normal; returns best value
- * (0..1), P updated in place */
+ * (0..1). Weak confidence trusts the extrapolated position over the noisy
+ * ridge max (continuous blend, no binary accept). */
 static double tr_snap(r3d_tracer *t, r3d_cpuvol *v, double P[3]) {
   double nrm[3], tn[3];
   tr_frame(t, P, nrm, tn);
@@ -82,9 +86,11 @@ static double tr_snap(r3d_tracer *t, r3d_cpuvol *v, double P[3]) {
       bs = s;
     }
   }
-  P[0] += nrm[0] * bs;
-  P[1] += nrm[1] * bs;
-  P[2] += nrm[2] * bs;
+  double trust = best >= TR_STRONG ? 1.0 : (best <= TR_FLOOR ? 0.0
+                                            : (best - TR_FLOOR) / (TR_STRONG - TR_FLOOR));
+  P[0] += nrm[0] * bs * trust;
+  P[1] += nrm[1] * bs * trust;
+  P[2] += nrm[2] * bs * trust;
   return best;
 }
 
@@ -115,9 +121,9 @@ static void *tr_worker(void *ud) {
       if (sv >= (double)t->cfg.thresh) break;
     }
     pthread_mutex_lock(&t->mu);
-    t->state[(size_t)c * t->W + c] =
-        sv >= (double)t->cfg.thresh ? R3D_TR_SET : R3D_TR_FAIL;
-    t->nset = sv >= (double)t->cfg.thresh ? 1u : 0u;
+    t->state[(size_t)c * t->W + c] = sv >= TR_FLOOR ? R3D_TR_SET : R3D_TR_FAIL;
+    t->conf[(size_t)c * t->W + c] = (float)(sv > 0.0 ? sv : 0.0);
+    t->nset = sv >= TR_FLOOR ? 1u : 0u;
     t->gen++;
     dead = t->nset == 0;
     pthread_mutex_unlock(&t->mu);
@@ -164,13 +170,15 @@ static void *tr_worker(void *ud) {
             }
             double val = tr_snap(t, &vol, P);
             pthread_mutex_lock(&t->mu);
-            if (val >= (double)t->cfg.thresh) {
+            if (val >= TR_FLOOR) {
               memcpy(t->pos + k * 3, P, sizeof P);
               t->state[k] = R3D_TR_SET;
+              t->conf[k] = (float)val;
               t->nset++;
               grew++;
             } else {
               t->state[k] = R3D_TR_FAIL;
+              t->conf[k] = (float)(val > 0.0 ? val : 0.0);
             }
             pthread_mutex_unlock(&t->mu);
           } else { /* relax: average toward neighbors, re-snap */
@@ -195,11 +203,14 @@ static void *tr_worker(void *ud) {
             if (na < 2) continue;
             double P[3];
             const double *pc = t->pos + k * 3;
-            for (int a = 0; a < 3; a++) P[a] = 0.6 * pc[a] + 0.4 * avg[a] / na;
+            /* weak vertices lean on their neighbors, strong ones hold */
+            double w = 0.25 + 0.55 * (1.0 - (double)t->conf[k]);
+            for (int a = 0; a < 3; a++) P[a] = (1.0 - w) * pc[a] + w * avg[a] / na;
             double val = tr_snap(t, &vol, P);
-            if (val >= (double)t->cfg.thresh) {
+            if (val >= TR_FLOOR) {
               pthread_mutex_lock(&t->mu);
               memcpy(t->pos + k * 3, P, sizeof P);
+              t->conf[k] = (float)val;
               pthread_mutex_unlock(&t->mu);
             }
           }
@@ -232,7 +243,8 @@ int r3d_tracer_start(r3d_tracer *t, const char *pred_root, const r3d_tracer_cfg 
   t->W = t->H = 2 * t->cfg.max_ring + 1;
   t->pos = calloc((size_t)t->W * t->H * 3, sizeof *t->pos);
   t->state = calloc((size_t)t->W * t->H, 1);
-  if (!t->pos || !t->state) {
+  t->conf = calloc((size_t)t->W * t->H, sizeof *t->conf);
+  if (!t->pos || !t->state || !t->conf) {
     r3d_tracer_free(t);
     return -1;
   }
@@ -258,9 +270,11 @@ int r3d_tracer_grow(r3d_tracer *t, uint32_t extra) {
   uint32_t NW = 2 * nr + 1, off = nr - t->cfg.max_ring;
   double *np = calloc((size_t)NW * NW * 3, sizeof *np);
   uint8_t *ns = calloc((size_t)NW * NW, 1);
-  if (!np || !ns) {
+  float *nc = calloc((size_t)NW * NW, sizeof *nc);
+  if (!np || !ns || !nc) {
     free(np);
     free(ns);
+    free(nc);
     return -1;
   }
   for (uint32_t j = 0; j < t->H; j++)
@@ -269,13 +283,16 @@ int r3d_tracer_grow(r3d_tracer *t, uint32_t extra) {
       size_t nk = (size_t)(j + off) * NW + (i + off);
       if (t->state[ok] == R3D_TR_SET) { /* FAILED cells retry as EMPTY */
         ns[nk] = R3D_TR_SET;
+        nc[nk] = t->conf[ok];
         memcpy(np + nk * 3, t->pos + ok * 3, 3 * sizeof(double));
       }
     }
   free(t->pos);
   free(t->state);
+  free(t->conf);
   t->pos = np;
   t->state = ns;
+  t->conf = nc;
   t->W = t->H = NW;
   t->cfg.max_ring = nr;
   t->quit = false;
@@ -301,15 +318,17 @@ void r3d_tracer_stop(r3d_tracer *t) {
 void r3d_tracer_free(r3d_tracer *t) {
   free(t->pos);
   free(t->state);
+  free(t->conf);
   r3d_umbilicus_free(&t->umb);
   memset(t, 0, sizeof *t);
 }
 
-uint64_t r3d_tracer_snapshot(r3d_tracer *t, double *pos, uint8_t *state, uint32_t *ring,
-                             uint32_t *nset, bool *done) {
+uint64_t r3d_tracer_snapshot(r3d_tracer *t, double *pos, uint8_t *state, float *conf,
+                             uint32_t *ring, uint32_t *nset, bool *done) {
   pthread_mutex_lock(&t->mu);
   if (pos) memcpy(pos, t->pos, (size_t)t->W * t->H * 3 * sizeof *pos);
   if (state) memcpy(state, t->state, (size_t)t->W * t->H);
+  if (conf) memcpy(conf, t->conf, (size_t)t->W * t->H * sizeof *conf);
   if (ring) *ring = t->ring;
   if (nset) *nset = t->nset;
   if (done) *done = t->done;
@@ -337,7 +356,7 @@ static int tr_write_plane(const char *path, const float *v, uint32_t w, uint32_t
   return rc;
 }
 
-int r3d_tracer_save(r3d_tracer *t, const char *dir) {
+int r3d_tracer_save(r3d_tracer *t, const char *dir, float cutoff) {
   if (!t->pos) return -1;
   uint64_t n = (uint64_t)t->W * t->H;
   float *pl = malloc(n * sizeof *pl);
@@ -347,7 +366,9 @@ int r3d_tracer_save(r3d_tracer *t, const char *dir) {
   pthread_mutex_lock(&t->mu);
   for (int a = 0; a < 3 && rc == 0; a++) {
     for (uint64_t k = 0; k < n; k++)
-      pl[k] = t->state[k] == R3D_TR_SET ? (float)t->pos[k * 3 + (size_t)a] : -1.0f;
+      pl[k] = t->state[k] == R3D_TR_SET && t->conf[k] >= cutoff
+                  ? (float)t->pos[k * 3 + (size_t)a]
+                  : -1.0f;
     char path[1200];
     snprintf(path, sizeof path, "%s/%s", dir, nm[a]);
     rc = tr_write_plane(path, pl, t->W, t->H);

@@ -19,7 +19,8 @@ enum { R3D_TR_EMPTY = 0, R3D_TR_SET = 1, R3D_TR_FAIL = 2 };
 typedef struct r3d_tracer_cfg {
   double seed[3];   /* world voxels */
   double step;      /* grid pitch, voxels (tifxyz scale = 1/step) */
-  float thresh;     /* prediction acceptance, 0..1 */
+  float thresh;     /* confidence cutoff for SAVING/display, 0..1; growth
+                     * itself only stops at a low fixed floor */
   uint32_t max_ring; /* grid radius, cells */
   uint32_t level;   /* prediction pyramid level to sample */
   double search;    /* ridge-snap range along the normal, voxels */
@@ -31,6 +32,7 @@ typedef struct r3d_tracer {
   uint32_t W, H;   /* 2*max_ring+1 square grid */
   double *pos;     /* [W*H*3], guarded by mu */
   uint8_t *state;  /* [W*H] R3D_TR_* */
+  float *conf;     /* [W*H] per-vertex prediction confidence 0..1 */
   r3d_umbilicus umb; /* copied winding guide (may be empty) */
   pthread_t th;
   pthread_mutex_t mu;
@@ -52,11 +54,11 @@ void r3d_tracer_free(r3d_tracer *t);
 
 /* Copy the current grid into caller buffers (each may be NULL); returns the
  * generation so callers can skip unchanged copies. */
-uint64_t r3d_tracer_snapshot(r3d_tracer *t, double *pos, uint8_t *state, uint32_t *ring,
-                             uint32_t *nset, bool *done);
+uint64_t r3d_tracer_snapshot(r3d_tracer *t, double *pos, uint8_t *state, float *conf,
+                             uint32_t *ring, uint32_t *nset, bool *done);
 
 /* Write the traced grid as <dir>/{x,y,z}.tif + meta.json (failed/empty
  * cells = the tifxyz invalid encoding). */
-int r3d_tracer_save(r3d_tracer *t, const char *dir);
+int r3d_tracer_save(r3d_tracer *t, const char *dir, float cutoff);
 
 #endif /* R3D_TRACER_H */

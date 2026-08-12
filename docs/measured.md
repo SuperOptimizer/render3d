@@ -1508,3 +1508,16 @@ tifxyz; segpack accepted it (83rd store surface, bbox consistent with
 GP). Verification is numeric (241 snapshot points in the XY slab) — the
 overlay itself is ImGui and invisible to --shot, a trap now noted twice
 in this ledger. All 5 suites green.
+
+## 2026-08-12 — tracer confidence is continuous, cutoff moves to save time
+
+Binary accept -> per-vertex confidence: growth only dies below a fixed
+floor (0.10); between floor and 0.45 the vertex blends continuously from
+"trust the extrapolation" to "trust the ridge snap", and relaxation
+weights weak vertices toward their confident neighbors. The GUI slider is
+now a confidence CUTOFF applied at display and save time (weak points
+draw translucent red below it, and saving masks them to invalid) — so
+you pick the quality bar after seeing the patch, and can re-save at a
+different bar without re-tracing. Same GP seed: 4784 -> 7128 points at
+60 rings (growth no longer stalls at brief prediction dips). All 5
+suites green.
