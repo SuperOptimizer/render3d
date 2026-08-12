@@ -2037,8 +2037,42 @@ int main(int argc, char **argv) {
       }
       if (in.annotate_click && in.click_ctrl) { /* Ctrl+click = set focus POI */
         int cv_ = r3d_mv_hit(mv, in.click_xy[0], in.click_xy[1]);
-        if (MV_IS3D(cv_)) cv_ = -1; /* the 3D pane has no plane to focus on */
         bool focused = false, have_ij = false;
+        if (MV_IS3D(cv_) && mv_crop_e > 0.0f) {
+          /* 3D pane: the click ray meets the view-facing plane through the
+           * crop center — lateral pick at the cube's depth (iterate from a
+           * plane view for exact depth) */
+          uint32_t md3 = brick_shape[0];
+          for (int a = 1; a < 3; a++)
+            if (brick_shape[a] > md3) md3 = brick_shape[a];
+          double eb3 = (double)mv_crop_e / md3;
+          r3d_camera_orbit_set(&cam,
+                               v3((float)(mv_crop_c[0] / md3), (float)(mv_crop_c[1] / md3),
+                                  (float)(mv_crop_c[2] / md3)),
+                               (float)(eb3 * (double)mv_crop_fit));
+          r3d_v3 c_r, c_u, c_f;
+          r3d_camera_basis(&cam, (float)mv[cv_].pw / (float)(mv[cv_].ph ? mv[cv_].ph : 1),
+                           &c_r, &c_u, &c_f);
+          float nx = ((in.click_xy[0] - (float)mv[cv_].px) / (float)mv[cv_].pw) * 2.0f - 1.0f;
+          float ny = 1.0f - ((in.click_xy[1] - (float)mv[cv_].py) / (float)mv[cv_].ph) * 2.0f;
+          r3d_v3 dir = v3_norm(v3_add(c_f, v3_add(v3_scale(c_r, nx), v3_scale(c_u, ny))));
+          float dz = v3_dot(dir, c_f);
+          if (dz > 1e-5f) {
+            float tt = v3_dot(v3_sub(cam.target, cam.pos), c_f) / dz;
+            r3d_v3 P = v3_add(cam.pos, v3_scale(dir, tt));
+            double W3[3] = {(double)P.x * md3, (double)P.y * md3, (double)P.z * md3};
+            double half3 = (double)mv_crop_e * 0.5;
+            for (int a = 0; a < 3; a++) { /* stay within the cube */
+              if (W3[a] < mv_crop_c[a] - half3) W3[a] = mv_crop_c[a] - half3;
+              if (W3[a] > mv_crop_c[a] + half3) W3[a] = mv_crop_c[a] + half3;
+              mv_focus[a] = W3[a];
+            }
+            focused = true;
+          }
+          cv_ = -1; /* the shared tail below handles the rest */
+        } else if (MV_IS3D(cv_)) {
+          cv_ = -1;
+        }
         if (cv_ == R3D_MV_SEG) {
           /* focus at the surface point under the cursor (CPU bilinear tap) */
           double gu, gv;
