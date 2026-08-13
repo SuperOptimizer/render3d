@@ -1,9 +1,14 @@
 #include "core/cpuvol.h"
 
+#include <blosc.h>
+#include <curl/curl.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
 
 #include <brick.h> /* c5d brick decode */
 #include <shard.h> /* c5d .c5s reader */
@@ -81,6 +86,37 @@ int r3d_cpuvol_open(r3d_cpuvol *v, const char *root, uint32_t cache_bricks) {
     return -1;
   }
   for (uint32_t i = 0; i < v->nslots; i++) v->keys[i] = UINT64_MAX;
+  /* optional net source: chunk fetch config, same file the renderer uses */
+  snprintf(mp, sizeof mp, "%s/source.json", root);
+  f = fopen(mp, "rb");
+  if (f) {
+    char sj[16384] = {0};
+    size_t sn = fread(sj, 1, sizeof sj - 1, f);
+    fclose(f);
+    (void)sn;
+    const char *up = strstr(sj, "\"url\": \"");
+    const char *qp = strstr(sj, "\"quality\": ");
+    if (up) {
+      up += 8;
+      const char *ue = strchr(up, '"');
+      if (ue && (size_t)(ue - up) < sizeof v->url) {
+        memcpy(v->url, up, (size_t)(ue - up));
+        v->url[ue - up] = 0;
+      }
+      v->q0 = qp ? strtof(qp + 11, NULL) : 2.0f;
+      const char *lp = sj;
+      for (uint32_t l = 0; l < v->nlev && (lp = strstr(lp, "\"chunk\": ")); l++) {
+        v->chsz[l] = (uint32_t)strtoul(lp + 9, NULL, 10);
+        const char *rp = strstr(lp, "\"raw\": ");
+        v->raw[l] = rp && strncmp(rp + 7, "true", 4) == 0;
+        if (v->chsz[l] < 32 || v->chsz[l] > 1024) {
+          v->url[0] = 0;
+          break;
+        }
+        lp += 9;
+      }
+    }
+  }
   return 0;
 }
 
@@ -93,10 +129,178 @@ void r3d_cpuvol_close(r3d_cpuvol *v) {
   free(v->slabs);
   free(v->keys);
   free(v->use);
+  if (v->curl) curl_easy_cleanup(v->curl);
   memset(v, 0, sizeof *v);
 }
 
 /* decode brick (li,bx,by,bz) into a cache slot; NULL when absent on disk */
+/* --- demand fetch: zarr chunks -> .c5b cache (mirrors ni_worker) --------- */
+
+static size_t cv_curl_write(const void *data, size_t sz, size_t nm, void *ud) {
+  struct cvbuf { uint8_t *p; size_t n, cap; } *b = ud;
+  size_t n = sz * nm;
+  if (b->n + n > b->cap) {
+    size_t nc = b->cap ? b->cap * 2 : (4u << 20);
+    while (nc < b->n + n) nc *= 2;
+    uint8_t *np = realloc(b->p, nc);
+    if (!np) return 0;
+    b->p = np;
+    b->cap = nc;
+  }
+  memcpy(b->p + b->n, data, n);
+  b->n += n;
+  return n;
+}
+
+static uint32_t cv_cell_dim(uint32_t chsz) { /* lcm(chsz, brick) */
+  uint32_t a = chsz, b = CV_BRICK;
+  while (b) {
+    uint32_t t = a % b;
+    a = b;
+    b = t;
+  }
+  return chsz / a * CV_BRICK;
+}
+
+static int cv_write_file(const char *path, const void *data, size_t n) {
+  char tmp[1460];
+  int pn = snprintf(tmp, sizeof tmp, "%s.tmp.%ld", path, (long)getpid());
+  if (pn < 0 || (size_t)pn >= sizeof tmp) return -1;
+  FILE *f = fopen(tmp, "wb");
+  if (!f) return -1;
+  int rc = n && fwrite(data, 1, n, f) != n ? -1 : 0;
+  if (fclose(f) != 0) rc = -1;
+  if (rc == 0 && rename(tmp, path) != 0) rc = -1;
+  if (rc != 0) unlink(tmp);
+  return rc;
+}
+
+/* Fetch the cell owning brick (bx,by,bz) at level li and write every brick
+ * of the cell to <root>/bricks/L<li> (.c5b; empty file = absent/air). */
+static void cv_net_fetch(r3d_cpuvol *v, uint32_t li, uint32_t bx, uint32_t by,
+                         uint32_t bz) {
+  if (!v->url[0] || li >= v->nlev || !v->chsz[li]) return;
+  uint64_t now = (uint64_t)time(NULL);
+  if (v->net_cool > now) return;
+  if (!v->curl) {
+    v->curl = curl_easy_init();
+    if (!v->curl) return;
+    curl_easy_setopt(v->curl, CURLOPT_WRITEFUNCTION, cv_curl_write);
+    curl_easy_setopt(v->curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(v->curl, CURLOPT_CONNECTTIMEOUT, 30L);
+    curl_easy_setopt(v->curl, CURLOPT_LOW_SPEED_LIMIT, 1024L);
+    curl_easy_setopt(v->curl, CURLOPT_LOW_SPEED_TIME, 60L);
+  }
+  uint32_t chsz = v->chsz[li], cell = cv_cell_dim(chsz), cb = cell / CV_BRICK,
+           cc = cell / chsz;
+  uint32_t cz = bz / cb, cy = by / cb, cx = bx / cb;
+  size_t chunk_bytes = (size_t)chsz * chsz * chsz;
+  size_t cell_bytes = (size_t)cell * cell * cell;
+  uint8_t *cellbuf = calloc(1, cell_bytes);
+  uint8_t *chunk = malloc(chunk_bytes);
+  uint8_t *raw = malloc(CV_RAW);
+  struct { uint8_t *p; size_t n, cap; } buf = {0};
+  if (!cellbuf || !chunk || !raw) goto done;
+  bool any = false;
+  for (uint32_t icz = 0; icz < cc; icz++)
+    for (uint32_t icy = 0; icy < cc; icy++)
+      for (uint32_t icx = 0; icx < cc; icx++) {
+        char url[1600];
+        snprintf(url, sizeof url, "%s/%u/%u/%u/%u", v->url, li, cz * cc + icz,
+                 cy * cc + icy, cx * cc + icx);
+        long code = 0;
+        CURLcode crc = CURLE_OK;
+        for (int attempt = 0; attempt < 3; attempt++) {
+          buf.n = 0;
+          curl_easy_setopt(v->curl, CURLOPT_URL, url);
+          curl_easy_setopt(v->curl, CURLOPT_WRITEDATA, &buf);
+          crc = curl_easy_perform(v->curl);
+          curl_easy_getinfo(v->curl, CURLINFO_RESPONSE_CODE, &code);
+          if (crc == CURLE_OK && (code == 200 || code == 404)) break;
+          sleep((unsigned)(1u << attempt));
+        }
+        if (!(crc == CURLE_OK && (code == 200 || code == 404))) {
+          v->net_cool = now + 30; /* network trouble: back off, stay air */
+          goto done;
+        }
+        if (code == 404) continue;
+        bool ok;
+        if (v->raw[li]) {
+          ok = buf.n == chunk_bytes;
+          if (ok) memcpy(chunk, buf.p, chunk_bytes);
+        } else {
+          size_t nb = 0, cby = 0, bs = 0;
+          blosc_cbuffer_sizes(buf.p, &nb, &cby, &bs);
+          ok = nb == chunk_bytes && cby <= buf.n &&
+               blosc_decompress_ctx(buf.p, chunk, chunk_bytes, 1) == (int)chunk_bytes;
+        }
+        if (!ok) continue; /* bad payload reads as air */
+        for (uint32_t zz = 0; zz < chsz; zz++)
+          for (uint32_t yy = 0; yy < chsz; yy++)
+            memcpy(cellbuf + (((size_t)icz * chsz + zz) * cell +
+                              ((size_t)icy * chsz + yy)) *
+                                 cell +
+                       (size_t)icx * chsz,
+                   chunk + ((size_t)zz * chsz + yy) * chsz, chsz);
+        any = true;
+      }
+  {
+    const r3d_cpuvol_level *l = &v->lev[li];
+    char dir[1360];
+    snprintf(dir, sizeof dir, "%s/bricks", v->root);
+    mkdir(dir, 0755);
+    snprintf(dir, sizeof dir, "%s/bricks/L%u", v->root, li);
+    mkdir(dir, 0755);
+    float q = v->q0 / (float)(1u << (li < 3u ? li : 3u));
+    if (q < 0.25f) q = 0.25f;
+    for (uint32_t sz2 = 0; sz2 < cb; sz2++)
+      for (uint32_t sy2 = 0; sy2 < cb; sy2++)
+        for (uint32_t sx2 = 0; sx2 < cb; sx2++) {
+          uint32_t obz = cz * cb + sz2, oby = cy * cb + sy2, obx = cx * cb + sx2;
+          if (obx >= l->bx || oby >= l->by || obz >= l->bz) continue;
+          char path[1500];
+          snprintf(path, sizeof path, "%s/bricks/L%u/%u_%u_%u.c5b", v->root, li, obz,
+                   oby, obx);
+          struct stat st;
+          if (stat(path, &st) == 0) continue; /* another fetcher won */
+          bool zero = !any;
+          if (any) {
+            for (uint32_t rr = 0; rr < CV_BRICK; rr++)
+              for (uint32_t qq = 0; qq < CV_BRICK; qq++)
+                memcpy(raw + ((size_t)rr * CV_BRICK + qq) * CV_BRICK,
+                       cellbuf + (((size_t)(sz2 * CV_BRICK + rr) * cell +
+                                   sy2 * CV_BRICK + qq) *
+                                      cell +
+                                  sx2 * CV_BRICK),
+                       CV_BRICK);
+            zero = true;
+            for (size_t k = 0; k < (size_t)CV_RAW; k++)
+              if (raw[k]) {
+                zero = false;
+                break;
+              }
+          }
+          if (zero) {
+            cv_write_file(path, NULL, 0);
+            continue;
+          }
+          c5d_brick_params bp = c5d_brick_defaults(1.0f);
+          bp.q = q;
+          uint8_t *enc = NULL;
+          size_t en = 0;
+          if (c5d_brick_encode(&bp, raw, CV_BRICK, &enc, &en) == 0) {
+            cv_write_file(path, enc, en);
+            free(enc);
+          }
+        }
+  }
+done:
+  free(cellbuf);
+  free(chunk);
+  free(raw);
+  free(buf.p);
+}
+
 static const uint8_t *cv_brick(r3d_cpuvol *v, uint32_t li, uint32_t bx, uint32_t by,
                                uint32_t bz) {
   uint64_t key = ((uint64_t)li << 60) | ((uint64_t)bz << 40) | ((uint64_t)by << 20) | bx;
@@ -147,6 +351,10 @@ static const uint8_t *cv_brick(r3d_cpuvol *v, uint32_t li, uint32_t bx, uint32_t
     char path[1400];
     snprintf(path, sizeof path, "%s/bricks/L%u/%u_%u_%u.c5b", v->root, li, bz, by, bx);
     FILE *bf = fopen(path, "rb");
+    if (!bf && v->url[0]) { /* never fetched: pull the owning cell now */
+      cv_net_fetch(v, li, bx, by, bz);
+      bf = fopen(path, "rb");
+    }
     if (bf) {
       fseek(bf, 0, SEEK_END);
       long fn = ftell(bf);

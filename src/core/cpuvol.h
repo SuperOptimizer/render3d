@@ -32,6 +32,17 @@ typedef struct r3d_cpuvol {
   uint64_t *use;     /* LRU ticks */
   uint32_t nslots;
   uint64_t tick;
+  /* demand fetch (source.json): brick misses pull the owning zarr cell,
+   * transcode, and land in <root>/bricks/L* — the same cache the
+   * renderer's net ingest fills, so either side feeds the other. The
+   * tracer must not go data-blind at its frontier just because the
+   * viewer never looked there. */
+  char url[1400];    /* empty = no net source */
+  float q0;          /* c5d quality ladder base */
+  uint32_t chsz[R3D_CPUVOL_LEVELS];
+  bool raw[R3D_CPUVOL_LEVELS];
+  void *curl;        /* lazy CURL handle */
+  uint64_t net_cool; /* backoff: no fetches until this tick-time (s) */
 } r3d_cpuvol;
 
 int r3d_cpuvol_open(r3d_cpuvol *v, const char *root, uint32_t cache_bricks);
