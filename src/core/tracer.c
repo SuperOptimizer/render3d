@@ -452,7 +452,7 @@ typedef struct ng_vol {
     uint32_t ref;     /* pinned by in-flight residual evals */
   } s[NG_SLOTS];
   uint16_t idx[8192]; /* open-addressed (plane,slice) -> slot+1 */
-  size_t bytes;        /* decoded total across slots */
+  _Atomic size_t bytes; /* decoded total across slots (incl. lazy paths) */
   pthread_mutex_t gmu; /* guards the slot table */
   uint64_t tick;
   /* prefetch pool: the frontier crosses xz/yz slices sequentially, so a
@@ -772,7 +772,7 @@ static ng_grid *ng_get(ng_vol *v, int plane, int slice, int *slot_out) {
   }
   if (v->s[victim].plane >= 0) {
     ng_idx_del(v, v->s[victim].plane, v->s[victim].slice);
-    if (v->s[victim].g) v->bytes -= v->s[victim].g->bytes;
+    if (v->s[victim].g) atomic_fetch_sub(&v->bytes, v->s[victim].g->bytes);
     ng_grid_free(v->s[victim].g);
   }
   v->s[victim].plane = plane;
@@ -783,9 +783,9 @@ static ng_grid *ng_get(ng_vol *v, int plane, int slice, int *slot_out) {
   ng_idx_put(v, plane, slice, victim);
   if (g) {
     *slot_out = (int)victim;
-    v->bytes += g->bytes;
+    atomic_fetch_add(&v->bytes, g->bytes);
   }
-  while (v->bytes > NG_BUDGET) { /* evict LRU unpinned down to budget */
+  while (atomic_load(&v->bytes) > NG_BUDGET) { /* evict LRU unpinned */
     uint32_t ev = UINT32_MAX;
     uint64_t old2 = UINT64_MAX;
     for (uint32_t i = 0; i < NG_SLOTS; i++) {
@@ -796,7 +796,7 @@ static ng_grid *ng_get(ng_vol *v, int plane, int slice, int *slot_out) {
       }
     }
     if (ev == UINT32_MAX) break;
-    v->bytes -= v->s[ev].g->bytes;
+    atomic_fetch_sub(&v->bytes, v->s[ev].g->bytes);
     ng_idx_del(v, v->s[ev].plane, v->s[ev].slice);
     ng_grid_free(v->s[ev].g);
     v->s[ev].plane = -1;
@@ -1066,7 +1066,7 @@ static double ncp_residual(tr_env *e, int plane, const double A[3],
   ng_hood *hd = ng_hood_get(e, g, plane, slice, mx, my);
   /* no segments: normal term 0, snap takes the fixed no-target penalty */
   double wsum = 0.0, nsum = 0.0;
-  double best_snap = -1.0;
+  double best_snap = -1.0, best_score = -1.0;
   float fmx = (float)mx, fmy = (float)my;
   float fex = (float)e2[0], fey = (float)e2[1];
   float fenx = (float)enx, feny = (float)eny;
@@ -1096,12 +1096,12 @@ static double ncp_residual(tr_env *e, int plane, const double A[3],
           double qby = dsn ? (double)sg[9] : (double)sg[1];
           double d2a = ncp_pt_seg_d2(a2[0], a2[1], qax, qay, qbx, qby);
           if (d2a < NCP_SNAP_RANGE * NCP_SNAP_RANGE) {
-            double score =
-                0.5 * (sqrt(d2a) / NCP_SNAP_RANGE + sqrt((double)d2e) / NCP_SNAP_TRIG);
-            if (best_snap < 0.0 || score < best_snap) {
-              double d1n = sqrt(d2a) / NCP_SNAP_RANGE,
-                     d2n = sqrt((double)d2e) / NCP_SNAP_TRIG;
-              best_snap = d1n * (1.0 - d2n) + d2n;
+            double d1n = sqrt(d2a) / NCP_SNAP_RANGE,
+                   d2n = sqrt((double)d2e) / NCP_SNAP_TRIG;
+            double score = 0.5 * (d1n + d2n); /* vc3d: min by score... */
+            if (best_score < 0.0 || score < best_score) {
+              best_score = score;
+              best_snap = d1n * (1.0 - d2n) + d2n; /* ...keep the value */
             }
           }
         }
@@ -1124,6 +1124,165 @@ static double ncp_residual(tr_env *e, int plane, const double A[3],
   double na = nq[axis] / sqrt(nl2);
   double aw = 0.5 * (1.0 - na * na);
   return (NCP_W_NORMAL * normal_loss + NCP_W_SNAP * snap_loss) * aw;
+}
+
+/* Fused residual + forward-difference gradient: the base evaluation and
+ * its three +h probes differ by half a voxel — same slice, same hood,
+ * near-identical chords — so all four run through ONE pass over the
+ * segment neighborhood with 4-wide math instead of four passes with
+ * four hood lookups. out[0]=r(x), out[1..3]=r(x + h e_k). */
+static void ncp_residual4(tr_env *e, int plane, const double Qr[4][3], int fxr,
+                          double h, double out[4]) {
+  int axis = 2 - plane;
+  double V[4][3]; /* free-corner variants */
+  for (int v = 0; v < 4; v++) {
+    memcpy(V[v], Qr[fxr], sizeof V[v]);
+    if (v) V[v][v - 1] += h;
+  }
+  /* per-variant chord prep (cheap scalar) */
+  bool ok[4];
+  int slice[4];
+  float vmx[4], vmy[4], vax[4], vay[4], vex4[4], vey4[4], venx[4], veny[4];
+  double aw[4];
+  int nok = 0;
+  for (int v = 0; v < 4; v++) {
+    const double *cor[4];
+    for (int c = 0; c < 4; c++) cor[c] = c == fxr ? V[v] : Qr[c];
+    const double *A = cor[0], *B1 = cor[1], *B2 = cor[2], *C = cor[3];
+    ok[v] = false;
+    out[v] = 0.0;
+    double b1r = B1[axis] - A[axis], b2r = B2[axis] - A[axis], cr = C[axis] - A[axis];
+    if ((b1r > 0 && b2r > 0 && cr > 0) || (b1r < 0 && b2r < 0 && cr < 0)) continue;
+    const double *Bn = NULL;
+    double bnr = 0.0;
+    if (fabs(cr) < 1e-9) {
+      if (fabs(b1r) > 1e-9) {
+        Bn = B1;
+        bnr = b1r;
+      } else if (fabs(b2r) > 1e-9) {
+        Bn = B2;
+        bnr = b2r;
+      }
+    } else {
+      if (b1r * cr <= 0.0) {
+        Bn = B1;
+        bnr = b1r;
+      } else if (b2r * cr <= 0.0) {
+        Bn = B2;
+        bnr = b2r;
+      }
+    }
+    if (!Bn || fabs(bnr - cr) < 1e-9) continue;
+    double t = -cr / (bnr - cr);
+    double E[3];
+    for (int a = 0; a < 3; a++) E[a] = C[a] + t * (Bn[a] - C[a]);
+    double a2[2], e2[2];
+    ncp_2d(plane, A, a2);
+    ncp_2d(plane, E, e2);
+    double ex = e2[0] - a2[0], ey = e2[1] - a2[1];
+    double el = sqrt(ex * ex + ey * ey);
+    if (el < 1e-9) continue;
+    double v1_[3], v2_[3], nq[3];
+    for (int a = 0; a < 3; a++) {
+      v1_[a] = Bn[a] - A[a];
+      v2_[a] = Bn[a] - C[a];
+    }
+    nq[0] = v1_[1] * v2_[2] - v1_[2] * v2_[1];
+    nq[1] = v1_[2] * v2_[0] - v1_[0] * v2_[2];
+    nq[2] = v1_[0] * v2_[1] - v1_[1] * v2_[0];
+    double nl2 = nq[0] * nq[0] + nq[1] * nq[1] + nq[2] * nq[2];
+    if (nl2 < 1e-18) continue;
+    double na = nq[axis] / sqrt(nl2);
+    aw[v] = 0.5 * (1.0 - na * na);
+    slice[v] = (int)llround(A[axis]);
+    vax[v] = (float)a2[0];
+    vay[v] = (float)a2[1];
+    vex4[v] = (float)e2[0];
+    vey4[v] = (float)e2[1];
+    venx[v] = (float)(ey / el);
+    veny[v] = (float)(-ex / el);
+    vmx[v] = (float)((a2[0] + e2[0]) * 0.5);
+    vmy[v] = (float)((a2[1] + e2[1]) * 0.5);
+    ok[v] = true;
+    nok++;
+  }
+  if (!nok) return;
+  /* one hood serves every variant (mids differ by <= h; the hood radius
+   * carries 12 px of quantization slack). Variants on a different slice
+   * (free coord crossing a .5 boundary) fall back to scalar. */
+  int s0 = -1;
+  for (int v = 0; v < 4; v++)
+    if (ok[v]) {
+      if (s0 < 0) s0 = slice[v];
+      else if (slice[v] != s0) {
+        double Qs[4][3];
+        for (int c = 0; c < 4; c++)
+          memcpy(Qs[c], c == fxr ? V[v] : Qr[c], sizeof Qs[c]);
+        out[v] = ncp_residual(e, plane, Qs[0], Qs[1], Qs[2], Qs[3]);
+        ok[v] = false;
+      }
+    }
+  int slot;
+  ng_grid *g = ng_eget(e, plane, s0, &slot);
+  (void)slot;
+  float wsum[4] = {0}, nsum[4] = {0};
+  float best_snap[4] = {-1, -1, -1, -1}, best_score4[4] = {-1, -1, -1, -1};
+  if (g && !g->empty) {
+    double m0x = 0, m0y = 0;
+    int nv = 0;
+    for (int v = 0; v < 4; v++)
+      if (ok[v]) {
+        m0x += (double)vmx[v];
+        m0y += (double)vmy[v];
+        nv++;
+      }
+    ng_hood *hd = ng_hood_get(e, g, plane, s0, m0x / nv, m0y / nv);
+    if (hd)
+      for (uint32_t k = 0; k < hd->nseg; k++) {
+        const float *sg = hd->sg[k];
+        float smx = (sg[0] + sg[2]) * 0.5f, smy = (sg[1] + sg[3]) * 0.5f;
+        for (int v = 0; v < 4; v++) { /* 4-wide: clang vectorizes this */
+          float dmx = smx - vmx[v], dmy = smy - vmy[v];
+          float d2 = dmx * dmx + dmy * dmy;
+          if (d2 <= (float)NCP_ROI2) {
+            float dd = d2 < 10.0f ? 10.0f : d2;
+            float dot = fabsf(venx[v] * sg[4] + veny[v] * sg[5]);
+            wsum[v] += 1.0f / dd;
+            nsum[v] += (1.0f - dot) / dd;
+          }
+          float tt = ((vex4[v] - sg[0]) * sg[10] + (vey4[v] - sg[1]) * sg[11]) * sg[12];
+          tt = tt < 0.0f ? 0.0f : (tt > 1.0f ? 1.0f : tt);
+          float qex = sg[0] + tt * sg[10] - vex4[v], qey = sg[1] + tt * sg[11] - vey4[v];
+          float d2e = qex * qex + qey * qey;
+          if (d2e < (float)(NCP_SNAP_TRIG * NCP_SNAP_TRIG)) {
+            for (int dsn = 0; dsn < 2; dsn++) {
+              if (!(hd->nb[k] & (dsn ? 2u : 1u))) continue;
+              double qax = dsn ? (double)sg[2] : (double)sg[6];
+              double qay = dsn ? (double)sg[3] : (double)sg[7];
+              double qbx = dsn ? (double)sg[8] : (double)sg[0];
+              double qby = dsn ? (double)sg[9] : (double)sg[1];
+              double d2a =
+                  ncp_pt_seg_d2((double)vax[v], (double)vay[v], qax, qay, qbx, qby);
+              if (d2a < NCP_SNAP_RANGE * NCP_SNAP_RANGE) {
+                double d1n = sqrt(d2a) / NCP_SNAP_RANGE,
+                       d2n = sqrt((double)d2e) / NCP_SNAP_TRIG;
+                float score = (float)(0.5 * (d1n + d2n));
+                if (best_score4[v] < 0.0f || score < best_score4[v]) {
+                  best_score4[v] = score;
+                  best_snap[v] = (float)(d1n * (1.0 - d2n) + d2n);
+                }
+              }
+            }
+          }
+        }
+      }
+  }
+  for (int v = 0; v < 4; v++) {
+    if (!ok[v]) continue;
+    double normal_loss = wsum[v] > 1e-9f ? (double)(nsum[v] / wsum[v]) : 0.0;
+    double snap_loss = best_snap[v] >= 0.0f ? (double)best_snap[v] : 1.0;
+    out[v] = (NCP_W_NORMAL * normal_loss + NCP_W_SNAP * snap_loss) * aw[v];
+  }
 }
 
 /* ===================== tiny LM over one 3-vector ===================== */
@@ -1266,7 +1425,8 @@ static void tr_res_sdir(tr_nlsq *acc, const double p[3], const double pu[3],
   double ds = detg + TR_SDIR_EPS_ABS + TR_SDIR_EPS_REL * fabs(trg);
   if (fabs(ds) < 1e-30) return;
   double E = trg + trg / ds;
-  if (!isfinite(E)) return;
+  if (fabs(E) > 1e30) return; /* range guard (isfinite is UB-checked away
+                               * under fast-math) */
   double r = w * (E - 4.0);
   /* dE/da etc. */
   double sgn = trg >= 0 ? 1.0 : -1.0;
@@ -1391,20 +1551,18 @@ static void tr_eval(tr_ctx *c, const double x[3], tr_nlsq *acc) {
       if (fx < 0) continue;
       for (int rr = 0; rr < 4; rr++)
         for (int pl = 0; pl < 3; pl++) {
-          double r0 = ncp_residual(e, pl, Q[rot[rr][0]], Q[rot[rr][1]],
-                                    Q[rot[rr][2]], Q[rot[rr][3]]);
-          if (r0 == 0.0) continue; /* non-straddling plane: flat region */
-          double J[3];
-          const double h = 0.5;
-          for (int a = 0; a < 3; a++) { /* forward diff: half the evals */
-            double sav = Q[fx][a];
-            Q[fx][a] = sav + h;
-            double rp = ncp_residual(e, pl, Q[rot[rr][0]], Q[rot[rr][1]],
-                                     Q[rot[rr][2]], Q[rot[rr][3]]);
-            Q[fx][a] = sav;
-            J[a] = (rp - r0) / h;
+          double Qrot[4][3];
+          int fxrot = -1;
+          for (int c2 = 0; c2 < 4; c2++) {
+            memcpy(Qrot[c2], Q[rot[rr][c2]], sizeof Qrot[c2]);
+            if (rot[rr][c2] == fx) fxrot = c2;
           }
-          nq_add(acc, r0, J);
+          double r4[4];
+          ncp_residual4(e, pl, Qrot, fxrot, 0.5, r4);
+          if (r4[0] == 0.0) continue; /* non-straddling plane */
+          double J[3];
+          for (int a = 0; a < 3; a++) J[a] = (r4[1 + a] - r4[0]) / 0.5;
+          nq_add(acc, r4[0], J);
         }
     }
     tr_tm_add(4, tt0);
