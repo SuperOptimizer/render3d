@@ -2356,6 +2356,34 @@ int r3d_tracer_save(r3d_tracer *t, const char *dir, float cutoff) {
         if (d2 > lim * lim) keep[k] = 0;
       }
     }
+    /* infill: an isolated low-conf cell whose neighbors are trusted and
+     * whose own edges are sane is geometrically vouched for. Scattered
+     * pinholes otherwise cost 4x their area on screen — the bilinear
+     * rule blacks every quad touching an invalid corner. */
+    for (uint64_t k = 0; k < n; k++) {
+      if (keep[k] || t->state[k] != R3D_TR_SET) continue;
+      int i = (int)(k % t->W), j = (int)(k / t->W);
+      int good = 0;
+      bool sane = true;
+      for (int dj = -1; dj <= 1 && sane; dj++)
+        for (int di = -1; di <= 1; di++) {
+          if (!di && !dj) continue;
+          int ii = i + di, jj = j + dj;
+          if (ii < 0 || jj < 0 || ii >= (int)t->W || jj >= (int)t->H) continue;
+          size_t k2 = (size_t)jj * t->W + (size_t)ii;
+          if (keep[k2] != 1) continue; /* originals only: no cascades */
+          good++;
+          double d2 = 0;
+          for (int a = 0; a < 3; a++) {
+            double dd = t->pos[k * 3 + (size_t)a] - t->pos[k2 * 3 + (size_t)a];
+            d2 += dd * dd;
+          }
+          double lim2 = lim * (di && dj ? 1.4142135623730951 : 1.0);
+          if (d2 > lim2 * lim2) sane = false;
+        }
+      if (good >= 6 && sane) keep[k] = 2; /* 2: infilled (not a seed for
+                                           * further infill) */
+    }
   }
   for (int a = 0; a < 3 && rc == 0; a++) {
     for (uint64_t k = 0; k < n; k++)
