@@ -24,6 +24,7 @@ int main(int argc, char **argv) {
     return 2;
   }
   const char *root = argv[1], *out = NULL, *umbp = NULL;
+  bool fill = true;
   r3d_tracer_cfg cfg = {.step = 20.0, .thresh = 0.35f, .max_ring = 60, .level = 1};
   bool have_seed = false;
   for (int i = 2; i < argc; i++) {
@@ -42,6 +43,8 @@ int main(int argc, char **argv) {
       out = argv[++i];
     else if (strcmp(argv[i], "--umbilicus") == 0 && i + 1 < argc)
       umbp = argv[++i];
+    else if (strcmp(argv[i], "--nofill") == 0)
+      fill = false;
     else {
       fprintf(stderr, "tracecli: bad arg %s\n", argv[i]);
       return 2;
@@ -85,7 +88,7 @@ int main(int argc, char **argv) {
   if (out && tr.nset > 8) {
     char mk[1400];
     snprintf(mk, sizeof mk, "mkdir -p '%s'", out);
-    if (system(mk) != 0 || r3d_tracer_save(&tr, out, tr.cfg.thresh) != 0) {
+    if (system(mk) != 0 || r3d_tracer_save(&tr, out, tr.cfg.thresh, fill) != 0) {
       fprintf(stderr, "tracecli: save failed (%s)\n", out);
       rc = 1;
     } else {

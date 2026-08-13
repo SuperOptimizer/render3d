@@ -2324,7 +2324,7 @@ static int tr_write_plane(const char *path, const float *v, uint32_t w, uint32_t
   return rc;
 }
 
-int r3d_tracer_save(r3d_tracer *t, const char *dir, float cutoff) {
+int r3d_tracer_save(r3d_tracer *t, const char *dir, float cutoff, bool fill) {
   if (!t->pos) return -1;
   uint64_t n = (uint64_t)t->W * t->H;
   float *pl = malloc(n * sizeof *pl);
@@ -2383,6 +2383,47 @@ int r3d_tracer_save(r3d_tracer *t, const char *dir, float cutoff) {
         }
       if (good >= 6 && sane) keep[k] = 2; /* 2: infilled (not a seed for
                                            * further infill) */
+    }
+    if (fill) {
+      /* no holes: every grown cell gets a point. Unkept cells (low conf
+       * or tear-cut) are re-seated by membrane interpolation anchored on
+       * kept neighbors — smooth continuation instead of a skip. */
+      double *fp = malloc(n * 3 * sizeof *fp);
+      if (fp) {
+        memcpy(fp, t->pos, n * 3 * sizeof *fp);
+        for (int it = 0; it < 64; it++) {
+          double moved = 0.0;
+          for (uint64_t k = 0; k < n; k++) {
+            if (keep[k] || t->state[k] != R3D_TR_SET) continue;
+            int i = (int)(k % t->W), j = (int)(k / t->W);
+            double avg[3] = {0, 0, 0};
+            int na = 0;
+            static const int o4[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+            for (int o = 0; o < 4; o++) {
+              int ii = i + o4[o][0], jj = j + o4[o][1];
+              if (ii < 0 || jj < 0 || ii >= (int)t->W || jj >= (int)t->H) continue;
+              size_t k2 = (size_t)jj * t->W + (size_t)ii;
+              if (t->state[k2] != R3D_TR_SET) continue;
+              const double *src = keep[k2] ? t->pos + k2 * 3 : fp + k2 * 3;
+              for (int a = 0; a < 3; a++) avg[a] += src[a];
+              na++;
+            }
+            if (na < 2) continue;
+            for (int a = 0; a < 3; a++) {
+              double nv2 = avg[a] / na;
+              moved += fabs(nv2 - fp[k * 3 + (size_t)a]);
+              fp[k * 3 + (size_t)a] = nv2;
+            }
+          }
+          if (moved < 0.01 * (double)n) break;
+        }
+        for (uint64_t k = 0; k < n; k++)
+          if (!keep[k] && t->state[k] == R3D_TR_SET) {
+            memcpy(t->pos + k * 3, fp + k * 3, 3 * sizeof(double));
+            keep[k] = 3; /* filled */
+          }
+        free(fp);
+      }
     }
   }
   for (int a = 0; a < 3 && rc == 0; a++) {

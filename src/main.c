@@ -2825,6 +2825,9 @@ int main(int argc, char **argv) {
       igTextDisabled("growth never rejects (vc3d); the cutoff masks display + save");
       igSliderInt("generations", &mv_tr_rings, 8, 200, "%d", 0);
       igCheckbox("live in segment view", &mv_tr_live);
+      static bool mv_tr_fill = true;
+      igSameLine(0, 10);
+      igCheckbox("fill holes", &mv_tr_fill);
       if (!mv_tr_active) {
         if (igButton("seed at focus", (ImVec2){0, 0})) {
           r3d_tracer_cfg tc = {.seed = {mv_focus[0], mv_focus[1], mv_focus[2]},
@@ -2893,7 +2896,8 @@ int main(int argc, char **argv) {
                    (unsigned)mv_tr_nset);
           char mk[300];
           snprintf(mk, sizeof mk, "mkdir -p '%s'", td);
-          if (system(mk) == 0 && r3d_tracer_save(&mv_tr, td, mv_tr_thresh) == 0) {
+          if (system(mk) == 0 &&
+              r3d_tracer_save(&mv_tr, td, mv_tr_thresh, mv_tr_fill) == 0) {
             printf("tracer: saved %s (%ux%u, %u pts)\n", td, mv_tr.W, mv_tr.H,
                    mv_tr_nset);
             if (sgc.open) { /* pack + reopen the corpus so it shows at once */
@@ -3542,7 +3546,7 @@ int main(int argc, char **argv) {
         mv_tr_nsaved = 1;
         r3d_tracer_stop(&mv_tr);
         if (system("mkdir -p cache/traced/trace-test") == 0 &&
-            r3d_tracer_save(&mv_tr, "cache/traced/trace-test", mv_tr_thresh) == 0)
+            r3d_tracer_save(&mv_tr, "cache/traced/trace-test", mv_tr_thresh, true) == 0)
           printf("tracer: saved cache/traced/trace-test\n");
       }
       if (mv_tr_active && mv_tr_pos) { /* growing trace: orange points */

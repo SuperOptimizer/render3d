@@ -67,7 +67,9 @@ uint64_t r3d_tracer_snapshot(r3d_tracer *t, double *pos, uint8_t *state, float *
                              uint32_t *ring, uint32_t *nset, bool *done);
 
 /* Write the traced grid as <dir>/{x,y,z}.tif + meta.json (failed/empty
- * cells = the tifxyz invalid encoding). */
-int r3d_tracer_save(r3d_tracer *t, const char *dir, float cutoff);
+ * cells = the tifxyz invalid encoding). fill = no holes: every grown
+ * cell is written; untrusted cells are re-seated by membrane
+ * interpolation anchored on trusted neighbors instead of skipped. */
+int r3d_tracer_save(r3d_tracer *t, const char *dir, float cutoff, bool fill);
 
 #endif /* R3D_TRACER_H */
