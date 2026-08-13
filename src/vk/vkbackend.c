@@ -1950,7 +1950,21 @@ static uint8_t *ni_load_brick(r3d_renderer *r, uint32_t b, size_t *n, int nsrc) 
   return buf;
 }
 
-/* Enqueue the zarr chunk that owns brick b (dedup against queue+inflight).
+/* Ingest unit: a CELL of lcm(chunk, brick) voxels per axis — one chunk
+ * when the chunk edge is a brick multiple (128/256/512), a 2x2x2 chunk
+ * group of 3x3x3 bricks for 192^3 trees (the eligible-scroll surface
+ * predictions), where bricks straddle chunk boundaries. */
+static uint32_t ni_cell_dim(uint32_t chsz) {
+  uint32_t a = chsz, b = BR_SLOT_DIM;
+  while (b) {
+    uint32_t t = a % b;
+    a = b;
+    b = t;
+  }
+  return chsz / a * BR_SLOT_DIM; /* lcm */
+}
+
+/* Enqueue the cell that owns brick b (dedup against queue+inflight).
  * Returns true while the brick may still arrive (queued/inflight/back-off),
  * false when the cache says the brick is definitively absent upstream. */
 static bool bricks_net_request(r3d_renderer *r, uint32_t b, int nsrc) {
@@ -1959,7 +1973,7 @@ static bool bricks_net_request(r3d_renderer *r, uint32_t b, int nsrc) {
   if (atomic_load(&hv[b]) == 2u) return false; /* definitively absent */
   uint32_t li, bx, by, bz;
   brlod_locate(r, b, &li, &bx, &by, &bz);
-  uint32_t cb = (nsrc ? r->ni.chsz2[li] : r->ni.chsz[li]) / BR_SLOT_DIM;
+  uint32_t cb = ni_cell_dim(nsrc ? r->ni.chsz2[li] : r->ni.chsz[li]) / BR_SLOT_DIM;
   uint64_t id = ((uint64_t)nsrc << 63) | ((uint64_t)li << 48) |
                 ((uint64_t)(bz / cb) << 32) | ((uint64_t)(by / cb) << 16) |
                 (uint64_t)(bx / cb);
@@ -2031,8 +2045,9 @@ static void *ni_worker(void *arg) {
   r3d_renderer *r = arg;
   CURL *curl = curl_easy_init();
   struct { uint8_t *p; size_t n, cap; } buf = {0};
-  uint8_t *chunk = NULL, *raw = malloc((size_t)BR_SLOT_DIM * BR_SLOT_DIM * BR_SLOT_DIM);
-  size_t chunk_cap = 0;
+  uint8_t *chunk = NULL, *cellbuf = NULL,
+          *raw = malloc((size_t)BR_SLOT_DIM * BR_SLOT_DIM * BR_SLOT_DIM);
+  size_t chunk_cap = 0, cell_cap = 0;
   if (!curl || !raw) goto out;
   curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, ni_curl_write);
   curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
@@ -2059,8 +2074,10 @@ static void *ni_worker(void *arg) {
     uint32_t li = (uint32_t)(id >> 48) & 0x3fffu, cz = (uint32_t)(id >> 32) & 0xffffu,
              cy = (uint32_t)(id >> 16) & 0xffffu, cx = (uint32_t)id & 0xffffu;
     _Atomic uint8_t *hvm = nsrc ? r->ni.have2 : r->ni.have;
-    uint32_t chsz = nsrc ? r->ni.chsz2[li] : r->ni.chsz[li], cb = chsz / BR_SLOT_DIM;
+    uint32_t chsz = nsrc ? r->ni.chsz2[li] : r->ni.chsz[li];
+    uint32_t cell = ni_cell_dim(chsz), cb = cell / BR_SLOT_DIM, cc = cell / chsz;
     size_t chunk_bytes = (size_t)chsz * chsz * chsz;
+    size_t cell_bytes = (size_t)cell * cell * cell;
     { /* cache files from an earlier session? publish them without fetching */
       const r3d_brlod_level *lv = &r->bricks_lev[li];
       bool all_known = true;
@@ -2090,22 +2107,81 @@ static void *ni_worker(void *arg) {
         continue;
       }
     }
-    char url[1400];
-    snprintf(url, sizeof url, "%s/%u/%u/%u/%u", nsrc ? r->ni.url2 : r->ni.url, li, cz, cy,
-             cx);
-    long code = 0;
-    CURLcode crc = CURLE_OK;
-    for (int attempt = 0; attempt < 4; attempt++) {
-      buf.n = 0;
-      curl_easy_setopt(curl, CURLOPT_URL, url);
-      curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buf);
-      crc = curl_easy_perform(curl);
-      curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
-      if (crc == CURLE_OK && (code == 200 || code == 404)) break;
-      if (r->ni.quit) break;
-      for (int w = 0; w < (1 << attempt) && !r->ni.quit; w++) sleep(1);
+    bool netfail = false, quitting = false, have = false;
+    if (cell_cap < cell_bytes) {
+      uint8_t *ncb = realloc(cellbuf, cell_bytes);
+      if (ncb) {
+        cellbuf = ncb;
+        cell_cap = cell_bytes;
+      } else
+        netfail = true;
     }
-    if (r->ni.quit) { /* teardown in progress: leave the chunk unfinished */
+    if (!netfail) memset(cellbuf, 0, cell_bytes);
+    for (uint32_t icz = 0; icz < cc && !netfail && !quitting; icz++)
+      for (uint32_t icy = 0; icy < cc && !netfail && !quitting; icy++)
+        for (uint32_t icx = 0; icx < cc; icx++) {
+          char url[1400];
+          snprintf(url, sizeof url, "%s/%u/%u/%u/%u", nsrc ? r->ni.url2 : r->ni.url, li,
+                   cz * cc + icz, cy * cc + icy, cx * cc + icx);
+          long code = 0;
+          CURLcode crc = CURLE_OK;
+          for (int attempt = 0; attempt < 4; attempt++) {
+            buf.n = 0;
+            curl_easy_setopt(curl, CURLOPT_URL, url);
+            curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buf);
+            crc = curl_easy_perform(curl);
+            curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+            if (crc == CURLE_OK && (code == 200 || code == 404)) break;
+            if (r->ni.quit) break;
+            for (int w = 0; w < (1 << attempt) && !r->ni.quit; w++) sleep(1);
+          }
+          if (r->ni.quit) { /* teardown: leave the cell unfinished */
+            quitting = true;
+            break;
+          }
+          if (!(crc == CURLE_OK && (code == 200 || code == 404))) {
+            netfail = true;
+            break;
+          }
+          if (code == 404) {
+            atomic_fetch_add(&r->ni.absent_chunks, 1);
+            continue; /* absent = air; cell is pre-zeroed */
+          }
+          atomic_fetch_add(nsrc ? &r->ni.fetched2 : &r->ni.fetched, 1);
+          bool ok = true;
+          if (chunk_cap < chunk_bytes) {
+            uint8_t *nc = realloc(chunk, chunk_bytes);
+            if (nc) {
+              chunk = nc;
+              chunk_cap = chunk_bytes;
+            } else
+              ok = false;
+          }
+          if (ok) {
+            if (nsrc ? r->ni.raw2[li] : r->ni.raw[li]) {
+              ok = buf.n == chunk_bytes;
+              if (ok) memcpy(chunk, buf.p, chunk_bytes);
+            } else {
+              size_t nbytes = 0, cbytes = 0, blocksize = 0;
+              blosc_cbuffer_sizes(buf.p, &nbytes, &cbytes, &blocksize);
+              ok = nbytes == chunk_bytes && cbytes <= buf.n &&
+                   blosc_decompress_ctx(buf.p, chunk, chunk_bytes, 1) == (int)chunk_bytes;
+            }
+          }
+          if (!ok) { /* bad payload reads as air */
+            fprintf(stderr, "bricks: bad chunk payload %s (%zu bytes)\n", url, buf.n);
+            continue;
+          }
+          for (uint32_t zz = 0; zz < chsz; zz++) /* blit into the cell */
+            for (uint32_t yy = 0; yy < chsz; yy++)
+              memcpy(cellbuf + (((size_t)icz * chsz + zz) * cell +
+                                ((size_t)icy * chsz + yy)) *
+                                   cell +
+                         (size_t)icx * chsz,
+                     chunk + ((size_t)zz * chsz + yy) * chsz, chsz);
+          have = true;
+        }
+    if (quitting) {
       pthread_mutex_lock(&r->ni.mu);
       for (uint32_t i = 0; i < r->ni.nin; i++)
         if (r->ni.inflight[i] == id) {
@@ -2115,33 +2191,7 @@ static void *ni_worker(void *arg) {
       pthread_mutex_unlock(&r->ni.mu);
       break;
     }
-    bool have = crc == CURLE_OK && code == 200;
-    if (crc == CURLE_OK && code == 404) atomic_fetch_add(&r->ni.absent_chunks, 1);
-    if (have) {
-      atomic_fetch_add(nsrc ? &r->ni.fetched2 : &r->ni.fetched, 1);
-      if (chunk_cap < chunk_bytes) {
-        uint8_t *nc = realloc(chunk, chunk_bytes);
-        if (nc) {
-          chunk = nc;
-          chunk_cap = chunk_bytes;
-        } else
-          have = false;
-      }
-    }
-    if (have) {
-      if (nsrc ? r->ni.raw2[li] : r->ni.raw[li]) {
-        have = buf.n == chunk_bytes;
-        if (have) memcpy(chunk, buf.p, chunk_bytes);
-      } else {
-        size_t nbytes = 0, cbytes = 0, blocksize = 0;
-        blosc_cbuffer_sizes(buf.p, &nbytes, &cbytes, &blocksize);
-        have = nbytes == chunk_bytes && cbytes <= buf.n &&
-               blosc_decompress_ctx(buf.p, chunk, chunk_bytes, 1) == (int)chunk_bytes;
-      }
-      if (!have)
-        fprintf(stderr, "bricks: bad chunk payload %s (%zu bytes)\n", url, buf.n);
-    }
-    if (crc == CURLE_OK && (code == 200 || code == 404)) {
+    if (!netfail) {
       const r3d_brlod_level *lv = &r->bricks_lev[li];
       const char *rt = nsrc ? r->ni.root2 : r->bricks_root;
       char dir[1360];
@@ -2169,10 +2219,10 @@ static void *ni_worker(void *arg) {
               for (uint32_t rr = 0; rr < BR_SLOT_DIM; rr++)
                 for (uint32_t qq = 0; qq < BR_SLOT_DIM; qq++)
                   memcpy(raw + ((size_t)rr * BR_SLOT_DIM + qq) * BR_SLOT_DIM,
-                         chunk + (((size_t)(sz_ * BR_SLOT_DIM + rr) * chsz +
-                                   sy * BR_SLOT_DIM + qq) *
-                                      chsz +
-                                  sx * BR_SLOT_DIM),
+                         cellbuf + (((size_t)(sz_ * BR_SLOT_DIM + rr) * cell +
+                                     sy * BR_SLOT_DIM + qq) *
+                                        cell +
+                                    sx * BR_SLOT_DIM),
                          BR_SLOT_DIM);
               zero = true;
               for (size_t v = 0; v < (size_t)BR_SLOT_DIM * BR_SLOT_DIM * BR_SLOT_DIM; v++)
@@ -2211,6 +2261,7 @@ out:
   if (curl) curl_easy_cleanup(curl);
   free(buf.p);
   free(chunk);
+  free(cellbuf);
   free(raw);
   return NULL;
 }
@@ -2831,7 +2882,8 @@ int r3d_bricks_begin(r3d_renderer *r, const char *c5s_path, uint32_t pool_bpa,
             r->ni.chsz[l] = (uint32_t)strtoul(lp + 9, NULL, 10);
             const char *rp = strstr(lp, "\"raw\": ");
             r->ni.raw[l] = rp && strncmp(rp + 7, "true", 4) == 0;
-            ok = r->ni.chsz[l] >= BR_SLOT_DIM && r->ni.chsz[l] % BR_SLOT_DIM == 0;
+            ok = r->ni.chsz[l] >= 32 && r->ni.chsz[l] <= 1024; /* any cubic:
+                   * non-brick-multiples (192) ingest as lcm cells */
             lp += 9;
           }
         }
@@ -3333,7 +3385,7 @@ static void ni_overlay_source(r3d_renderer *r) {
     r->ni.chsz2[l] = (uint32_t)strtoul(lp + 9, NULL, 10);
     const char *rp = strstr(lp, "\"raw\": ");
     r->ni.raw2[l] = rp && strncmp(rp + 7, "true", 4) == 0;
-    if (r->ni.chsz2[l] < BR_SLOT_DIM || r->ni.chsz2[l] % BR_SLOT_DIM != 0) {
+    if (r->ni.chsz2[l] < 32 || r->ni.chsz2[l] > 1024) {
       r->ni.url2[0] = 0;
       return;
     }

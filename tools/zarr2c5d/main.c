@@ -309,6 +309,7 @@ static int load_chunk(uint32_t level, uint64_t cz, uint64_t cy, uint64_t cx, uin
 typedef struct shard_job {
   uint32_t level;
   uint64_t oz, oy, ox; /* shard coords */
+  uint8_t *assem;      /* SHARD^3 assembly (phase 1 fills, phase 2 cuts) */
   blob bricks[NBRICKS];
   uint8_t zero[NBRICKS];
   _Atomic uint32_t next;
@@ -316,31 +317,35 @@ typedef struct shard_job {
   _Atomic uint64_t missing; /* chunks not yet downloaded */
 } shard_job;
 
-/* chunk-major: decode each zarr chunk once and cut it into its (chsz/128)^3
- * bricks — with 256^3 chunks a brick-major loop would decompress the same
- * 16 MB chunk eight times */
-static void *brick_worker(void *arg) {
+/* Phase 1: decode every zarr chunk overlapping the shard into a shared
+ * SHARD^3 assembly (disjoint copy regions — no locking). Handles any cubic
+ * chunk size, including ones that don't divide 1024 (e.g. the 192^3
+ * surface-prediction trees): a brick may straddle chunk boundaries. */
+static void *fill_worker(void *arg) {
   shard_job *j = arg;
   const level_info *lv = &g_lv[j->level];
-  uint32_t chsz = lv->chsz, cpa = SHARD / chsz, bpc = chsz / BRICK;
+  uint32_t chsz = lv->chsz;
+  uint64_t O[3] = {j->oz * SHARD, j->oy * SHARD, j->ox * SHARD};
+  uint64_t c0[3], c1[3];
+  for (int a = 0; a < 3; a++) {
+    c0[a] = O[a] / chsz;
+    c1[a] = (O[a] + SHARD - 1) / chsz;
+  }
+  uint64_t nz = c1[0] - c0[0] + 1, ny = c1[1] - c0[1] + 1, nx = c1[2] - c0[2] + 1;
   size_t chunk_bytes = (size_t)chsz * chsz * chsz;
   uint8_t *chunk = malloc(chunk_bytes);
-  uint8_t *raw = malloc(BRICK_BYTES);
-  uint8_t *rec = g_verify ? malloc(BRICK_BYTES) : NULL;
-  if (!chunk || !raw || (g_verify && !rec)) {
-    free(chunk);
-    free(raw);
-    free(rec);
+  if (!chunk) {
     atomic_store(&j->failed, 1);
     return NULL;
   }
-  uint32_t ncells = cpa * cpa * cpa;
+  uint64_t ncells = nz * ny * nx;
   for (;;) {
     uint32_t cell = atomic_fetch_add(&j->next, 1);
     if (cell >= ncells || atomic_load(&j->failed)) break;
-    uint32_t lz = cell / (cpa * cpa), ly = (cell / cpa) % cpa, lx = cell % cpa;
-    int rc = load_chunk(j->level, j->oz * cpa + lz, j->oy * cpa + ly, j->ox * cpa + lx,
-                        chunk);
+    uint64_t cz = c0[0] + cell / (ny * nx);
+    uint64_t cy = c0[1] + (cell / nx) % ny;
+    uint64_t cx = c0[2] + cell % nx;
+    int rc = load_chunk(j->level, cz, cy, cx, chunk);
     if (rc == -2) {
       atomic_fetch_add(&j->missing, 1);
       continue;
@@ -349,20 +354,49 @@ static void *brick_worker(void *arg) {
       atomic_store(&j->failed, 1);
       break;
     }
-    for (uint32_t sz = 0; sz < bpc && !atomic_load(&j->failed); sz++)
-      for (uint32_t sy = 0; sy < bpc; sy++)
-        for (uint32_t sx = 0; sx < bpc; sx++) {
-          uint32_t bz = lz * bpc + sz, by = ly * bpc + sy, bx = lx * bpc + sx;
-          uint32_t b = (bz * SHARD_BPA + by) * SHARD_BPA + bx;
-          if (rc == 0) {
-            j->zero[b] = 1;
-            continue;
-          }
+    if (rc == 0) continue; /* absent = fill; assembly is pre-zeroed */
+    /* copy chunk ∩ shard into the assembly */
+    uint64_t G[3] = {cz * chsz, cy * chsz, cx * chsz};
+    uint64_t s[3], e[3];
+    for (int a = 0; a < 3; a++) {
+      s[a] = G[a] > O[a] ? G[a] : O[a];
+      uint64_t ge = G[a] + chsz, oe = O[a] + SHARD;
+      e[a] = ge < oe ? ge : oe;
+    }
+    for (uint64_t z2 = s[0]; z2 < e[0]; z2++)
+      for (uint64_t y2 = s[1]; y2 < e[1]; y2++)
+        memcpy(j->assem + (((z2 - O[0]) * SHARD + (y2 - O[1])) * SHARD + (s[2] - O[2])),
+               chunk + (((z2 - G[0]) * chsz + (y2 - G[1])) * chsz + (s[2] - G[2])),
+               e[2] - s[2]);
+  }
+  free(chunk);
+  return NULL;
+}
+
+/* Phase 2: cut 128^3 bricks out of the assembly and encode them. */
+static void *brick_worker(void *arg) {
+  shard_job *j = arg;
+  uint8_t *raw = malloc(BRICK_BYTES);
+  uint8_t *rec = g_verify ? malloc(BRICK_BYTES) : NULL;
+  if (!raw || (g_verify && !rec)) {
+    free(raw);
+    free(rec);
+    atomic_store(&j->failed, 1);
+    return NULL;
+  }
+  for (;;) {
+    uint32_t b = atomic_fetch_add(&j->next, 1);
+    if (b >= NBRICKS || atomic_load(&j->failed)) break;
+    uint32_t bz = b / (SHARD_BPA * SHARD_BPA), by = (b / SHARD_BPA) % SHARD_BPA,
+             bx = b % SHARD_BPA;
+    {
           for (uint32_t r = 0; r < BRICK; r++) /* gather the 128^3 sub-cube */
             for (uint32_t q_ = 0; q_ < BRICK; q_++)
               memcpy(raw + ((size_t)r * BRICK + q_) * BRICK,
-                     chunk + (((size_t)(sz * BRICK + r) * chsz + sy * BRICK + q_) * chsz +
-                              sx * BRICK),
+                     j->assem + (((size_t)(bz * BRICK + r) * SHARD +
+                                  ((size_t)by * BRICK + q_)) *
+                                     SHARD +
+                                 (size_t)bx * BRICK),
                      BRICK);
           if (all_zero(raw, BRICK_BYTES)) {
             j->zero[b] = 1;
@@ -398,7 +432,6 @@ static void *brick_worker(void *arg) {
           }
         }
   }
-  free(chunk);
   free(raw);
   free(rec);
   return NULL;
@@ -414,11 +447,14 @@ static int process_shard(uint32_t level, uint64_t oz, uint64_t oy, uint64_t ox,
   /* missing-list pass: enumerate instead of transcode */
   if (g_missing_list) {
     const level_info *lv = &g_lv[level];
-    uint32_t cpa = SHARD / lv->chsz;
-    for (uint32_t b = 0; b < cpa * cpa * cpa; b++) {
-      uint64_t cz = oz * cpa + b / (cpa * cpa);
-      uint64_t cy = oy * cpa + (b / cpa) % cpa;
-      uint64_t cx = ox * cpa + b % cpa;
+    uint64_t O[3] = {oz * SHARD, oy * SHARD, ox * SHARD}, c0[3], c1[3];
+    for (int a = 0; a < 3; a++) {
+      c0[a] = O[a] / lv->chsz;
+      c1[a] = (O[a] + SHARD - 1) / lv->chsz;
+    }
+    for (uint64_t cz = c0[0]; cz <= c1[0]; cz++)
+    for (uint64_t cy = c0[1]; cy <= c1[1]; cy++)
+    for (uint64_t cx = c0[2]; cx <= c1[2]; cx++) {
       if (cz >= lv->chunks.z || cy >= lv->chunks.y || cx >= lv->chunks.x) continue;
       if (level >= g_full_from || !chunk_wanted(lv, cz, cy, cx)) continue;
       char path[2048], marker[2064];
@@ -439,14 +475,25 @@ static int process_shard(uint32_t level, uint64_t oz, uint64_t oy, uint64_t ox,
   j->oz = oz;
   j->oy = oy;
   j->ox = ox;
+  j->assem = calloc(1, (size_t)SHARD * SHARD * SHARD);
+  if (!j->assem) {
+    free(j);
+    return -1;
+  }
   pthread_t tids[32];
-  uint32_t nt = threads > 32u ? 32u : threads, created = 0;
-  for (; created < nt; created++)
-    if (pthread_create(&tids[created], NULL, brick_worker, j) != 0) {
-      atomic_store(&j->failed, 1);
-      break;
-    }
-  for (uint32_t t = 0; t < created; t++) pthread_join(tids[t], NULL);
+  uint32_t nt = threads > 32u ? 32u : threads;
+  for (int phase = 0; phase < 2 && !atomic_load(&j->failed); phase++) {
+    atomic_store(&j->next, 0);
+    uint32_t created = 0;
+    for (; created < nt; created++)
+      if (pthread_create(&tids[created], NULL, phase == 0 ? fill_worker : brick_worker,
+                         j) != 0) {
+        atomic_store(&j->failed, 1);
+        break;
+      }
+    for (uint32_t t = 0; t < created; t++) pthread_join(tids[t], NULL);
+    if (phase == 0 && atomic_load(&j->missing)) break; /* incomplete: no encode */
+  }
 
   int rc = atomic_load(&j->failed) ? -1 : 0;
   uint64_t miss = atomic_load(&j->missing);
@@ -472,6 +519,7 @@ static int process_shard(uint32_t level, uint64_t oz, uint64_t oy, uint64_t ox,
     if (rc != 0) unlink(tmp);
   }
   for (uint32_t b = 0; b < NBRICKS; b++) free(j->bricks[b].p);
+  free(j->assem);
   free(j);
   return rc;
 }
@@ -522,10 +570,18 @@ static int mark_surface(const char *surf_dir, uint32_t pad, uint32_t min_level,
                           (uint64_t)ax;
             if (lv->cwant[ci]) continue;
             lv->cwant[ci] = 1;
-            lv->want[(((uint64_t)az * lv->chsz) / SHARD * lv->shards.y +
-                      ((uint64_t)ay * lv->chsz) / SHARD) *
-                         lv->shards.x +
-                     ((uint64_t)ax * lv->chsz) / SHARD] = 1;
+            /* a chunk can span two shards per axis when chsz doesn't
+             * divide SHARD — mark every shard it touches */
+            uint64_t s0[3] = {(uint64_t)az * lv->chsz / SHARD,
+                              (uint64_t)ay * lv->chsz / SHARD,
+                              (uint64_t)ax * lv->chsz / SHARD};
+            uint64_t s1[3] = {((uint64_t)az * lv->chsz + lv->chsz - 1) / SHARD,
+                              ((uint64_t)ay * lv->chsz + lv->chsz - 1) / SHARD,
+                              ((uint64_t)ax * lv->chsz + lv->chsz - 1) / SHARD};
+            for (uint64_t wz = s0[0]; wz <= s1[0] && wz < lv->shards.z; wz++)
+              for (uint64_t wy = s0[1]; wy <= s1[1] && wy < lv->shards.y; wy++)
+                for (uint64_t wx = s0[2]; wx <= s1[2] && wx < lv->shards.x; wx++)
+                  lv->want[(wz * lv->shards.y + wy) * lv->shards.x + wx] = 1;
           }
     }
   }
@@ -673,9 +729,9 @@ int main(int argc, char **argv) {
     bool raw = false;
     if (read_zarray(l, &shape, &chunks, &raw) != 0) break;
     g_lv[l].raw = raw;
-    if (chunks.z != chunks.y || chunks.y != chunks.x ||
-        (chunks.z != 128 && chunks.z != 256 && chunks.z != 512)) {
-      fprintf(stderr, "zarr2c5d: L%u chunks must be cubic 128/256/512\n", l);
+    if (chunks.z != chunks.y || chunks.y != chunks.x || chunks.z < 32 ||
+        chunks.z > 1024) {
+      fprintf(stderr, "zarr2c5d: L%u chunks must be cubic (32..1024 edge)\n", l);
       return 1;
     }
     uint32_t ch = (uint32_t)chunks.z;

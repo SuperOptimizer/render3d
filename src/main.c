@@ -1424,11 +1424,22 @@ int main(int argc, char **argv) {
       return EXIT_FAILURE;
     }
     SDL_PumpEvents(); /* dataset swap: multi-second setup, stay responsive */
-    if (r3d_tifxyz_load(&mv_seg, multiview_path) != 0) return EXIT_FAILURE;
+    if (r3d_tifxyz_load(&mv_seg, multiview_path) != 0) {
+      /* virgin scroll, no segment yet: start with the close-segment empty
+       * state — blank flattened pane, plane views centered on the volume,
+       * ready for the tracer to grow the first patch */
+      printf("multiview: no segment at %s — starting empty\n", multiview_path);
+      mv_seg = (r3d_tifxyz){.w = 2, .h = 2, .sx = 0.05f, .sy = 0.05f};
+      mv_seg.xyz = malloc(2 * 2 * 3 * sizeof *mv_seg.xyz);
+      if (!mv_seg.xyz) return EXIT_FAILURE;
+      for (int k = 0; k < 12; k++) mv_seg.xyz[k] = -1.0f;
+    }
     if (r3d_segrows_build(&mv_seg, &mv_rows) != 0) return EXIT_FAILURE;
     SDL_PumpEvents();
     for (int a = 0; a < 3; a++)
       mv_focus[a] = ((double)mv_seg.bbox[0][a] + (double)mv_seg.bbox[1][a]) * 0.5;
+    if (!mv_seg.nvalid) /* empty active surface: center on the volume */
+      for (int a = 0; a < 3; a++) mv_focus[a] = (double)brick_shape[a] * 0.5;
     mv_align_ij[0] = mv_seg.w / 2;
     mv_align_ij[1] = mv_seg.h / 2;
     const float *mc = r3d_tifxyz_at(&mv_seg, mv_seg.w / 2, mv_seg.h / 2);
