@@ -227,28 +227,58 @@ static uint32_t ng_be32(const uint8_t *p) {
   return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
 }
 
+#define NG_BUDGET ((size_t)3u << 29) /* decoded-slice RAM budget (1.5 GB) */
+
 typedef struct ng_grid {
+  size_t bytes;         /* footprint (budget accounting) */
   int32_t bx, by;       /* bounds origin (always 0 in published grids) */
   uint32_t w, h;        /* slice extent, px */
   uint32_t cell, gw, gh; /* bucket grid */
   uint32_t npaths;
-  float *pts;           /* all decoded vertices, xy interleaved */
-  uint32_t *pstart;     /* [npaths+1] into pts/2 */
+  uint8_t *blob;        /* paths region verbatim: {u32be sx, sy, noff,
+                         * int8 deltas[noff]} records — 4x smaller than
+                         * decoded float pairs; decoded per hood build */
+  size_t blob_n;
   uint32_t *precoff;    /* [npaths] byte offset of each record (sorted) */
   uint32_t *bidx;       /* [gw*gh+1] CSR into boff */
-  uint32_t *boff;       /* record byte offsets per bucket */
+  uint32_t *boff;       /* PATH INDICES per bucket (resolved at load) */
   bool empty;
 } ng_grid;
 
 static void ng_grid_free(ng_grid *g) {
   if (!g) return;
-  free(g->pts);
-  free(g->pstart);
+  free(g->blob);
   free(g->precoff);
   free(g->bidx);
   free(g->boff);
   free(g);
 }
+
+/* decode path pi into pts (caller cap >= npts); returns point count */
+static uint32_t ng_path_decode(const ng_grid *g, uint32_t pi, float *pts,
+                               uint32_t cap) {
+  const uint8_t *r = g->blob + g->precoff[pi];
+  double cx = ng_be32(r), cy = ng_be32(r + 4);
+  uint32_t noff = ng_be32(r + 8), n = 0;
+  const int8_t *dl = (const int8_t *)(r + 12);
+  if (n < cap) {
+    pts[n * 2] = (float)cx;
+    pts[n * 2 + 1] = (float)cy;
+  }
+  n++;
+  for (uint32_t k = 0; k < noff; k += 2) {
+    cx += dl[k];
+    cy += dl[k + 1];
+    if (n < cap) {
+      pts[n * 2] = (float)cx;
+      pts[n * 2 + 1] = (float)cy;
+    }
+    n++;
+  }
+  return n < cap ? n : cap;
+}
+
+static int32_t ng_path_of(const ng_grid *g, uint32_t rec);
 
 /* decode a whole .grid file (v3, big-endian); empty file = empty slice */
 static ng_grid *ng_grid_load(const char *path) {
@@ -293,63 +323,40 @@ static ng_grid *ng_grid_load(const char *path) {
   /* walk path records sequentially: {u32 sx, u32 sy, u32 noff, int8[]} */
   uint32_t cap = 256, np = 0;
   g->precoff = malloc(cap * sizeof *g->precoff);
-  g->pstart = malloc((cap + 1) * sizeof *g->pstart);
-  uint32_t vcap = 4096, nv = 0;
-  g->pts = malloc((size_t)vcap * 2 * sizeof *g->pts);
-  if (!g->precoff || !g->pstart || !g->pts) goto bad;
+  if (!g->precoff) goto bad;
   size_t off = po;
   while (off + 12 <= pend) {
-    uint32_t sx = ng_be32(d + off), sy = ng_be32(d + off + 4),
-             noff = ng_be32(d + off + 8);
+    uint32_t noff = ng_be32(d + off + 8);
     if (off + 12 + noff > pend || (noff & 1u)) break;
-    uint32_t npts = 1 + noff / 2;
     if (np + 1 > cap) {
       cap *= 2;
       uint32_t *nr = realloc(g->precoff, cap * sizeof *nr);
-      uint32_t *ns = realloc(g->pstart, (cap + 1) * sizeof *ns);
-      if (!nr || !ns) {
-        free(nr ? nr : g->precoff);
-        g->precoff = nr ? nr : g->precoff;
-        goto bad;
-      }
+      if (!nr) goto bad;
       g->precoff = nr;
-      g->pstart = ns;
     }
-    while (nv + npts > vcap) {
-      vcap *= 2;
-      float *npv = realloc(g->pts, (size_t)vcap * 2 * sizeof *npv);
-      if (!npv) goto bad;
-      g->pts = npv;
-    }
-    g->precoff[np] = (uint32_t)(off - po);
-    g->pstart[np] = nv;
-    double cx = sx, cy = sy;
-    g->pts[(size_t)nv * 2] = (float)cx;
-    g->pts[(size_t)nv * 2 + 1] = (float)cy;
-    nv++;
-    const int8_t *dl = (const int8_t *)(d + off + 12);
-    for (uint32_t k = 0; k < noff; k += 2) {
-      cx += dl[k];
-      cy += dl[k + 1];
-      g->pts[(size_t)nv * 2] = (float)cx;
-      g->pts[(size_t)nv * 2 + 1] = (float)cy;
-      nv++;
-    }
-    np++;
+    g->precoff[np++] = (uint32_t)(off - po);
     off += 12 + noff;
   }
   g->npaths = np;
-  g->pstart[np] = nv;
-  /* bucket CSR: keep record offsets (resolved to path index at query) */
+  g->blob_n = off - po;
+  g->blob = malloc(g->blob_n ? g->blob_n : 1);
+  if (!g->blob) goto bad;
+  memcpy(g->blob, d + po, g->blob_n);
+  /* bucket CSR: resolve record offsets to path indices once */
   uint32_t nboff = ng_be32(d + bio + 4u * nbuck);
   if ((size_t)po - bio - 4u * (nbuck + 1) < 4u * (size_t)nboff) goto bad;
   g->bidx = malloc((nbuck + 1) * sizeof *g->bidx);
   g->boff = malloc((nboff ? nboff : 1) * sizeof *g->boff);
   if (!g->bidx || !g->boff) goto bad;
   for (uint32_t i = 0; i <= nbuck; i++) g->bidx[i] = ng_be32(d + bio + 4u * i);
-  for (uint32_t i = 0; i < nboff; i++)
-    g->boff[i] = ng_be32(d + bio + 4u * (nbuck + 1) + 4u * i);
+  for (uint32_t i = 0; i < nboff; i++) {
+    uint32_t rec = ng_be32(d + bio + 4u * (nbuck + 1) + 4u * i);
+    int32_t pi = ng_path_of(g, rec);
+    g->boff[i] = pi >= 0 ? (uint32_t)pi : UINT32_MAX;
+  }
   free(d);
+  g->bytes = sizeof *g + g->blob_n + (size_t)np * sizeof(uint32_t) +
+             (size_t)(nbuck + 1 + nboff) * sizeof(uint32_t);
   return g;
 bad:
   free(d);
@@ -390,11 +397,11 @@ static uint32_t ng_query(const ng_grid *g, double cx, double cy, double radius,
     for (uint32_t bx2 = bx0; bx2 <= bx1; bx2++) {
       uint32_t b = by2 * g->gw + bx2;
       for (uint32_t k = g->bidx[b]; k < g->bidx[b + 1]; k++) {
-        int32_t pi = ng_path_of(g, g->boff[k]);
-        if (pi < 0) continue;
+        uint32_t pi = g->boff[k];
+        if (pi == UINT32_MAX) continue;
         bool dup = false;
-        for (uint32_t q = 0; q < nout && !dup; q++) dup = out[q] == (uint32_t)pi;
-        if (!dup && nout < max) out[nout++] = (uint32_t)pi;
+        for (uint32_t q = 0; q < nout && !dup; q++) dup = out[q] == pi;
+        if (!dup && nout < max) out[nout++] = pi;
       }
     }
   return nout;
@@ -427,10 +434,8 @@ typedef struct ng_hood {
   int plane, slice, qx, qy; /* plane<0 = free */
   const ng_grid *g;
   uint32_t nseg;
-  uint32_t seg[NG_HOODSEG];    /* first-vertex index of each segment */
-  uint32_t segv0[NG_HOODSEG];  /* owning path vertex range for snap */
-  uint32_t segv1[NG_HOODSEG];
-  float sg[NG_HOODSEG][6]; /* ax ay bx by nx ny (unit normal) */
+  float sg[NG_HOODSEG][10]; /* ax ay bx by nx ny prevx prevy nextx nexty */
+  uint8_t nb[NG_HOODSEG];   /* bit0: prev exists, bit1: next exists */
   uint64_t use;
 } ng_hood;
 
@@ -448,6 +453,7 @@ typedef struct ng_vol {
     uint32_t ref;     /* pinned by in-flight residual evals */
   } s[NG_SLOTS];
   uint16_t idx[8192]; /* open-addressed (plane,slice) -> slot+1 */
+  size_t bytes;        /* decoded total across slots */
   pthread_mutex_t gmu; /* guards the slot table */
   uint64_t tick;
   /* prefetch pool: the frontier crosses xz/yz slices sequentially, so a
@@ -767,6 +773,7 @@ static ng_grid *ng_get(ng_vol *v, int plane, int slice, int *slot_out) {
   }
   if (v->s[victim].plane >= 0) {
     ng_idx_del(v, v->s[victim].plane, v->s[victim].slice);
+    if (v->s[victim].g) v->bytes -= v->s[victim].g->bytes;
     ng_grid_free(v->s[victim].g);
   }
   v->s[victim].plane = plane;
@@ -775,7 +782,27 @@ static ng_grid *ng_get(ng_vol *v, int plane, int slice, int *slot_out) {
   v->s[victim].use = ++v->tick;
   v->s[victim].ref = g ? 1u : 0u;
   ng_idx_put(v, plane, slice, victim);
-  if (g) *slot_out = (int)victim;
+  if (g) {
+    *slot_out = (int)victim;
+    v->bytes += g->bytes;
+  }
+  while (v->bytes > NG_BUDGET) { /* evict LRU unpinned down to budget */
+    uint32_t ev = UINT32_MAX;
+    uint64_t old2 = UINT64_MAX;
+    for (uint32_t i = 0; i < NG_SLOTS; i++) {
+      if (v->s[i].plane < 0 || v->s[i].ref || !v->s[i].g) continue;
+      if (v->s[i].use < old2) {
+        old2 = v->s[i].use;
+        ev = i;
+      }
+    }
+    if (ev == UINT32_MAX) break;
+    v->bytes -= v->s[ev].g->bytes;
+    ng_idx_del(v, v->s[ev].plane, v->s[ev].slice);
+    ng_grid_free(v->s[ev].g);
+    v->s[ev].plane = -1;
+    v->s[ev].g = NULL;
+  }
   pthread_mutex_unlock(&v->gmu);
   return g;
 }
@@ -797,6 +824,8 @@ typedef struct tr_env { /* one per solving thread */
   ng_hood *hood;  /* [NG_NHOOD] private neighborhood cache */
   uint64_t htick;
   bool in_pool;   /* set inside pool workers: never nest pools */
+  struct tr_pool *pl; /* coordinator: the persistent worker pool */
+  unsigned rng;
   struct { int plane, slice, slot; ng_grid *g; } gc[12]; /* held grid refs:
       * one mutexed acquire per (slice, cell-solve) instead of per residual */
   uint32_t gcn;
@@ -838,30 +867,45 @@ static ng_hood *ng_hood_get(tr_env *e, ng_grid *g, int plane, int slice, double 
   double R = 92.0; /* query radius 80 + 16-px quantization slack */
   uint32_t paths[NG_QMAX];
   uint32_t np = ng_query(g, cx, cy, R, paths, NG_QMAX);
+  static _Thread_local float *dec = NULL;
+  static _Thread_local uint32_t dec_cap = 0;
   for (uint32_t p = 0; p < np && h->nseg < NG_HOODSEG; p++) {
-    uint32_t v0 = g->pstart[paths[p]], v1 = g->pstart[paths[p] + 1];
-    for (uint32_t s = v0; s + 1 < v1 && h->nseg < NG_HOODSEG; s++) {
-      double smx = ((double)g->pts[(size_t)s * 2] + (double)g->pts[(size_t)(s + 1) * 2]) *
-                   0.5;
-      double smy = ((double)g->pts[(size_t)s * 2 + 1] +
-                    (double)g->pts[(size_t)(s + 1) * 2 + 1]) *
-                   0.5;
+    if (dec_cap < 4096) {
+      float *nd = realloc(dec, 4096 * 2 * sizeof *nd);
+      if (!nd) break;
+      dec = nd;
+      dec_cap = 4096;
+    }
+    uint32_t npts = ng_path_decode(g, paths[p], dec, dec_cap);
+    for (uint32_t s2 = 0; s2 + 1 < npts && h->nseg < NG_HOODSEG; s2++) {
+      float ax = dec[(size_t)s2 * 2], ay = dec[(size_t)s2 * 2 + 1];
+      float bx = dec[(size_t)(s2 + 1) * 2], by = dec[(size_t)(s2 + 1) * 2 + 1];
+      double smx = ((double)ax + (double)bx) * 0.5,
+             smy = ((double)ay + (double)by) * 0.5;
       double dx = smx - cx, dy = smy - cy;
       if (dx * dx + dy * dy > R * R) continue;
-      float ax = g->pts[(size_t)s * 2], ay = g->pts[(size_t)s * 2 + 1];
-      float bx = g->pts[(size_t)(s + 1) * 2], by = g->pts[(size_t)(s + 1) * 2 + 1];
       float tx = bx - ax, ty = by - ay;
       float tl = sqrtf(tx * tx + ty * ty);
       if (tl < 1e-6f) continue;
-      h->seg[h->nseg] = s;
-      h->segv0[h->nseg] = v0;
-      h->segv1[h->nseg] = v1;
-      h->sg[h->nseg][0] = ax;
-      h->sg[h->nseg][1] = ay;
-      h->sg[h->nseg][2] = bx;
-      h->sg[h->nseg][3] = by;
-      h->sg[h->nseg][4] = -ty / tl;
-      h->sg[h->nseg][5] = tx / tl;
+      float *sg = h->sg[h->nseg];
+      sg[0] = ax;
+      sg[1] = ay;
+      sg[2] = bx;
+      sg[3] = by;
+      sg[4] = -ty / tl;
+      sg[5] = tx / tl;
+      uint8_t nb = 0;
+      if (s2 > 0) {
+        sg[6] = dec[(size_t)(s2 - 1) * 2];
+        sg[7] = dec[(size_t)(s2 - 1) * 2 + 1];
+        nb |= 1;
+      }
+      if (s2 + 2 < npts) {
+        sg[8] = dec[(size_t)(s2 + 2) * 2];
+        sg[9] = dec[(size_t)(s2 + 2) * 2 + 1];
+        nb |= 2;
+      }
+      h->nb[h->nseg] = nb;
       h->nseg++;
     }
   }
@@ -973,28 +1017,28 @@ static double ncp_residual(tr_env *e, int plane, const double A[3],
   double best_snap = -1.0;
   if (hd)
     for (uint32_t k = 0; k < hd->nseg; k++) {
-      uint32_t s = hd->seg[k], v0 = hd->segv0[k], v1 = hd->segv1[k];
-      double sax = (double)hd->sg[k][0], say = (double)hd->sg[k][1];
-      double sbx = (double)hd->sg[k][2], sby = (double)hd->sg[k][3];
+      const float *sg = hd->sg[k];
+      double sax = (double)sg[0], say = (double)sg[1];
+      double sbx = (double)sg[2], sby = (double)sg[3];
       double smx = (sax + sbx) * 0.5, smy = (say + sby) * 0.5;
       double dmx = smx - mx, dmy = smy - my;
       double d2 = dmx * dmx + dmy * dmy; /* midpoint-to-midpoint, vc3d */
       if (d2 <= NCP_ROI2) {
         double dd = d2 < 10.0 ? 10.0 : d2;
-        double dot = fabs(enx * (double)hd->sg[k][4] + eny * (double)hd->sg[k][5]);
+        double dot = fabs(enx * (double)sg[4] + eny * (double)sg[5]);
         wsum += 1.0 / dd;
         nsum += (1.0 - dot) / dd;
       }
-      /* snap: E near segment s, A near segment s-1 or s+1 of SAME path */
+      /* snap: E near this segment, A near a NEIGHBOR segment of the same
+       * polyline (prev/next captured at hood build) */
       double d2e = ncp_pt_seg_d2(e2[0], e2[1], sax, say, sbx, sby);
       if (d2e < NCP_SNAP_TRIG * NCP_SNAP_TRIG) {
-        for (int dsn = -1; dsn <= 1; dsn += 2) {
-          int64_t s2 = (int64_t)s + dsn;
-          if (s2 < (int64_t)v0 || s2 + 1 >= (int64_t)v1) continue;
-          double qax = (double)g->pts[(size_t)s2 * 2],
-                 qay = (double)g->pts[(size_t)s2 * 2 + 1];
-          double qbx = (double)g->pts[(size_t)(s2 + 1) * 2],
-                 qby = (double)g->pts[(size_t)(s2 + 1) * 2 + 1];
+        for (int dsn = 0; dsn < 2; dsn++) {
+          if (!(hd->nb[k] & (dsn ? 2u : 1u))) continue;
+          double qax = dsn ? sbx : (double)sg[6];
+          double qay = dsn ? sby : (double)sg[7];
+          double qbx = dsn ? (double)sg[8] : sax;
+          double qby = dsn ? (double)sg[9] : say;
           double d2a = ncp_pt_seg_d2(a2[0], a2[1], qax, qay, qbx, qby);
           if (d2a < NCP_SNAP_RANGE * NCP_SNAP_RANGE) {
             double score = 0.5 * (sqrt(d2a) / NCP_SNAP_RANGE + sqrt(d2e) / NCP_SNAP_TRIG);
@@ -1347,19 +1391,43 @@ static double tr_solve_cell(r3d_tracer *t, tr_env *e, int i, int j, uint32_t fla
   return cost;
 }
 
-static void tr_update_conf(r3d_tracer *t, td_cache *dt, int i, int j) {
+static void tr_update_conf(r3d_tracer *t, tr_env *e, int i, int j) {
   size_t k = (size_t)j * t->W + (size_t)i;
   if (t->state[k] != R3D_TR_SET) return;
   double tt0 = tr_now();
-  double v = td_tri(dt, t->pos + k * 3, NULL);
+  const double *P = t->pos + k * 3;
+  double d = TR_CONF_R;
+  if (e->ngv && e->ngv->active) {
+    /* distance to the nearest xy-plane polyline — no prediction volume,
+     * no EDT: the grids ARE the data now */
+    int slot;
+    ng_grid *g = ng_eget(e, 0, (int)llround(P[2]), &slot);
+    if (g && !g->empty) {
+      ng_hood *hd = ng_hood_get(e, g, 0, (int)llround(P[2]), P[0], P[1]);
+      if (hd && hd->nseg) {
+        double d2min = 1e30;
+        for (uint32_t q = 0; q < hd->nseg; q++) {
+          double d2 = ncp_pt_seg_d2(P[0], P[1], (double)hd->sg[q][0],
+                                    (double)hd->sg[q][1], (double)hd->sg[q][2],
+                                    (double)hd->sg[q][3]);
+          if (d2 < d2min) d2min = d2;
+        }
+        d = sqrt(d2min);
+      }
+    }
+    tr_env_flush(e);
+  } else if (e->dt) {
+    d = td_tri(e->dt, P, NULL);
+  }
   tr_tm_add(2, tt0);
-  double cf = 1.0 - (v > TR_CONF_R ? TR_CONF_R : v) / TR_CONF_R;
+  double cf = 1.0 - (d > TR_CONF_R ? TR_CONF_R : d) / TR_CONF_R;
   t->conf[k] = (float)cf;
 }
 
-static uint32_t tr_pool_run(r3d_tracer *t, ng_vol *ngv, tr_env *cenv,
-                            const uint32_t *items, uint32_t n, uint32_t *out,
-                            int mode);
+#define TR_NTHREADS 10
+struct tr_pool;
+static uint32_t tr_pool_run2(struct tr_pool *pl, tr_env *cenv, const uint32_t *items,
+                             uint32_t n, uint32_t *out, int mode);
 
 /* vc3d local_optimization(radius, p): free = SET cells within Euclidean
  * `radius` of center, boundary ring fixed; here solved as alternating
@@ -1384,7 +1452,7 @@ static void tr_local_opt(r3d_tracer *t, tr_env *e, int ci, int cj, int radius,
         ng_prefetch(e->ngv, 1, (int)llround(P[1]));
         ng_prefetch(e->ngv, 2, (int)llround(P[0]));
       }
-  if (radius >= 16 && e->ngv && e->ngv->active && !e->in_pool) {
+  if (radius >= 16 && e->ngv && e->ngv->active && !e->in_pool && e->pl) {
     /* big disc (global solves, final polish): run each sweep through the
      * candidate pool — >= 7-cell separation keeps concurrent radius-2
      * residual stencils disjoint */
@@ -1400,10 +1468,10 @@ static void tr_local_opt(r3d_tracer *t, tr_env *e, int ci, int cj, int radius,
           cells[nc2++] = (uint32_t)((size_t)jj * t->W + (size_t)ii);
         }
       for (int s = 0; s < sweeps && !t->quit; s++)
-        tr_pool_run(t, e->ngv, e, cells, nc2, NULL, 2);
-      if (do_conf && e->dt)
+        tr_pool_run2(e->pl, e, cells, nc2, NULL, 2);
+      if (do_conf)
         for (uint32_t c2 = 0; c2 < nc2 && !t->quit; c2++)
-          tr_update_conf(t, e->dt, (int)(cells[c2] % t->W), (int)(cells[c2] / t->W));
+          tr_update_conf(t, e, (int)(cells[c2] % t->W), (int)(cells[c2] / t->W));
       free(cells);
       tr_tm_add(1, tt0);
       return;
@@ -1419,7 +1487,7 @@ static void tr_local_opt(r3d_tracer *t, tr_env *e, int ci, int cj, int radius,
         if (di * di + dj * dj > (long)radius * radius) continue;
         if (t->state[(size_t)j * t->W + (size_t)i] != R3D_TR_SET) continue;
         tr_solve_cell(t, e, i, j, TRF_ALL, 4);
-        if (do_conf && e->dt && s + 1 == sweeps) tr_update_conf(t, e->dt, i, j);
+        if (do_conf && s + 1 == sweeps) tr_update_conf(t, e, i, j);
       }
   }
   tr_tm_add(1, tt0);
@@ -1470,117 +1538,172 @@ static bool tr_place_cand(r3d_tracer *t, tr_env *e, uint32_t cell, unsigned *rng
   return true;
 }
 
-/* parallel candidate pool: vc3d runs candidates under OMP with >= 7 grid
- * cells between concurrently-processed points, so simultaneous radius-3
- * discs never overlap. Same protocol here with pthreads. */
-#define TR_NTHREADS 10
+/* persistent candidate pool: vc3d runs candidates under OMP with >= 7
+ * grid cells between concurrently-processed points, so simultaneous
+ * radius-3 discs never overlap. Threads, solve envs, and neighborhood
+ * caches live for the whole trace — jobs are posted per phase. */
 typedef struct tr_pool {
   r3d_tracer *t;
   ng_vol *ngv;
+  pthread_t th[TR_NTHREADS];
+  tr_env env[TR_NTHREADS];
+  uint32_t nth;
+  /* current job, guarded by mu */
   const uint32_t *items;
   uint32_t n;
-  uint8_t *st;   /* 0 pending 1 active 2 done */
-  uint32_t scan0; /* watermark: everything below is claimed/done */
+  uint8_t *st; /* 0 pending 1 active 2 done */
+  uint32_t scan0;
+  int mode; /* 0 placement (sep 7), 1 radius-8 opt (sep 17), 2 sweep visit */
   int act[TR_NTHREADS][2];
   uint32_t nact;
-  uint32_t *out; /* placed cells */
+  uint32_t *out;
   uint32_t nout;
-  int mode;      /* 0 = placement (sep 7), 1 = radius-8 opt (sep 17) */
+  uint64_t job;
+  uint32_t done;
+  bool quit;
   pthread_mutex_t mu;
-  pthread_cond_t cv;
-  unsigned seed;
+  pthread_cond_t cv, idle_cv;
 } tr_pool;
 
-static void *tr_pool_worker(void *ud) {
-  tr_pool *pl = ud;
+static void *tr_pool_thread(void *ud) {
+  tr_env *e = ud;
+  tr_pool *pl = e->pl;
   r3d_tracer *t = pl->t;
-  tr_env env = {.dt = NULL, .ngv = pl->ngv, .in_pool = true};
-  env.hood = calloc(NG_NHOOD, sizeof *env.hood);
-  if (env.hood)
-    for (int i = 0; i < NG_NHOOD; i++) env.hood[i].plane = -1;
-  long sep2 = pl->mode == 1 ? 289 : 49; /* placement/sweep 7^2, opt 17^2 */
-  unsigned rng;
+  uint64_t seen = 0;
   pthread_mutex_lock(&pl->mu);
-  rng = pl->seed = pl->seed * 1664525u + 1013904223u;
-  pthread_mutex_unlock(&pl->mu);
   for (;;) {
-    if (t->quit) break;
-    pthread_mutex_lock(&pl->mu);
-    while (pl->scan0 < pl->n && pl->st[pl->scan0] != 0) pl->scan0++;
-    int pick = -1;
-    bool pending = false;
-    for (uint32_t c = pl->scan0; c < pl->n; c++) {
-      if (pl->st[c] != 0) continue;
-      pending = true;
-      int i = (int)(pl->items[c] % t->W), j = (int)(pl->items[c] / t->W);
-      bool clear = true;
-      for (uint32_t a = 0; a < pl->nact && clear; a++) {
-        long di = i - pl->act[a][0], dj = j - pl->act[a][1];
-        clear = di * di + dj * dj >= sep2;
+    while (!pl->quit && pl->job == seen) pthread_cond_wait(&pl->cv, &pl->mu);
+    if (pl->quit) break;
+    seen = pl->job;
+    for (;;) { /* claim loop; mu held at the top of each iteration */
+      if (t->quit) break;
+      while (pl->scan0 < pl->n && pl->st[pl->scan0] != 0) pl->scan0++;
+      long sep2 = pl->mode == 1 ? 289 : 49;
+      int pick = -1;
+      bool pending = false;
+      for (uint32_t c = pl->scan0; c < pl->n; c++) {
+        if (pl->st[c] != 0) continue;
+        pending = true;
+        int i = (int)(pl->items[c] % t->W), j = (int)(pl->items[c] / t->W);
+        bool clear = true;
+        for (uint32_t a = 0; a < pl->nact && clear; a++) {
+          long di = i - pl->act[a][0], dj = j - pl->act[a][1];
+          clear = di * di + dj * dj >= sep2;
+        }
+        if (clear) {
+          pick = (int)c;
+          break;
+        }
       }
-      if (clear) {
-        pick = (int)c;
-        break;
+      if (pick < 0) {
+        if (!pending || pl->nact == 0) break;
+        pthread_cond_wait(&pl->cv, &pl->mu);
+        continue;
       }
-    }
-    if (pick < 0) {
-      if (!pending || pl->nact == 0) {
-        pthread_mutex_unlock(&pl->mu);
-        break; /* done, or deadlocked-empty (nothing active to wait on) */
-      }
-      pthread_cond_wait(&pl->cv, &pl->mu);
+      uint32_t cell = pl->items[pick];
+      pl->st[pick] = 1;
+      pl->act[pl->nact][0] = (int)(cell % t->W);
+      pl->act[pl->nact][1] = (int)(cell / t->W);
+      uint32_t slot = pl->nact++;
+      int mode = pl->mode;
       pthread_mutex_unlock(&pl->mu);
-      continue;
+      bool placed = false;
+      if (mode == 0) {
+        placed = tr_place_cand(t, e, cell, &e->rng);
+      } else if (mode == 1) {
+        tr_local_opt(t, e, (int)(cell % t->W), (int)(cell / t->W), 8, 3, false);
+      } else { /* one sweep visit of a big-radius solve */
+        tr_solve_cell(t, e, (int)(cell % t->W), (int)(cell / t->W), TRF_ALL, 4);
+      }
+      pthread_mutex_lock(&pl->mu);
+      pl->st[pick] = 2;
+      pl->act[slot][0] = pl->act[--pl->nact][0];
+      pl->act[slot][1] = pl->act[pl->nact][1];
+      if (placed) pl->out[pl->nout++] = cell;
+      pthread_cond_broadcast(&pl->cv);
     }
-    uint32_t cell = pl->items[pick];
-    pl->st[pick] = 1;
-    pl->act[pl->nact][0] = (int)(cell % t->W);
-    pl->act[pl->nact][1] = (int)(cell / t->W);
-    uint32_t slot = pl->nact++;
-    pthread_mutex_unlock(&pl->mu);
-    bool placed = false;
-    if (pl->mode == 0) {
-      placed = tr_place_cand(t, &env, cell, &rng);
-    } else if (pl->mode == 1) {
-      tr_local_opt(t, &env, (int)(cell % t->W), (int)(cell / t->W), 8, 3, false);
-    } else { /* mode 2: one sweep visit of a big-radius solve */
-      tr_solve_cell(t, &env, (int)(cell % t->W), (int)(cell / t->W), TRF_ALL, 4);
-    }
-    pthread_mutex_lock(&pl->mu);
-    pl->st[pick] = 2;
-    pl->act[slot][0] = pl->act[--pl->nact][0];
-    pl->act[slot][1] = pl->act[pl->nact][1];
-    if (placed) pl->out[pl->nout++] = cell;
-    pthread_cond_broadcast(&pl->cv);
-    pthread_mutex_unlock(&pl->mu);
+    pl->done++;
+    pthread_cond_signal(&pl->idle_cv);
   }
-  free(env.hood);
+  pthread_mutex_unlock(&pl->mu);
+  tr_env_flush(e);
   return NULL;
 }
 
-/* run items through the pool; returns number of placed cells in out */
-static uint32_t tr_pool_run(r3d_tracer *t, ng_vol *ngv, tr_env *cenv,
-                            const uint32_t *items, uint32_t n, uint32_t *out,
-                            int mode) {
-  if (!n) return 0;
-  tr_pool pl = {.t = t, .ngv = ngv, .items = items, .n = n, .out = out, .mode = mode,
-                .seed = t->rng};
-  pl.st = calloc(n, 1);
-  if (!pl.st) return 0;
-  pthread_mutex_init(&pl.mu, NULL);
-  pthread_cond_init(&pl.cv, NULL);
-  pthread_t th[TR_NTHREADS];
-  uint32_t nth = 0;
-  for (uint32_t i = 0; i < TR_NTHREADS && i * 2 < n; i++)
-    if (pthread_create(&th[nth], NULL, tr_pool_worker, &pl) == 0) nth++;
-  for (uint32_t i = 0; i < nth; i++) pthread_join(th[i], NULL);
-  t->rng = pl.seed;
-  /* safety net: candidates were already marked PROC (offered once, ever) —
-   * anything the pool failed to process would be lost; drain serially */
-  for (uint32_t c = 0; c < n && !t->quit; c++) {
-    if (pl.st[c] != 0) continue;
+static void tr_pool_init(tr_pool *pl, r3d_tracer *t, ng_vol *ngv) {
+  memset(pl, 0, sizeof *pl);
+  pl->t = t;
+  pl->ngv = ngv;
+  pl->st = malloc((size_t)t->W * t->H);
+  if (!pl->st) return;
+  pthread_mutex_init(&pl->mu, NULL);
+  pthread_cond_init(&pl->cv, NULL);
+  pthread_cond_init(&pl->idle_cv, NULL);
+  for (uint32_t i = 0; i < TR_NTHREADS; i++) {
+    tr_env *e = &pl->env[pl->nth];
+    memset(e, 0, sizeof *e);
+    e->ngv = ngv;
+    e->in_pool = true;
+    e->pl = pl;
+    e->rng = t->rng ^ (0x9E3779B9u * (i + 1));
+    e->hood = calloc(NG_NHOOD, sizeof *e->hood);
+    if (!e->hood) break;
+    for (int hi = 0; hi < NG_NHOOD; hi++) e->hood[hi].plane = -1;
+    if (pthread_create(&pl->th[pl->nth], NULL, tr_pool_thread, e) != 0) {
+      free(e->hood);
+      break;
+    }
+    pl->nth++;
+  }
+}
+
+static void tr_pool_destroy(tr_pool *pl) {
+  if (pl->st) {
+    pthread_mutex_lock(&pl->mu);
+    pl->quit = true;
+    pthread_cond_broadcast(&pl->cv);
+    pthread_mutex_unlock(&pl->mu);
+    for (uint32_t i = 0; i < pl->nth; i++) {
+      pthread_join(pl->th[i], NULL);
+      free(pl->env[i].hood);
+    }
+    pthread_mutex_destroy(&pl->mu);
+    pthread_cond_destroy(&pl->cv);
+    pthread_cond_destroy(&pl->idle_cv);
+    free(pl->st);
+  }
+  pl->st = NULL;
+  pl->nth = 0;
+}
+
+/* run items through the pool; cenv drains anything left (safety: items
+ * are PROC-marked before the pool sees them). Returns placed count. */
+static uint32_t tr_pool_run2(tr_pool *pl, tr_env *cenv, const uint32_t *items,
+                             uint32_t n, uint32_t *out, int mode) {
+  r3d_tracer *t = pl->t;
+  uint32_t nout = 0;
+  if (n && pl->nth) {
+    memset(pl->st, 0, n);
+    pthread_mutex_lock(&pl->mu);
+    pl->items = items;
+    pl->n = n;
+    pl->scan0 = 0;
+    pl->mode = mode;
+    pl->nact = 0;
+    pl->out = out;
+    pl->nout = 0;
+    pl->done = 0;
+    pl->job++;
+    pthread_cond_broadcast(&pl->cv);
+    while (pl->done < pl->nth) pthread_cond_wait(&pl->idle_cv, &pl->mu);
+    nout = pl->nout;
+    pl->n = 0;
+    pthread_mutex_unlock(&pl->mu);
+  }
+  for (uint32_t c = 0; c < n && !t->quit; c++) { /* serial drain */
+    if (pl->nth && pl->st[c] != 0) continue;
     if (mode == 0) {
-      if (tr_place_cand(t, cenv, items[c], &t->rng)) pl.out[pl.nout++] = items[c];
+      if (tr_place_cand(t, cenv, items[c], &t->rng)) out[nout++] = items[c];
     } else if (mode == 1) {
       tr_local_opt(t, cenv, (int)(items[c] % t->W), (int)(items[c] / t->W), 8, 3,
                    false);
@@ -1589,12 +1712,8 @@ static uint32_t tr_pool_run(r3d_tracer *t, ng_vol *ngv, tr_env *cenv,
                     4);
     }
   }
-  pthread_mutex_destroy(&pl.mu);
-  pthread_cond_destroy(&pl.cv);
-  free(pl.st);
-  return pl.nout;
+  return nout;
 }
-
 
 static void *tr_worker(void *ud) {
   r3d_tracer *t = ud;
@@ -1613,6 +1732,9 @@ static void *tr_worker(void *ud) {
   cenv.hood = calloc(NG_NHOOD, sizeof *cenv.hood);
   if (cenv.hood)
     for (int hi = 0; hi < NG_NHOOD; hi++) cenv.hood[hi].plane = -1;
+  tr_pool pool = {0};
+  if (ng.active) tr_pool_init(&pool, t, &ng);
+  cenv.pl = pool.nth ? &pool : NULL;
   if (ng.active && fabs(ng.spiral_step - t->cfg.step) > 1e-6)
     printf("tracer: grid step %.1f != normal-grid spiral-step %.1f (vc3d "
            "errors here; proceeding)\n",
@@ -1626,6 +1748,7 @@ static void *tr_worker(void *ud) {
     free(fringe);
     free(nfringe);
     free(cands);
+    tr_pool_destroy(&pool);
     free(cenv.hood);
     ng_close(&ng);
     td_close(dt);
@@ -1725,9 +1848,9 @@ static void *tr_worker(void *ud) {
           }
       }
     uint32_t nnew = 0;
-    if (ng.active && nc >= 8 && !t->quit) { /* parallel (grids are the slow
+    if (pool.nth && nc >= 8 && !t->quit) { /* parallel (grids are the slow
                                              * path and are thread-safe) */
-      nnew = tr_pool_run(t, &ng, &cenv, cands, nc, nfringe, 0);
+      nnew = tr_pool_run2(&pool, &cenv, cands, nc, nfringe, 0);
     } else {
       unsigned rng = t->rng;
       for (uint32_t ci = 0; ci < nc && !t->quit; ci++)
@@ -1735,7 +1858,7 @@ static void *tr_worker(void *ud) {
       t->rng = rng;
     }
     for (uint32_t f = 0; f < nnew; f++) /* conf: coordinator only (DT) */
-      tr_update_conf(t, dt, (int)(nfringe[f] % W), (int)(nfringe[f] / W));
+      tr_update_conf(t, &cenv, (int)(nfringe[f] % W), (int)(nfringe[f] / W));
     /* schedule: early global solves, later subsampled radius-8 solves */
     if (global_opt) {
       if (generation % 8 == 0)
@@ -1746,8 +1869,8 @@ static void *tr_worker(void *ud) {
         int i = (int)(nfringe[f] % W), j = (int)(nfringe[f] / W);
         if (i % 4 == 0 && j % 4 == 0) cands[nsub++] = nfringe[f];
       }
-      if (ng.active && nsub >= 4) {
-        tr_pool_run(t, &ng, &cenv, cands, nsub, cands + nsub, 1);
+      if (pool.nth && nsub >= 4) {
+        tr_pool_run2(&pool, &cenv, cands, nsub, cands + nsub, 1);
       } else {
         for (uint32_t f = 0; f < nsub && !t->quit; f++)
           tr_local_opt(t, &cenv, (int)(cands[f] % W), (int)(cands[f] / W), 8, 3, true);
@@ -1766,6 +1889,8 @@ static void *tr_worker(void *ud) {
   free(fringe);
   free(nfringe);
   free(cands);
+  tr_pool_destroy(&pool);
+  tr_env_flush(&cenv);
   free(cenv.hood);
   printf("tracer: finished at generation %u with %u point%s (level L%u%s)\n", t->ring,
          t->nset, t->nset == 1 ? "" : "s", t->cfg.level,
