@@ -870,11 +870,16 @@ static ng_hood *ng_hood_get(tr_env *e, ng_grid *g, int plane, int slice, double 
   static _Thread_local float *dec = NULL;
   static _Thread_local uint32_t dec_cap = 0;
   for (uint32_t p = 0; p < np && h->nseg < NG_HOODSEG; p++) {
-    if (dec_cap < 4096) {
-      float *nd = realloc(dec, 4096 * 2 * sizeof *nd);
+    /* size the scratch from the record header — xy cross-sections are
+     * long spirals and MUST NOT be truncated */
+    uint32_t want = 1 + ng_be32(g->blob + g->precoff[paths[p]] + 8) / 2;
+    if (dec_cap < want) {
+      uint32_t nc2 = dec_cap ? dec_cap : 4096;
+      while (nc2 < want) nc2 *= 2;
+      float *nd = realloc(dec, (size_t)nc2 * 2 * sizeof *nd);
       if (!nd) break;
       dec = nd;
-      dec_cap = 4096;
+      dec_cap = nc2;
     }
     uint32_t npts = ng_path_decode(g, paths[p], dec, dec_cap);
     for (uint32_t s2 = 0; s2 + 1 < npts && h->nseg < NG_HOODSEG; s2++) {
@@ -1885,7 +1890,7 @@ static void *tr_worker(void *ud) {
   }
   t->gens_done += gens_run;
   /* final polish: one bounded pass so late cells see settled neighbors */
-  if (!t->quit) tr_local_opt(t, &cenv, x0, y0, (int)W + (int)H, 2, true);
+  if (!t->quit) tr_local_opt(t, &cenv, x0, y0, (int)W + (int)H, 4, true);
   free(fringe);
   free(nfringe);
   free(cands);
