@@ -1,5 +1,6 @@
 #include "core/cpuvol.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -171,6 +172,48 @@ static const uint8_t *cv_brick(r3d_cpuvol *v, uint32_t li, uint32_t bx, uint32_t
   memo_ptr = dst;
   memo_vol = v;
   return dst;
+}
+
+static double cv_vox(r3d_cpuvol *v, uint32_t li, int64_t lx, int64_t ly, int64_t lz) {
+  const r3d_cpuvol_level *l = &v->lev[li];
+  if (lx < 0 || ly < 0 || lz < 0 || lx >= (int64_t)l->vx || ly >= (int64_t)l->vy ||
+      lz >= (int64_t)l->vz)
+    return 0.0;
+  const uint8_t *b =
+      cv_brick(v, li, (uint32_t)lx / CV_BRICK, (uint32_t)ly / CV_BRICK, (uint32_t)lz / CV_BRICK);
+  if (!b) return 0.0;
+  uint32_t ox = (uint32_t)lx % CV_BRICK, oy = (uint32_t)ly % CV_BRICK,
+           oz = (uint32_t)lz % CV_BRICK;
+  return (double)b[((size_t)oz * CV_BRICK + oy) * CV_BRICK + ox];
+}
+
+double r3d_cpuvol_tri(r3d_cpuvol *v, uint32_t li, const double p[3], double grad[3]) {
+  if (grad) grad[0] = grad[1] = grad[2] = 0.0;
+  if (li >= v->nlev) return 0.0;
+  const r3d_cpuvol_level *l = &v->lev[li];
+  double lx = p[0] / l->scale, ly = p[1] / l->scale, lz = p[2] / l->scale;
+  double fx = floor(lx), fy = floor(ly), fz = floor(lz);
+  double tx = lx - fx, ty = ly - fy, tz = lz - fz;
+  int64_t ix = (int64_t)fx, iy = (int64_t)fy, iz = (int64_t)fz;
+  double c[2][2][2];
+  for (int dz = 0; dz < 2; dz++)
+    for (int dy = 0; dy < 2; dy++)
+      for (int dx = 0; dx < 2; dx++)
+        c[dz][dy][dx] = cv_vox(v, li, ix + dx, iy + dy, iz + dz);
+  double c00 = c[0][0][0] * (1 - tx) + c[0][0][1] * tx;
+  double c01 = c[0][1][0] * (1 - tx) + c[0][1][1] * tx;
+  double c10 = c[1][0][0] * (1 - tx) + c[1][0][1] * tx;
+  double c11 = c[1][1][0] * (1 - tx) + c[1][1][1] * tx;
+  double c0 = c00 * (1 - ty) + c01 * ty;
+  double c1 = c10 * (1 - ty) + c11 * ty;
+  if (grad) {
+    double gx0 = (c[0][0][1] - c[0][0][0]) * (1 - ty) + (c[0][1][1] - c[0][1][0]) * ty;
+    double gx1 = (c[1][0][1] - c[1][0][0]) * (1 - ty) + (c[1][1][1] - c[1][1][0]) * ty;
+    grad[0] = (gx0 * (1 - tz) + gx1 * tz) / l->scale;
+    grad[1] = ((c01 - c00) * (1 - tz) + (c11 - c10) * tz) / l->scale;
+    grad[2] = (c1 - c0) / l->scale;
+  }
+  return c0 * (1 - tz) + c1 * tz;
 }
 
 uint8_t r3d_cpuvol_at(r3d_cpuvol *v, uint32_t li, double x, double y, double z) {

@@ -41,4 +41,10 @@ void r3d_cpuvol_close(r3d_cpuvol *v);
  * pyramid level li. Out-of-bounds or no-data reads 0. */
 uint8_t r3d_cpuvol_at(r3d_cpuvol *v, uint32_t li, double x, double y, double z);
 
+/* Trilinear value at base-resolution voxel coords sampled from level li,
+ * 0..255 continuous; optionally its analytic gradient d value / d base
+ * voxel (the trilinear surface is piecewise differentiable — solvers need
+ * this the way vc3d gets interpolator derivatives from autodiff). */
+double r3d_cpuvol_tri(r3d_cpuvol *v, uint32_t li, const double p[3], double grad[3]);
+
 #endif /* R3D_CPUVOL_H */

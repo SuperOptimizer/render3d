@@ -1491,7 +1491,7 @@ int main(int argc, char **argv) {
   float *mv_tr_cf = NULL;
   uint64_t mv_tr_gen = 0;
   uint32_t mv_tr_ring = 0, mv_tr_nset = 0;
-  float mv_tr_step = 20.0f, mv_tr_thresh = 0.35f, mv_tr_march = 3.0f;
+  float mv_tr_step = 20.0f, mv_tr_thresh = 0.35f;
   int mv_tr_rings = 60, mv_tr_nsaved = 0;
   bool mv_tr_live = true;      /* render the growing grid in the seg pane */
   uint64_t mv_tr_live_ns = 0;  /* last live swap (throttle) */
@@ -2810,24 +2810,17 @@ int main(int argc, char **argv) {
       const char *prb = strrchr(pr, '/');
       igTextDisabled("predictions: %s", prb ? prb + 1 : pr);
       igSliderFloat("grid step (vox)", &mv_tr_step, 5.0f, 40.0f, "%.0f", 0);
-      igSliderFloat("snap distance (vox)", &mv_tr_march, 1.0f, 10.0f, "%.1f", 0);
       igSliderFloat("confidence cutoff", &mv_tr_thresh, 0.05f, 0.9f, "%.2f", 0);
-      igTextDisabled("growth is continuous; the cutoff masks display + save");
-      igSliderInt("max rings", &mv_tr_rings, 8, 200, "%d", 0);
+      igTextDisabled("growth never rejects (vc3d); the cutoff masks display + save");
+      igSliderInt("generations", &mv_tr_rings, 8, 200, "%d", 0);
       igCheckbox("live in segment view", &mv_tr_live);
-      static bool mv_tr_fill = true;
-      igSameLine(0, 10);
-      igCheckbox("fill holes", &mv_tr_fill);
       if (!mv_tr_active) {
         if (igButton("seed at focus", (ImVec2){0, 0})) {
           r3d_tracer_cfg tc = {.seed = {mv_focus[0], mv_focus[1], mv_focus[2]},
                                .step = (double)mv_tr_step,
-                               .march = (double)mv_tr_march,
                                .thresh = mv_tr_thresh,
                                .max_ring = (uint32_t)mv_tr_rings,
-                               .level = 1,
-                               .search = 12.0,
-                               .fill = mv_tr_fill};
+                               .level = 1};
           if (r3d_tracer_start(&mv_tr, pr, &tc, &umbilicus) == 0) {
             free(mv_tr_pos);
             free(mv_tr_st);
@@ -2844,7 +2837,10 @@ int main(int argc, char **argv) {
         igTextDisabled("(uses the SELECTED overlay as predictions)");
       } else {
         igText("ring %u/%u  %u point%s%s", mv_tr_ring, mv_tr.cfg.max_ring, mv_tr_nset,
-               mv_tr_nset == 1 ? "" : "s", mv_tr_done ? "  done" : "  growing...");
+               mv_tr_nset == 1 ? "" : "s",
+               mv_tr_done ? "  done"
+                          : (mv_tr_ring >= mv_tr.cfg.max_ring ? "  optimizing..."
+                                                              : "  growing..."));
         if (igButton(mv_tr_done ? "discard" : "stop", (ImVec2){0, 0})) {
           r3d_tracer_stop(&mv_tr);
           if (!mv_tr_done) { /* stopped mid-grow: keep result on screen */
@@ -3135,12 +3131,9 @@ int main(int argc, char **argv) {
         frame_index == 120) { /* headless: seed a trace at the focus */
       r3d_tracer_cfg tc = {.seed = {mv_focus[0], mv_focus[1], mv_focus[2]},
                            .step = (double)mv_tr_step,
-                           .march = (double)mv_tr_march,
                            .thresh = mv_tr_thresh,
                            .max_ring = (uint32_t)mv_tr_rings,
-                           .level = 1,
-                           .search = 12.0,
-                           .fill = true};
+                           .level = 1};
       if (r3d_tracer_start(&mv_tr, overlay_paths[overlay_sel], &tc, &umbilicus) == 0) {
         mv_tr_pos = malloc((size_t)mv_tr.W * mv_tr.H * 3 * sizeof *mv_tr_pos);
         mv_tr_st = calloc((size_t)mv_tr.W * mv_tr.H, 1);
