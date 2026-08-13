@@ -241,7 +241,7 @@ typedef struct ng_grid {
   size_t blob_n;
   uint32_t *precoff;    /* [npaths] byte offset of each record (sorted) */
   uint32_t *bidx;       /* [gw*gh+1] CSR into boff */
-  uint32_t *boff;       /* PATH INDICES per bucket (resolved at load) */
+  uint32_t *boff;       /* record byte offsets per bucket */
   bool empty;
 } ng_grid;
 
@@ -349,11 +349,8 @@ static ng_grid *ng_grid_load(const char *path) {
   g->boff = malloc((nboff ? nboff : 1) * sizeof *g->boff);
   if (!g->bidx || !g->boff) goto bad;
   for (uint32_t i = 0; i <= nbuck; i++) g->bidx[i] = ng_be32(d + bio + 4u * i);
-  for (uint32_t i = 0; i < nboff; i++) {
-    uint32_t rec = ng_be32(d + bio + 4u * (nbuck + 1) + 4u * i);
-    int32_t pi = ng_path_of(g, rec);
-    g->boff[i] = pi >= 0 ? (uint32_t)pi : UINT32_MAX;
-  }
+  for (uint32_t i = 0; i < nboff; i++)
+    g->boff[i] = ng_be32(d + bio + 4u * (nbuck + 1) + 4u * i);
   free(d);
   g->bytes = sizeof *g + g->blob_n + (size_t)np * sizeof(uint32_t) +
              (size_t)(nbuck + 1 + nboff) * sizeof(uint32_t);
@@ -397,11 +394,12 @@ static uint32_t ng_query(const ng_grid *g, double cx, double cy, double radius,
     for (uint32_t bx2 = bx0; bx2 <= bx1; bx2++) {
       uint32_t b = by2 * g->gw + bx2;
       for (uint32_t k = g->bidx[b]; k < g->bidx[b + 1]; k++) {
-        uint32_t pi = g->boff[k];
-        if (pi == UINT32_MAX) continue;
+        int32_t pi = ng_path_of(g, g->boff[k]); /* resolved here: queries
+                                * are amortized by hoods, loads are not */
+        if (pi < 0) continue;
         bool dup = false;
-        for (uint32_t q = 0; q < nout && !dup; q++) dup = out[q] == pi;
-        if (!dup && nout < max) out[nout++] = pi;
+        for (uint32_t q = 0; q < nout && !dup; q++) dup = out[q] == (uint32_t)pi;
+        if (!dup && nout < max) out[nout++] = (uint32_t)pi;
       }
     }
   return nout;
@@ -434,7 +432,8 @@ typedef struct ng_hood {
   int plane, slice, qx, qy; /* plane<0 = free */
   const ng_grid *g;
   uint32_t nseg;
-  float sg[NG_HOODSEG][10]; /* ax ay bx by nx ny prevx prevy nextx nexty */
+  float sg[NG_HOODSEG][13]; /* ax ay bx by nx ny prevx prevy nextx nexty
+                             * dx dy invL2 (pt-seg without divides) */
   uint8_t nb[NG_HOODSEG];   /* bit0: prev exists, bit1: next exists */
   uint64_t use;
 } ng_hood;
@@ -822,6 +821,8 @@ typedef struct tr_env { /* one per solving thread */
   td_cache *dt;   /* coordinator-only (conf/DT fallback) — NULL in workers */
   ng_vol *ngv;
   ng_hood *hood;  /* [NG_NHOOD] private neighborhood cache */
+  uint16_t hidx[2048]; /* open-addressed hood key -> slot+1 (the linear
+                        * 512-entry scan was 40%% of trace CPU) */
   uint64_t htick;
   bool in_pool;   /* set inside pool workers: never nest pools */
   struct tr_pool *pl; /* coordinator: the persistent worker pool */
@@ -833,29 +834,67 @@ typedef struct tr_env { /* one per solving thread */
 
 /* segment neighborhood lookup/build; center quantized to 16 px so the
  * full-path scan amortizes across residual evals and LM iterations */
+static uint32_t ng_hood_hash(int plane, int slice, int qx, int qy) {
+  uint64_t key = ((uint64_t)(unsigned)plane << 60) ^ ((uint64_t)(unsigned)slice << 32) ^
+                 ((uint64_t)(unsigned)qx << 16) ^ (uint64_t)(unsigned)qy;
+  return (uint32_t)(key * 0x9E3779B97F4A7C15ull >> 45) & 2047u;
+}
+
+static void ng_hood_idx_del(tr_env *e, const ng_hood *h) {
+  for (uint32_t p = ng_hood_hash(h->plane, h->slice, h->qx, h->qy), n = 0; n < 2048;
+       p = (p + 1) & 2047u, n++) {
+    uint16_t ent = e->hidx[p];
+    if (!ent) return;
+    if (&e->hood[ent - 1] == h) {
+      e->hidx[p] = 0;
+      for (uint32_t p2 = (p + 1) & 2047u; e->hidx[p2]; p2 = (p2 + 1) & 2047u) {
+        uint16_t ent2 = e->hidx[p2];
+        e->hidx[p2] = 0;
+        const ng_hood *h2 = &e->hood[ent2 - 1];
+        for (uint32_t p3 = ng_hood_hash(h2->plane, h2->slice, h2->qx, h2->qy);;
+             p3 = (p3 + 1) & 2047u)
+          if (!e->hidx[p3]) {
+            e->hidx[p3] = ent2;
+            break;
+          }
+      }
+      return;
+    }
+  }
+}
+
 static ng_hood *ng_hood_get(tr_env *e, ng_grid *g, int plane, int slice, double mx,
                             double my) {
   if (!e->hood) return NULL;
   int qx = (int)floor(mx / 16.0), qy = (int)floor(my / 16.0);
-  uint32_t victim = 0;
-  uint64_t oldest = UINT64_MAX;
-  for (uint32_t i = 0; i < NG_NHOOD; i++) {
-    ng_hood *h = &e->hood[i];
+  for (uint32_t p = ng_hood_hash(plane, slice, qx, qy), n = 0; n < 2048;
+       p = (p + 1) & 2047u, n++) {
+    uint16_t ent = e->hidx[p];
+    if (!ent) break;
+    ng_hood *h = &e->hood[ent - 1];
     if (h->plane == plane && h->slice == slice && h->qx == qx && h->qy == qy &&
         h->g == g) {
       h->use = ++e->htick;
       return h;
     }
+  }
+  uint32_t victim = 0;
+  uint64_t oldest = UINT64_MAX;
+  for (uint32_t i = 0; i < NG_NHOOD; i++) { /* miss: LRU victim (rare) */
+    ng_hood *h = &e->hood[i];
     if (h->plane < 0) {
       victim = i;
-      oldest = 0;
-    } else if (h->use < oldest) {
+      break;
+    }
+    if (h->use < oldest) {
       oldest = h->use;
       victim = i;
     }
   }
   double t0 = tr_now();
   ng_hood *h = &e->hood[victim];
+  if (h->plane >= 0) ng_hood_idx_del(e, h); /* stale key (incl. same-key
+                                             * different-grid rebuilds) */
   h->plane = plane;
   h->slice = slice;
   h->qx = qx;
@@ -863,6 +902,11 @@ static ng_hood *ng_hood_get(tr_env *e, ng_grid *g, int plane, int slice, double 
   h->g = g;
   h->nseg = 0;
   h->use = ++e->htick;
+  for (uint32_t p = ng_hood_hash(plane, slice, qx, qy);; p = (p + 1) & 2047u)
+    if (!e->hidx[p]) {
+      e->hidx[p] = (uint16_t)(victim + 1);
+      break;
+    }
   double cx = ((double)qx + 0.5) * 16.0, cy = ((double)qy + 0.5) * 16.0;
   double R = 92.0; /* query radius 80 + 16-px quantization slack */
   uint32_t paths[NG_QMAX];
@@ -899,6 +943,9 @@ static ng_hood *ng_hood_get(tr_env *e, ng_grid *g, int plane, int slice, double 
       sg[3] = by;
       sg[4] = -ty / tl;
       sg[5] = tx / tl;
+      sg[10] = tx;
+      sg[11] = ty;
+      sg[12] = 1.0f / (tl * tl);
       uint8_t nb = 0;
       if (s2 > 0) {
         sg[6] = dec[(size_t)(s2 - 1) * 2];
@@ -1036,7 +1083,13 @@ static double ncp_residual(tr_env *e, int plane, const double A[3],
       }
       /* snap: E near this segment, A near a NEIGHBOR segment of the same
        * polyline (prev/next captured at hood build) */
-      double d2e = ncp_pt_seg_d2(e2[0], e2[1], sax, say, sbx, sby);
+      double tt = ((e2[0] - sax) * (double)sg[10] + (e2[1] - say) * (double)sg[11]) *
+                  (double)sg[12];
+      if (tt < 0.0) tt = 0.0;
+      if (tt > 1.0) tt = 1.0;
+      double qex = sax + tt * (double)sg[10] - e2[0],
+             qey = say + tt * (double)sg[11] - e2[1];
+      double d2e = qex * qex + qey * qey;
       if (d2e < NCP_SNAP_TRIG * NCP_SNAP_TRIG) {
         for (int dsn = 0; dsn < 2; dsn++) {
           if (!(hd->nb[k] & (dsn ? 2u : 1u))) continue;
@@ -1565,6 +1618,9 @@ typedef struct tr_pool {
   uint32_t nout;
   uint64_t job;
   uint32_t done;
+  uint32_t nwait; /* claim-loop waiters (gate cv wakeups) */
+  int klass;              /* mode 3: (i%7) + 7*(j%7) residue class */
+  _Atomic uint32_t aidx;  /* mode 3: lock-free work index */
   bool quit;
   pthread_mutex_t mu;
   pthread_cond_t cv, idle_cv;
@@ -1580,6 +1636,24 @@ static void *tr_pool_thread(void *ud) {
     while (!pl->quit && pl->job == seen) pthread_cond_wait(&pl->cv, &pl->mu);
     if (pl->quit) break;
     seen = pl->job;
+    if (pl->mode == 3) { /* sweep visit, residue-class scheduled: cells of
+                          * one (i%7, j%7) class are pairwise >= 7 apart —
+                          * no claims, no conflict scans, no cv traffic */
+      int kls = pl->klass;
+      pthread_mutex_unlock(&pl->mu);
+      for (;;) {
+        uint32_t c = atomic_fetch_add(&pl->aidx, 1);
+        if (c >= pl->n || t->quit) break;
+        uint32_t cell = pl->items[c];
+        int i = (int)(cell % t->W), j = (int)(cell / t->W);
+        if (i % 7 + 7 * (j % 7) != kls) continue;
+        tr_solve_cell(t, e, i, j, TRF_ALL, 4);
+      }
+      pthread_mutex_lock(&pl->mu);
+      pl->done++;
+      pthread_cond_signal(&pl->idle_cv);
+      continue;
+    }
     for (;;) { /* claim loop; mu held at the top of each iteration */
       if (t->quit) break;
       while (pl->scan0 < pl->n && pl->st[pl->scan0] != 0) pl->scan0++;
@@ -1602,7 +1676,9 @@ static void *tr_pool_thread(void *ud) {
       }
       if (pick < 0) {
         if (!pending || pl->nact == 0) break;
+        pl->nwait++;
         pthread_cond_wait(&pl->cv, &pl->mu);
+        pl->nwait--;
         continue;
       }
       uint32_t cell = pl->items[pick];
@@ -1625,7 +1701,7 @@ static void *tr_pool_thread(void *ud) {
       pl->act[slot][0] = pl->act[--pl->nact][0];
       pl->act[slot][1] = pl->act[pl->nact][1];
       if (placed) pl->out[pl->nout++] = cell;
-      pthread_cond_broadcast(&pl->cv);
+      if (pl->nwait) pthread_cond_broadcast(&pl->cv);
     }
     pl->done++;
     pthread_cond_signal(&pl->idle_cv);
@@ -1644,7 +1720,13 @@ static void tr_pool_init(tr_pool *pl, r3d_tracer *t, ng_vol *ngv) {
   pthread_mutex_init(&pl->mu, NULL);
   pthread_cond_init(&pl->cv, NULL);
   pthread_cond_init(&pl->idle_cv, NULL);
-  for (uint32_t i = 0; i < TR_NTHREADS; i++) {
+  uint32_t want = TR_NTHREADS;
+  const char *tenv = getenv("R3D_TRACE_THREADS");
+  if (tenv) { /* 0/1 = serial (deterministic quality A/B runs) */
+    long tv = strtol(tenv, NULL, 10);
+    want = tv < 2 ? 0 : (tv > TR_NTHREADS ? TR_NTHREADS : (uint32_t)tv);
+  }
+  for (uint32_t i = 0; i < want; i++) {
     tr_env *e = &pl->env[pl->nth];
     memset(e, 0, sizeof *e);
     e->ngv = ngv;
@@ -1687,6 +1769,25 @@ static uint32_t tr_pool_run2(tr_pool *pl, tr_env *cenv, const uint32_t *items,
                              uint32_t n, uint32_t *out, int mode) {
   r3d_tracer *t = pl->t;
   uint32_t nout = 0;
+  if (false && n && pl->nth && mode == 2) { /* residue-class scheduling:
+      * lock-free but stride-7 iteration wrecks slice/hood locality —
+      * kept for reference, claim order wins in practice */
+    for (int kls = 0; kls < 49 && !t->quit; kls++) {
+      pthread_mutex_lock(&pl->mu);
+      pl->items = items;
+      pl->n = n;
+      pl->mode = 3;
+      pl->klass = kls;
+      atomic_store(&pl->aidx, 0);
+      pl->done = 0;
+      pl->job++;
+      pthread_cond_broadcast(&pl->cv);
+      while (pl->done < pl->nth) pthread_cond_wait(&pl->idle_cv, &pl->mu);
+      pl->n = 0;
+      pthread_mutex_unlock(&pl->mu);
+    }
+    return 0;
+  }
   if (n && pl->nth) {
     memset(pl->st, 0, n);
     pthread_mutex_lock(&pl->mu);
@@ -1864,11 +1965,14 @@ static void *tr_worker(void *ud) {
     }
     for (uint32_t f = 0; f < nnew; f++) /* conf: coordinator only (DT) */
       tr_update_conf(t, &cenv, (int)(nfringe[f] % W), (int)(nfringe[f] / W));
-    /* schedule: early global solves, later subsampled radius-8 solves */
-    if (global_opt) {
-      if (generation % 8 == 0)
-        tr_local_opt(t, &cenv, x0, y0, (int)W + (int)H, 6, true);
-    } else {
+    /* schedule: vc3d runs global solves only in the first 10 generations
+     * (Ceres cost); our parallel sweeps are cheap enough to keep them
+     * coming — every 8th generation, forever. This anneals away the
+     * candidate-order nondeterminism that tears weak outskirt regions
+     * (same-build 60-gen QC swung 0.06%..9.7% v-edges >30 vox). */
+    if (!resume && generation % 8 == 0) {
+      tr_local_opt(t, &cenv, x0, y0, (int)W + (int)H, global_opt ? 6 : 3, true);
+    } else if (!global_opt) {
       uint32_t nsub = 0;
       for (uint32_t f = 0; f < nnew; f++) {
         int i = (int)(nfringe[f] % W), j = (int)(nfringe[f] / W);
@@ -2056,9 +2160,35 @@ int r3d_tracer_save(r3d_tracer *t, const char *dir, float cutoff) {
   static const char *nm[3] = {"x.tif", "y.tif", "z.tif"};
   int rc = 0;
   pthread_mutex_lock(&t->mu);
+  /* tear mask: a cell whose edge to any 4-neighbor is way off the unit
+   * is mis-seated (usually a wrong-wrap capture in ambiguous data) — an
+   * honest hole beats a committed discontinuity */
+  uint8_t *keep = malloc(n);
+  if (keep) {
+    double lim = 1.75 * t->cfg.step;
+    for (uint64_t k = 0; k < n; k++) {
+      keep[k] = t->state[k] == R3D_TR_SET && t->conf[k] >= cutoff;
+      if (!keep[k]) continue;
+      int i = (int)(k % t->W), j = (int)(k / t->W);
+      static const int o4[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+      for (int o = 0; o < 4 && keep[k]; o++) {
+        int ii = i + o4[o][0], jj = j + o4[o][1];
+        if (ii < 0 || jj < 0 || ii >= (int)t->W || jj >= (int)t->H) continue;
+        size_t k2 = (size_t)jj * t->W + (size_t)ii;
+        if (t->state[k2] != R3D_TR_SET) continue;
+        double d2 = 0;
+        for (int a = 0; a < 3; a++) {
+          double dd = t->pos[k * 3 + (size_t)a] - t->pos[k2 * 3 + (size_t)a];
+          d2 += dd * dd;
+        }
+        if (d2 > lim * lim) keep[k] = 0;
+      }
+    }
+  }
   for (int a = 0; a < 3 && rc == 0; a++) {
     for (uint64_t k = 0; k < n; k++)
-      pl[k] = t->state[k] == R3D_TR_SET && t->conf[k] >= cutoff
+      pl[k] = (keep ? keep[k]
+                    : t->state[k] == R3D_TR_SET && t->conf[k] >= cutoff)
                   ? (float)t->pos[k * 3 + (size_t)a]
                   : -1.0f;
     char path[1200];
@@ -2066,6 +2196,7 @@ int r3d_tracer_save(r3d_tracer *t, const char *dir, float cutoff) {
     rc = tr_write_plane(path, pl, t->W, t->H);
   }
   pthread_mutex_unlock(&t->mu);
+  free(keep);
   free(pl);
   if (rc != 0) return -1;
   char mp[1200];
