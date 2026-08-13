@@ -67,6 +67,7 @@ static _Atomic uint64_t g_fetched_bytes = 0, g_fetched_n = 0, g_absent_n = 0;
 static level_info g_lv[MAX_LEVELS];
 static uint32_t g_nlev = 0, g_full_from = 3;
 static float g_quality = 2.0f;
+static float g_tau = 0.0f; /* >0: c5d hard max-error bound (sparse corrections) */
 static FILE *g_missing_list = NULL;
 static uint64_t g_missing_count = 0;
 static _Atomic uint64_t g_psnr_bricks = 0;
@@ -371,6 +372,7 @@ static void *brick_worker(void *arg) {
           if (q < 0.25f) q = 0.25f;
           c5d_brick_params p = c5d_brick_defaults(1.0f);
           p.q = q;
+          p.tau = g_tau;
           size_t n = 0;
           if (c5d_brick_encode(&p, raw, BRICK, &j->bricks[b].p, &n) != 0 ||
               n > UINT32_MAX) {
@@ -580,7 +582,7 @@ int main(int argc, char **argv) {
     fprintf(stderr,
             "usage: zarr2c5d <zarr-mirror-dir> <output-dir> [--url BASE] [--surface DIR] "
             "[--pad N] [--full-from L] [--min-level L] [--rect i0 j0 i1 j1] [--threads N] "
-            "[--c5d-quality Q] [--only-level L] "
+            "[--c5d-quality Q] [--tau T] [--only-level L] "
             "[--list-missing FILE] [--dry-run] [--verify N] [--force]\n"
             "  --url: streaming ingest — chunks are fetched straight into memory and only "
             "transcoded c5d shards are written (the mirror dir holds .zarray metadata "
@@ -608,6 +610,8 @@ int main(int argc, char **argv) {
       threads = (uint32_t)strtoul(argv[++i], NULL, 10);
     else if (strcmp(argv[i], "--c5d-quality") == 0 && i + 1 < argc)
       g_quality = strtof(argv[++i], NULL);
+    else if (strcmp(argv[i], "--tau") == 0 && i + 1 < argc)
+      g_tau = strtof(argv[++i], NULL);
     else if (strcmp(argv[i], "--only-level") == 0 && i + 1 < argc)
       only_level = (uint32_t)strtoul(argv[++i], NULL, 10);
     else if (strcmp(argv[i], "--min-level") == 0 && i + 1 < argc)
