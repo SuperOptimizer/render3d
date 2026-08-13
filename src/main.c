@@ -3179,7 +3179,8 @@ int main(int argc, char **argv) {
             uint64_t nv = 0;
             uint32_t gi0 = ts.w, gi1 = 0, gj0 = ts.h, gj1 = 0; /* grid bbox */
             for (size_t k = 0; k < (size_t)ts.w * ts.h; k++) {
-              bool ok2 = mv_tr_st[k] == R3D_TR_SET && mv_tr_cf[k] >= mv_tr_thresh;
+              bool ok2 = mv_tr_st[k] == R3D_TR_SET; /* growth never skips a
+                  * cell; the cutoff is a SAVE decision, not a display one */
               for (int a = 0; a < 3; a++) {
                 float vv2 = ok2 ? (float)mv_tr_pos[k * 3 + (size_t)a] : -1.0f;
                 ts.xyz[k * 3 + (size_t)a] = vv2;
@@ -3579,7 +3580,7 @@ int main(int argc, char **argv) {
               for (uint32_t j = 0; j < TH; j += strd)
                 for (uint32_t ii = 0; ii < TW; ii += strd) {
                   size_t k = (size_t)j * TW + ii;
-                  if (mv_tr_st[k] != R3D_TR_SET || mv_tr_cf[k] < mv_tr_thresh) continue;
+                  if (mv_tr_st[k] != R3D_TR_SET) continue;
                   const double *P = mv_tr_pos + k * 3;
                   bool inb = true;
                   for (int a = 0; a < 3; a++)
@@ -3596,7 +3597,9 @@ int main(int argc, char **argv) {
                   float ny = v3_dot(d, un) / (zf * (lu > 0 ? lu : 1));
                   ImVec2 sp = {(float)mv[i].px + (nx * 0.5f + 0.5f) * (float)mv[i].pw,
                                (float)mv[i].py + (0.5f - ny * 0.5f) * (float)mv[i].ph};
-                  ImDrawList_AddCircleFilled(draw, sp, 2.0f, tc_, 6);
+                  ImDrawList_AddCircleFilled(
+                      draw, sp, 2.0f,
+                      mv_tr_cf[k] < mv_tr_thresh ? 0x907070e0u : tc_, 6);
                 }
             }
           } else {
@@ -3604,8 +3607,7 @@ int main(int argc, char **argv) {
             for (uint32_t j = 0; j < TH; j++)
               for (uint32_t ii = 0; ii < TW; ii++) {
                 size_t k = (size_t)j * TW + ii;
-                if (mv_tr_st[k] != R3D_TR_SET || mv_tr_cf[k] < mv_tr_thresh * 0.5f)
-                  continue;
+                if (mv_tr_st[k] != R3D_TR_SET) continue;
                 const double *P = mv_tr_pos + k * 3;
                 double fu, fv, fs;
                 r3d_mv_w2b(mv_pb[i], mv_po[i], P, &fu, &fv, &fs);

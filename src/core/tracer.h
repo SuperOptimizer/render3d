@@ -46,6 +46,7 @@ typedef struct r3d_tracer {
   pthread_mutex_t mu;
   bool running, quit, done;
   uint32_t ring, nset;   /* ring = generations grown so far */
+  double vdim[3];        /* scroll volume extent (growth hard-stops there) */
   uint32_t gens_done;    /* completed generations across resumes */
   unsigned rng;          /* placement-perturbation PRNG state */
   uint64_t gen;

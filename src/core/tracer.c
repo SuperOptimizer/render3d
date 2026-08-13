@@ -1764,6 +1764,17 @@ static bool tr_place_cand(r3d_tracer *t, tr_env *e, uint32_t cell, unsigned *rng
   tr_tm_add(0, tt0);
   tr_local_opt(t, e, i, j, 1, 2, false);
   tr_local_opt(t, e, i, j, 3, 3, false);
+  const double *fp = t->pos + k * 3; /* the ONLY legitimate hole: the
+                                      * point left the scroll volume */
+  if (t->vdim[0] > 0 &&
+      (fp[0] < 0 || fp[1] < 0 || fp[2] < 0 || fp[0] >= t->vdim[0] ||
+       fp[1] >= t->vdim[1] || fp[2] >= t->vdim[2])) {
+    pthread_mutex_lock(&t->mu);
+    t->state[k] = R3D_TR_FAIL;
+    if (t->nset) t->nset--;
+    pthread_mutex_unlock(&t->mu);
+    return false;
+  }
   return true;
 }
 
@@ -2003,6 +2014,9 @@ static void *tr_worker(void *ud) {
   }
   for (int k = 0; k < 6; k++) atomic_store(&tr_tm_ns[k], 0);
   double tr_t_start = tr_now();
+  t->vdim[0] = (double)vol.nx;
+  t->vdim[1] = (double)vol.ny;
+  t->vdim[2] = (double)vol.nz;
   ng_vol ng; /* vc3d's real data term when the store exists upstream */
   ng_open(&ng, t->root);
   tr_env cenv = {.dt = dt, .ngv = &ng}; /* coordinator's solve env */
