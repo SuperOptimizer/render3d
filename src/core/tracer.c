@@ -620,14 +620,17 @@ static void ng_close(ng_vol *v) {
 /* fetch one slice file to disk with the given handle; thread-safe
  * (unique tmp names, atomic rename). Returns 0 when the file (or a
  * .missing sentinel) now exists. */
-static int ng_fetch_file(ng_vol *v, CURL *c, int plane, int slice) {
+static int ng_fetch_file(ng_vol *v, CURL *c, int plane, int slice, bool sync) {
   char dir[1300], path[1500], miss[1520];
   snprintf(dir, sizeof dir, "%s/%s", v->root, ng_plane_dir[plane]);
   snprintf(path, sizeof path, "%s/%06d.grid", dir, slice);
   snprintf(miss, sizeof miss, "%s.missing", path);
   struct stat st;
   if (stat(path, &st) == 0 || stat(miss, &st) == 0) return 0;
-  if (!v->url[0] || !c || v->net_cool > (uint64_t)time(NULL)) return -1;
+  if (!v->url[0] || !c) return -1;
+  if (!sync && v->net_cool > (uint64_t)time(NULL)) return -1; /* growth must
+      * not go data-blind: the solve path always retries, only the
+      * background prefetchers back off */
   mkdir(dir, 0755);
   char tmp[1600], url[1600];
   snprintf(tmp, sizeof tmp, "%s.tmp.%ld.%lx", path, (long)getpid(),
@@ -682,10 +685,17 @@ static void *ng_prefetch_worker(void *ud) {
     int plane = v->fq[0].plane, slice = v->fq[0].slice;
     memmove(v->fq, v->fq + 1, --v->fqn * sizeof v->fq[0]);
     pthread_mutex_unlock(&v->fmu);
-    if (c) ng_fetch_file(v, c, plane, slice);
+    if (c) ng_fetch_file(v, c, plane, slice, false);
   }
   if (c) curl_easy_cleanup(c);
   return NULL;
+}
+
+static void ng_prefetch_reset(ng_vol *v) { /* let a new generation re-ask */
+  if (!v->nfth) return;
+  pthread_mutex_lock(&v->fmu);
+  memset(v->fseen, 0, sizeof v->fseen);
+  pthread_mutex_unlock(&v->fmu);
 }
 
 static void ng_prefetch(ng_vol *v, int plane, int slice) {
@@ -737,7 +747,7 @@ static ng_grid *ng_get(ng_vol *v, int plane, int slice, int *slot_out) {
     }
     static _Thread_local CURL *tcurl = NULL;
     if (!tcurl) tcurl = ng_mkcurl();
-    if (ng_fetch_file(v, tcurl, plane, slice) == 0) g = ng_grid_load(path);
+    if (ng_fetch_file(v, tcurl, plane, slice, true) == 0) g = ng_grid_load(path);
   }
   tr_tm_add(3, tt0);
   pthread_mutex_lock(&v->gmu);
@@ -1631,6 +1641,10 @@ static void tr_update_conf(r3d_tracer *t, tr_env *e, int i, int j) {
       }
     }
     tr_env_flush(e);
+    if (d >= TR_CONF_R && e->dt) /* no polyline within reach: the grids
+        * prune short traces — ask the raw predictions before declaring
+        * the point unsupported */
+      d = td_tri(e->dt, P, NULL);
   } else if (e->dt) {
     d = td_tri(e->dt, P, NULL);
   }
@@ -2093,6 +2107,7 @@ static void *tr_worker(void *ud) {
         cands[nc++] = (uint32_t)k;
       }
     }
+    ng_prefetch_reset(&ng);
     if (ng.nfth) /* a generation of lead time: enqueue the grid slices
                   * every candidate will touch before any solving starts */
       for (uint32_t ci = 0; ci < nc; ci++) {
