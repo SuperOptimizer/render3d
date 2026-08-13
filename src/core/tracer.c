@@ -823,6 +823,7 @@ typedef struct tr_env { /* one per solving thread */
   ng_hood *hood;  /* [NG_NHOOD] private neighborhood cache */
   uint16_t hidx[2048]; /* open-addressed hood key -> slot+1 (the linear
                         * 512-entry scan was 40%% of trace CPU) */
+  uint32_t hclock;     /* clock-hand eviction cursor */
   uint64_t htick;
   bool in_pool;   /* set inside pool workers: never nest pools */
   struct tr_pool *pl; /* coordinator: the persistent worker pool */
@@ -878,18 +879,17 @@ static ng_hood *ng_hood_get(tr_env *e, ng_grid *g, int plane, int slice, double 
       return h;
     }
   }
-  uint32_t victim = 0;
-  uint64_t oldest = UINT64_MAX;
-  for (uint32_t i = 0; i < NG_NHOOD; i++) { /* miss: LRU victim (rare) */
-    ng_hood *h = &e->hood[i];
-    if (h->plane < 0) {
-      victim = i;
+  uint32_t victim = e->hclock; /* clock hand: skip recently-used entries
+                                * (full LRU scans were the next hotspot) */
+  for (uint32_t nprobe = 0; nprobe < NG_NHOOD; nprobe++) {
+    ng_hood *h = &e->hood[e->hclock];
+    uint32_t cur = e->hclock;
+    e->hclock = (e->hclock + 1) & (NG_NHOOD - 1);
+    if (h->plane < 0 || h->use + 64 < e->htick) {
+      victim = cur;
       break;
     }
-    if (h->use < oldest) {
-      oldest = h->use;
-      victim = i;
-    }
+    victim = cur;
   }
   double t0 = tr_now();
   ng_hood *h = &e->hood[victim];
@@ -1067,41 +1067,40 @@ static double ncp_residual(tr_env *e, int plane, const double A[3],
   /* no segments: normal term 0, snap takes the fixed no-target penalty */
   double wsum = 0.0, nsum = 0.0;
   double best_snap = -1.0;
+  float fmx = (float)mx, fmy = (float)my;
+  float fex = (float)e2[0], fey = (float)e2[1];
+  float fenx = (float)enx, feny = (float)eny;
   if (hd)
     for (uint32_t k = 0; k < hd->nseg; k++) {
       const float *sg = hd->sg[k];
-      double sax = (double)sg[0], say = (double)sg[1];
-      double sbx = (double)sg[2], sby = (double)sg[3];
-      double smx = (sax + sbx) * 0.5, smy = (say + sby) * 0.5;
-      double dmx = smx - mx, dmy = smy - my;
-      double d2 = dmx * dmx + dmy * dmy; /* midpoint-to-midpoint, vc3d */
-      if (d2 <= NCP_ROI2) {
-        double dd = d2 < 10.0 ? 10.0 : d2;
-        double dot = fabs(enx * (double)sg[4] + eny * (double)sg[5]);
-        wsum += 1.0 / dd;
-        nsum += (1.0 - dot) / dd;
+      float dmx = (sg[0] + sg[2]) * 0.5f - fmx, dmy = (sg[1] + sg[3]) * 0.5f - fmy;
+      float d2 = dmx * dmx + dmy * dmy; /* midpoint-to-midpoint, vc3d */
+      if (d2 <= (float)NCP_ROI2) {
+        float dd = d2 < 10.0f ? 10.0f : d2;
+        float dot = fabsf(fenx * sg[4] + feny * sg[5]);
+        wsum += (double)(1.0f / dd);
+        nsum += (double)((1.0f - dot) / dd);
       }
       /* snap: E near this segment, A near a NEIGHBOR segment of the same
        * polyline (prev/next captured at hood build) */
-      double tt = ((e2[0] - sax) * (double)sg[10] + (e2[1] - say) * (double)sg[11]) *
-                  (double)sg[12];
-      if (tt < 0.0) tt = 0.0;
-      if (tt > 1.0) tt = 1.0;
-      double qex = sax + tt * (double)sg[10] - e2[0],
-             qey = say + tt * (double)sg[11] - e2[1];
-      double d2e = qex * qex + qey * qey;
-      if (d2e < NCP_SNAP_TRIG * NCP_SNAP_TRIG) {
+      float tt = ((fex - sg[0]) * sg[10] + (fey - sg[1]) * sg[11]) * sg[12];
+      tt = tt < 0.0f ? 0.0f : (tt > 1.0f ? 1.0f : tt);
+      float qex = sg[0] + tt * sg[10] - fex, qey = sg[1] + tt * sg[11] - fey;
+      float d2e = qex * qex + qey * qey;
+      if ((double)d2e < NCP_SNAP_TRIG * NCP_SNAP_TRIG) {
         for (int dsn = 0; dsn < 2; dsn++) {
           if (!(hd->nb[k] & (dsn ? 2u : 1u))) continue;
-          double qax = dsn ? sbx : (double)sg[6];
-          double qay = dsn ? sby : (double)sg[7];
-          double qbx = dsn ? (double)sg[8] : sax;
-          double qby = dsn ? (double)sg[9] : say;
+          double qax = dsn ? (double)sg[2] : (double)sg[6];
+          double qay = dsn ? (double)sg[3] : (double)sg[7];
+          double qbx = dsn ? (double)sg[8] : (double)sg[0];
+          double qby = dsn ? (double)sg[9] : (double)sg[1];
           double d2a = ncp_pt_seg_d2(a2[0], a2[1], qax, qay, qbx, qby);
           if (d2a < NCP_SNAP_RANGE * NCP_SNAP_RANGE) {
-            double score = 0.5 * (sqrt(d2a) / NCP_SNAP_RANGE + sqrt(d2e) / NCP_SNAP_TRIG);
+            double score =
+                0.5 * (sqrt(d2a) / NCP_SNAP_RANGE + sqrt((double)d2e) / NCP_SNAP_TRIG);
             if (best_snap < 0.0 || score < best_snap) {
-              double d1n = sqrt(d2a) / NCP_SNAP_RANGE, d2n = sqrt(d2e) / NCP_SNAP_TRIG;
+              double d1n = sqrt(d2a) / NCP_SNAP_RANGE,
+                     d2n = sqrt((double)d2e) / NCP_SNAP_TRIG;
               best_snap = d1n * (1.0 - d2n) + d2n;
             }
           }
