@@ -207,6 +207,8 @@ add_executable(tifxyz-transform tools/tifxyz-transform/main.c)
 target_link_libraries(tifxyz-transform PRIVATE r3d_core m r3d_warnings r3d_sanitize)
 add_executable(segpack tools/segpack/main.c)
 target_link_libraries(segpack PRIVATE r3d_core r3d_warnings r3d_sanitize)
+add_executable(tracecli tools/tracecli/main.c)
+target_link_libraries(tracecli PRIVATE r3d_core r3d_warnings r3d_sanitize)
 add_executable(zarr2c5d tools/zarr2c5d/main.c)
 target_link_libraries(zarr2c5d PRIVATE r3d_core r3d_c5d ${BLOSC_LIB} CURL::libcurl
                                        r3d_warnings r3d_sanitize)

@@ -3140,6 +3140,8 @@ int main(int argc, char **argv) {
 
     if (getenv("R3D_TRACE_TEST") && multiview_path && n_overlays && !mv_tr_active &&
         frame_index == 120) { /* headless: seed a trace at the focus */
+      if (getenv("R3D_TRACE_RINGS"))
+        mv_tr_rings = atoi(getenv("R3D_TRACE_RINGS"));
       r3d_tracer_cfg tc = {.seed = {mv_focus[0], mv_focus[1], mv_focus[2]},
                            .step = (double)mv_tr_step,
                            .thresh = mv_tr_thresh,
