@@ -2503,6 +2503,14 @@ static void tr_eval(tr_ctx *c, const double x[3], tr_nlsq *acc) {
   if ((c->flags & TRF_WIND) && t->sp_valid && t->cfg.wind_weight > 0)
     tr_res_wind(acc, t, x, (double)t->wind[(size_t)j * t->W + (size_t)i],
                 t->cfg.wind_weight);
+  if (t->cfg.rib_rows) {
+    /* ribbon rows are fixed-z cross-section curves (Lasagna's per-slice
+     * mesh): anchor z to the row's plane so u follows sheet-x-plane —
+     * a free 3D ribbon geodesically walks out of its slab instead */
+    double zrow = t->cfg.seed[2] + ((double)j - (double)t->H / 2) * t->cfg.step;
+    double Jz[3] = {0, 0, 10.0};
+    nq_add(acc, 10.0 * (x[2] - zrow), Jz);
+  }
   if ((c->flags & TRF_SELF) && t->sfx && t->sp_valid)
     tr_res_self(acc, t, x, (size_t)j * t->W + (size_t)i);
   if ((c->flags & TRF_SURF) && t->don) {
@@ -3019,6 +3027,10 @@ static void *tr_worker(void *ud) {
   t->vdim[1] = (double)vol.ny;
   t->vdim[2] = (double)vol.nz;
   tr_uc_build(t, (uint32_t)vol.nz); /* spiral frame origin per slice */
+  if (t->cfg.rib_rows && !(t->cfg.z_max > t->cfg.z_min)) {
+    t->cfg.z_min = t->cfg.seed[2] - ((double)t->H / 2 + 2.0) * t->cfg.step;
+    t->cfg.z_max = t->cfg.seed[2] + ((double)t->H / 2 + 2.0) * t->cfg.step;
+  }
   if (t->cfg.wind_weight > 0 && !t->uc)
     printf("tracer: spiral prior requested but no usable umbilicus (needs "
            ">= 2 control points) — growing without it\n");
@@ -3067,14 +3079,32 @@ static void *tr_worker(void *ud) {
       for (int s2 = 0; s2 < TD_SLOTS; s2++) dt->s[s2].key = 0;
     }
     static const int off4[4][2] = {{0, 0}, {1, 0}, {0, 1}, {1, 1}};
+    double ax[3] = {1, 0, 0}, ay[3] = {0, 1, 0}; /* seed quad axes */
+    if (t->cfg.rib_rows) {
+      /* ribbon: u along the in-plane spiral tangent, v along z — the
+       * quad's orientation is what the straight losses propagate, and a
+       * ribbon that starts tilted walks into its own z clamp */
+      double cx2, cy2;
+      if (tr_uc_at(t, t->cfg.seed[2], &cx2, &cy2, NULL, NULL)) {
+        double ux2 = t->cfg.seed[0] - cx2, uy2 = t->cfg.seed[1] - cy2;
+        double rr = hypot(ux2, uy2);
+        if (rr > 1e-6) {
+          ax[0] = -uy2 / rr;
+          ax[1] = ux2 / rr;
+          ax[2] = 0;
+        }
+      }
+      ay[0] = ay[1] = 0;
+      ay[2] = t->cfg.step; /* rows sit one z-plane (= step vox) apart */
+    }
     pthread_mutex_lock(&t->mu);
     for (int q = 0; q < 4; q++) {
       int i = x0 + off4[q][0], j = y0 + off4[q][1];
       size_t k = (size_t)j * W + (size_t)i;
       double *P = t->pos + k * 3;
-      P[0] = t->cfg.seed[0] + 0.1 * off4[q][0];
-      P[1] = t->cfg.seed[1] + 0.1 * off4[q][1];
-      P[2] = t->cfg.seed[2];
+      for (int a = 0; a < 3; a++)
+        P[a] = t->cfg.seed[a] +
+               0.1 * (off4[q][0] * ax[a] + off4[q][1] * ay[a]);
       t->state[k] = R3D_TR_SET;
       t->conf[k] = 1.0f;
       fringe[nf++] = (uint32_t)k;
