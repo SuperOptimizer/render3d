@@ -16,6 +16,7 @@
 #include "core/segstore.h"
 #include "core/segtrace.h"
 #include "core/tifxyz.h"
+#include "core/tracer.h"
 #include "core/umbilicus.h"
 #include "core/vslab.h"
 #include "core/transfer.h"
@@ -708,6 +709,7 @@ int main(void) {
   test_orbit();
   test_transfer();
   test_umbilicus();
+  CHECK(r3d_tracer_spiral_selftest() == 0);
   test_tifxyz();
   test_mview();
   if (failures) {

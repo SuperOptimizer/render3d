@@ -20,11 +20,12 @@ int main(int argc, char **argv) {
   if (argc < 2) {
     fprintf(stderr,
             "usage: tracecli <pred-root> [--seed x y z] [--step S] [--gens N] "
-            "[--level L] [--cutoff C] [--out DIR] [--umbilicus FILE]\n");
+            "[--level L] [--cutoff C] [--out DIR] [--umbilicus FILE] [--nofill] "
+            "[--nospiral] [--spiral-weight W]\n");
     return 2;
   }
   const char *root = argv[1], *out = NULL, *umbp = NULL;
-  bool fill = true;
+  bool fill = true, spiral = true;
   r3d_tracer_cfg cfg = {.step = 20.0, .thresh = 0.35f, .max_ring = 60, .level = 1};
   bool have_seed = false;
   for (int i = 2; i < argc; i++) {
@@ -45,6 +46,10 @@ int main(int argc, char **argv) {
       umbp = argv[++i];
     else if (strcmp(argv[i], "--nofill") == 0)
       fill = false;
+    else if (strcmp(argv[i], "--nospiral") == 0)
+      spiral = false;
+    else if (strcmp(argv[i], "--spiral-weight") == 0 && i + 1 < argc)
+      cfg.wind_weight = strtod(argv[++i], NULL);
     else {
       fprintf(stderr, "tracecli: bad arg %s\n", argv[i]);
       return 2;
@@ -65,8 +70,12 @@ int main(int argc, char **argv) {
   r3d_umbilicus_init(&umb);
   if (umbp && r3d_umbilicus_load(&umb, umbp) != 0)
     fprintf(stderr, "tracecli: no umbilicus at %s (continuing)\n", umbp);
-  printf("tracecli: seed %.0f,%.0f,%.0f step %.0f gens %u level L%u\n", cfg.seed[0],
-         cfg.seed[1], cfg.seed[2], cfg.step, cfg.max_ring, cfg.level);
+  if (spiral && cfg.wind_weight == 0.0 && umb.count >= 2)
+    cfg.wind_weight = 0.5; /* spiral prior on by default with an umbilicus */
+  if (!spiral) cfg.wind_weight = 0.0;
+  printf("tracecli: seed %.0f,%.0f,%.0f step %.0f gens %u level L%u spiral %s\n",
+         cfg.seed[0], cfg.seed[1], cfg.seed[2], cfg.step, cfg.max_ring, cfg.level,
+         cfg.wind_weight > 0 ? "on" : "off");
   r3d_tracer tr;
   if (r3d_tracer_start(&tr, root, &cfg, &umb) != 0) {
     fprintf(stderr, "tracecli: tracer start failed\n");
@@ -79,7 +88,11 @@ int main(int argc, char **argv) {
     uint32_t ring = 0, nset = 0;
     r3d_tracer_snapshot(&tr, NULL, NULL, NULL, &ring, &nset, &done);
     if (ring != last_ring || done) {
-      printf("tracecli: generation %u/%u, %u points\n", ring, tr.cfg.max_ring, nset);
+      if (tr.sp_valid)
+        printf("tracecli: generation %u/%u, %u points (omega %.1f rms %.1f)\n", ring,
+               tr.cfg.max_ring, nset, tr.sp_omega, tr.sp_rms);
+      else
+        printf("tracecli: generation %u/%u, %u points\n", ring, tr.cfg.max_ring, nset);
       last_ring = ring;
     }
   }

@@ -31,6 +31,9 @@ typedef struct r3d_tracer_cfg {
                       * itself never rejects (vc3d semantics) */
   uint32_t max_ring; /* generations to grow (grid dim = 2*g + 50) */
   uint32_t level;    /* prediction pyramid level to sample */
+  double wind_weight; /* spiral winding prior weight (0 = off). Needs an
+                       * umbilicus; the residual is normalized by the
+                       * fitted sheet spacing so ~0.5 is a gentle prior. */
 } r3d_tracer_cfg;
 
 typedef struct r3d_tracer {
@@ -40,8 +43,26 @@ typedef struct r3d_tracer {
   double *pos;     /* [W*H*3], guarded by mu */
   uint8_t *state;  /* [W*H] R3D_TR_* */
   float *conf;     /* [W*H] data-term proximity 0..1 (display/save mask) */
-  r3d_umbilicus umb; /* copied winding guide (unused by the vc3d energy;
-                      * kept for future fusion modes) */
+  float *wind;     /* [W*H] winding number about the umbilicus (spiral
+                    * frame; seed = 0, accumulated combinatorially at
+                    * placement, never rewritten by solves) */
+  r3d_umbilicus umb; /* winding guide (spiral frame origin per slice) */
+  /* smoothed umbilicus centerline, x,y per z slice (sigma = 75 slices,
+   * vc3d spiral-service convention); NULL when no/degenerate umbilicus */
+  double *uc;
+  uint32_t ucn;
+  /* global spiral fit rho ~ r0(z) + omega*w over the grown points,
+   * refit each generation (piecewise-linear r0, IRLS/Cauchy) */
+  double sp_omega, sp_rms;
+  double sp_om_meas; /* inter-sheet gap measured on radial DT rays; lets
+                      * the fit run fixed-omega before the patch spans a
+                      * full winding (where joint omega is unidentifiable) */
+  double sp_r0[64];
+  double sp_ab[4]; /* theta harmonics 1..2 (cos1,sin1,cos2,sin2): absorbs
+                    * umbilicus offset + cross-section ellipticity */
+  double sp_z0, sp_dz;
+  uint32_t sp_k;
+  bool sp_valid;
   pthread_t th;
   pthread_mutex_t mu;
   bool running, quit, done;
@@ -72,5 +93,9 @@ uint64_t r3d_tracer_snapshot(r3d_tracer *t, double *pos, uint8_t *state, float *
  * cell is written; untrusted cells are re-seated by membrane
  * interpolation anchored on trusted neighbors instead of skipped. */
 int r3d_tracer_save(r3d_tracer *t, const char *dir, float cutoff, bool fill);
+
+/* Synthetic self-check of the spiral winding frame + global fit (used by
+ * the unit tests; no volume access). Returns 0 on success. */
+int r3d_tracer_spiral_selftest(void);
 
 #endif /* R3D_TRACER_H */

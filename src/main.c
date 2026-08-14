@@ -2828,13 +2828,25 @@ int main(int argc, char **argv) {
       static bool mv_tr_fill = true;
       igSameLine(0, 10);
       igCheckbox("fill holes", &mv_tr_fill);
+      static bool mv_tr_spiral = true;
+      if (umbilicus.count >= 2) {
+        igCheckbox("spiral prior", &mv_tr_spiral);
+        if (mv_tr_active && mv_tr.sp_valid) {
+          igSameLine(0, 10);
+          igTextDisabled("omega %.1f rms %.1f", mv_tr.sp_omega, mv_tr.sp_rms);
+        }
+      } else {
+        igTextDisabled("spiral prior needs an umbilicus (U to annotate)");
+      }
       if (!mv_tr_active) {
         if (igButton("seed at focus", (ImVec2){0, 0})) {
           r3d_tracer_cfg tc = {.seed = {mv_focus[0], mv_focus[1], mv_focus[2]},
                                .step = (double)mv_tr_step,
                                .thresh = mv_tr_thresh,
                                .max_ring = (uint32_t)mv_tr_rings,
-                               .level = 1};
+                               .level = 1,
+                               .wind_weight =
+                                   mv_tr_spiral && umbilicus.count >= 2 ? 0.5 : 0.0};
           if (r3d_tracer_start(&mv_tr, pr, &tc, &umbilicus) == 0) {
             free(mv_tr_pos);
             free(mv_tr_st);
@@ -3150,7 +3162,8 @@ int main(int argc, char **argv) {
                            .step = (double)mv_tr_step,
                            .thresh = mv_tr_thresh,
                            .max_ring = (uint32_t)mv_tr_rings,
-                           .level = 1};
+                           .level = 1,
+                           .wind_weight = umbilicus.count >= 2 ? 0.5 : 0.0};
       if (r3d_tracer_start(&mv_tr, overlay_paths[overlay_sel], &tc, &umbilicus) == 0) {
         mv_tr_pos = malloc((size_t)mv_tr.W * mv_tr.H * 3 * sizeof *mv_tr_pos);
         mv_tr_st = calloc((size_t)mv_tr.W * mv_tr.H, 1);
