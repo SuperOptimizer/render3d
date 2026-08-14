@@ -2590,6 +2590,92 @@ static bool tr_wf_at(const tr_wf *w, double x, double y, double *val, double g2[
   return true;
 }
 
+/* seed columns along one winding-field iso-contour (the wrap's whole
+ * perimeter, the outline "worked inward"): march the level set of r1
+ * through p0, dropping a 2x2 seed column every `every` grid cells of
+ * arc. Fronts then close the small gaps between columns instead of
+ * relaying around the entire cross section from one start. */
+#define TR_RIB_SEEDEVERY 32
+static void tr_rib_seed_contour(r3d_tracer *t, const tr_wf *wf, const double p0[2],
+                                int y0b, float w0, int x0, uint32_t *fringe,
+                                uint32_t *nf) {
+  double lev;
+  if (!tr_wf_at(wf, p0[0], p0[1], &lev, NULL)) return;
+  int placed = 0;
+  for (int dir = 0; dir < 2; dir++) {
+    double p[2] = {p0[0], p0[1]};
+    double heading[2] = {0, 0};
+    double arc = 0;
+    int lastu = INT32_MIN;
+    bool closed = false;
+    for (int stp = 0; stp < 4000; stp++) {
+      double v, g[2];
+      if (!tr_wf_at(wf, p[0], p[1], &v, g)) break;
+      double gl = hypot(g[0], g[1]);
+      if (gl < 1e-4) break; /* field flat: outside data */
+      double tx = -g[1] / gl, ty = g[0] / gl;
+      if (dir == 1) {
+        tx = -tx;
+        ty = -ty;
+      }
+      if (heading[0] != 0 || heading[1] != 0)
+        if (tx * heading[0] + ty * heading[1] < 0) {
+          tx = -tx;
+          ty = -ty;
+        }
+      heading[0] = tx;
+      heading[1] = ty;
+      double sl = t->cfg.step;
+      p[0] += tx * sl;
+      p[1] += ty * sl;
+      for (int nw = 0; nw < 2; nw++) { /* Newton back onto the level set */
+        if (!tr_wf_at(wf, p[0], p[1], &v, g)) break;
+        double g2 = g[0] * g[0] + g[1] * g[1];
+        if (g2 < 1e-8) break;
+        double c = (v - lev) / g2;
+        p[0] -= c * g[0];
+        p[1] -= c * g[1];
+      }
+      arc += sl;
+      if (arc > 8 * sl && hypot(p[0] - p0[0], p[1] - p0[1]) < sl) {
+        closed = true;
+        break;
+      }
+      int du = (int)llround(arc / sl);
+      int u = dir == 0 ? x0 + du : x0 - du;
+      if (u < 2 || u + 1 >= (int)t->W - 2) break;
+      if (du % TR_RIB_SEEDEVERY || u == lastu) continue;
+      lastu = u;
+      /* place a 2x2 column if the spot is free */
+      bool free4 = true;
+      for (int q = 0; q < 4 && free4; q++)
+        if (t->state[(size_t)(y0b + q / 2) * t->W + (size_t)(u + q % 2)] !=
+            R3D_TR_EMPTY)
+          free4 = false;
+      if (!free4) continue;
+      pthread_mutex_lock(&t->mu);
+      for (int q = 0; q < 4; q++) {
+        int i = u + q % 2, j = y0b + q / 2;
+        size_t k = (size_t)j * t->W + (size_t)i;
+        double *P = t->pos + k * 3;
+        P[0] = p[0] + 0.1 * (q % 2) * tx;
+        P[1] = p[1] + 0.1 * (q % 2) * ty;
+        P[2] = t->cfg.seed[2] + 0.1 * (q / 2);
+        t->state[k] = R3D_TR_SET;
+        t->conf[k] = 1.0f;
+        t->wind[k] = w0;
+        fringe[(*nf)++] = (uint32_t)k;
+      }
+      t->nset += 4;
+      pthread_mutex_unlock(&t->mu);
+      placed++;
+    }
+    if (closed) break;
+  }
+  if (placed)
+    printf("tracer: wrap %+d seeded at %d perimeter columns\n", (int)w0, placed + 1);
+}
+
 /* ======================== residual evaluation ======================== */
 enum {
   TRF_DIST = 1,
@@ -3642,6 +3728,14 @@ static void *tr_worker(void *ud) {
     }
     t->gen++;
     pthread_mutex_unlock(&t->mu);
+    if (nblk > 1 && t->wf) /* perimeter seeding along each wrap's
+                            * iso-contour (outline worked inward) */
+      for (int b = 0; b < nblk; b++) {
+        double pb[2] = {t->cfg.seed[0] + cross_s[b] * rdir[0],
+                        t->cfg.seed[1] + cross_s[b] * rdir[1]};
+        tr_rib_seed_contour(t, t->wf, pb, b * (rr + 1) + rr / 2,
+                            (float)(b - seed_rank), x0, fringe, &nf);
+      }
     for (int b = 0; b < nblk; b++) {
       int y0b = nblk > 1 ? b * (rr + 1) + rr / 2 : y0;
       tr_local_opt(t, &cenv, x0, y0b, 8, 6, true);
