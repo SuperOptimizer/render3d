@@ -2596,9 +2596,9 @@ static bool tr_wf_at(const tr_wf *w, double x, double y, double *val, double g2[
  * arc. Fronts then close the small gaps between columns instead of
  * relaying around the entire cross section from one start. */
 #define TR_RIB_SEEDEVERY 32
-static void tr_rib_seed_contour(r3d_tracer *t, const tr_wf *wf, const double p0[2],
-                                int y0b, float w0, int x0, uint32_t *fringe,
-                                uint32_t *nf) {
+static void tr_rib_seed_contour(r3d_tracer *t, const tr_wf *wf, td_cache *dt,
+                                const double p0[2], int y0b, float w0, int x0,
+                                uint32_t *fringe, uint32_t *nf) {
   double lev;
   if (!tr_wf_at(wf, p0[0], p0[1], &lev, NULL)) return;
   int placed = 0;
@@ -2646,6 +2646,11 @@ static void tr_rib_seed_contour(r3d_tracer *t, const tr_wf *wf, const double p0[
       if (u < 2 || u + 1 >= (int)t->W - 2) break;
       if (du % TR_RIB_SEEDEVERY || u == lastu) continue;
       lastu = u;
+      if (dt) { /* the field is wrong in sheared zones — only seed where
+                 * the predictions confirm a sheet actually lives here */
+        double q[3] = {p[0], p[1], t->cfg.seed[2]};
+        if (td_tri(dt, q, NULL) > 3.0) continue;
+      }
       /* place a 2x2 column if the spot is free */
       bool free4 = true;
       for (int q = 0; q < 4 && free4; q++)
@@ -3733,7 +3738,7 @@ static void *tr_worker(void *ud) {
       for (int b = 0; b < nblk; b++) {
         double pb[2] = {t->cfg.seed[0] + cross_s[b] * rdir[0],
                         t->cfg.seed[1] + cross_s[b] * rdir[1]};
-        tr_rib_seed_contour(t, t->wf, pb, b * (rr + 1) + rr / 2,
+        tr_rib_seed_contour(t, t->wf, cenv.dt, pb, b * (rr + 1) + rr / 2,
                             (float)(b - seed_rank), x0, fringe, &nf);
       }
     for (int b = 0; b < nblk; b++) {
