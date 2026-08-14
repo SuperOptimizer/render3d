@@ -3560,6 +3560,7 @@ static void *tr_worker(void *ud) {
   r3d_cpuvol ctv; /* optional raw CT for the boundary pass */
   bool ctv_ok = false;
   uint32_t ct_lv = 2;
+  double ct_min = t->cfg.ct_min > 0 ? t->cfg.ct_min : 128.0;
   if (t->cfg.ct_root[0]) {
     ctv_ok = r3d_cpuvol_open(&ctv, t->cfg.ct_root, 64) == 0;
     if (ctv_ok && ct_lv >= ctv.nlev) ct_lv = ctv.nlev - 1;
@@ -3829,7 +3830,7 @@ static void *tr_worker(void *ud) {
         bool dead = false;
         if (ctv_ok) {
           double v = r3d_cpuvol_tri(&ctv, ct_lv, P, NULL);
-          dead = v < 1.0;
+          dead = v < ct_min;
         } else {
           dead = td_tri(cenv.dt, P, NULL) > 50.0;
         }

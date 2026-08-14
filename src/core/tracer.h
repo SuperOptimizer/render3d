@@ -42,9 +42,13 @@ typedef struct r3d_tracer_cfg {
   double z_min, z_max; /* z_max > z_min: hard z clamp (vc3d z_range);
                         * solved points outside FAIL like a volume exit */
   char ct_root[1024]; /* optional raw-CT LOD tree: ribbon fronts stop
-                       * where the masked CT reads zero (true padding).
-                       * Predictions may be weak where papyrus continues —
-                       * only CT zero proves there is nothing to trace. */
+                       * where the CT says there is no scroll. Predictions
+                       * may be weak where papyrus continues — the CT is
+                       * the ground truth for "nothing here". */
+  double ct_min;      /* CT validity cutoff (default 128): masked volumes
+                       * zero the outside but leave a gray halo that was
+                       * never fully masked — intensities below this are
+                       * not scroll volume and fronts must not cross. */
   double wind_weight; /* spiral winding prior weight (0 = off). Needs an
                        * umbilicus; the residual is normalized by the
                        * fitted sheet spacing so ~0.5 is a gentle prior. */
