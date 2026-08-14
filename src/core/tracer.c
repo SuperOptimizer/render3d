@@ -2210,13 +2210,57 @@ static void tr_res_self(tr_nlsq *acc, const r3d_tracer *t, const double x[3],
             bq = Q;
           }
         }
-  if (!bq) return;
-  double d = sqrt(bd2);
-  if (d < 1e-6) return;
-  double r = TR_W_SELF * (rmin - d) / rmin;
-  double J[3];
-  for (int a = 0; a < 3; a++) J[a] = -TR_W_SELF * (x[a] - bq[a]) / (d * rmin);
-  nq_add(acc, r, J);
+  if (bq) { /* hinge: too close to another wrap */
+    double d = sqrt(bd2);
+    if (d > 1e-6) {
+      double r = TR_W_SELF * (rmin - d) / rmin;
+      double J[3];
+      for (int a = 0; a < 3; a++) J[a] = -TR_W_SELF * (x[a] - bq[a]) / (d * rmin);
+      nq_add(acc, r, J);
+    }
+  }
+  /* two-sided wrap spacing (geometry-agnostic, unlike the global rho
+   * model): the nearest cell exactly one winding away should sit ~omega
+   * from here. Weak Cauchy pull — real gaps vary. */
+  double om = fabs(t->sp_omega);
+  double rad2 = 1.6 * om;
+  long d0[3], d1[3];
+  for (int a = 0; a < 3; a++) {
+    d0[a] = (long)floor((x[a] - rad2) / sx->cs);
+    d1[a] = (long)floor((x[a] + rad2) / sx->cs);
+  }
+  double nd2 = rad2 * rad2;
+  const double *nq = NULL;
+  for (long cz = d0[2]; cz <= d1[2]; cz++)
+    for (long cy = d0[1]; cy <= d1[1]; cy++)
+      for (long cx = d0[0]; cx <= d1[0]; cx++)
+        for (uint32_t e = sx->head[tr_sfx_h(sx, cx, cy, cz)]; e; e = sx->next[e - 1]) {
+          uint32_t k = sx->cell[e - 1];
+          if (k == self_k || t->state[k] != R3D_TR_SET) continue;
+          double dw = fabs((double)t->wind[k] - wself);
+          if (dw < 0.6 || dw > 1.6) continue;
+          const double *Q = t->pos + (size_t)k * 3;
+          double d2 = 0;
+          for (int a = 0; a < 3; a++) {
+            double dd = x[a] - Q[a];
+            d2 += dd * dd;
+          }
+          if (d2 < nd2) {
+            nd2 = d2;
+            nq = Q;
+          }
+        }
+  if (nq) {
+    double d = sqrt(nd2);
+    if (d > 1e-6) {
+      double w2 = 0.3;
+      double r = w2 * (d - om) / om;
+      double sc = sqrt(1.0 / (1.0 + r * r)); /* Cauchy(1) */
+      double J[3];
+      for (int a = 0; a < 3; a++) J[a] = sc * w2 * (x[a] - nq[a]) / (d * om);
+      nq_add(acc, r * sc, J);
+    }
+  }
 }
 
 /* ======================== residual evaluation ======================== */
@@ -2780,6 +2824,13 @@ static bool tr_place_cand(r3d_tracer *t, tr_env *e, uint32_t cell, unsigned *rng
   }
   bool zclamp = t->cfg.z_max > t->cfg.z_min &&
                 (fp[2] < t->cfg.z_min || fp[2] > t->cfg.z_max);
+  if (!zclamp && t->cfg.rib_rows && e->dt) {
+    /* ribbons cross the whole cross section and must stop at the
+     * scroll's edge: a point this far from ANY predicted sheet is off
+     * the papyrus, not in an ambiguous fold */
+    double dv = td_tri(e->dt, fp, NULL);
+    if (dv > 50.0) zclamp = true;
+  }
   if (zclamp || (t->vdim[0] > 0 &&
       (fp[0] < 0 || fp[1] < 0 || fp[2] < 0 || fp[0] >= t->vdim[0] ||
        fp[1] >= t->vdim[1] || fp[2] >= t->vdim[2]))) {
