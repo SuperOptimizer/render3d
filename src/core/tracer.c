@@ -2568,6 +2568,33 @@ static double tr_urand(unsigned *st) { /* U(-0.05, 0.05), vc3d perturbation */
   return ((double)(*st >> 8) / (double)(1u << 24) - 0.5) * 0.1;
 }
 
+/* winding for cell k: neighbor wind + unwrapped angle step, averaged
+ * over the placed 3x3 ring — combinatorial, so later solves can move
+ * the point but never re-wind it */
+static void tr_wind_assign(r3d_tracer *t, size_t k, int i, int j) {
+  if (!t->uc) return;
+  const double *fp = t->pos + k * 3;
+  double th;
+  if (!tr_theta_of(t, fp, &th)) return;
+  double sum = 0.0;
+  int nn = 0;
+  for (int dj = -1; dj <= 1; dj++)
+    for (int di = -1; di <= 1; di++) {
+      if (!di && !dj) continue;
+      int ii = i + di, jj = j + dj;
+      if (!tr_valid(t, ii, jj)) continue;
+      size_t nk = (size_t)jj * t->W + (size_t)ii;
+      double thn;
+      if (!tr_theta_of(t, t->pos + nk * 3, &thn)) continue;
+      double d = th - thn;
+      while (d > M_PI) d -= 2.0 * M_PI;
+      while (d < -M_PI) d += 2.0 * M_PI;
+      sum += (double)t->wind[nk] + d / (2.0 * M_PI);
+      nn++;
+    }
+  if (nn) t->wind[k] = (float)(sum / nn);
+}
+
 /* =========================== growth loop =========================== */
 /* one candidate: pick the best parent, commit on top of it, solve into
  * place (vc3d per-candidate sequence). Returns true when placed. */
@@ -2599,38 +2626,31 @@ static bool tr_place_cand(r3d_tracer *t, tr_env *e, uint32_t cell, unsigned *rng
   t->state[k] = R3D_TR_SET; /* committed before the solve (vc3d) */
   t->nset++;
   pthread_mutex_unlock(&t->mu);
+  tr_wind_assign(t, k, i, j); /* preliminary: the donor gates in the
+                               * placement solve read it */
   /* placement: geometric + data terms, then radius-1 and radius-3 */
   double tt0 = tr_now();
-  tr_solve_cell(t, e, i, j, TRF_DIST | TRF_STRAIGHT | TRF_SPACE, 50);
+  tr_solve_cell(t, e, i, j, TRF_DIST | TRF_STRAIGHT | TRF_SPACE | TRF_SURF, 50);
+  if (t->don) { /* adoption (vc3d commit semantics): a candidate that
+                 * lands within same_surface_th of a same-winding donor
+                 * takes the donor's exact geometry before refinement */
+    double q[3], dwnd;
+    double *P = t->pos + k * 3;
+    int di = tr_don_closest(t->don, P, TR_FUS_TH, q, &dwnd);
+    if (di >= 0 &&
+        !(t->uc && dwnd > -1e29 &&
+          fabs(dwnd - (double)t->wind[k]) > TR_FUS_WIND_TH)) {
+      pthread_mutex_lock(&t->mu);
+      memcpy(P, q, 3 * sizeof *P);
+      pthread_mutex_unlock(&t->mu);
+    }
+  }
   tr_tm_add(0, tt0);
   tr_local_opt(t, e, i, j, 1, 2, false);
   tr_local_opt(t, e, i, j, 3, 3, false);
   const double *fp = t->pos + k * 3; /* the ONLY legitimate hole: the
                                       * point left the scroll volume */
-  if (t->uc) { /* winding: neighbor wind + unwrapped angle step, averaged
-                * over the placed 3x3 ring — combinatorial, so later
-                * solves can move the point but never re-wind it */
-    double th;
-    if (tr_theta_of(t, fp, &th)) {
-      double sum = 0.0;
-      int nn = 0;
-      for (int dj = -1; dj <= 1; dj++)
-        for (int di = -1; di <= 1; di++) {
-          if (!di && !dj) continue;
-          int ii = i + di, jj = j + dj;
-          if (!tr_valid(t, ii, jj)) continue;
-          size_t nk = (size_t)jj * t->W + (size_t)ii;
-          double thn;
-          if (!tr_theta_of(t, t->pos + nk * 3, &thn)) continue;
-          double d = th - thn;
-          while (d > M_PI) d -= 2.0 * M_PI;
-          while (d < -M_PI) d += 2.0 * M_PI;
-          sum += (double)t->wind[nk] + d / (2.0 * M_PI);
-          nn++;
-        }
-      if (nn) t->wind[k] = (float)(sum / nn);
-    }
-  }
+  tr_wind_assign(t, k, i, j); /* final: settled position */
   if (t->don && t->dsup) { /* consensus count (vc3d inlier vote, gated by
                             * the winding frame) */
     int sup = tr_don_support(t->don, fp, (double)t->wind[k], t->uc != NULL);
@@ -3389,8 +3409,9 @@ int r3d_tracer_save(r3d_tracer *t, const char *dir, float cutoff, bool fill) {
   double sc = 1.0 / t->cfg.step;
   fprintf(mf,
           "{\n  \"format\": \"tifxyz\",\n  \"type\": \"seg\",\n  \"scale\": [\n"
-          "    %.6f,\n    %.6f\n  ],\n  \"source\": \"render3d-tracer\"\n}\n",
-          sc, sc);
+          "    %.6f,\n    %.6f\n  ],\n  \"source\": \"render3d-tracer\",\n"
+          "  \"donor_segments\": %u\n}\n",
+          sc, sc, t->ndon);
   fclose(mf);
   if (t->sp_valid) { /* spiral model, for fusion / winding registration */
     snprintf(mp, sizeof mp, "%s/spiral.json", dir);
