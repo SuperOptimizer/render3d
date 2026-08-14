@@ -63,6 +63,9 @@ typedef struct r3d_tracer {
   double sp_z0, sp_dz;
   uint32_t sp_k;
   bool sp_valid;
+  void *don;      /* donor segments + spatial index (fusion), owned */
+  uint32_t ndon;
+  uint8_t *dsup;  /* [W*H] donor-support count per cell (0 = raw-traced) */
   pthread_t th;
   pthread_mutex_t mu;
   bool running, quit, done;
@@ -76,6 +79,16 @@ typedef struct r3d_tracer {
 /* Copies cfg + umbilicus and starts the grow thread. */
 int r3d_tracer_start(r3d_tracer *t, const char *pred_root, const r3d_tracer_cfg *cfg,
                      const r3d_umbilicus *umb);
+/* Same, with donor segments (fusion): each dir is a saved tifxyz
+ * (winding.tif + spiral.json consumed when present). Candidates near a
+ * donor are pulled onto it during solves (vc3d grow_surf_from_surfs's
+ * SurfaceLossD role); donors on a different winding never attract
+ * (spiral-frame gate — vc3d has no such guard). Cells without donor
+ * support fall back to raw tracing, so a set of patches plus growth in
+ * the gaps fuses into one surface. */
+int r3d_tracer_start_fused(r3d_tracer *t, const char *pred_root,
+                           const r3d_tracer_cfg *cfg, const r3d_umbilicus *umb,
+                           const char *const *donor_dirs, uint32_t ndonors);
 void r3d_tracer_stop(r3d_tracer *t); /* request stop + join; result kept */
 /* Enlarge a finished (stopped) trace and resume growth for `extra` more
  * generations (vc3d resume path: existing cells persist and anchor the
@@ -97,5 +110,6 @@ int r3d_tracer_save(r3d_tracer *t, const char *dir, float cutoff, bool fill);
 /* Synthetic self-check of the spiral winding frame + global fit (used by
  * the unit tests; no volume access). Returns 0 on success. */
 int r3d_tracer_spiral_selftest(void);
+int r3d_tracer_fusion_selftest(void);
 
 #endif /* R3D_TRACER_H */

@@ -21,10 +21,12 @@ int main(int argc, char **argv) {
     fprintf(stderr,
             "usage: tracecli <pred-root> [--seed x y z] [--step S] [--gens N] "
             "[--level L] [--cutoff C] [--out DIR] [--umbilicus FILE] [--nofill] "
-            "[--nospiral] [--spiral-weight W]\n");
+            "[--nospiral] [--spiral-weight W] [--fuse DIR ...]\n");
     return 2;
   }
   const char *root = argv[1], *out = NULL, *umbp = NULL;
+  const char *fuse[16];
+  uint32_t nfuse = 0;
   bool fill = true, spiral = true;
   r3d_tracer_cfg cfg = {.step = 20.0, .thresh = 0.35f, .max_ring = 60, .level = 1};
   bool have_seed = false;
@@ -50,6 +52,8 @@ int main(int argc, char **argv) {
       spiral = false;
     else if (strcmp(argv[i], "--spiral-weight") == 0 && i + 1 < argc)
       cfg.wind_weight = strtod(argv[++i], NULL);
+    else if (strcmp(argv[i], "--fuse") == 0 && i + 1 < argc && nfuse < 16)
+      fuse[nfuse++] = argv[++i];
     else {
       fprintf(stderr, "tracecli: bad arg %s\n", argv[i]);
       return 2;
@@ -77,7 +81,7 @@ int main(int argc, char **argv) {
          cfg.seed[0], cfg.seed[1], cfg.seed[2], cfg.step, cfg.max_ring, cfg.level,
          cfg.wind_weight > 0 ? "on" : "off");
   r3d_tracer tr;
-  if (r3d_tracer_start(&tr, root, &cfg, &umb) != 0) {
+  if (r3d_tracer_start_fused(&tr, root, &cfg, &umb, fuse, nfuse) != 0) {
     fprintf(stderr, "tracecli: tracer start failed\n");
     return 1;
   }

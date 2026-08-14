@@ -11,6 +11,7 @@
 #include <unistd.h>
 
 #include "core/cpuvol.h"
+#include "core/tifxyz.h"
 
 /* ============================= constants =============================
  * Weights and schedule mirror vc3d GrowPatch.cpp defaults. */
@@ -1653,8 +1654,414 @@ static void tr_spiral_flag(r3d_tracer *t) {
      * scroll cannot justify distrusting 2-sigma cells) */
     double thr = 0.5 * fabs(t->sp_omega);
     if (2.5 * t->sp_rms > thr) thr = 2.5 * t->sp_rms;
-    if (fabs(r) > thr && t->conf[k] > 0.25f)
+    if (fabs(r) > thr && t->conf[k] > 0.25f && !(t->dsup && t->dsup[k] >= 2))
       t->conf[k] = 0.25f;
+  }
+}
+
+/* ====================== donor segments (fusion) ======================
+ * The tracer-side half of vc3d's grow_surf_from_surfs: saved tifxyz
+ * patches become donors; candidates near a donor are pulled onto it
+ * (SurfaceLossD, w=0.1) and their agreement is counted, while cells no
+ * donor covers grow by raw tracing exactly as before. The spiral frame
+ * supplies what vc3d's fusion lacks: a donor whose registered winding
+ * disagrees with the cell is never consulted, so adjacent wraps cannot
+ * fuse no matter how close they pass. */
+static int tr_dcmp(const void *a, const void *b);
+
+#define TR_FUS_TH 2.0      /* same_surface_th (vc3d) */
+#define TR_FUS_PULL 8.0    /* capture radius for the donor pull, vox */
+#define TR_FUS_WIND_TH 0.3 /* winding agreement gate, windings */
+#define TR_W_SURF 0.1      /* SurfaceLossD weight (vc3d hardcoded) */
+
+typedef struct tr_donor {
+  r3d_tifxyz s;
+  float *dwind;  /* optional winding.tif channel, w*h; < -1e29 = none */
+  double woff;   /* registered: global_wind = donor_wind + woff */
+  bool woff_ok;
+} tr_donor;
+
+typedef struct tr_didx { /* uniform hash grid over donor quads */
+  double cs;
+  uint32_t nbuck; /* power of two */
+  uint32_t *head; /* bucket -> entry+1 */
+  uint32_t *next;
+  uint64_t *qid; /* donor<<48 | j<<24 | i */
+  uint32_t nent, cap;
+} tr_didx;
+
+typedef struct tr_dons {
+  tr_donor *d;
+  uint32_t n;
+  tr_didx ix;
+} tr_dons;
+
+static uint32_t tr_didx_h(const tr_didx *ix, long cx, long cy, long cz) {
+  uint64_t h = (uint64_t)cx * 0x9E3779B185EBCA87ull ^
+               (uint64_t)cy * 0xC2B2AE3D27D4EB4Full ^ (uint64_t)cz * 0x165667B19E3779F9ull;
+  return (uint32_t)(h >> 32) & (ix->nbuck - 1);
+}
+
+static int tr_didx_put(tr_didx *ix, long cx, long cy, long cz, uint64_t qid) {
+  if (ix->nent == ix->cap) {
+    uint32_t nc = ix->cap ? ix->cap * 2 : 4096;
+    uint32_t *nn = realloc(ix->next, (size_t)nc * sizeof *nn);
+    uint64_t *nq = realloc(ix->qid, (size_t)nc * sizeof *nq);
+    if (!nn || !nq) {
+      free(nn ? nn : ix->next);
+      ix->next = NULL;
+      return -1;
+    }
+    ix->next = nn;
+    ix->qid = nq;
+    ix->cap = nc;
+  }
+  uint32_t b = tr_didx_h(ix, cx, cy, cz);
+  ix->qid[ix->nent] = qid;
+  ix->next[ix->nent] = ix->head[b];
+  ix->head[b] = ix->nent + 1;
+  ix->nent++;
+  return 0;
+}
+
+/* closest point on triangle abc to p (Eberly); returns squared distance,
+ * fills q and barycentric (u for b, v for c) */
+static double tr_tri_close(const double p[3], const double a[3], const double b[3],
+                           const double c[3], double q[3], double *ub, double *vc) {
+  double ab[3], ac[3], ap[3];
+  for (int k = 0; k < 3; k++) {
+    ab[k] = b[k] - a[k];
+    ac[k] = c[k] - a[k];
+    ap[k] = p[k] - a[k];
+  }
+  double d1 = ab[0] * ap[0] + ab[1] * ap[1] + ab[2] * ap[2];
+  double d2 = ac[0] * ap[0] + ac[1] * ap[1] + ac[2] * ap[2];
+  double u = 0, v = 0;
+  if (d1 <= 0 && d2 <= 0) {
+    u = 0;
+    v = 0;
+  } else {
+    double bp[3], cp[3];
+    for (int k = 0; k < 3; k++) {
+      bp[k] = p[k] - b[k];
+      cp[k] = p[k] - c[k];
+    }
+    double d3 = ab[0] * bp[0] + ab[1] * bp[1] + ab[2] * bp[2];
+    double d4 = ac[0] * bp[0] + ac[1] * bp[1] + ac[2] * bp[2];
+    double d5 = ab[0] * cp[0] + ab[1] * cp[1] + ab[2] * cp[2];
+    double d6 = ac[0] * cp[0] + ac[1] * cp[1] + ac[2] * cp[2];
+    if (d3 >= 0 && d4 <= d3) {
+      u = 1;
+      v = 0;
+    } else if (d6 >= 0 && d5 <= d6) {
+      u = 0;
+      v = 1;
+    } else {
+      double vc0 = d1 * d4 - d3 * d2;
+      double vb = d5 * d2 - d1 * d6;
+      double va = d3 * d6 - d5 * d4;
+      if (vc0 <= 0 && d1 >= 0 && d3 <= 0) {
+        u = d1 / (d1 - d3);
+        v = 0;
+      } else if (vb <= 0 && d2 >= 0 && d6 <= 0) {
+        u = 0;
+        v = d2 / (d2 - d6);
+      } else if (va <= 0 && d4 - d3 >= 0 && d5 - d6 >= 0) {
+        u = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+        v = 1 - u;
+      } else {
+        double den = va + vb + vc0;
+        u = vb / den;
+        v = vc0 / den;
+      }
+    }
+  }
+  double d2s = 0;
+  for (int k = 0; k < 3; k++) {
+    q[k] = a[k] + u * ab[k] + v * ac[k];
+    double dd = p[k] - q[k];
+    d2s += dd * dd;
+  }
+  *ub = u;
+  *vc = v;
+  return d2s;
+}
+
+/* nearest donor surface point to p within `rad`; returns donor index or
+ * -1; fills q (closest point) and wnd (interpolated donor winding in the
+ * GLOBAL frame; < -1e29 when the donor has no registered winding) */
+static int tr_don_closest(const tr_dons *dn, const double p[3], double rad, double q[3],
+                          double *wnd) {
+  if (!dn || !dn->ix.nent) return -1;
+  const tr_didx *ix = &dn->ix;
+  long c0[3], c1[3];
+  for (int k = 0; k < 3; k++) {
+    c0[k] = (long)floor((p[k] - rad) / ix->cs);
+    c1[k] = (long)floor((p[k] + rad) / ix->cs);
+  }
+  double bd2 = rad * rad;
+  int bdon = -1;
+  for (long cz = c0[2]; cz <= c1[2]; cz++)
+    for (long cy = c0[1]; cy <= c1[1]; cy++)
+      for (long cx = c0[0]; cx <= c1[0]; cx++)
+        for (uint32_t e = ix->head[tr_didx_h(ix, cx, cy, cz)]; e; e = ix->next[e - 1]) {
+          uint64_t id = ix->qid[e - 1];
+          uint32_t di = (uint32_t)(id >> 48);
+          uint32_t j = (uint32_t)(id >> 24) & 0xFFFFFFu;
+          uint32_t i = (uint32_t)(id & 0xFFFFFFu);
+          const tr_donor *d = &dn->d[di];
+          const float *p00 = r3d_tifxyz_at(&d->s, i, j);
+          const float *p10 = r3d_tifxyz_at(&d->s, i + 1, j);
+          const float *p01 = r3d_tifxyz_at(&d->s, i, j + 1);
+          const float *p11 = r3d_tifxyz_at(&d->s, i + 1, j + 1);
+          double A[3] = {(double)p00[0], (double)p00[1], (double)p00[2]};
+          double B[3] = {(double)p10[0], (double)p10[1], (double)p10[2]};
+          double C[3] = {(double)p01[0], (double)p01[1], (double)p01[2]};
+          double D[3] = {(double)p11[0], (double)p11[1], (double)p11[2]};
+          double qq[3], ub, vc2;
+          for (int tri = 0; tri < 2; tri++) {
+            double d2 = tri == 0 ? tr_tri_close(p, A, B, C, qq, &ub, &vc2)
+                                 : tr_tri_close(p, D, C, B, qq, &ub, &vc2);
+            if (d2 >= bd2) continue;
+            bd2 = d2;
+            bdon = (int)di;
+            memcpy(q, qq, sizeof qq);
+            if (wnd) {
+              *wnd = -1e30;
+              if (d->dwind && d->woff_ok) {
+                uint64_t k00 = (uint64_t)j * d->s.w + i;
+                float w00 = d->dwind[k00], w10 = d->dwind[k00 + 1];
+                float w01 = d->dwind[k00 + d->s.w], w11 = d->dwind[k00 + d->s.w + 1];
+                if (w00 > -1e29f && w10 > -1e29f && w01 > -1e29f && w11 > -1e29f) {
+                  double wA, wB, wC;
+                  if (tri == 0) {
+                    wA = (double)w00;
+                    wB = (double)w10;
+                    wC = (double)w01;
+                  } else {
+                    wA = (double)w11;
+                    wB = (double)w01;
+                    wC = (double)w10;
+                  }
+                  *wnd = wA + ub * (wB - wA) + vc2 * (wC - wA) + d->woff;
+                }
+              }
+            }
+          }
+        }
+  return bdon;
+}
+
+/* count donors within TR_FUS_TH of p (winding-gated) — the consensus
+ * number vc3d scores candidates by */
+static int tr_don_support(const tr_dons *dn, const double p[3], double cellw,
+                          bool have_w) {
+  if (!dn || !dn->ix.nent || dn->n > 64) return 0;
+  double mind2[64], mwnd[64];
+  for (uint32_t i = 0; i < dn->n; i++) {
+    mind2[i] = 1e30;
+    mwnd[i] = -1e30;
+  }
+  const tr_didx *ix = &dn->ix;
+  double rad = TR_FUS_TH;
+  long c0[3], c1[3];
+  for (int k = 0; k < 3; k++) {
+    c0[k] = (long)floor((p[k] - rad) / ix->cs);
+    c1[k] = (long)floor((p[k] + rad) / ix->cs);
+  }
+  for (long cz = c0[2]; cz <= c1[2]; cz++)
+    for (long cy = c0[1]; cy <= c1[1]; cy++)
+      for (long cx = c0[0]; cx <= c1[0]; cx++)
+        for (uint32_t e = ix->head[tr_didx_h(ix, cx, cy, cz)]; e; e = ix->next[e - 1]) {
+          uint64_t id = ix->qid[e - 1];
+          uint32_t di = (uint32_t)(id >> 48);
+          uint32_t j = (uint32_t)(id >> 24) & 0xFFFFFFu;
+          uint32_t i = (uint32_t)(id & 0xFFFFFFu);
+          const tr_donor *d = &dn->d[di];
+          const float *p00 = r3d_tifxyz_at(&d->s, i, j);
+          const float *p10 = r3d_tifxyz_at(&d->s, i + 1, j);
+          const float *p01 = r3d_tifxyz_at(&d->s, i, j + 1);
+          const float *p11 = r3d_tifxyz_at(&d->s, i + 1, j + 1);
+          double A[3] = {(double)p00[0], (double)p00[1], (double)p00[2]};
+          double B[3] = {(double)p10[0], (double)p10[1], (double)p10[2]};
+          double C[3] = {(double)p01[0], (double)p01[1], (double)p01[2]};
+          double D[3] = {(double)p11[0], (double)p11[1], (double)p11[2]};
+          double qq[3], ub, vc2;
+          for (int tri = 0; tri < 2; tri++) {
+            double d2 = tri == 0 ? tr_tri_close(p, A, B, C, qq, &ub, &vc2)
+                                 : tr_tri_close(p, D, C, B, qq, &ub, &vc2);
+            if (d2 >= mind2[di]) continue;
+            mind2[di] = d2;
+            mwnd[di] = -1e30;
+            if (d->dwind && d->woff_ok) {
+              uint64_t k00 = (uint64_t)j * d->s.w + i;
+              float w00 = d->dwind[k00], w10 = d->dwind[k00 + 1];
+              float w01 = d->dwind[k00 + d->s.w], w11 = d->dwind[k00 + d->s.w + 1];
+              if (w00 > -1e29f && w10 > -1e29f && w01 > -1e29f && w11 > -1e29f) {
+                double wA = (double)(tri == 0 ? w00 : w11);
+                double wB = (double)(tri == 0 ? w10 : w01);
+                double wC = (double)(tri == 0 ? w01 : w10);
+                mwnd[di] = wA + ub * (wB - wA) + vc2 * (wC - wA) + d->woff;
+              }
+            }
+          }
+        }
+  int sup = 0;
+  for (uint32_t i = 0; i < dn->n; i++) {
+    if (mind2[i] > TR_FUS_TH * TR_FUS_TH) continue;
+    if (have_w && mwnd[i] > -1e29 && fabs(mwnd[i] - cellw) > TR_FUS_WIND_TH) continue;
+    sup++;
+  }
+  return sup;
+}
+
+/* single float32 TIFF plane, w*h expected (winding.tif channel) */
+static float *tr_read_plane(const char *path, uint32_t w, uint32_t h) {
+  TIFF *tf = TIFFOpen(path, "r");
+  if (!tf) return NULL;
+  uint32_t tw = 0, th2 = 0;
+  uint16_t bps = 0, fmt = 0;
+  TIFFGetField(tf, TIFFTAG_IMAGEWIDTH, &tw);
+  TIFFGetField(tf, TIFFTAG_IMAGELENGTH, &th2);
+  TIFFGetField(tf, TIFFTAG_BITSPERSAMPLE, &bps);
+  TIFFGetFieldDefaulted(tf, TIFFTAG_SAMPLEFORMAT, &fmt);
+  float *v = NULL;
+  if (tw == w && th2 == h && bps == 32 && fmt == SAMPLEFORMAT_IEEEFP &&
+      !TIFFIsTiled(tf)) {
+    v = malloc((size_t)w * h * sizeof *v);
+    if (v)
+      for (uint32_t j = 0; j < h; j++)
+        if (TIFFReadScanline(tf, v + (size_t)j * w, j, 0) < 0) {
+          free(v);
+          v = NULL;
+          break;
+        }
+  }
+  TIFFClose(tf);
+  return v;
+}
+
+static void tr_dons_free(tr_dons *dn) {
+  if (!dn) return;
+  for (uint32_t i = 0; i < dn->n; i++) {
+    r3d_tifxyz_free(&dn->d[i].s);
+    free(dn->d[i].dwind);
+  }
+  free(dn->d);
+  free(dn->ix.head);
+  free(dn->ix.next);
+  free(dn->ix.qid);
+  free(dn);
+}
+
+/* load donors + build the quad hash index */
+static tr_dons *tr_dons_load(const char *const *dirs, uint32_t n, double step) {
+  if (!n) return NULL;
+  tr_dons *dn = calloc(1, sizeof *dn);
+  if (!dn) return NULL;
+  dn->d = calloc(n, sizeof *dn->d);
+  if (!dn->d) {
+    free(dn);
+    return NULL;
+  }
+  uint64_t nquad = 0;
+  for (uint32_t i = 0; i < n; i++) {
+    tr_donor *d = &dn->d[dn->n];
+    if (r3d_tifxyz_load(&d->s, dirs[i]) != 0) {
+      printf("tracer: donor %s failed to load (skipping)\n", dirs[i]);
+      continue;
+    }
+    char wp[1200];
+    snprintf(wp, sizeof wp, "%s/winding.tif", dirs[i]);
+    d->dwind = tr_read_plane(wp, d->s.w, d->s.h); /* NULL = none */
+    dn->n++;
+    nquad += (uint64_t)(d->s.w - 1) * (d->s.h - 1);
+  }
+  if (!dn->n) {
+    tr_dons_free(dn);
+    return NULL;
+  }
+  tr_didx *ix = &dn->ix;
+  ix->cs = 4.0 * step; /* quads span ~step vox; a few per cell */
+  uint32_t nb = 1;
+  while (nb < nquad / 2 + 64) nb <<= 1;
+  if (nb > 1u << 22) nb = 1u << 22;
+  ix->nbuck = nb;
+  ix->head = calloc(nb, sizeof *ix->head);
+  if (!ix->head) {
+    tr_dons_free(dn);
+    return NULL;
+  }
+  for (uint32_t di = 0; di < dn->n; di++) {
+    const r3d_tifxyz *s = &dn->d[di].s;
+    for (uint32_t j = 0; j + 1 < s->h; j++)
+      for (uint32_t i = 0; i + 1 < s->w; i++) {
+        const float *p00 = r3d_tifxyz_at(s, i, j), *p10 = r3d_tifxyz_at(s, i + 1, j);
+        const float *p01 = r3d_tifxyz_at(s, i, j + 1),
+                    *p11 = r3d_tifxyz_at(s, i + 1, j + 1);
+        if (!r3d_tifxyz_valid(p00) || !r3d_tifxyz_valid(p10) ||
+            !r3d_tifxyz_valid(p01) || !r3d_tifxyz_valid(p11))
+          continue;
+        double lo[3] = {1e30, 1e30, 1e30}, hi[3] = {-1e30, -1e30, -1e30};
+        const float *ps[4] = {p00, p10, p01, p11};
+        for (int q = 0; q < 4; q++)
+          for (int k = 0; k < 3; k++) {
+            double vv = (double)ps[q][k];
+            if (vv < lo[k]) lo[k] = vv;
+            if (vv > hi[k]) hi[k] = vv;
+          }
+        uint64_t qid = (uint64_t)di << 48 | (uint64_t)j << 24 | i;
+        long c0[3], c1[3];
+        for (int k = 0; k < 3; k++) {
+          c0[k] = (long)floor((lo[k] - TR_FUS_PULL) / ix->cs);
+          c1[k] = (long)floor((hi[k] + TR_FUS_PULL) / ix->cs);
+        }
+        for (long cz = c0[2]; cz <= c1[2]; cz++)
+          for (long cy = c0[1]; cy <= c1[1]; cy++)
+            for (long cx = c0[0]; cx <= c1[0]; cx++)
+              if (tr_didx_put(ix, cx, cy, cz, qid) != 0) {
+                tr_dons_free(dn);
+                return NULL;
+              }
+      }
+  }
+  printf("tracer: %u donor segment%s, %u indexed quad-cells\n", dn->n,
+         dn->n == 1 ? "" : "s", ix->nent);
+  return dn;
+}
+
+/* register donor windings into the global spiral frame: offset = robust
+ * median of (spiral-model winding estimate - donor winding) over donor
+ * vertices. Runs on the coordinator once the fit is valid. */
+static void tr_don_register(r3d_tracer *t) {
+  tr_dons *dn = t->don;
+  if (!dn || !t->sp_valid) return;
+  for (uint32_t di = 0; di < dn->n; di++) {
+    tr_donor *d = &dn->d[di];
+    if (!d->dwind || d->woff_ok) continue;
+    double diffs[513];
+    int nd = 0;
+    uint64_t nv = (uint64_t)d->s.w * d->s.h;
+    for (uint64_t k = 0; k < nv && nd < 512; k += 131) {
+      const float *P = d->s.xyz + k * 3;
+      if (!r3d_tifxyz_valid(P) || d->dwind[k] < -1e29f) continue;
+      double cx, cy;
+      double Pd[3] = {(double)P[0], (double)P[1], (double)P[2]};
+      if (!tr_uc_at(t, Pd[2], &cx, &cy, NULL, NULL)) continue;
+      double ux = Pd[0] - cx, uy = Pd[1] - cy;
+      double rho = hypot(ux, uy), th = atan2(uy, ux);
+      double r0v;
+      tr_sp_r0_at(t, Pd[2], &r0v, NULL);
+      double H = t->sp_ab[0] * cos(th) + t->sp_ab[1] * sin(th) +
+                 t->sp_ab[2] * cos(2 * th) + t->sp_ab[3] * sin(2 * th);
+      double west = (rho - r0v - H) / t->sp_omega;
+      diffs[nd++] = west - (double)d->dwind[k];
+    }
+    if (nd < 32) continue;
+    qsort(diffs, (size_t)nd, sizeof *diffs, tr_dcmp);
+    d->woff = diffs[nd / 2];
+    d->woff_ok = true;
+    printf("tracer: donor %u registered at winding offset %+.2f\n", di, d->woff);
   }
 }
 
@@ -1709,9 +2116,11 @@ enum {
   TRF_SDIR = 4,
   TRF_SPACE = 8,
   TRF_NCP = 16,
-  TRF_WIND = 32
+  TRF_WIND = 32,
+  TRF_SURF = 64
 };
-#define TRF_ALL (TRF_DIST | TRF_STRAIGHT | TRF_SDIR | TRF_SPACE | TRF_NCP | TRF_WIND)
+#define TRF_ALL \
+  (TRF_DIST | TRF_STRAIGHT | TRF_SDIR | TRF_SPACE | TRF_NCP | TRF_WIND | TRF_SURF)
 
 typedef struct tr_ctx {
   r3d_tracer *t;
@@ -1987,6 +2396,23 @@ static void tr_eval(tr_ctx *c, const double x[3], tr_nlsq *acc) {
   if ((c->flags & TRF_WIND) && t->sp_valid && t->cfg.wind_weight > 0)
     tr_res_wind(acc, t, x, (double)t->wind[(size_t)j * t->W + (size_t)i],
                 t->cfg.wind_weight);
+  if ((c->flags & TRF_SURF) && t->don) {
+    /* donor anchor (vc3d SurfaceLossD, w=0.1): pull toward the nearest
+     * donor surface point, frozen for this evaluation; donors on a
+     * different registered winding never attract */
+    double q[3], dwnd;
+    size_t kc = (size_t)j * t->W + (size_t)i;
+    int di = tr_don_closest(t->don, x, TR_FUS_PULL, q, &dwnd);
+    if (di >= 0 &&
+        !(t->uc && dwnd > -1e29 &&
+          fabs(dwnd - (double)t->wind[kc]) > TR_FUS_WIND_TH)) {
+      for (int a = 0; a < 3; a++) {
+        double J[3] = {0, 0, 0};
+        J[a] = TR_W_SURF;
+        nq_add(acc, TR_W_SURF * (x[a] - q[a]), J);
+      }
+    }
+  }
 }
 
 /* LM solve for one cell; updates pos in place (under mu), returns cost */
@@ -2060,6 +2486,11 @@ static void tr_update_conf(r3d_tracer *t, tr_env *e, int i, int j) {
   }
   tr_tm_add(2, tt0);
   double cf = 1.0 - (d > TR_CONF_R ? TR_CONF_R : d) / TR_CONF_R;
+  if (t->dsup && t->dsup[k]) { /* donor-vouched cells keep a conf floor:
+                                * 2+ donors agreeing beats a weak DT */
+    double fl = t->dsup[k] >= 2 ? 0.95 : 0.75;
+    if (cf < fl) cf = fl;
+  }
   t->conf[k] = (float)cf;
 }
 
@@ -2199,6 +2630,11 @@ static bool tr_place_cand(r3d_tracer *t, tr_env *e, uint32_t cell, unsigned *rng
         }
       if (nn) t->wind[k] = (float)(sum / nn);
     }
+  }
+  if (t->don && t->dsup) { /* consensus count (vc3d inlier vote, gated by
+                            * the winding frame) */
+    int sup = tr_don_support(t->don, fp, (double)t->wind[k], t->uc != NULL);
+    t->dsup[k] = (uint8_t)(sup > 255 ? 255 : sup);
   }
   if (t->vdim[0] > 0 &&
       (fp[0] < 0 || fp[1] < 0 || fp[2] < 0 || fp[0] >= t->vdim[0] ||
@@ -2595,6 +3031,7 @@ static void *tr_worker(void *ud) {
     tr_spiral_fit(t); /* refit the global spiral before the anneal so the
                        * winding prior joins the big solves */
     tr_spiral_flag(t);
+    tr_don_register(t);
     /* schedule: vc3d runs global solves only in the first 10 generations
      * (Ceres cost); our parallel sweeps are cheap enough to keep them
      * coming — every 8th generation, forever. This anneals away the
@@ -2662,6 +3099,12 @@ fail_open:
 /* ============================ lifecycle ============================ */
 int r3d_tracer_start(r3d_tracer *t, const char *pred_root, const r3d_tracer_cfg *cfg,
                      const r3d_umbilicus *umb) {
+  return r3d_tracer_start_fused(t, pred_root, cfg, umb, NULL, 0);
+}
+
+int r3d_tracer_start_fused(r3d_tracer *t, const char *pred_root,
+                           const r3d_tracer_cfg *cfg, const r3d_umbilicus *umb,
+                           const char *const *donor_dirs, uint32_t ndonors) {
   memset(t, 0, sizeof *t);
   t->cfg = *cfg;
   if (t->cfg.max_ring < 4) t->cfg.max_ring = 4;
@@ -2682,6 +3125,17 @@ int r3d_tracer_start(r3d_tracer *t, const char *pred_root, const r3d_tracer_cfg 
   if (umb)
     for (size_t k = 0; k < umb->count; k++)
       r3d_umbilicus_set(&t->umb, umb->points[k].x, umb->points[k].y, umb->points[k].z);
+  if (ndonors) {
+    t->don = tr_dons_load(donor_dirs, ndonors, t->cfg.step);
+    if (t->don) {
+      t->ndon = ((tr_dons *)t->don)->n;
+      t->dsup = calloc((size_t)t->W * t->H, 1);
+      if (!t->dsup) {
+        r3d_tracer_free(t);
+        return -1;
+      }
+    }
+  }
   pthread_mutex_init(&t->mu, NULL);
   t->running = true;
   if (pthread_create(&t->th, NULL, tr_worker, t) != 0) {
@@ -2702,11 +3156,13 @@ int r3d_tracer_grow(r3d_tracer *t, uint32_t extra) {
   uint8_t *ns = calloc((size_t)NW * NW, 1);
   float *nc = calloc((size_t)NW * NW, sizeof *nc);
   float *nw = calloc((size_t)NW * NW, sizeof *nw);
-  if (!np || !ns || !nc || !nw) {
+  uint8_t *nd = t->dsup ? calloc((size_t)NW * NW, 1) : NULL;
+  if (!np || !ns || !nc || !nw || (t->dsup && !nd)) {
     free(np);
     free(ns);
     free(nc);
     free(nw);
+    free(nd);
     return -1;
   }
   for (uint32_t j = 0; j < t->H; j++)
@@ -2717,6 +3173,7 @@ int r3d_tracer_grow(r3d_tracer *t, uint32_t extra) {
         ns[nk] = R3D_TR_SET;
         nc[nk] = t->conf[ok];
         nw[nk] = t->wind[ok];
+        if (nd) nd[nk] = t->dsup[ok];
         memcpy(np + nk * 3, t->pos + ok * 3, 3 * sizeof(double));
       }
     }
@@ -2724,10 +3181,12 @@ int r3d_tracer_grow(r3d_tracer *t, uint32_t extra) {
   free(t->state);
   free(t->conf);
   free(t->wind);
+  free(t->dsup);
   t->pos = np;
   t->state = ns;
   t->conf = nc;
   t->wind = nw;
+  t->dsup = nd;
   t->W = t->H = NW;
   t->cfg.max_ring = nr;
   t->quit = false;
@@ -2754,7 +3213,9 @@ void r3d_tracer_free(r3d_tracer *t) {
   free(t->state);
   free(t->conf);
   free(t->wind);
+  free(t->dsup);
   free(t->uc);
+  tr_dons_free(t->don);
   r3d_umbilicus_free(&t->umb);
   memset(t, 0, sizeof *t);
 }
@@ -3051,5 +3512,73 @@ out:
   free(t.uc);
   r3d_umbilicus_free(&t.umb);
   pthread_mutex_destroy(&t.mu);
+  return rc;
+}
+
+/* ========================= fusion selftest =========================
+ * Synthetic donor round-trip: write a flat tifxyz + winding channel,
+ * load + index it, and check closest-point queries, the winding
+ * interpolation, and the support vote. */
+int r3d_tracer_fusion_selftest(void) {
+  int rc = -1;
+  char dir[] = "/tmp/r3d_test_donor_XXXXXX";
+  if (!mkdtemp(dir)) return -1;
+  const uint32_t W = 12, H = 10;
+  float *pl = malloc((size_t)W * H * sizeof *pl);
+  tr_dons *dn = NULL;
+  if (!pl) goto out;
+  static const char *nm[4] = {"x.tif", "y.tif", "z.tif", "winding.tif"};
+  for (int a = 0; a < 4; a++) { /* plane z=50, spacing 20, wind = i*0.05 */
+    for (uint32_t j = 0; j < H; j++)
+      for (uint32_t i = 0; i < W; i++) {
+        float v = a == 0 ? (float)i * 20.0f
+                  : a == 1 ? (float)j * 20.0f
+                  : a == 2 ? 50.0f
+                           : (float)i * 0.05f;
+        pl[(size_t)j * W + i] = v;
+      }
+    char path[1300];
+    snprintf(path, sizeof path, "%s/%s", dir, nm[a]);
+    if (tr_write_plane(path, pl, W, H) != 0) goto out;
+  }
+  {
+    char mp[1300];
+    snprintf(mp, sizeof mp, "%s/meta.json", dir);
+    FILE *mf = fopen(mp, "w");
+    if (!mf) goto out;
+    fprintf(mf, "{\"format\":\"tifxyz\",\"scale\":[0.05,0.05]}\n");
+    fclose(mf);
+  }
+  const char *dirs[1] = {dir};
+  dn = tr_dons_load(dirs, 1, 20.0);
+  if (!dn || dn->n != 1 || !dn->d[0].dwind) goto out;
+  {
+    double q[3], wnd;
+    double p[3] = {35.0, 42.0, 53.0};
+    int di = tr_don_closest(dn, p, TR_FUS_PULL, q, &wnd);
+    if (di != 0 || fabs(q[0] - 35.0) > 1e-6 || fabs(q[1] - 42.0) > 1e-6 ||
+        fabs(q[2] - 50.0) > 1e-6)
+      goto out;
+    if (wnd > -1e29) goto out; /* not registered yet: no winding */
+    dn->d[0].woff = 2.0;
+    dn->d[0].woff_ok = true;
+    di = tr_don_closest(dn, p, TR_FUS_PULL, q, &wnd);
+    if (di != 0 || fabs(wnd - (35.0 / 20.0 * 0.05 + 2.0)) > 1e-4) goto out;
+    /* support: on-surface within threshold, winding-gated */
+    double ps[3] = {35.0, 42.0, 51.0};
+    if (tr_don_support(dn, ps, wnd, true) != 1) goto out;
+    if (tr_don_support(dn, ps, wnd + 1.0, true) != 0) goto out; /* wrong wrap */
+    double pf[3] = {35.0, 42.0, 58.0}; /* beyond same-surface threshold */
+    if (tr_don_support(dn, pf, wnd, true) != 0) goto out;
+  }
+  rc = 0;
+out:
+  if (dn) tr_dons_free(dn);
+  free(pl);
+  {
+    char cmd[1400];
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
+    if (system(cmd) != 0) rc = rc == 0 ? 0 : rc;
+  }
   return rc;
 }

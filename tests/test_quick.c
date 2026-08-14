@@ -710,6 +710,7 @@ int main(void) {
   test_transfer();
   test_umbilicus();
   CHECK(r3d_tracer_spiral_selftest() == 0);
+  CHECK(r3d_tracer_fusion_selftest() == 0);
   test_tifxyz();
   test_mview();
   if (failures) {
