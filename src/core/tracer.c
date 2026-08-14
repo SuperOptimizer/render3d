@@ -2555,8 +2555,12 @@ static void tr_eval(tr_ctx *c, const double x[3], tr_nlsq *acc) {
   if (t->cfg.rib_rows) {
     /* ribbon rows are fixed-z cross-section curves (Lasagna's per-slice
      * mesh): anchor z to the row's plane so u follows sheet-x-plane —
-     * a free 3D ribbon geodesically walks out of its slab instead */
-    double zrow = t->cfg.seed[2] + ((double)j - (double)t->H / 2) * t->cfg.step;
+     * a free 3D ribbon geodesically walks out of its slab instead.
+     * Multi-wrap grids stack sibling blocks; every block spans the SAME
+     * z slab (row index is block-local). */
+    int rr = (int)t->cfg.rib_rows;
+    int jl = t->cfg.rib_wraps > 1 ? j % (rr + 1) : j;
+    double zrow = t->cfg.seed[2] + ((double)jl - (double)rr / 2) * t->cfg.step;
     double Jz[3] = {0, 0, 10.0};
     nq_add(acc, 10.0 * (x[2] - zrow), Jz);
   }
@@ -2830,6 +2834,38 @@ static bool tr_place_cand(r3d_tracer *t, tr_env *e, uint32_t cell, unsigned *rng
      * the papyrus, not in an ambiguous fold */
     double dv = td_tri(e->dt, fp, NULL);
     if (dv > 50.0) zclamp = true;
+  }
+  if (!zclamp && t->cfg.rib_wraps > 1 && t->sfx) {
+    /* sibling-wrap fronts stop where the sheet is already traced: a
+     * candidate landing on an existing SAME-winding cell that is not a
+     * grid neighbor is coverage overlap, not new surface */
+    const tr_sfx *sx = t->sfx;
+    double rad = 3.0;
+    long c0[3], c1[3];
+    for (int a = 0; a < 3; a++) {
+      c0[a] = (long)floor((fp[a] - rad) / sx->cs);
+      c1[a] = (long)floor((fp[a] + rad) / sx->cs);
+    }
+    for (long cz = c0[2]; cz <= c1[2] && !zclamp; cz++)
+      for (long cy = c0[1]; cy <= c1[1] && !zclamp; cy++)
+        for (long cx = c0[0]; cx <= c1[0] && !zclamp; cx++)
+          for (uint32_t en = sx->head[tr_sfx_h(sx, cx, cy, cz)]; en;
+               en = sx->next[en - 1]) {
+            uint32_t k2 = sx->cell[en - 1];
+            if (t->state[k2] != R3D_TR_SET) continue;
+            long di = (long)(k2 % t->W) - i, dj = (long)(k2 / t->W) - j;
+            if (labs(di) <= 5 && labs(dj) <= (long)t->cfg.rib_rows + 1) continue;
+            if (fabs((double)t->wind[k2] - (double)t->wind[k]) > 0.3) continue;
+            double d2 = 0;
+            for (int a = 0; a < 3; a++) {
+              double dd = fp[a] - t->pos[(size_t)k2 * 3 + (size_t)a];
+              d2 += dd * dd;
+            }
+            if (d2 < rad * rad) {
+              zclamp = true;
+              break;
+            }
+          }
   }
   if (zclamp || (t->vdim[0] > 0 &&
       (fp[0] < 0 || fp[1] < 0 || fp[2] < 0 || fp[0] >= t->vdim[0] ||
@@ -3135,6 +3171,57 @@ static void *tr_worker(void *ud) {
       for (int s2 = 0; s2 < TD_SLOTS; s2++) dt->s[s2].key = 0;
     }
     static const int off4[4][2] = {{0, 0}, {1, 0}, {0, 1}, {1, 1}};
+    /* multi-wrap ribbons: one seed per radial sheet crossing */
+    double cross_s[256];
+    int ncr = 0, seed_rank = 0;
+    uint32_t nwr = t->cfg.rib_rows ? t->cfg.rib_wraps : 1;
+    if (nwr > 1 && t->uc) {
+      double cx2, cy2;
+      if (tr_uc_at(t, t->cfg.seed[2], &cx2, &cy2, NULL, NULL)) {
+        double ux2 = t->cfg.seed[0] - cx2, uy2 = t->cfg.seed[1] - cy2;
+        double rr2 = hypot(ux2, uy2);
+        if (rr2 > 1e-6) {
+          ux2 /= rr2;
+          uy2 /= rr2;
+          double range = 60.0 * nwr;
+          double all_s[256];
+          int nall = 0;
+          double prev = 1e30, pprev = 1e30, last_s = -1e30;
+          for (double sm = -range; sm <= range && nall < 256; sm += 1.0) {
+            double q[3] = {t->cfg.seed[0] + sm * ux2, t->cfg.seed[1] + sm * uy2,
+                           t->cfg.seed[2]};
+            double dv = td_tri(dt, q, NULL);
+            /* local DT minimum on a sheet, min separation 5 vox */
+            if (pprev > prev && dv >= prev && prev < 2.5 && sm - 1.0 - last_s >= 5.0) {
+              all_s[nall++] = sm - 1.0;
+              last_s = sm - 1.0;
+            }
+            pprev = prev;
+            prev = dv;
+          }
+          if (nall) { /* window of nwr crossings centered on the seed's */
+            int i0 = 0;
+            for (int q2 = 1; q2 < nall; q2++)
+              if (fabs(all_s[q2]) < fabs(all_s[i0])) i0 = q2;
+            int lo = i0 - (int)(nwr - 1) / 2;
+            if (lo < 0) lo = 0;
+            if (lo + (int)nwr > nall) lo = nall - (int)nwr;
+            if (lo < 0) lo = 0;
+            for (int q2 = lo; q2 < nall && ncr < (int)nwr; q2++)
+              cross_s[ncr++] = all_s[q2];
+            seed_rank = i0 - lo;
+            if (seed_rank >= ncr) seed_rank = ncr ? ncr - 1 : 0;
+          }
+        }
+      }
+      if (ncr < 2) { /* not enough sheet crossings found — single wrap */
+        ncr = 0;
+        nwr = 1;
+      } else {
+        printf("tracer: %d sibling wraps seeded on radial crossings\n", ncr);
+        nwr = (uint32_t)ncr;
+      }
+    }
     double ax[3] = {1, 0, 0}, ay[3] = {0, 1, 0}; /* seed quad axes */
     if (t->cfg.rib_rows) {
       /* ribbon: u along the in-plane spiral tangent, v along z — the
@@ -3153,22 +3240,49 @@ static void *tr_worker(void *ud) {
       ay[0] = ay[1] = 0;
       ay[2] = t->cfg.step; /* rows sit one z-plane (= step vox) apart */
     }
-    pthread_mutex_lock(&t->mu);
-    for (int q = 0; q < 4; q++) {
-      int i = x0 + off4[q][0], j = y0 + off4[q][1];
-      size_t k = (size_t)j * W + (size_t)i;
-      double *P = t->pos + k * 3;
-      for (int a = 0; a < 3; a++)
-        P[a] = t->cfg.seed[a] +
-               0.1 * (off4[q][0] * ax[a] + off4[q][1] * ay[a]);
-      t->state[k] = R3D_TR_SET;
-      t->conf[k] = 1.0f;
-      fringe[nf++] = (uint32_t)k;
+    double rdir[2] = {0, 0};
+    if (ncr > 1 && t->uc) {
+      double cx2, cy2;
+      tr_uc_at(t, t->cfg.seed[2], &cx2, &cy2, NULL, NULL);
+      double ux2 = t->cfg.seed[0] - cx2, uy2 = t->cfg.seed[1] - cy2;
+      double rr2 = hypot(ux2, uy2);
+      rdir[0] = ux2 / rr2;
+      rdir[1] = uy2 / rr2;
     }
-    t->nset = 4;
+    int nblk = ncr > 1 ? ncr : 1;
+    int rr = (int)t->cfg.rib_rows;
+    pthread_mutex_lock(&t->mu);
+    if (nblk > 1) /* spacer rows: never grown, never coupled */
+      for (int b = 0; b + 1 < nblk; b++) {
+        size_t row = (size_t)(b * (rr + 1) + rr);
+        for (uint32_t i2 = 0; i2 < W; i2++) t->state[row * W + i2] = R3D_TR_FAIL;
+      }
+    for (int b = 0; b < nblk; b++) {
+      double s_off = nblk > 1 ? cross_s[b] : 0.0;
+      int y0b = t->cfg.rib_rows ? (nblk > 1 ? b * (rr + 1) + rr / 2 : y0) : y0;
+      float w0 = nblk > 1 ? (float)(b - seed_rank) : 0.0f;
+      for (int q = 0; q < 4; q++) {
+        int i = x0 + off4[q][0], j = y0b + off4[q][1];
+        size_t k = (size_t)j * W + (size_t)i;
+        double *P = t->pos + k * 3;
+        for (int a = 0; a < 3; a++)
+          P[a] = t->cfg.seed[a] +
+                 0.1 * (off4[q][0] * ax[a] + off4[q][1] * ay[a]);
+        P[0] += s_off * rdir[0];
+        P[1] += s_off * rdir[1];
+        t->state[k] = R3D_TR_SET;
+        t->conf[k] = 1.0f;
+        t->wind[k] = w0;
+        fringe[nf++] = (uint32_t)k;
+      }
+      t->nset += 4;
+    }
     t->gen++;
     pthread_mutex_unlock(&t->mu);
-    tr_local_opt(t, &cenv, x0, y0, 8, 6, true);
+    for (int b = 0; b < nblk; b++) {
+      int y0b = nblk > 1 ? b * (rr + 1) + rr / 2 : y0;
+      tr_local_opt(t, &cenv, x0, y0b, 8, 6, true);
+    }
     pthread_mutex_lock(&t->mu);
     t->gen++;
     pthread_mutex_unlock(&t->mu);
@@ -3349,8 +3463,10 @@ int r3d_tracer_start_fused(r3d_tracer *t, const char *pred_root,
   snprintf(t->root, sizeof t->root, "%s", pred_root);
   if (t->cfg.rib_rows) { /* ribbon: long in u, a few rows of v */
     if (t->cfg.rib_rows < 4) t->cfg.rib_rows = 4;
+    if (t->cfg.rib_wraps < 1) t->cfg.rib_wraps = 1;
+    if (t->cfg.rib_wraps > 256) t->cfg.rib_wraps = 256;
     t->W = 2 * t->cfg.max_ring + 10;
-    t->H = t->cfg.rib_rows;
+    t->H = t->cfg.rib_wraps * t->cfg.rib_rows + (t->cfg.rib_wraps - 1);
   } else {
     t->W = t->H = 2 * t->cfg.max_ring + 50;
   }

@@ -34,6 +34,11 @@ typedef struct r3d_tracer_cfg {
   uint32_t rib_rows; /* >0: ribbon mode — grid is (2*max_ring+10) x rib_rows,
                       * growth runs along the sheet (whole-cross-section
                       * tracing in a thin z slab, Lasagna-style) */
+  uint32_t rib_wraps; /* >1: grow this many wraps at once as sibling
+                       * ribbons (one seed per radial sheet crossing,
+                       * spacer rows between blocks, shared winding frame
+                       * + mutual spacing; fronts stop where they meet a
+                       * sibling on the same winding) */
   double z_min, z_max; /* z_max > z_min: hard z clamp (vc3d z_range);
                         * solved points outside FAIL like a volume exit */
   double wind_weight; /* spiral winding prior weight (0 = off). Needs an
