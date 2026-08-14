@@ -3562,7 +3562,10 @@ static void *tr_worker(void *ud) {
   uint32_t ct_lv = 1; /* L2 partial-volumes thin sheets with their air
                        * gaps and mid-sheet reads fall below the cutoff —
                        * L1 keeps sheets ~6 px thick */
-  double ct_min = t->cfg.ct_min > 0 ? t->cfg.ct_min : 128.0;
+  double ct_min = t->cfg.ct_min > 0 ? t->cfg.ct_min : 64.0;
+  /* default from measured traced-point histograms (PHerc0125 L1):
+   * real surface peaks 96..143 and ~90% sits above 64; 128 rejected
+   * three quarters of legitimate points */
   if (t->cfg.ct_root[0]) {
     ctv_ok = r3d_cpuvol_open(&ctv, t->cfg.ct_root, 64) == 0;
     if (ctv_ok && ct_lv >= ctv.nlev) ct_lv = ctv.nlev - 1;
