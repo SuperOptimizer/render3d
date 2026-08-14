@@ -73,6 +73,10 @@ typedef struct r3d_tracer {
   double sp_z0, sp_dz;
   uint32_t sp_k;
   bool sp_valid;
+  void *wf;       /* winding-potential field r1(x,y) for the seed slab
+                   * (evolutor port: geometry-agnostic winding coordinate
+                   * from normal-grid polylines + one linear solve) */
+  double wf_base;  /* field value at the seed (winding 0 reference) */
   void *sfx;      /* self-overlap hash (SET cell positions), rebuilt per
                    * generation; the anti-interpenetration hinge reads it */
   void *don;      /* donor segments + spatial index (fusion), owned */

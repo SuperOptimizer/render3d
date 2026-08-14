@@ -1344,6 +1344,10 @@ static int nq_step(const double A[9], const double b[3], double lm, double d[3])
  * changes rho by ~omega without changing its (combinatorial) winding
  * number, so the prior pulls it back — the wrap-jump immunity the torch
  * fit provides upstream, without its inputs. */
+typedef struct tr_wf tr_wf; /* winding-potential field (defined below) */
+static bool tr_wf_at(const tr_wf *w, double x, double y, double *val, double g2[2]);
+static double tr_om_eff(const r3d_tracer *t);
+
 #define TR_SP_KMAX 64    /* r0(z) knots (piecewise linear) */
 #define TR_SP_KNOT 256.0 /* knot spacing, slices */
 #define TR_SP_SIGMA 75.0 /* umbilicus smoothing, slices (vc3d) */
@@ -1639,6 +1643,22 @@ static void tr_spiral_fit(r3d_tracer *t) {
 
 /* after a fit: distrust cells the spiral model calls wrong-wrap */
 static void tr_spiral_flag(r3d_tracer *t) {
+  const tr_wf *wfp = t->wf;
+  double ome = tr_om_eff(t);
+  if (wfp && ome > 0) {
+    uint64_t N2 = (uint64_t)t->W * t->H;
+    for (uint64_t k = 0; k < N2; k++) {
+      if (t->state[k] != R3D_TR_SET) continue;
+      double v;
+      if (!tr_wf_at(wfp, t->pos[k * 3], t->pos[k * 3 + 1], &v, NULL)) continue;
+      double r = v - t->wf_base - ome * (double)t->wind[k];
+      double thr = 0.5 * ome;
+      if (2.5 * t->sp_rms > thr && t->sp_valid) thr = 2.5 * t->sp_rms;
+      if (fabs(r) > thr && t->conf[k] > 0.25f && !(t->dsup && t->dsup[k] >= 2))
+        t->conf[k] = 0.25f;
+    }
+    return;
+  }
   if (!t->sp_valid) return;
   uint64_t N = (uint64_t)t->W * t->H;
   for (uint64_t k = 0; k < N; k++) {
@@ -2145,12 +2165,12 @@ static void tr_sfx_free(tr_sfx *x) {
 
 /* rebuild from all SET cells (coordinator, pool idle) */
 static void tr_sfx_build(r3d_tracer *t) {
-  if (!t->sp_valid) return;
+  if (tr_om_eff(t) <= 0) return;
   tr_sfx *old = t->sfx;
   uint64_t N = (uint64_t)t->W * t->H;
   tr_sfx *x = calloc(1, sizeof *x);
   if (!x) return;
-  x->cs = 2.0 * fabs(t->sp_omega);
+  x->cs = 2.0 * tr_om_eff(t);
   if (x->cs < 8.0) x->cs = 8.0;
   uint32_t nb = 1;
   while (nb < t->nset / 2 + 64) nb <<= 1;
@@ -2183,7 +2203,7 @@ static void tr_res_self(tr_nlsq *acc, const r3d_tracer *t, const double x[3],
                         size_t self_k) {
   const tr_sfx *sx = t->sfx;
   if (!sx || !sx->nent) return;
-  double rmin = 0.55 * fabs(t->sp_omega);
+  double rmin = 0.55 * tr_om_eff(t);
   double wself = (double)t->wind[self_k];
   long c0[3], c1[3];
   for (int a = 0; a < 3; a++) {
@@ -2222,7 +2242,7 @@ static void tr_res_self(tr_nlsq *acc, const r3d_tracer *t, const double x[3],
   /* two-sided wrap spacing (geometry-agnostic, unlike the global rho
    * model): the nearest cell exactly one winding away should sit ~omega
    * from here. Weak Cauchy pull — real gaps vary. */
-  double om = fabs(t->sp_omega);
+  double om = tr_om_eff(t);
   double rad2 = 1.6 * om;
   long d0[3], d1[3];
   for (int a = 0; a < 3; a++) {
@@ -2261,6 +2281,313 @@ static void tr_res_self(tr_nlsq *acc, const r3d_tracer *t, const double x[3],
       nq_add(acc, r * sc, J);
     }
   }
+}
+
+/* ================ winding-potential field (evolutor port) ================
+ * KhartesViewer/evolutor's core idea, fed by our normal grids instead of
+ * a structure tensor: solve one sparse linear system per cross-section
+ * slab for a scalar field r1 with  n.grad(r1) = 1 (unit advance per voxel
+ * crossed along the sheet normal) and  n x grad(r1) = 0.  r1 / sheet-gap
+ * is then a winding coordinate valid on ANY cross-section shape — the
+ * pancake scrolls where the Archimedean rho model fails. Normal sign is
+ * disambiguated by a preliminary r0 solve (umbilicus-direction signs are
+ * wrong on crushed scrolls). Solved matrix-free by CG on the normal
+ * equations; seconds per slab. */
+#define WF_MAX 1100
+
+struct tr_wf {
+  float *r1;
+  uint32_t W, H;
+  double dec; /* fullres vox per field cell */
+  bool ok;
+};
+
+typedef struct wf_sys { /* one least-squares stencil system */
+  uint32_t W, H;
+  const float *nx, *ny, *coh;
+  double wdot, wcross, ws1, ws2;
+  uint32_t anchor;
+} wf_sys;
+
+/* y = A^T (A x): accumulate every residual row's value, scatter back */
+static void wf_apply(const wf_sys *S, const double *x, double *y) {
+  uint32_t W = S->W, H = S->H;
+  memset(y, 0, (size_t)W * H * sizeof *y);
+  for (uint32_t j = 0; j < H; j++)
+    for (uint32_t i = 0; i < W; i++) {
+      size_t k = (size_t)j * W + i;
+      if (i + 1 < W && j + 1 < H && S->coh[k] > 0) {
+        double gx = x[k + 1] - x[k], gy = x[k + W] - x[k];
+        double cnx = (double)S->nx[k], cny = (double)S->ny[k];
+        double c = (double)S->coh[k];
+        if (S->wdot > 0) { /* r = a*(cnx*gx + cny*gy) */
+          double a = S->wdot * c;
+          double r = a * (cnx * gx + cny * gy);
+          y[k + 1] += r * a * cnx;
+          y[k + W] += r * a * cny;
+          y[k] -= r * a * (cnx + cny);
+        }
+        if (S->wcross > 0) { /* r = a*(cnx*gy - cny*gx) */
+          double a = S->wcross * c;
+          double r = a * (cnx * gy - cny * gx);
+          y[k + W] += r * a * cnx;
+          y[k + 1] -= r * a * cny;
+          y[k] += r * a * (cny - cnx);
+        }
+      }
+      if (S->ws1 > 0) { /* first-difference smoothing rows */
+        if (i + 1 < W) {
+          double r = S->ws1 * (x[k + 1] - x[k]);
+          y[k + 1] += r * S->ws1;
+          y[k] -= r * S->ws1;
+        }
+        if (j + 1 < H) {
+          double r = S->ws1 * (x[k + W] - x[k]);
+          y[k + W] += r * S->ws1;
+          y[k] -= r * S->ws1;
+        }
+      }
+      if (S->ws2 > 0) { /* second-difference smoothing rows */
+        if (i > 0 && i + 1 < W) {
+          double r = S->ws2 * (x[k + 1] - 2 * x[k] + x[k - 1]);
+          y[k + 1] += r * S->ws2;
+          y[k - 1] += r * S->ws2;
+          y[k] -= 2 * r * S->ws2;
+        }
+        if (j > 0 && j + 1 < H) {
+          double r = S->ws2 * (x[k + W] - 2 * x[k] + x[k - W]);
+          y[k + W] += r * S->ws2;
+          y[k - W] += r * S->ws2;
+          y[k] -= 2 * r * S->ws2;
+        }
+      }
+    }
+  y[S->anchor] += x[S->anchor]; /* weight-1 gauge pin */
+}
+
+/* y = A^T b for targets: tdot (per-cell dot target), ts1 (per-cell pair
+ * targets for first-difference smoothing, from a base field), others 0 */
+static void wf_rhs(const wf_sys *S, const double *tdot, const double *base,
+                   double *y) {
+  uint32_t W = S->W, H = S->H;
+  memset(y, 0, (size_t)W * H * sizeof *y);
+  for (uint32_t j = 0; j < H; j++)
+    for (uint32_t i = 0; i < W; i++) {
+      size_t k = (size_t)j * W + i;
+      if (tdot && S->wdot > 0 && i + 1 < W && j + 1 < H && S->coh[k] > 0) {
+        double a = S->wdot * (double)S->coh[k];
+        double br = a * tdot[k];
+        y[k + 1] += br * a * (double)S->nx[k];
+        y[k + W] += br * a * (double)S->ny[k];
+        y[k] -= br * a * ((double)S->nx[k] + (double)S->ny[k]);
+      }
+      if (base && S->ws1 > 0) {
+        if (i + 1 < W) {
+          double br = S->ws1 * (base[k + 1] - base[k]);
+          y[k + 1] += br * S->ws1;
+          y[k] -= br * S->ws1;
+        }
+        if (j + 1 < H) {
+          double br = S->ws1 * (base[k + W] - base[k]);
+          y[k + W] += br * S->ws1;
+          y[k] -= br * S->ws1;
+        }
+      }
+    }
+}
+
+/* conjugate gradient on the (SPD) normal equations */
+static void wf_cg(const wf_sys *S, const double *b, double *x, int iters) {
+  size_t N = (size_t)S->W * S->H;
+  double *r = malloc(N * sizeof *r), *p = malloc(N * sizeof *p),
+         *ap = malloc(N * sizeof *ap);
+  if (!r || !p || !ap) {
+    free(r);
+    free(p);
+    free(ap);
+    return;
+  }
+  wf_apply(S, x, ap);
+  double rr = 0;
+  for (size_t k = 0; k < N; k++) {
+    r[k] = b[k] - ap[k];
+    p[k] = r[k];
+    rr += r[k] * r[k];
+  }
+  double rr0 = rr > 0 ? rr : 1.0;
+  for (int it = 0; it < iters && rr > 1e-8 * rr0; it++) {
+    wf_apply(S, p, ap);
+    double pap = 0;
+    for (size_t k = 0; k < N; k++) pap += p[k] * ap[k];
+    if (pap <= 0) break;
+    double alpha = rr / pap;
+    double nrr = 0;
+    for (size_t k = 0; k < N; k++) {
+      x[k] += alpha * p[k];
+      r[k] -= alpha * ap[k];
+      nrr += r[k] * r[k];
+    }
+    double beta = nrr / rr;
+    rr = nrr;
+    for (size_t k = 0; k < N; k++) p[k] = r[k] + beta * p[k];
+  }
+  free(r);
+  free(p);
+  free(ap);
+}
+
+static void tr_wf_free(tr_wf *w) {
+  if (!w) return;
+  free(w->r1);
+  free(w);
+}
+
+/* build the field for the seed slab from the xy normal-grid slice */
+static tr_wf *tr_wf_build(r3d_tracer *t, ng_vol *ngv, double nx_vox, double ny_vox) {
+  if (!ngv || !ngv->active || !t->uc) return NULL;
+  int slice = (int)llround(t->cfg.seed[2]);
+  int slot;
+  ng_grid *g = ng_get(ngv, 0, slice, &slot);
+  if (!g || g->empty || !g->npaths) {
+    ng_put(ngv, slot, g);
+    return NULL;
+  }
+  double dec = 8.0;
+  while (nx_vox / dec > WF_MAX || ny_vox / dec > WF_MAX) dec *= 2.0;
+  uint32_t W = (uint32_t)(nx_vox / dec) + 1, H = (uint32_t)(ny_vox / dec) + 1;
+  size_t N = (size_t)W * H;
+  double t0 = tr_now();
+  float *c2 = calloc(N, sizeof *c2), *s2 = calloc(N, sizeof *s2);
+  float *fnx = calloc(N, sizeof *fnx), *fny = calloc(N, sizeof *fny);
+  float *coh = calloc(N, sizeof *coh);
+  double *xs = calloc(N, sizeof *xs), *b = calloc(N, sizeof *b);
+  double *rg = calloc(N, sizeof *rg);
+  tr_wf *w = calloc(1, sizeof *w);
+  float *r1f = calloc(N, sizeof *r1f);
+  uint32_t maxpts = 4096;
+  float *pts = malloc((size_t)maxpts * 2 * sizeof *pts);
+  bool oom = !c2 || !s2 || !fnx || !fny || !coh || !xs || !b || !rg || !w ||
+             !r1f || !pts;
+  if (!oom) {
+    /* rasterize doubled-angle normals along every polyline */
+    for (uint32_t pi = 0; pi < g->npaths; pi++) {
+      const uint8_t *rec = g->blob + g->precoff[pi];
+      uint32_t noff = (uint32_t)rec[8] << 24 | (uint32_t)rec[9] << 16 |
+                      (uint32_t)rec[10] << 8 | rec[11];
+      if (noff + 2 > maxpts) {
+        maxpts = noff + 2;
+        float *np = realloc(pts, (size_t)maxpts * 2 * sizeof *np);
+        if (!np) continue;
+        pts = np;
+      }
+      uint32_t n = ng_path_decode(g, pi, pts, maxpts);
+      for (uint32_t q = 0; q + 1 < n; q++) {
+        double x0 = (double)pts[q * 2], y0 = (double)pts[q * 2 + 1];
+        double x1 = (double)pts[q * 2 + 2], y1 = (double)pts[q * 2 + 3];
+        double tx = x1 - x0, ty = y1 - y0;
+        double L = hypot(tx, ty);
+        if (L < 1e-6) continue;
+        double phi = atan2(tx / L, -ty / L); /* normal angle */
+        float cc = (float)(cos(2 * phi) * L), ss = (float)(sin(2 * phi) * L);
+        int nsp = (int)(L / (dec * 0.5)) + 1;
+        for (int sp = 0; sp <= nsp; sp++) {
+          double f = (double)sp / nsp;
+          long ci = (long)((x0 + f * tx) / dec), cj = (long)((y0 + f * ty) / dec);
+          if (ci < 0 || cj < 0 || ci >= (long)W || cj >= (long)H) continue;
+          c2[(size_t)cj * W + (size_t)ci] += cc;
+          s2[(size_t)cj * W + (size_t)ci] += ss;
+        }
+      }
+    }
+    double cx, cy;
+    tr_uc_at(t, (double)slice, &cx, &cy, NULL, NULL);
+    float cmax = 0;
+    for (size_t k = 0; k < N; k++) {
+      double m = hypot((double)c2[k], (double)s2[k]);
+      if (m > 1e-9) {
+        double phi = 0.5 * atan2((double)s2[k], (double)c2[k]);
+        (void)0;
+        fnx[k] = (float)cos(phi);
+        fny[k] = (float)sin(phi);
+        coh[k] = (float)m;
+        if (coh[k] > cmax) cmax = coh[k];
+      }
+    }
+    if (cmax > 0)
+      for (size_t k = 0; k < N; k++) coh[k] /= cmax;
+    for (uint32_t j = 0; j < H; j++)
+      for (uint32_t i = 0; i < W; i++)
+        rg[(size_t)j * W + i] = hypot(i * dec - cx, j * dec - cy) / dec;
+    uint32_t anchor =
+        (uint32_t)((size_t)(cy / dec) * W + (size_t)(cx / dec)) % (uint32_t)N;
+    /* stage 1: r0 — cross rows only + smoothing toward geometric r */
+    wf_sys S0 = {.W = W, .H = H, .nx = fnx, .ny = fny, .coh = coh,
+                 .wdot = 0, .wcross = 0.95, .ws1 = 0.1, .ws2 = 0,
+                 .anchor = anchor};
+    wf_rhs(&S0, NULL, rg, b);
+    memcpy(xs, rg, N * sizeof *xs);
+    wf_cg(&S0, b, xs, 300);
+    /* sign disambiguation: n . grad(r0) >= 0 */
+    for (uint32_t j = 0; j + 1 < H; j++)
+      for (uint32_t i = 0; i + 1 < W; i++) {
+        size_t k = (size_t)j * W + i;
+        double gx = xs[k + 1] - xs[k], gy = xs[k + W] - xs[k];
+        if ((double)fnx[k] * gx + (double)fny[k] * gy < 0) {
+          fnx[k] = -fnx[k];
+          fny[k] = -fny[k];
+        }
+      }
+    /* stage 2: r1 — unit advance along n per voxel */
+    double *tdot = rg; /* reuse */
+    for (size_t k = 0; k < N; k++) tdot[k] = dec;
+    wf_sys S1 = {.W = W, .H = H, .nx = fnx, .ny = fny, .coh = coh,
+                 .wdot = 0.05, .wcross = 0.95, .ws1 = 0, .ws2 = 0.2,
+                 .anchor = anchor};
+    wf_rhs(&S1, tdot, NULL, b);
+    memset(xs, 0, N * sizeof *xs);
+    wf_cg(&S1, b, xs, 400);
+    for (size_t k = 0; k < N; k++) r1f[k] = (float)xs[k];
+    w->r1 = r1f;
+    w->W = W;
+    w->H = H;
+    w->dec = dec;
+    w->ok = true;
+    printf("tracer: winding field %ux%u (dec %.0f) from %u polylines in %.1fs\n",
+           W, H, dec, g->npaths, tr_now() - t0);
+  }
+  ng_put(ngv, slot, g);
+  free(c2);
+  free(s2);
+  free(fnx);
+  free(fny);
+  free(coh);
+  free(xs);
+  free(b);
+  free(rg);
+  free(pts);
+  if (oom || !w->ok) {
+    if (w && !w->ok) free(r1f);
+    free(w);
+    return NULL;
+  }
+  return w;
+}
+
+/* bilinear field sample + gradient (per fullres voxel) */
+static bool tr_wf_at(const tr_wf *w, double x, double y, double *val, double g2[2]) {
+  double u = x / w->dec, v = y / w->dec;
+  if (u < 0 || v < 0 || u >= w->W - 1 || v >= w->H - 1) return false;
+  uint32_t i = (uint32_t)u, j = (uint32_t)v;
+  double fu = u - i, fv = v - j;
+  size_t k = (size_t)j * w->W + i;
+  double a = (double)w->r1[k], bb = (double)w->r1[k + 1];
+  double c = (double)w->r1[k + w->W], d = (double)w->r1[k + w->W + 1];
+  *val = a * (1 - fu) * (1 - fv) + bb * fu * (1 - fv) + c * (1 - fu) * fv + d * fu * fv;
+  if (g2) {
+    g2[0] = ((bb - a) * (1 - fv) + (d - c) * fv) / w->dec;
+    g2[1] = ((c - a) * (1 - fu) + (d - bb) * fu) / w->dec;
+  }
+  return true;
 }
 
 /* ======================== residual evaluation ======================== */
@@ -2427,12 +2754,31 @@ static void tr_res_space(tr_nlsq *acc, td_cache *dt, const double x[3],
   nq_add(acc, rsum * sc, Js);
 }
 
+/* effective sheet gap: joint-fit omega when trusted, else measured */
+static double tr_om_eff(const r3d_tracer *t) {
+  if (t->sp_valid) return fabs(t->sp_omega);
+  return t->sp_om_meas >= 4.0 ? t->sp_om_meas : 0.0;
+}
+
 /* spiral winding prior: r = w * (rho - (r0(z) + omega*wind)) / |omega|,
  * Cauchy(1)-robustified; the free point is x. Normalizing by omega makes
  * one whole wrap of error cost ~w — commensurate with the other O(1)
  * residuals. */
 static void tr_res_wind(tr_nlsq *acc, const r3d_tracer *t, const double x[3],
                         double wnd, double wgt) {
+  const tr_wf *wfp = t->wf;
+  double ome = tr_om_eff(t);
+  if (wfp && ome > 0) { /* geometry-agnostic winding-potential target */
+    double v, g2[2];
+    if (tr_wf_at(wfp, x[0], x[1], &v, g2)) {
+      double r = wgt * (v - t->wf_base - ome * wnd) / ome;
+      double s = sqrt(1.0 / (1.0 + r * r)); /* Cauchy(1) */
+      double J[3] = {s * wgt * g2[0] / ome, s * wgt * g2[1] / ome, 0.0};
+      nq_add(acc, r * s, J);
+      return;
+    }
+  }
+  if (!t->sp_valid) return;
   double cx, cy, dxz, dyz;
   if (!tr_uc_at(t, x[2], &cx, &cy, &dxz, &dyz)) return;
   double ux = x[0] - cx, uy = x[1] - cy;
@@ -2549,7 +2895,7 @@ static void tr_eval(tr_ctx *c, const double x[3], tr_nlsq *acc) {
     }
     tr_tm_add(4, tt0);
   }
-  if ((c->flags & TRF_WIND) && t->sp_valid && t->cfg.wind_weight > 0)
+  if ((c->flags & TRF_WIND) && (t->sp_valid || t->wf) && t->cfg.wind_weight > 0)
     tr_res_wind(acc, t, x, (double)t->wind[(size_t)j * t->W + (size_t)i],
                 t->cfg.wind_weight);
   if (t->cfg.rib_rows) {
@@ -2564,7 +2910,7 @@ static void tr_eval(tr_ctx *c, const double x[3], tr_nlsq *acc) {
     double Jz[3] = {0, 0, 10.0};
     nq_add(acc, 10.0 * (x[2] - zrow), Jz);
   }
-  if ((c->flags & TRF_SELF) && t->sfx && t->sp_valid)
+  if ((c->flags & TRF_SELF) && t->sfx)
     tr_res_self(acc, t, x, (size_t)j * t->W + (size_t)i);
   if ((c->flags & TRF_SURF) && t->don) {
     /* donor anchor (vc3d SurfaceLossD, w=0.1): pull toward the nearest
@@ -3120,14 +3466,27 @@ static void *tr_worker(void *ud) {
   t->vdim[2] = (double)vol.nz;
   tr_uc_build(t, (uint32_t)vol.nz); /* spiral frame origin per slice */
   if (t->cfg.rib_rows && !(t->cfg.z_max > t->cfg.z_min)) {
-    t->cfg.z_min = t->cfg.seed[2] - ((double)t->H / 2 + 2.0) * t->cfg.step;
-    t->cfg.z_max = t->cfg.seed[2] + ((double)t->H / 2 + 2.0) * t->cfg.step;
+    double hh = (double)t->cfg.rib_rows / 2 + 2.0;
+    t->cfg.z_min = t->cfg.seed[2] - hh * t->cfg.step;
+    t->cfg.z_max = t->cfg.seed[2] + hh * t->cfg.step;
   }
   if (t->cfg.wind_weight > 0 && !t->uc)
     printf("tracer: spiral prior requested but no usable umbilicus (needs "
            ">= 2 control points) — growing without it\n");
   ng_vol ng; /* vc3d's real data term when the store exists upstream */
   ng_open(&ng, t->root);
+  if (t->cfg.rib_rows && t->cfg.wind_weight > 0 && !t->wf) {
+    t->wf = tr_wf_build(t, &ng, (double)vol.nx, (double)vol.ny);
+    if (t->wf) {
+      double v0;
+      if (tr_wf_at(t->wf, t->cfg.seed[0], t->cfg.seed[1], &v0, NULL)) {
+        t->wf_base = v0;
+      } else {
+        tr_wf_free(t->wf);
+        t->wf = NULL;
+      }
+    }
+  }
   tr_env cenv = {.dt = dt, .ngv = &ng}; /* coordinator's solve env */
   cenv.hood = calloc(NG_NHOOD, sizeof *cenv.hood);
   if (cenv.hood)
@@ -3574,6 +3933,7 @@ void r3d_tracer_free(r3d_tracer *t) {
   free(t->dsup);
   free(t->uc);
   tr_sfx_free(t->sfx);
+  tr_wf_free(t->wf);
   tr_dons_free(t->don);
   r3d_umbilicus_free(&t->umb);
   memset(t, 0, sizeof *t);
