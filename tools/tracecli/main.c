@@ -22,7 +22,7 @@ int main(int argc, char **argv) {
             "usage: tracecli <pred-root> [--seed x y z] [--step S] [--gens N] "
             "[--level L] [--cutoff C] [--out DIR] [--umbilicus FILE] [--nofill] "
             "[--nospiral] [--spiral-weight W] [--fuse DIR ...] [--ribbon ROWS] "
-            "[--zspan S] [--wraps N]\n");
+            "[--zspan S] [--wraps N] [--ct CT-ROOT]\n");
     return 2;
   }
   const char *root = argv[1], *out = NULL, *umbp = NULL;
@@ -60,6 +60,8 @@ int main(int argc, char **argv) {
       cfg.rib_rows = (uint32_t)strtoul(argv[++i], NULL, 10);
     else if (strcmp(argv[i], "--wraps") == 0 && i + 1 < argc)
       cfg.rib_wraps = (uint32_t)strtoul(argv[++i], NULL, 10);
+    else if (strcmp(argv[i], "--ct") == 0 && i + 1 < argc)
+      snprintf(cfg.ct_root, sizeof cfg.ct_root, "%s", argv[++i]);
     else if (strcmp(argv[i], "--zspan") == 0 && i + 1 < argc)
       zspan = strtod(argv[++i], NULL);
     else {

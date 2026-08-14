@@ -3174,13 +3174,6 @@ static bool tr_place_cand(r3d_tracer *t, tr_env *e, uint32_t cell, unsigned *rng
   }
   bool zclamp = t->cfg.z_max > t->cfg.z_min &&
                 (fp[2] < t->cfg.z_min || fp[2] > t->cfg.z_max);
-  if (!zclamp && t->cfg.rib_rows && e->dt) {
-    /* ribbons cross the whole cross section and must stop at the
-     * scroll's edge: a point this far from ANY predicted sheet is off
-     * the papyrus, not in an ambiguous fold */
-    double dv = td_tri(e->dt, fp, NULL);
-    if (dv > 50.0) zclamp = true;
-  }
   if (!zclamp && t->cfg.rib_wraps > 1 && t->sfx) {
     /* sibling-wrap fronts stop where the sheet is already traced: a
      * candidate landing on an existing SAME-winding cell that is not a
@@ -3473,6 +3466,17 @@ static void *tr_worker(void *ud) {
   if (t->cfg.wind_weight > 0 && !t->uc)
     printf("tracer: spiral prior requested but no usable umbilicus (needs "
            ">= 2 control points) — growing without it\n");
+  r3d_cpuvol ctv; /* optional raw CT for the boundary pass */
+  bool ctv_ok = false;
+  uint32_t ct_lv = 2;
+  if (t->cfg.ct_root[0]) {
+    ctv_ok = r3d_cpuvol_open(&ctv, t->cfg.ct_root, 64) == 0;
+    if (ctv_ok && ct_lv >= ctv.nlev) ct_lv = ctv.nlev - 1;
+    if (!ctv_ok)
+      printf("tracer: CT tree %s failed to open (boundary pass falls back "
+             "to predictions)\n",
+             t->cfg.ct_root);
+  }
   ng_vol ng; /* vc3d's real data term when the store exists upstream */
   ng_open(&ng, t->root);
   if (t->cfg.rib_rows && t->cfg.wind_weight > 0 && !t->wf) {
@@ -3714,6 +3718,33 @@ static void *tr_worker(void *ud) {
         if (tr_place_cand(t, &cenv, cands[ci], &rng)) nfringe[nnew++] = cands[ci];
       t->rng = rng;
     }
+    if (t->cfg.rib_rows && nnew) {
+      /* boundary pass: fronts stop at TRUE nothingness. Masked CT reads
+       * exactly zero in the padding outside the scroll — that is proof.
+       * Weak/missing predictions are not (papyrus often continues), so
+       * the prediction-DT test is only the no-CT fallback. */
+      uint32_t kept = 0;
+      for (uint32_t f = 0; f < nnew; f++) {
+        size_t k = nfringe[f];
+        const double *P = t->pos + k * 3;
+        bool dead = false;
+        if (ctv_ok) {
+          double v = r3d_cpuvol_tri(&ctv, ct_lv, P, NULL);
+          dead = v < 1.0;
+        } else {
+          dead = td_tri(cenv.dt, P, NULL) > 50.0;
+        }
+        if (dead) {
+          pthread_mutex_lock(&t->mu);
+          t->state[k] = R3D_TR_FAIL;
+          if (t->nset) t->nset--;
+          pthread_mutex_unlock(&t->mu);
+        } else {
+          nfringe[kept++] = (uint32_t)k;
+        }
+      }
+      nnew = kept;
+    }
     for (uint32_t f = 0; f < nnew; f++) /* conf: coordinator only (DT) */
       tr_update_conf(t, &cenv, (int)(nfringe[f] % W), (int)(nfringe[f] / W));
     if (t->cfg.wind_weight > 0 && t->uc && t->nset >= 200 &&
@@ -3788,6 +3819,7 @@ static void *tr_worker(void *ud) {
          TR_TM(3));
   ng_close(&ng);
   td_close(dt);
+  if (ctv_ok) r3d_cpuvol_close(&ctv);
   r3d_cpuvol_close(&vol);
   pthread_mutex_lock(&t->mu);
   t->done = true;

@@ -41,6 +41,10 @@ typedef struct r3d_tracer_cfg {
                        * sibling on the same winding) */
   double z_min, z_max; /* z_max > z_min: hard z clamp (vc3d z_range);
                         * solved points outside FAIL like a volume exit */
+  char ct_root[1024]; /* optional raw-CT LOD tree: ribbon fronts stop
+                       * where the masked CT reads zero (true padding).
+                       * Predictions may be weak where papyrus continues —
+                       * only CT zero proves there is nothing to trace. */
   double wind_weight; /* spiral winding prior weight (0 = off). Needs an
                        * umbilicus; the residual is normalized by the
                        * fitted sheet spacing so ~0.5 is a gentle prior. */
