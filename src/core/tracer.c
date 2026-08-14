@@ -3559,7 +3559,9 @@ static void *tr_worker(void *ud) {
            ">= 2 control points) — growing without it\n");
   r3d_cpuvol ctv; /* optional raw CT for the boundary pass */
   bool ctv_ok = false;
-  uint32_t ct_lv = 2;
+  uint32_t ct_lv = 1; /* L2 partial-volumes thin sheets with their air
+                       * gaps and mid-sheet reads fall below the cutoff —
+                       * L1 keeps sheets ~6 px thick */
   double ct_min = t->cfg.ct_min > 0 ? t->cfg.ct_min : 128.0;
   if (t->cfg.ct_root[0]) {
     ctv_ok = r3d_cpuvol_open(&ctv, t->cfg.ct_root, 64) == 0;
@@ -3830,6 +3832,17 @@ static void *tr_worker(void *ud) {
         bool dead = false;
         if (ctv_ok) {
           double v = r3d_cpuvol_tri(&ctv, ct_lv, P, NULL);
+          if (v < ct_min) { /* try a slim neighborhood before declaring
+                             * non-volume: traced points ride a voxel or
+                             * two off mid-sheet routinely */
+            for (int o = 0; o < 6 && v < ct_min; o++) {
+              static const double off[6][3] = {{2, 0, 0}, {-2, 0, 0}, {0, 2, 0},
+                                               {0, -2, 0}, {0, 0, 2}, {0, 0, -2}};
+              double q[3] = {P[0] + off[o][0], P[1] + off[o][1], P[2] + off[o][2]};
+              double v2 = r3d_cpuvol_tri(&ctv, ct_lv, q, NULL);
+              if (v2 > v) v = v2;
+            }
+          }
           dead = v < ct_min;
         } else {
           dead = td_tri(cenv.dt, P, NULL) > 50.0;
