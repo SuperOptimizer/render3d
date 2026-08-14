@@ -1485,7 +1485,11 @@ static void tr_spiral_fit(r3d_tracer *t) {
   double om_meas = t->sp_om_meas;
   int ncand;
   double cand[2];
-  bool joint = wmax - wmin >= 1.0;
+  /* joint omega only when clearly identifiable: 2.5+ windings of span.
+   * Between 1 and 2.5 the column is near-collinear with r0 and the
+   * "fit" happily explains radial sheet-hopping as a huge omega
+   * (rib4: omega 2302 at span 1.13) — measured omega stays in charge. */
+  bool joint = wmax - wmin >= 2.5;
   double psign = t->sp_valid && t->sp_omega < 0 ? -1.0 : 1.0;
   if (nobs < 200) {
     return;
@@ -1624,7 +1628,8 @@ static void tr_spiral_fit(r3d_tracer *t) {
     t->sp_omega = best_om;
     t->sp_rms = best_rms;
   }
-  t->sp_valid = have && fabs(best_om) >= 2.0 && best_rms <= 0.5 * fabs(best_om);
+  t->sp_valid = have && fabs(best_om) >= 2.0 && fabs(best_om) <= 120.0 &&
+                best_rms <= 0.5 * fabs(best_om);
   pthread_mutex_unlock(&t->mu);
   free(A);
   free(x);
