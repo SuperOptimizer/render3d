@@ -21,12 +21,14 @@ int main(int argc, char **argv) {
     fprintf(stderr,
             "usage: tracecli <pred-root> [--seed x y z] [--step S] [--gens N] "
             "[--level L] [--cutoff C] [--out DIR] [--umbilicus FILE] [--nofill] "
-            "[--nospiral] [--spiral-weight W] [--fuse DIR ...]\n");
+            "[--nospiral] [--spiral-weight W] [--fuse DIR ...] [--ribbon ROWS] "
+            "[--zspan S]\n");
     return 2;
   }
   const char *root = argv[1], *out = NULL, *umbp = NULL;
   const char *fuse[16];
   uint32_t nfuse = 0;
+  double zspan = 0.0;
   bool fill = true, spiral = true;
   r3d_tracer_cfg cfg = {.step = 20.0, .thresh = 0.35f, .max_ring = 60, .level = 1};
   bool have_seed = false;
@@ -54,6 +56,10 @@ int main(int argc, char **argv) {
       cfg.wind_weight = strtod(argv[++i], NULL);
     else if (strcmp(argv[i], "--fuse") == 0 && i + 1 < argc && nfuse < 16)
       fuse[nfuse++] = argv[++i];
+    else if (strcmp(argv[i], "--ribbon") == 0 && i + 1 < argc)
+      cfg.rib_rows = (uint32_t)strtoul(argv[++i], NULL, 10);
+    else if (strcmp(argv[i], "--zspan") == 0 && i + 1 < argc)
+      zspan = strtod(argv[++i], NULL);
     else {
       fprintf(stderr, "tracecli: bad arg %s\n", argv[i]);
       return 2;
@@ -74,6 +80,10 @@ int main(int argc, char **argv) {
   r3d_umbilicus_init(&umb);
   if (umbp && r3d_umbilicus_load(&umb, umbp) != 0)
     fprintf(stderr, "tracecli: no umbilicus at %s (continuing)\n", umbp);
+  if (zspan > 0) { /* thin-slab clamp about the seed (vc3d z_range) */
+    cfg.z_min = cfg.seed[2] - zspan * 0.5;
+    cfg.z_max = cfg.seed[2] + zspan * 0.5;
+  }
   if (spiral && cfg.wind_weight == 0.0 && umb.count >= 2)
     cfg.wind_weight = 0.5; /* spiral prior on by default with an umbilicus */
   if (!spiral) cfg.wind_weight = 0.0;

@@ -31,6 +31,11 @@ typedef struct r3d_tracer_cfg {
                       * itself never rejects (vc3d semantics) */
   uint32_t max_ring; /* generations to grow (grid dim = 2*g + 50) */
   uint32_t level;    /* prediction pyramid level to sample */
+  uint32_t rib_rows; /* >0: ribbon mode — grid is (2*max_ring+10) x rib_rows,
+                      * growth runs along the sheet (whole-cross-section
+                      * tracing in a thin z slab, Lasagna-style) */
+  double z_min, z_max; /* z_max > z_min: hard z clamp (vc3d z_range);
+                        * solved points outside FAIL like a volume exit */
   double wind_weight; /* spiral winding prior weight (0 = off). Needs an
                        * umbilicus; the residual is normalized by the
                        * fitted sheet spacing so ~0.5 is a gentle prior. */
@@ -63,6 +68,8 @@ typedef struct r3d_tracer {
   double sp_z0, sp_dz;
   uint32_t sp_k;
   bool sp_valid;
+  void *sfx;      /* self-overlap hash (SET cell positions), rebuilt per
+                   * generation; the anti-interpenetration hinge reads it */
   void *don;      /* donor segments + spatial index (fusion), owned */
   uint32_t ndon;
   uint8_t *dsup;  /* [W*H] donor-support count per cell (0 = raw-traced) */

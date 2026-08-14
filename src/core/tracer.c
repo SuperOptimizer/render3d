@@ -2109,6 +2109,111 @@ static double tr_omega_measure(r3d_tracer *t, td_cache *dt) {
   return gaps[ngap / 2];
 }
 
+/* ==================== self-overlap index + hinge ====================
+ * Lasagna's min_dist idea in LM form: a cell may not come closer than
+ * ~half a sheet gap to any part of the SAME grown surface on a DIFFERENT
+ * winding. One-sided hinge — it separates wraps and preserves their
+ * ordering without auxiliary variables. */
+#define TR_W_SELF 1.0
+#define TR_SELF_DW 0.5 /* windings apart to count as "another wrap" */
+
+typedef struct tr_sfx {
+  double cs;
+  uint32_t nbuck; /* pow2 */
+  uint32_t *head, *next, *cell;
+  uint32_t nent, cap;
+} tr_sfx;
+
+static uint32_t tr_sfx_h(const tr_sfx *x, long cx, long cy, long cz) {
+  uint64_t h = (uint64_t)cx * 0x9E3779B185EBCA87ull ^
+               (uint64_t)cy * 0xC2B2AE3D27D4EB4Full ^ (uint64_t)cz * 0x165667B19E3779F9ull;
+  return (uint32_t)(h >> 32) & (x->nbuck - 1);
+}
+
+static void tr_sfx_free(tr_sfx *x) {
+  if (!x) return;
+  free(x->head);
+  free(x->next);
+  free(x->cell);
+  free(x);
+}
+
+/* rebuild from all SET cells (coordinator, pool idle) */
+static void tr_sfx_build(r3d_tracer *t) {
+  if (!t->sp_valid) return;
+  tr_sfx *old = t->sfx;
+  uint64_t N = (uint64_t)t->W * t->H;
+  tr_sfx *x = calloc(1, sizeof *x);
+  if (!x) return;
+  x->cs = 2.0 * fabs(t->sp_omega);
+  if (x->cs < 8.0) x->cs = 8.0;
+  uint32_t nb = 1;
+  while (nb < t->nset / 2 + 64) nb <<= 1;
+  if (nb > 1u << 21) nb = 1u << 21;
+  x->nbuck = nb;
+  x->head = calloc(nb, sizeof *x->head);
+  x->cap = t->nset + 16;
+  x->next = malloc((size_t)x->cap * sizeof *x->next);
+  x->cell = malloc((size_t)x->cap * sizeof *x->cell);
+  if (!x->head || !x->next || !x->cell) {
+    tr_sfx_free(x);
+    return;
+  }
+  for (uint64_t k = 0; k < N && x->nent < x->cap; k++) {
+    if (t->state[k] != R3D_TR_SET) continue;
+    const double *P = t->pos + k * 3;
+    uint32_t b = tr_sfx_h(x, (long)floor(P[0] / x->cs), (long)floor(P[1] / x->cs),
+                          (long)floor(P[2] / x->cs));
+    x->cell[x->nent] = (uint32_t)k;
+    x->next[x->nent] = x->head[b];
+    x->head[b] = x->nent + 1;
+    x->nent++;
+  }
+  t->sfx = x;
+  tr_sfx_free(old);
+}
+
+/* hinge residual against the nearest other-wrap cell; free point is x */
+static void tr_res_self(tr_nlsq *acc, const r3d_tracer *t, const double x[3],
+                        size_t self_k) {
+  const tr_sfx *sx = t->sfx;
+  if (!sx || !sx->nent) return;
+  double rmin = 0.55 * fabs(t->sp_omega);
+  double wself = (double)t->wind[self_k];
+  long c0[3], c1[3];
+  for (int a = 0; a < 3; a++) {
+    c0[a] = (long)floor((x[a] - rmin) / sx->cs);
+    c1[a] = (long)floor((x[a] + rmin) / sx->cs);
+  }
+  double bd2 = rmin * rmin;
+  const double *bq = NULL;
+  for (long cz = c0[2]; cz <= c1[2]; cz++)
+    for (long cy = c0[1]; cy <= c1[1]; cy++)
+      for (long cx = c0[0]; cx <= c1[0]; cx++)
+        for (uint32_t e = sx->head[tr_sfx_h(sx, cx, cy, cz)]; e; e = sx->next[e - 1]) {
+          uint32_t k = sx->cell[e - 1];
+          if (k == self_k || t->state[k] != R3D_TR_SET) continue;
+          if (fabs((double)t->wind[k] - wself) < TR_SELF_DW) continue;
+          const double *Q = t->pos + (size_t)k * 3;
+          double d2 = 0;
+          for (int a = 0; a < 3; a++) {
+            double dd = x[a] - Q[a];
+            d2 += dd * dd;
+          }
+          if (d2 < bd2) {
+            bd2 = d2;
+            bq = Q;
+          }
+        }
+  if (!bq) return;
+  double d = sqrt(bd2);
+  if (d < 1e-6) return;
+  double r = TR_W_SELF * (rmin - d) / rmin;
+  double J[3];
+  for (int a = 0; a < 3; a++) J[a] = -TR_W_SELF * (x[a] - bq[a]) / (d * rmin);
+  nq_add(acc, r, J);
+}
+
 /* ======================== residual evaluation ======================== */
 enum {
   TRF_DIST = 1,
@@ -2117,10 +2222,12 @@ enum {
   TRF_SPACE = 8,
   TRF_NCP = 16,
   TRF_WIND = 32,
-  TRF_SURF = 64
+  TRF_SURF = 64,
+  TRF_SELF = 128
 };
 #define TRF_ALL \
-  (TRF_DIST | TRF_STRAIGHT | TRF_SDIR | TRF_SPACE | TRF_NCP | TRF_WIND | TRF_SURF)
+  (TRF_DIST | TRF_STRAIGHT | TRF_SDIR | TRF_SPACE | TRF_NCP | TRF_WIND | TRF_SURF | \
+   TRF_SELF)
 
 typedef struct tr_ctx {
   r3d_tracer *t;
@@ -2396,6 +2503,8 @@ static void tr_eval(tr_ctx *c, const double x[3], tr_nlsq *acc) {
   if ((c->flags & TRF_WIND) && t->sp_valid && t->cfg.wind_weight > 0)
     tr_res_wind(acc, t, x, (double)t->wind[(size_t)j * t->W + (size_t)i],
                 t->cfg.wind_weight);
+  if ((c->flags & TRF_SELF) && t->sfx && t->sp_valid)
+    tr_res_self(acc, t, x, (size_t)j * t->W + (size_t)i);
   if ((c->flags & TRF_SURF) && t->don) {
     /* donor anchor (vc3d SurfaceLossD, w=0.1): pull toward the nearest
      * donor surface point, frozen for this evaluation; donors on a
@@ -2656,9 +2765,11 @@ static bool tr_place_cand(r3d_tracer *t, tr_env *e, uint32_t cell, unsigned *rng
     int sup = tr_don_support(t->don, fp, (double)t->wind[k], t->uc != NULL);
     t->dsup[k] = (uint8_t)(sup > 255 ? 255 : sup);
   }
-  if (t->vdim[0] > 0 &&
+  bool zclamp = t->cfg.z_max > t->cfg.z_min &&
+                (fp[2] < t->cfg.z_min || fp[2] > t->cfg.z_max);
+  if (zclamp || (t->vdim[0] > 0 &&
       (fp[0] < 0 || fp[1] < 0 || fp[2] < 0 || fp[0] >= t->vdim[0] ||
-       fp[1] >= t->vdim[1] || fp[2] >= t->vdim[2])) {
+       fp[1] >= t->vdim[1] || fp[2] >= t->vdim[2]))) {
     pthread_mutex_lock(&t->mu);
     t->state[k] = R3D_TR_FAIL;
     if (t->nset) t->nset--;
@@ -3008,7 +3119,8 @@ static void *tr_worker(void *ud) {
       int i = (int)(fringe[f] % W), j = (int)(fringe[f] / W);
       for (int o = 0; o < 8; o++) {
         int ii = i + n8[o][0], jj = j + n8[o][1];
-        if (ii < 2 || jj < 2 || ii >= (int)W - 2 || jj >= (int)H - 2) continue;
+        int mv = t->cfg.rib_rows ? 0 : 2; /* ribbons use every row */
+        if (ii < 2 || jj < mv || ii >= (int)W - 2 || jj >= (int)H - mv) continue;
         size_t k = (size_t)jj * W + (size_t)ii;
         if (t->state[k] != R3D_TR_EMPTY) continue;
         t->state[k] = R3D_TR_PROC; /* offered once, ever (vc3d) */
@@ -3052,13 +3164,30 @@ static void *tr_worker(void *ud) {
                        * winding prior joins the big solves */
     tr_spiral_flag(t);
     tr_don_register(t);
+    tr_sfx_build(t); /* refresh the self-overlap index (pool is idle) */
     /* schedule: vc3d runs global solves only in the first 10 generations
      * (Ceres cost); our parallel sweeps are cheap enough to keep them
      * coming — every 8th generation, forever. This anneals away the
      * candidate-order nondeterminism that tears weak outskirt regions
      * (same-build 60-gen QC swung 0.06%..9.7% v-edges >30 vox). */
     if (!resume && generation % 8 == 0) {
-      tr_local_opt(t, &cenv, x0, y0, (int)W + (int)H, global_opt ? 6 : 3, true);
+      if (t->cfg.rib_rows && nnew) {
+        /* ribbon: whole-grid anneals are O(len) x O(len/8) — solve a
+         * sliding window around each growth front instead (Lasagna
+         * opt_window / vc3d sliding_w) */
+        int umin = (int)W, umax = 0;
+        for (uint32_t f = 0; f < nnew; f++) {
+          int iu = (int)(nfringe[f] % W);
+          if (iu < umin) umin = iu;
+          if (iu > umax) umax = iu;
+        }
+        int win = 48;
+        tr_local_opt(t, &cenv, umin, y0, win, global_opt ? 6 : 3, true);
+        if (umax - umin > win)
+          tr_local_opt(t, &cenv, umax, y0, win, global_opt ? 6 : 3, true);
+      } else {
+        tr_local_opt(t, &cenv, x0, y0, (int)W + (int)H, global_opt ? 6 : 3, true);
+      }
     } else if (!global_opt) {
       uint32_t nsub = 0;
       for (uint32_t f = 0; f < nnew; f++) {
@@ -3128,10 +3257,17 @@ int r3d_tracer_start_fused(r3d_tracer *t, const char *pred_root,
   memset(t, 0, sizeof *t);
   t->cfg = *cfg;
   if (t->cfg.max_ring < 4) t->cfg.max_ring = 4;
-  if (t->cfg.max_ring > 400) t->cfg.max_ring = 400;
+  if (t->cfg.max_ring > (t->cfg.rib_rows ? 40000u : 400u)) 
+    t->cfg.max_ring = t->cfg.rib_rows ? 40000u : 400u;
   if (t->cfg.step < 1.0) t->cfg.step = 20.0;
   snprintf(t->root, sizeof t->root, "%s", pred_root);
-  t->W = t->H = 2 * t->cfg.max_ring + 50;
+  if (t->cfg.rib_rows) { /* ribbon: long in u, a few rows of v */
+    if (t->cfg.rib_rows < 4) t->cfg.rib_rows = 4;
+    t->W = 2 * t->cfg.max_ring + 10;
+    t->H = t->cfg.rib_rows;
+  } else {
+    t->W = t->H = 2 * t->cfg.max_ring + 50;
+  }
   t->pos = calloc((size_t)t->W * t->H * 3, sizeof *t->pos);
   t->state = calloc((size_t)t->W * t->H, 1);
   t->conf = calloc((size_t)t->W * t->H, sizeof *t->conf);
@@ -3235,6 +3371,7 @@ void r3d_tracer_free(r3d_tracer *t) {
   free(t->wind);
   free(t->dsup);
   free(t->uc);
+  tr_sfx_free(t->sfx);
   tr_dons_free(t->don);
   r3d_umbilicus_free(&t->umb);
   memset(t, 0, sizeof *t);
