@@ -2347,10 +2347,17 @@ int main(int argc, char **argv) {
           }
           const float *pred;
           uint32_t pw2, ph2, pi0, pj0, pup;
-          if (r3d_inklive_poll(&inklive, &pred, &pw2, &ph2, &pi0, &pj0, &pup) &&
-              r3d_surfvol_inkpred(renderer, pred, pw2, ph2, (float)pi0, (float)pj0,
-                                  (float)pup) == 0)
-            inklive_have = true;
+          if (r3d_inklive_poll(&inklive, &pred, &pw2, &ph2, &pi0, &pj0, &pup)) {
+            if (r3d_surfvol_inkpred(renderer, pred, pw2, ph2, (float)pi0, (float)pj0,
+                                    (float)pup) == 0) {
+              if (!inklive_have)
+                printf("inklive: displaying %ux%u at grid (%u,%u), %u px/cell\n", pw2,
+                       ph2, pi0, pj0, pup);
+              inklive_have = true;
+            } else {
+              fprintf(stderr, "inklive: prediction upload failed (%ux%u)\n", pw2, ph2);
+            }
+          }
         }
       }
     }

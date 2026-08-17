@@ -274,10 +274,17 @@ static void *il_worker(void *ud) {
     }
     free(stack);
 
+    float pmax = 0.0f;
+    double psum = 0.0;
+    size_t pn = 0;
     if (pred) { /* scrollprize display rescale: confident no-ink sits at 0.25 */
       for (size_t k = 0; k < (size_t)W * H; k++) {
         float v = (pred[k] - 0.25f) * 2.0f;
-        pred[k] = v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v;
+        v = v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v;
+        pred[k] = v;
+        if (v > pmax) pmax = v;
+        psum += (double)v;
+        pn++;
       }
     }
     pthread_mutex_lock(&il->mu);
@@ -293,8 +300,10 @@ static void *il_worker(void *ud) {
       il->res_fresh = true;
       il->res_ms = il_now_ms() - t0;
       snprintf(il->status, sizeof il->status, "%ux%u in %.1fs", W, H, il->res_ms / 1e3);
-      printf("inklive: %ux%u prediction in %.1f s (sample %.1f s + infer)\n", W, H,
-             il->res_ms / 1e3, t_sampled / 1e3);
+      printf("inklive: %ux%u prediction in %.1f s (sample %.1f s + infer), "
+             "ink max %.2f mean %.3f\n",
+             W, H, il->res_ms / 1e3, t_sampled / 1e3, (double)pmax,
+             pn ? psum / (double)pn : 0.0);
     } else {
       snprintf(il->status, sizeof il->status,
                il->fd < 0 ? "server unreachable (port %d)" : "request failed (port %d)",
