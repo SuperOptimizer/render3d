@@ -28,6 +28,7 @@ int main(int argc, char **argv) {
   const char *root = argv[1], *out = NULL, *umbp = NULL;
   const char *fuse[16], *loadp = NULL;
   uint32_t nfuse = 0, rewind_gen = 0, regrow = 0;
+  int derive_dir = 0;
   double zspan = 0.0;
   bool fill = true, spiral = true;
   r3d_tracer_cfg cfg = {.step = 20.0, .thresh = 0.35f, .max_ring = 60, .level = 1};
@@ -72,6 +73,8 @@ int main(int argc, char **argv) {
       rewind_gen = (uint32_t)strtoul(argv[++i], NULL, 10);
     else if (strcmp(argv[i], "--regrow") == 0 && i + 1 < argc)
       regrow = (uint32_t)strtoul(argv[++i], NULL, 10);
+    else if (strcmp(argv[i], "--derive") == 0 && i + 1 < argc)
+      derive_dir = atoi(argv[++i]);
     else {
       fprintf(stderr, "tracecli: bad arg %s\n", argv[i]);
       return 2;
@@ -103,6 +106,23 @@ int main(int argc, char **argv) {
          cfg.seed[0], cfg.seed[1], cfg.seed[2], cfg.step, cfg.max_ring, cfg.level,
          cfg.wind_weight > 0 ? "on" : "off");
   r3d_tracer tr;
+  if (loadp && derive_dir) {
+    /* unified-tracer stage 1: load a wrap, derive its neighbor */
+    if (r3d_tracer_load(&tr, loadp, root) != 0) {
+      fprintf(stderr, "tracecli: cannot load %s\n", loadp);
+      return 1;
+    }
+    if (!out) {
+      fprintf(stderr, "tracecli: --derive needs --out\n");
+      return 2;
+    }
+    char mk[1300];
+    snprintf(mk, sizeof mk, "mkdir -p '%s'", out);
+    if (system(mk) != 0) return 1;
+    int nh = r3d_tracer_derive(&tr, root, derive_dir, out);
+    r3d_tracer_free(&tr);
+    return nh > 0 ? 0 : 1;
+  }
   if (loadp) {
     /* load -> optional rewind -> regrow (vc3d --resume/--rewind-gen) */
     if (r3d_tracer_load(&tr, loadp, root) != 0) {

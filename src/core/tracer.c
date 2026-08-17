@@ -2414,9 +2414,7 @@ static void tr_don_members(r3d_tracer *t) {
         }
       }
     }
-  if (nfold)
-    printf("tracer: donor membership: %u fold-suspect cell%s vetoed\n", nfold,
-           nfold == 1 ? "" : "s");
+  (void)nfold; /* vetoed silently; visible via donor QC coverage */
 }
 
 static int tr_dcmp(const void *a, const void *b) {
@@ -5417,7 +5415,7 @@ static void *tr_worker(void *ud) {
   if (!t->quit) tr_inpaint(t, &cenv); /* re-solve enclosed holes with the
                                        * real losses (G8) */
   tr_wind_relax(t, 30);
-  /* final QC: a >90-degree fold is never legitimate papyrus — surviving
+  /* final QC: a >90-degree fold is never legitimate papyrus ï¿½ surviving
    * folds are marked untrusted so the save writes an honest hole there
    * instead of doubled-back geometry */
   tr_qc2(t, true);
@@ -5717,6 +5715,148 @@ int r3d_tracer_rewind(r3d_tracer *t, uint32_t gen) {
   pthread_mutex_unlock(&t->mu);
   printf("tracer: rewound to generation %u (%u cells dropped)\n", gen, dropped);
   return 0;
+}
+
+int r3d_tracer_derive(r3d_tracer *t, const char *pred_root, int dir,
+                      const char *out_dir) {
+  if (t->running || !t->pos || !t->nset || !dir) return -1;
+  r3d_cpuvol vol;
+  if (r3d_cpuvol_open(&vol, pred_root, 96) != 0) return -1;
+  td_cache *dt = td_open(&vol, t->cfg.level);
+  if (!dt) {
+    r3d_cpuvol_close(&vol);
+    return -1;
+  }
+  /* gap field over this grid (tr_om_at reads it; median fallback) */
+  double om_med = tr_omega_measure(t, dt);
+  if (om_med > 0.0) t->sp_om_meas = om_med;
+  if (tr_om_eff(t) <= 0.0) t->sp_om_meas = 20.0; /* last resort */
+  int W = (int)t->W, H = (int)t->H;
+  size_t n = (size_t)W * (size_t)H;
+  double *np = malloc(n * 3 * sizeof *np);
+  uint8_t *hit = calloc(n, 1);
+  int rc = -1, sgn = dir > 0 ? 1 : -1;
+  uint32_t nhit = 0, nmiss = 0;
+  if (!np || !hit) goto out;
+  for (int j = 0; j < H; j++)
+    for (int i = 0; i < W; i++) {
+      size_t k = (size_t)j * (size_t)W + (size_t)i;
+      if (!tr_qc_ok(t, i, j)) continue;
+      /* local normal (consistent orientation from the grid frame) */
+      if (!tr_valid(t, i - 1, j) || !tr_valid(t, i + 1, j) ||
+          !tr_valid(t, i, j - 1) || !tr_valid(t, i, j + 1))
+        continue;
+      const double *P = t->pos + k * 3;
+      const double *pu0 = t->pos + ((size_t)j * (size_t)W + (size_t)i - 1) * 3;
+      const double *pu1 = t->pos + ((size_t)j * (size_t)W + (size_t)i + 1) * 3;
+      const double *pv0 = t->pos + ((size_t)(j - 1) * (size_t)W + (size_t)i) * 3;
+      const double *pv1 = t->pos + ((size_t)(j + 1) * (size_t)W + (size_t)i) * 3;
+      double eu[3], ev[3], nr[3];
+      for (int a = 0; a < 3; a++) {
+        eu[a] = pu1[a] - pu0[a];
+        ev[a] = pv1[a] - pv0[a];
+      }
+      nr[0] = eu[1] * ev[2] - eu[2] * ev[1];
+      nr[1] = eu[2] * ev[0] - eu[0] * ev[2];
+      nr[2] = eu[0] * ev[1] - eu[1] * ev[0];
+      double l = sqrt(nr[0] * nr[0] + nr[1] * nr[1] + nr[2] * nr[2]);
+      if (l < 1e-9) continue;
+      for (int a = 0; a < 3; a++) nr[a] = nr[a] / l * sgn;
+      double g = tr_om_at(t, P);
+      double clear = g * 0.35 > 2.5 ? g * 0.35 : 2.5;
+      /* clearance/exit machine (vc3d gen_neighbor): the ray must first
+       * leave THIS sheet, then the first DT minimum is the neighbor */
+      bool exited = false;
+      double prev = 1e30, pprev = 1e30, hs = -1.0;
+      for (double s2 = 1.0; s2 <= 2.2 * g; s2 += 1.0) {
+        double q[3] = {P[0] + s2 * nr[0], P[1] + s2 * nr[1], P[2] + s2 * nr[2]};
+        double dv = td_tri(dt, q, NULL);
+        if (!exited && dv > clear) exited = true;
+        if (exited && pprev > prev && dv >= prev && prev < 2.0) {
+          hs = s2 - 1.0;
+          break;
+        }
+        pprev = prev;
+        prev = dv;
+      }
+      if (hs > 0.0) {
+        for (int a = 0; a < 3; a++) np[k * 3 + (size_t)a] = P[a] + hs * nr[a];
+        hit[k] = 1;
+        nhit++;
+      } else {
+        nmiss++;
+      }
+    }
+  if (nhit < 64) {
+    printf("tracer: derive found only %u crossings â€” no neighbor sheet?\n", nhit);
+    goto out;
+  }
+  /* fill misses: interpolate the OFFSET (np - pos) from hit neighbors so
+   * the derived wrap stays parallel where the DT was ambiguous */
+  for (int it = 0; it < 48; it++) {
+    for (int j = 0; j < H; j++)
+      for (int i = 0; i < W; i++) {
+        size_t k = (size_t)j * (size_t)W + (size_t)i;
+        if (hit[k] || !tr_qc_ok(t, i, j)) continue;
+        double off[3] = {0, 0, 0};
+        int na = 0;
+        static const int o4[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+        for (int o = 0; o < 4; o++) {
+          int ii = i + o4[o][0], jj = j + o4[o][1];
+          if (ii < 0 || jj < 0 || ii >= W || jj >= H) continue;
+          size_t k2 = (size_t)jj * (size_t)W + (size_t)ii;
+          if (!(hit[k2] & 3)) continue;
+          for (int a = 0; a < 3; a++)
+            off[a] += np[k2 * 3 + (size_t)a] - t->pos[k2 * 3 + (size_t)a];
+          na++;
+        }
+        if (na >= 2) {
+          for (int a = 0; a < 3; a++)
+            np[k * 3 + (size_t)a] = t->pos[k * 3 + (size_t)a] + off[a] / na;
+          hit[k] = 2; /* interpolated (not a seed for the first sweeps) */
+        }
+      }
+    for (size_t k2 = 0; k2 < n; k2++) /* interpolated cells join in */
+      if (hit[k2] == 2) hit[k2] = 3;
+  }
+  { /* write the derived wrap as tifxyz via a shallow tracer */
+    r3d_tracer d;
+    memset(&d, 0, sizeof d);
+    d.W = t->W;
+    d.H = t->H;
+    d.cfg = t->cfg;
+    d.pos = np;
+    d.state = calloc(n, 1);
+    d.conf = calloc(n, sizeof *d.conf);
+    d.wind = calloc(n, sizeof *d.wind);
+    d.uc = t->uc; /* borrow: enables the winding channel */
+    d.ucn = t->ucn;
+    pthread_mutex_init(&d.mu, NULL);
+    if (d.state && d.conf && d.wind) {
+      for (size_t k = 0; k < n; k++) {
+        if (!hit[k]) continue;
+        d.state[k] = R3D_TR_SET;
+        d.conf[k] = hit[k] == 1 ? 0.9f : 0.4f; /* interpolated = tentative */
+        d.wind[k] = t->wind ? t->wind[k] + (float)sgn : (float)sgn;
+        d.nset++;
+      }
+      rc = r3d_tracer_save(&d, out_dir, 0.35f, false);
+      if (rc == 0)
+        printf("tracer: derived %s wrap -> %s (%u cast + %u interpolated)\n",
+               sgn > 0 ? "outer" : "inner", out_dir, nhit, d.nset - nhit);
+    }
+    free(d.state);
+    free(d.conf);
+    free(d.wind);
+    pthread_mutex_destroy(&d.mu);
+  }
+out:
+  free(np);
+  free(hit);
+  td_close(dt);
+  r3d_cpuvol_close(&vol);
+  (void)nmiss;
+  return rc == 0 ? (int)nhit : -1;
 }
 
 int r3d_tracer_reopt(r3d_tracer *t, const double p[3], int radius) {

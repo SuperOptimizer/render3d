@@ -1128,6 +1128,8 @@ int main(int argc, char **argv) {
   int inklive_port = 0;             /* --inklive: live 2.5D ink on the seg view */
   r3d_inklive inklive = {.fd = -1};
   bool inklive_up = false, inklive_have = false;
+  bool inklive_show = true; /* GUI toggle: display the ink overlay on the
+                             * flattened pane (worker keeps predicting) */
   int64_t il_rect[4] = {-1, -1, -1, -1}; /* last requested grid rect */
   int64_t il_view[4] = {-2, -2, -2, -2}; /* rect currently under the view */
   uint32_t il_stable = 0;
@@ -3281,6 +3283,7 @@ int main(int argc, char **argv) {
     }
       }
     if (inklive_up && igCollapsingHeader_TreeNodeFlags("live ink", 0)) {
+      igCheckbox("show ink on flattened view", &inklive_show);
       igTextDisabled("server 127.0.0.1:%d", inklive_port);
       igTextDisabled("%s", inklive.status);
       if (il_rect[0] >= 0)
@@ -3993,9 +3996,12 @@ int main(int argc, char **argv) {
          * follows the source: bit 8 = surface-prediction cyan for the plane
          * views' overlay tree, bit 1 = the flat pane carries live ink and
          * tints green regardless of that tree's palette */
-        .overlay_flags = ((overlay_path && overlay_show) || inklive_have ? 1u : 0u) |
-                         (inklive_have ? 2u : 0u) |
-                         (overlay_path && !strstr(overlay_path, "ink") ? 256u : 0u),
+        .overlay_flags =
+            ((overlay_path && overlay_show) || (inklive_have && inklive_show)
+                 ? 1u
+                 : 0u) |
+            (inklive_have && inklive_show ? 2u : 0u) |
+            (overlay_path && !strstr(overlay_path, "ink") ? 256u : 0u),
     };
     memcpy(p.vol_r0, &vm.r0, 12);
     memcpy(p.vol_r1, &vm.r1, 12);
@@ -4202,7 +4208,8 @@ int main(int argc, char **argv) {
         q.viewport[1] = (uint32_t)mv[i].ph;
         q.view_org = (uint32_t)mv[i].px | ((uint32_t)mv[i].py << 16);
         if (!(mv_ov_mask & (1u << i)) &&
-            !(i == R3D_MV_SEG && inklive_have)) /* live ink on the flat pane
+            !(i == R3D_MV_SEG && inklive_have &&
+              inklive_show)) /* live ink on the flat pane
                                                  * outlives the pane's overlay
                                                  * checkbox: unchecking it must
                                                  * not silently hide the ink */
