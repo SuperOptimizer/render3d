@@ -1731,3 +1731,17 @@ Headless harness (15 s per scenario, 3 repeats each, RTX 5080 / Dozen):
   parallel and inserts fetched bricks straight into its decode cache; warm
   2060^2 prediction 10.4 s end to end (2.8 s sampling), cold 33 s (network).
 Windowed: 294 / 236 fps static / exercised (WSLg present is the remainder).
+
+## 2026-08-17 — round 4: deferred upload wait, adaptive pane half-res
+
+Harness vs the round-3 start baseline (headless, 15 s/scenario):
+exercise +120% (455 -> 1003 fps, gpu 2.1 -> 0.97 ms), all-panes-redrawn
+exercise +153%, static all-panes +83% (285 -> 522 fps), decode job 51 -> 22 ms.
+- worker no longer waits on its atlas upload (queue order already covers the
+  publishing frame); the fence is finished at the next staging reuse.
+- multiview panes drop to one ray per 2x2 block while interacting, only when
+  the smoothed GPU frame time says the GPU is actually loaded (enter > 4 ms,
+  leave < 1.3 ms). Measured: at 1080p/1 ms frames the GPU is clock-gated
+  and 4x fewer rays are no faster; 4K exercised 185 -> 254 fps.
+Lesson for the ledger: below ~2 ms/frame this GPU's timestamps mostly
+measure clock state, not work — compare heavier scenes or repeated runs.
