@@ -2954,14 +2954,15 @@ static int bricks_post_fill(r3d_renderer *r, const uint32_t *sel_slot, const uin
  * the render queue caused multi-hundred-millisecond stalls on unified GPUs;
  * the worker now performs entropy+IDCT on CPU and leaves the queue only this
  * compact copy plus the per-slot mip blits above. */
-static int bricks_upload_raw(r3d_renderer *r, r3d_vkimage *atlas, const uint32_t *sel_slot,
-                             uint32_t n) {
+/* record the copy (+ per-slot mips) of one staging half into one atlas */
+static void bricks_record_upload(r3d_renderer *r, VkCommandBuffer cmd, r3d_vkimage *atlas,
+                                 const uint32_t *sel_slot, uint32_t n, VkDeviceSize stage_off) {
   VkBufferImageCopy reg[BR_MAX_BATCH];
   uint32_t abpa = r->bricks_abpa;
   for (uint32_t i = 0; i < n; i++) {
     uint32_t s = sel_slot[i];
     reg[i] = (VkBufferImageCopy){
-        .bufferOffset = (VkDeviceSize)i * BR_RAW_BYTES,
+        .bufferOffset = stage_off + (VkDeviceSize)i * BR_RAW_BYTES,
         .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
         .imageOffset = {(int32_t)((s % abpa) * BR_SLOT_DIM),
                         (int32_t)(((s / abpa) % abpa) * BR_SLOT_DIM),
@@ -2969,8 +2970,6 @@ static int bricks_upload_raw(r3d_renderer *r, r3d_vkimage *atlas, const uint32_t
         .imageExtent = {BR_SLOT_DIM, BR_SLOT_DIM, BR_SLOT_DIM},
     };
   }
-  VkCommandBuffer cmd = r3d_vk_oneshot_begin(&r->vk, r->bs.upload_pool);
-  if (!cmd) return -1;
   r3d_vk_image_barrier(cmd, atlas->img, VK_IMAGE_LAYOUT_GENERAL,
                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                        VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT,
@@ -3016,7 +3015,23 @@ static int bricks_upload_raw(r3d_renderer *r, r3d_vkimage *atlas, const uint32_t
                        VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_BLIT_BIT,
                        VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                        VK_ACCESS_2_SHADER_SAMPLED_READ_BIT, 0, r->bricks_amips);
+}
+
+/* one fenced submission uploading staging half 0 into atlas0 and (if given)
+ * half 1 into atlas1 — the CT+overlay batch used to cost two round trips */
+static int bricks_upload_raw2(r3d_renderer *r, r3d_vkimage *atlas0, r3d_vkimage *atlas1,
+                              const uint32_t *sel_slot, uint32_t n) {
+  VkCommandBuffer cmd = r3d_vk_oneshot_begin(&r->vk, r->bs.upload_pool);
+  if (!cmd) return -1;
+  bricks_record_upload(r, cmd, atlas0, sel_slot, n, 0);
+  if (atlas1)
+    bricks_record_upload(r, cmd, atlas1, sel_slot, n, (VkDeviceSize)BR_MAX_BATCH * BR_RAW_BYTES);
   return r3d_vk_oneshot_end(&r->vk, r->bs.upload_pool, cmd);
+}
+
+static int bricks_upload_raw(r3d_renderer *r, r3d_vkimage *atlas, const uint32_t *sel_slot,
+                             uint32_t n) {
+  return bricks_upload_raw2(r, atlas, NULL, sel_slot, n);
 }
 
 /* Parallel CPU brick decode: one single-threaded c5d_brick_decode per brick,
@@ -3186,8 +3201,8 @@ static int bricks_decode_batch(r3d_renderer *r, uint32_t n) {
       .r = r, .it = items, .raw = raw, .maxes = r->bs.maxes, .ni_fallback = true, .n = n};
   if (brdec_run(&job) != 0) return -1;
   memcpy(r->bs.raw_stage.mapped, raw, (size_t)n * BR_RAW_BYTES);
-  if (bricks_upload_raw(r, &r->brick_atlas, r->bs.sel_slot, n) != 0) return -1;
-  if (r->ink_active) {
+  if (!r->ink_active) return bricks_upload_raw(r, &r->brick_atlas, r->bs.sel_slot, n);
+  {
     /* same bricks, same slots, the overlay tree's data (absent brick = 0) */
     for (uint32_t i = 0; i < n; i++) {
       size_t bn = 0;
@@ -3196,7 +3211,8 @@ static int bricks_decode_batch(r3d_renderer *r, uint32_t n) {
       items[i].b = r->bs.sel_b[i];
     }
     uint8_t loaded[BR_MAX_BATCH] = {0};
-    struct brdec ijob = {.r = r, .it = items, .raw = raw, .loaded = loaded,
+    uint8_t *raw2 = raw + (size_t)BR_MAX_BATCH * BR_RAW_BYTES; /* overlay half */
+    struct brdec ijob = {.r = r, .it = items, .raw = raw2, .loaded = loaded,
                          .zero_on_fail = true, .ni_fallback = r->ni.url2[0] != 0,
                          .ni_src = 1, .n = n};
     brdec_run(&ijob);
@@ -3210,8 +3226,10 @@ static int bricks_decode_batch(r3d_renderer *r, uint32_t n) {
         bricks_net_request(r, r->bs.sel_b[i], 1);
         if (r->bs.ink_missing) r->bs.ink_missing[r->bs.sel_slot[i]] = 1;
       }
-    memcpy(r->bs.raw_stage.mapped, raw, (size_t)n * BR_RAW_BYTES);
-    if (bricks_upload_raw(r, &r->ink_atlas, r->bs.sel_slot, n) != 0) return -1;
+    memcpy((uint8_t *)r->bs.raw_stage.mapped + (size_t)BR_MAX_BATCH * BR_RAW_BYTES, raw2,
+           (size_t)n * BR_RAW_BYTES);
+    if (bricks_upload_raw2(r, &r->brick_atlas, &r->ink_atlas, r->bs.sel_slot, n) != 0)
+      return -1;
   }
   return 0;
 }
@@ -3670,10 +3688,12 @@ int r3d_bricks_begin(r3d_renderer *r, const char *c5s_path, uint32_t pool_bpa,
                               &r->bs.warm) != 0)
       return -1;
     if (r->bs.cpu_decode) {
-      if (r3d_vkbuf_create_host(&r->vk, (VkDeviceSize)BR_MAX_BATCH * BR_RAW_BYTES,
+      /* two halves: CT batch, then the overlay batch, so both go up in ONE
+       * fenced submission instead of two back-to-back round trips */
+      if (r3d_vkbuf_create_host(&r->vk, (VkDeviceSize)2u * BR_MAX_BATCH * BR_RAW_BYTES,
                                 VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &r->bs.raw_stage) != 0)
         return -1;
-      r->bs.raw_host = malloc((size_t)BR_MAX_BATCH * BR_RAW_BYTES);
+      r->bs.raw_host = malloc((size_t)2u * BR_MAX_BATCH * BR_RAW_BYTES);
       if (!r->bs.raw_host) return -1;
     }
     warm_release(r, 0, (uint32_t)r->bs.warm_cap); /* one node spanning the tier */

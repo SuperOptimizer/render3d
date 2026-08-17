@@ -1708,3 +1708,26 @@ Decisions measured this round (each has an env switch for re-checking):
   the driver): opt-in `R3D_PRESENT_THREAD=1`.
 - Decode pool bug fixed en route: a late-waking worker could run a NULL job.
 - Live-ink sampler fans out across cores (cpuvol is now thread-safe).
+
+## 2026-08-17 — round 3: surfvol column kernel, single upload per batch
+
+Headless harness (15 s per scenario, 3 repeats each, RTX 5080 / Dozen):
+
+| scenario | before | after |
+|---|---|---|
+| exercise (pane cache) | ~440-455 fps, gpu 2.1-2.2 ms | ~920 fps, gpu 1.05 ms |
+| exercise, all panes redrawn | ~370-530 fps, gpu 1.8-2.6 ms | ~860 fps, gpu 1.14 ms |
+| static, all panes redrawn | ~285-310 fps, gpu 3.2-3.4 ms | ~390 fps, gpu 2.5 ms |
+| decode job (8 bricks) | 51-58 ms | 37-41 ms |
+
+- surfvol.comp is a column kernel: one thread per (u,v), coords/normal
+  bilerp once, layers looped with a brick cache. Alone: exercised
+  all-panes +46% fps / -31% GPU.
+- CT + overlay bricks of a batch go up in ONE fenced submission (staging and
+  host raw buffers doubled into two halves) instead of two back-to-back
+  round trips. On Dozen every fenced upload submission stalls the queue
+  behind the in-flight frame; halving them roughly doubled exercised fps.
+- live ink: cpuvol prefetches the bricks along each corner's normal line in
+  parallel and inserts fetched bricks straight into its decode cache; warm
+  2060^2 prediction 10.4 s end to end (2.8 s sampling), cold 33 s (network).
+Windowed: 294 / 236 fps static / exercised (WSLg present is the remainder).
