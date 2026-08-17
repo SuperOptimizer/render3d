@@ -37,10 +37,11 @@ void r3d_input_poll(r3d_input *in, SDL_Window *win,
     case SDL_EVENT_MOUSE_BUTTON_DOWN:
       if (!allow_capture) break;
       if (multiview_mode && ev.button.button == SDL_BUTTON_RIGHT) {
-        if (!in->dragging) { /* multiview pans with the RIGHT button */
-          SDL_SetWindowRelativeMouseMode(win, true);
-          in->dragging = true;
-        }
+        /* multiview pans with the RIGHT button. No relative-mouse (pointer
+         * lock) here: a pan is bounded, and under WSLg/Wayland the warp-based
+         * relative mode reports huge bogus deltas that threw every pane off
+         * the volume. SDL still delivers xrel/yrel per motion event. */
+        in->dragging = true;
         break;
       }
       if (ev.button.button != SDL_BUTTON_LEFT) break;
@@ -70,7 +71,7 @@ void r3d_input_poll(r3d_input *in, SDL_Window *win,
       if ((ev.button.button == SDL_BUTTON_LEFT ||
            (multiview_mode && ev.button.button == SDL_BUTTON_RIGHT)) &&
           in->dragging) {
-        SDL_SetWindowRelativeMouseMode(win, false);
+        if (!multiview_mode) SDL_SetWindowRelativeMouseMode(win, false);
         in->dragging = false;
       }
       break;
