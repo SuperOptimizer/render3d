@@ -57,7 +57,7 @@ struct il_job {
   r3d_inklive *il;
   const float *xyz;
   uint8_t *img;
-  uint32_t rw, rh, up, W, H, gen, tid, nth;
+  uint32_t rw, rh, up, W, H, gen, tid, nth, nl;
   _Atomic uint32_t *abort;
 };
 
@@ -66,7 +66,7 @@ static void *il_sample_rows(void *ud) {
   r3d_inklive *il = jb->il;
   const float *xyz = jb->xyz;
   uint8_t *img = jb->img;
-  uint32_t W = jb->W, H = jb->H, nl = R3D_INKLIVE_LAYERS, up = jb->up, gen = jb->gen;
+  uint32_t W = jb->W, H = jb->H, nl = jb->nl, up = jb->up, gen = jb->gen;
   uint32_t cw = jb->rw + 1; /* corner grid pitch */
   for (uint32_t oy = jb->tid; oy < H; oy += jb->nth) {
     if ((oy & 15u) == 0 && atomic_load_explicit(&il->req_gen, memory_order_relaxed) != gen) {
@@ -113,9 +113,10 @@ static void *il_sample_rows(void *ud) {
 }
 
 static uint8_t *il_sample(r3d_inklive *il, const float *xyz, uint32_t rw, uint32_t rh,
-                          uint32_t up, uint32_t gen, uint32_t *ow, uint32_t *oh) {
+                          uint32_t up, uint32_t gen, uint32_t nl, uint32_t *ow,
+                          uint32_t *oh) {
   uint32_t W = rw * up, H = rh * up;
-  uint8_t *img = calloc((size_t)W * H * R3D_INKLIVE_LAYERS, 1);
+  uint8_t *img = calloc((size_t)W * H * nl, 1);
   if (!img) return NULL;
   long nc = sysconf(_SC_NPROCESSORS_ONLN);
   uint32_t nth = nc > 2 ? (uint32_t)(nc - 2) : 1u; /* leave the render thread room */
@@ -128,7 +129,7 @@ static uint8_t *il_sample(r3d_inklive *il, const float *xyz, uint32_t rw, uint32
   for (uint32_t t = 0; t < nth; t++) {
     jobs[t] = (struct il_job){.il = il, .xyz = xyz, .img = img, .rw = rw, .rh = rh, .up = up,
                               .W = W, .H = H, .gen = gen, .tid = t, .nth = nth,
-                              .abort = &abort_flag};
+                              .nl = nl, .abort = &abort_flag};
     if (t + 1 < nth) {
       if (pthread_create(&th[spawned], NULL, il_sample_rows, &jobs[t]) == 0) spawned++;
       else il_sample_rows(&jobs[t]); /* no thread: do this stripe inline */
@@ -150,7 +151,8 @@ static uint8_t *il_sample(r3d_inklive *il, const float *xyz, uint32_t rw, uint32
  * bricks the surface can touch (corner points, +-11 voxels for the layer
  * span, so a point near a brick face also pulls its neighbour) and fetch
  * the missing cells in parallel first. */
-static void il_prefetch(r3d_inklive *il, const float *xyz, uint32_t rw, uint32_t rh) {
+static void il_prefetch(r3d_inklive *il, const float *xyz, uint32_t rw, uint32_t rh,
+                        uint32_t nl) {
   if (!il->vol.url[0]) return;
   uint32_t cw = rw + 1, ch = rh + 1;
   size_t cap = (size_t)cw * ch * 8u;
@@ -158,7 +160,7 @@ static void il_prefetch(r3d_inklive *il, const float *xyz, uint32_t rw, uint32_t
   uint32_t *list = malloc(cap * 3u * sizeof *list);
   if (!list) return;
   uint32_t n = 0;
-  const double span = 11.0; /* (21-1)/2 layers, 1 voxel each */
+  const double span = (double)(nl - 1) / 2.0 + 1.0; /* slab half-depth */
   for (uint32_t j = 0; j < ch; j++)
     for (uint32_t i = 0; i < cw; i++) {
       const float *p = xyz + ((size_t)j * cw + i) * 3;
@@ -235,13 +237,18 @@ static void *il_worker(void *ud) {
     il->req_xyz = NULL;
     uint32_t rw = il->rw, rh = il->rh, i0 = il->ri0, j0 = il->rj0, up = il->up;
     uint32_t tta = il->req_tta;
+    /* TTA depth-shift range S (bits 8..11) beyond the built-in 2-layer
+     * slack needs a deeper sampled slab: model depth 17 + 2*S layers */
+    uint32_t dsr = (tta >> 8) & 0xfu;
+    uint32_t nl = R3D_INKLIVE_LAYERS;
+    if ((tta & 2u) && dsr > 2) nl = 17u + 2u * dsr;
     snprintf(il->status, sizeof il->status, "sampling %ux%u px...", rw * up, rh * up);
     pthread_mutex_unlock(&il->mu);
 
     double t0 = il_now_ms();
-    if (xyz) il_prefetch(il, xyz, rw, rh);
+    if (xyz) il_prefetch(il, xyz, rw, rh, nl);
     uint32_t W = 0, H = 0;
-    uint8_t *stack = xyz ? il_sample(il, xyz, rw, rh, up, gen, &W, &H) : NULL;
+    uint8_t *stack = xyz ? il_sample(il, xyz, rw, rh, up, gen, nl, &W, &H) : NULL;
     double t_sampled = il_now_ms() - t0;
     free(xyz);
     float *pred = NULL;
@@ -254,12 +261,12 @@ static void *il_worker(void *ud) {
         /* INK2 carries the TTA/ensemble bitmask; plain INK1 keeps old
          * servers working for the fast path */
         uint8_t hdr[20] = {'I', 'N', 'K', tta ? '2' : '1'};
-        uint32_t v[4] = {R3D_INKLIVE_LAYERS, H, W, tta};
+        uint32_t v[4] = {nl, H, W, tta};
         size_t hlen = tta ? 20 : 16;
         memcpy(hdr + 4, v, hlen - 4);
         uint8_t rhdr[12];
         if (il_io(il->fd, hdr, hlen, true) == 0 &&
-            il_io(il->fd, stack, (size_t)R3D_INKLIVE_LAYERS * W * H, true) == 0 &&
+            il_io(il->fd, stack, (size_t)nl * W * H, true) == 0 &&
             il_io(il->fd, rhdr, sizeof rhdr, false) == 0 &&
             memcmp(rhdr, "INKR", 4) == 0) {
           uint32_t ph, pw;

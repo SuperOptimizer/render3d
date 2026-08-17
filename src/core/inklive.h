@@ -10,7 +10,10 @@
 
 #include "core/cpuvol.h"
 
-#define R3D_INKLIVE_LAYERS 21u
+#define R3D_INKLIVE_LAYERS 21u /* base slab depth (model 17 + 2 slack);
+                                * a TTA depth-shift range S > 2 grows the
+                                * sampled slab to 17 + 2*S layers so the
+                                * server can slide the window that far */
 #define R3D_INKLIVE_MAX_PX 2048u /* per-axis cap on one request's pixels */
 
 typedef struct r3d_inklive {

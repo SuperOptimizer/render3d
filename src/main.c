@@ -2437,6 +2437,10 @@ int main(int argc, char **argv) {
          * a frame early, missed publications, and cost two stats locks/frame */
         if (inklive_up && !inkmap_job && !inkmap_have && getenv("R3D_INKMAP_TEST") &&
             mv_seg.w > 2 && mv_seg.nvalid > 16) {
+          {
+            const char *tm = getenv("R3D_INKMAP_TTA"); /* mask override */
+            if (tm) inkmap_tta = (uint32_t)strtoul(tm, NULL, 0);
+          }
           /* headless test: start the full-map pass as soon as a segment
            * is up (the GUI button lives in a collapsed panel) */
           uint32_t iup = (uint32_t)lround(1.0 / (double)mv_seg.sx);
@@ -3463,7 +3467,17 @@ int main(int argc, char **argv) {
         bool b0 = inkmap_tta & 1u, b1 = inkmap_tta & 2u, b2 = inkmap_tta & 4u,
              b3 = inkmap_tta & 8u;
         if (igCheckbox("flips (x4)", &b0)) inkmap_tta ^= 1u;
-        if (igCheckbox("depth shift +-1 (+2)", &b1)) inkmap_tta ^= 2u;
+        if (igCheckbox("depth shift (+4)", &b1)) inkmap_tta ^= 2u;
+        if (inkmap_tta & 2u) {
+          /* range S: the surface can sit several voxels off mid-sheet;
+           * the sampler ships a deeper slab (17 + 2*S layers) and the
+           * server slides the window to +-S and +-S/2 */
+          int dsr = (int)((inkmap_tta >> 8) & 0xfu);
+          if (dsr < 1) dsr = 1;
+          igSetNextItemWidth(140);
+          if (igSliderInt("depth range##tta", &dsr, 1, 10, "+-%d layers", 0))
+            inkmap_tta = (inkmap_tta & 0xffu) | ((uint32_t)dsr << 8);
+        }
         if (igCheckbox("intensity x0.9/1.1 (+2)", &b2)) inkmap_tta ^= 4u;
         if (igCheckbox("checkpoint ensemble (x2)", &b3)) inkmap_tta ^= 8u;
         igTextDisabled("used by 'compute full ink map'; recompute to re-run\n"

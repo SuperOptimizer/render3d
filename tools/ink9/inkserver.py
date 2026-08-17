@@ -137,9 +137,21 @@ def tta_variants(stack, flags, layers, depth):
                     lambda p: np.ascontiguousarray(p[::-1, :])))
         out.append((np.ascontiguousarray(s0[:, ::-1, ::-1]),
                     lambda p: np.ascontiguousarray(p[::-1, ::-1])))
-    if flags & 2:  # depth window slid one layer each way
-        out.append((window(-1), lambda p: p))
-        out.append((window(+1), lambda p: p))
+    if flags & 2:
+        # depth window slid within the sampled slab. flags bits 8..11
+        # carry the range S (default 1): the client ships a slab deep
+        # enough for +-S. To keep cost bounded we sample 4 offsets across
+        # the range (+-S, +-ceil(S/2)) instead of every step - the traced
+        # surface can sit several voxels off mid-sheet, and one of the
+        # wider offsets catches the ink the centered window misses.
+        rng = (flags >> 8) & 0xF
+        if rng <= 1:
+            offs = [-1, 1]
+        else:
+            half = (rng + 1) // 2
+            offs = sorted({-rng, -half, half, rng})
+        for off in offs:
+            out.append((window(off), lambda p: p))
     if flags & 4:  # intensity gain
         for g in (0.9, 1.1):
             sv = np.clip(s0.astype(np.float32) * g, 0, 255).astype(np.uint8)
