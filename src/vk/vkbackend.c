@@ -1088,14 +1088,15 @@ static void bricks_teardown(r3d_renderer *r) {
     r->ni.rc_up = false;
   }
   if (r->vk.dev) r3d_vkctx_device_wait_idle(&r->vk);
+  bricks_stage_ready(r); /* free the deferred upload's fence/cmd BEFORE its pool dies */
   if (r->bs.upload_pool) vkDestroyCommandPool(r->vk.dev, r->bs.upload_pool, NULL);
+  r->bs.upload_pool = VK_NULL_HANDLE;
   if (r->c5d) r3d_vkc5d_destroy(r->c5d);
   r->c5d = NULL;
   if (r->brick_atlas_mip0) vkDestroyImageView(r->vk.dev, r->brick_atlas_mip0, NULL);
   r->brick_atlas_mip0 = VK_NULL_HANDLE;
   r3d_vkimage_destroy(&r->vk, &r->brick_atlas);
   r3d_vkimage_destroy(&r->vk, &r->brick_occ);
-  bricks_stage_ready(r); /* drain a deferred upload before its staging dies */
   r3d_vkbuf_destroy(&r->vk, &r->page_buf);
   r3d_vkbuf_destroy(&r->vk, &r->page_stage[0]);
   r3d_vkbuf_destroy(&r->vk, &r->page_stage[1]);
@@ -1202,7 +1203,9 @@ void r3d_destroy(r3d_renderer *r) {
     pthread_mutex_destroy(&r->vsl.fetch_mu);
   }
   if (r->vk.dev) r3d_vkctx_device_wait_idle(&r->vk);
+  bricks_stage_ready(r); /* free the deferred upload's fence/cmd BEFORE its pool dies */
   if (r->bs.upload_pool) vkDestroyCommandPool(r->vk.dev, r->bs.upload_pool, NULL);
+  r->bs.upload_pool = VK_NULL_HANDLE;
   if (r->vsl.upload_pool) vkDestroyCommandPool(r->vk.dev, r->vsl.upload_pool, NULL);
   r3d_vkbuf_destroy(&r->vk, &r->vsl.upload_stage);
   if (r->gui_up) {
@@ -1229,7 +1232,6 @@ void r3d_destroy(r3d_renderer *r) {
   if (r->brick_atlas_mip0) vkDestroyImageView(r->vk.dev, r->brick_atlas_mip0, NULL);
   r3d_vkimage_destroy(&r->vk, &r->brick_atlas);
   r3d_vkimage_destroy(&r->vk, &r->brick_occ);
-  bricks_stage_ready(r); /* drain a deferred upload before its staging dies */
   r3d_vkbuf_destroy(&r->vk, &r->page_buf);
   r3d_vkbuf_destroy(&r->vk, &r->page_stage[0]);
   r3d_vkbuf_destroy(&r->vk, &r->page_stage[1]);

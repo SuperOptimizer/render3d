@@ -1215,6 +1215,13 @@ int main(int argc, char **argv) {
         slab_wz = (uint32_t)atoi(argv[i + 1]);
     }
   }
+  /* A bricks LOD session is always the 2x2 multiview: with no segment the
+   * flattened pane starts blank (tracer-ready) and the plane views center on
+   * the volume. The single-pane LOD slab remains reachable with --slab-view. */
+  bool slab_view = false;
+  for (int i = 1; i < argc; i++)
+    if (strcmp(argv[i], "--slab-view") == 0) slab_view = true;
+  if (bricks_path && !multiview_path && !slab_view && !umbilicus_path) multiview_path = "(none)";
   if (umbilicus_path && !multiview_path) { /* multiview annotates in-place;
                                             * standalone uses the vslab rig */
     vslab_mode = true;
@@ -1331,8 +1338,14 @@ int main(int argc, char **argv) {
   if (od_swap) {
     od_swap = false;
     bricks_path = od_next_bricks[0] ? od_next_bricks : NULL;
-    multiview_path = od_next_seg[0] ? od_next_seg : NULL;
+    /* keep the 2x2 layout across a volume-only swap: with no segment the
+     * multiview starts in its empty state (blank flattened pane, planes
+     * centered on the volume, tracer ready) instead of dropping to the
+     * single-pane slab view */
+    multiview_path = od_next_seg[0] ? od_next_seg : "(none)";
     n_overlays = 0; /* browser-opened datasets have no overlay tree yet */
+    overlay_path = NULL; /* else the old tree is reopened against the new
+                          * volume: shape mismatch -> silent EXIT_FAILURE */
     umbilicus_path = NULL;
     vslab_mode = false;
     clip_mode = false;
@@ -1386,8 +1399,12 @@ int main(int argc, char **argv) {
       brick_z = (int)brick_shape[2] - brick_depth;
     mode = R3D_MODE_FULL;
     if (n_overlays) overlay_path = overlay_paths[0];
-    if (overlay_path && r3d_bricks_overlay(renderer, overlay_path) != 0)
-      return EXIT_FAILURE;
+    if (overlay_path && r3d_bricks_overlay(renderer, overlay_path) != 0) {
+      fprintf(stderr, "overlay %s not usable with this volume; continuing without\n",
+              overlay_path);
+      overlay_path = NULL;
+      n_overlays = 0;
+    }
   }
   bool overlay_show = overlay_path != NULL;
   float overlay_gain = 1.5f;
@@ -1509,6 +1526,11 @@ int main(int argc, char **argv) {
                           (uint32_t)sv_l / 2, mv_seg.sx, mv_seg.sy) != 0) {
       fprintf(stderr, "multiview: surface-volume window init failed\n");
       return EXIT_FAILURE;
+    }
+    if (inklive_up) { /* dataset swap: the sampler must follow the new CT tree */
+      r3d_inklive_stop(&inklive);
+      inklive_up = false;
+      inklive_have = false;
     }
     if (inklive_port) { /* live 2.5D ink worker (CT sampled via cpuvol on the
                          * same cache tree; predictions from inkserver.py) */
