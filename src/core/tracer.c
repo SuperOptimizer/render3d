@@ -2659,6 +2659,30 @@ static void tr_sfx_build(r3d_tracer *t) {
 }
 
 /* hinge residual against the nearest other-wrap cell; free point is x */
+/* unit surface normal at a grid cell from central differences; false when
+ * the 4-neighbourhood is incomplete or degenerate */
+static bool tr_cell_normal(const r3d_tracer *t, int i, int j, double n[3]) {
+  if (!tr_valid(t, i - 1, j) || !tr_valid(t, i + 1, j) || !tr_valid(t, i, j - 1) ||
+      !tr_valid(t, i, j + 1))
+    return false;
+  const double *pu0 = t->pos + ((size_t)j * t->W + (size_t)i - 1) * 3;
+  const double *pu1 = t->pos + ((size_t)j * t->W + (size_t)i + 1) * 3;
+  const double *pv0 = t->pos + ((size_t)(j - 1) * t->W + (size_t)i) * 3;
+  const double *pv1 = t->pos + ((size_t)(j + 1) * t->W + (size_t)i) * 3;
+  double eu[3], ev[3];
+  for (int a = 0; a < 3; a++) {
+    eu[a] = pu1[a] - pu0[a];
+    ev[a] = pv1[a] - pv0[a];
+  }
+  n[0] = eu[1] * ev[2] - eu[2] * ev[1];
+  n[1] = eu[2] * ev[0] - eu[0] * ev[2];
+  n[2] = eu[0] * ev[1] - eu[1] * ev[0];
+  double l = sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+  if (l < 1e-9) return false;
+  for (int a = 0; a < 3; a++) n[a] /= l;
+  return true;
+}
+
 static void tr_res_self(tr_nlsq *acc, const r3d_tracer *t, const double x[3],
                         size_t self_k) {
   const tr_sfx *sx = t->sfx;
@@ -2672,6 +2696,7 @@ static void tr_res_self(tr_nlsq *acc, const r3d_tracer *t, const double x[3],
   }
   double bd2 = rmin * rmin;
   const double *bq = NULL;
+  uint32_t bk_hinge = 0;
   for (long cz = c0[2]; cz <= c1[2]; cz++)
     for (long cy = c0[1]; cy <= c1[1]; cy++)
       for (long cx = c0[0]; cx <= c1[0]; cx++)
@@ -2699,15 +2724,35 @@ static void tr_res_self(tr_nlsq *acc, const r3d_tracer *t, const double x[3],
           if (d2 < bd2) {
             bd2 = d2;
             bq = Q;
+            bk_hinge = k;
           }
         }
-  if (bq) { /* hinge: too close to another wrap */
-    double d = sqrt(bd2);
-    if (d > 1e-6) {
-      double r = TR_W_SELF * (rmin - d) / rmin;
-      double J[3];
-      for (int a = 0; a < 3; a++) J[a] = -TR_W_SELF * (x[a] - bq[a]) / (d * rmin);
-      nq_add(acc, r, J);
+  if (bq) { /* too close to another part of the surface: decide by the
+             * NORMALS whether this is a fold-back (opposing) before
+             * pushing - a legitimately tight curl brings same-wrap cells
+             * near each other at moderate angles and must not be pried
+             * open (the taco failure). Opposing normals within half a
+             * sheet gap can only be a flap folded back onto the sheet;
+             * near-parallel normals at large grid distance are a wrap
+             * interpenetration. The ambiguous middle band is left to the
+             * data and fold-hinge terms. */
+    double n1[3], n2[3];
+    bool ok1 = tr_cell_normal(t, (int)(self_k % t->W), (int)(self_k / t->W), n1);
+    bool ok2 = tr_cell_normal(t, (int)(bk_hinge % t->W), (int)(bk_hinge / t->W), n2);
+    double ndot = ok1 && ok2 ? n1[0] * n2[0] + n1[1] * n2[1] + n1[2] * n2[2] : 0.0;
+    int gdi = abs((int)(bk_hinge % t->W) - (int)(self_k % t->W));
+    int gdj = abs((int)(bk_hinge / t->W) - (int)(self_k / t->W));
+    int gd = gdi > gdj ? gdi : gdj;
+    bool fold_back = ok1 && ok2 && ndot < -0.3;
+    bool interpen = ok1 && ok2 && ndot > 0.3 && gd > 20;
+    if (fold_back || interpen || (!ok1 || !ok2)) {
+      double d = sqrt(bd2);
+      if (d > 1e-6) {
+        double r = TR_W_SELF * (rmin - d) / rmin;
+        double J[3];
+        for (int a = 0; a < 3; a++) J[a] = -TR_W_SELF * (x[a] - bq[a]) / (d * rmin);
+        nq_add(acc, r, J);
+      }
     }
   }
   /* two-sided wrap spacing (geometry-agnostic, unlike the global rho
@@ -3311,6 +3356,24 @@ static void tr_res_fold(tr_nlsq *acc, const double a[3], const double b[3],
   nq_add(acc, r, J);
 }
 
+/* Curvature continuation (sparse-region prior): penalize the CHANGE of
+ * curvature along a grid line — the third difference a - 3b + 3c - d of
+ * four consecutive cells. Where the data term is silent, the sheet keeps
+ * bending at its established rate instead of going straight (a
+ * straightness prior sends the front off tangent to a curl, which then
+ * re-latches onto the wrong wrap when data resumes). role = index of the
+ * free cell in the 4-tuple. */
+static void tr_res_curv(tr_nlsq *acc, const double a[3], const double b[3],
+                        const double c[3], const double d[3], int role, double w) {
+  static const double coef[4] = {1.0, -3.0, 3.0, -1.0};
+  for (int k = 0; k < 3; k++) {
+    double r = w * (a[k] - 3.0 * b[k] + 3.0 * c[k] - d[k]);
+    double J[3] = {0, 0, 0};
+    J[k] = w * coef[role];
+    nq_add(acc, r, J);
+  }
+}
+
 /* Quad planarity (twist): distance of the free corner from the plane of
  * the quad's other three corners, frozen for this evaluation (Jacobian =
  * w*n). Curvature terms act along grid lines; a quad can still twist
@@ -3490,7 +3553,12 @@ static void tr_eval(tr_ctx *c, const double x[3], tr_nlsq *acc) {
     }
     sparse = 1.0 - (bc > 1.0f ? 1.0 : (double)bc);
     if (sparse < 0.0) sparse = 0.0;
-    stiff = 1.0 + 2.0 * sparse; /* up to 3x straightness with no evidence */
+    /* NOTE deliberately NO straightness boost: a scroll sheet in a gap
+     * must keep CURVING at its established rate - a straightness prior
+     * sent the front off tangent to the curl (then it re-latched onto a
+     * different wrap when data resumed: the fork/taco failure). The
+     * sparse prior is curvature CONTINUATION (below) + 2D planarity. */
+    (void)stiff;
   }
   if (c->flags & TRF_STRAIGHT) {
     static const int ax[4][2] = {{1, 0}, {0, 1}, {1, 1}, {1, -1}};
@@ -3503,12 +3571,27 @@ static void tr_eval(tr_ctx *c, const double x[3], tr_nlsq *acc) {
           continue;
         tr_res_straight(acc, tr_at(c, ai, aj, x), tr_at(c, bi, bj, x),
                         tr_at(c, ci, cj, x), -w0,
-                        TR_W_STRAIGHT * stiff * tr_ws(e->ws_straight));
+                        TR_W_STRAIGHT * tr_ws(e->ws_straight));
         if (a < 2) /* anti-double-back hinge: inert on healthy geometry
                     * (activates only past 90 degrees) */
           tr_res_fold(acc, tr_at(c, ai, aj, x), tr_at(c, bi, bj, x),
                       tr_at(c, ci, cj, x), -w0, TR_W_FOLD);
       }
+    if (sparse > 0.05) /* gap prior: continue the established curvature */
+      for (int a = 0; a < 2; a++)
+        for (int w0 = -2; w0 <= -1; w0++) { /* 4-tuple starts at p + w0*axis */
+          static const int axc[2][2] = {{1, 0}, {0, 1}};
+          int ai = i + w0 * axc[a][0], aj = j + w0 * axc[a][1];
+          int bi = ai + axc[a][0], bj = aj + axc[a][1];
+          int ci2 = bi + axc[a][0], cj2 = bj + axc[a][1];
+          int di2 = ci2 + axc[a][0], dj2 = cj2 + axc[a][1];
+          if (!tr_valid(t, ai, aj) || !tr_valid(t, bi, bj) ||
+              !tr_valid(t, ci2, cj2) || !tr_valid(t, di2, dj2))
+            continue;
+          tr_res_curv(acc, tr_at(c, ai, aj, x), tr_at(c, bi, bj, x),
+                      tr_at(c, ci2, cj2, x), tr_at(c, di2, dj2, x), -w0,
+                      0.6 * sparse * tr_ws(e->ws_straight));
+        }
     /* quad planarity: for each full quad containing the free cell, keep the
      * free corner on the plane of the other three */
     static const int qoff2[4][2] = {{0, 0}, {-1, 0}, {0, -1}, {-1, -1}};

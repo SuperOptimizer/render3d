@@ -1945,3 +1945,22 @@ Bench: 16-gen fill 0.86 -> 0.90 median, holes ~halved, folds mostly 0;
 60-gen folds 46 -> 10 with equal coverage. Twist metric reads higher
 because sparse-region cells now SURVIVE as trusted instead of
 scattering below the cutoff.
+
+## Fork/taco fix: curvature continuation replaces the straightness boost
+
+User report: fronts forking and "growing like a taco" after the sparse
+stiffening. Root cause: a STRAIGHTNESS prior is wrong for a scroll -
+in a prediction gap on a curling sheet it sends the front off tangent,
+which then re-latches onto a different wrap when data resumes (fork),
+flattening the curl on the way (taco). Replaced with curvature
+CONTINUATION: a third-difference residual (change of curvature -> 0)
+at weight 0.6*sparse along the main axes, so the sheet keeps bending
+at its established rate through gaps. The winding-free overlap hinge
+additionally gates on NORMALS: opposing normals within half a gap =
+fold-back flap (hinge), near-parallel at >20 grid cells = wrap
+interpenetration (hinge), ambiguous middle band left alone - a
+legitimately tight curl is never pried open.
+Bench (16-gen raw rows): folds 0 everywhere, kinks 2-25 (baseline
+~150, and the same-build variance that survived every earlier phase is
+essentially gone); slant p95 ~0.15. 60-gen: kinks 3164 -> 385, slant
+2.4 -> 0.51, fullest coherent render of the session.
