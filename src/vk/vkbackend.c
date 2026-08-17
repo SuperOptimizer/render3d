@@ -247,6 +247,8 @@ struct r3d_renderer {
     bool comp_ready;
     r3d_vkbuf warm;
     r3d_vkbuf raw_stage; /* upload staging (write-combined; never read back) */
+    VkFence up_fence;      /* in-flight batch upload (deferred wait) */
+    VkCommandBuffer up_cmd;
     uint8_t *raw_host;   /* decode target + seed-cache source (heap: decode
                             passes and cache fwrite both READ it; reading the
                             mapped staging buffer ran at WC speeds) */
@@ -416,6 +418,7 @@ static int create_compute_pipeline(r3d_renderer *r, const char *name, VkPipeline
 static void pres_start(r3d_renderer *r);
 static void pres_stop(r3d_renderer *r);
 static void pres_drain(r3d_renderer *r);
+static int bricks_stage_ready(r3d_renderer *r);
 
 /* ---- page table shadow ---- */
 static int page_alloc(r3d_renderer *r, uint32_t words) {
@@ -1092,6 +1095,7 @@ static void bricks_teardown(r3d_renderer *r) {
   r->brick_atlas_mip0 = VK_NULL_HANDLE;
   r3d_vkimage_destroy(&r->vk, &r->brick_atlas);
   r3d_vkimage_destroy(&r->vk, &r->brick_occ);
+  bricks_stage_ready(r); /* drain a deferred upload before its staging dies */
   r3d_vkbuf_destroy(&r->vk, &r->page_buf);
   r3d_vkbuf_destroy(&r->vk, &r->page_stage[0]);
   r3d_vkbuf_destroy(&r->vk, &r->page_stage[1]);
@@ -1225,6 +1229,7 @@ void r3d_destroy(r3d_renderer *r) {
   if (r->brick_atlas_mip0) vkDestroyImageView(r->vk.dev, r->brick_atlas_mip0, NULL);
   r3d_vkimage_destroy(&r->vk, &r->brick_atlas);
   r3d_vkimage_destroy(&r->vk, &r->brick_occ);
+  bricks_stage_ready(r); /* drain a deferred upload before its staging dies */
   r3d_vkbuf_destroy(&r->vk, &r->page_buf);
   r3d_vkbuf_destroy(&r->vk, &r->page_stage[0]);
   r3d_vkbuf_destroy(&r->vk, &r->page_stage[1]);
@@ -3026,7 +3031,18 @@ static int bricks_upload_raw2(r3d_renderer *r, r3d_vkimage *atlas0, r3d_vkimage 
   bricks_record_upload(r, cmd, atlas0, sel_slot, n, 0);
   if (atlas1)
     bricks_record_upload(r, cmd, atlas1, sel_slot, n, (VkDeviceSize)BR_MAX_BATCH * BR_RAW_BYTES);
-  return r3d_vk_oneshot_end(&r->vk, r->bs.upload_pool, cmd);
+  /* no wait here: queue order puts this upload before the frame that will
+   * publish these slots. The wait moves to the next reuse of the staging
+   * buffer (bricks_stage_ready), overlapping the copy with the next decode.
+   * On Dozen a fenced wait behind the in-flight frame cost several ms per
+   * batch. */
+  return r3d_vk_oneshot_end_async(&r->vk, r->bs.upload_pool, cmd, &r->bs.up_fence,
+                                  &r->bs.up_cmd);
+}
+
+/* wait for the previous batch's upload before overwriting the staging half */
+static int bricks_stage_ready(r3d_renderer *r) {
+  return r3d_vk_oneshot_finish(&r->vk, r->bs.upload_pool, &r->bs.up_fence, &r->bs.up_cmd);
 }
 
 static int bricks_upload_raw(r3d_renderer *r, r3d_vkimage *atlas, const uint32_t *sel_slot,
@@ -3200,6 +3216,7 @@ static int bricks_decode_batch(r3d_renderer *r, uint32_t n) {
   struct brdec job = {
       .r = r, .it = items, .raw = raw, .maxes = r->bs.maxes, .ni_fallback = true, .n = n};
   if (brdec_run(&job) != 0) return -1;
+  if (bricks_stage_ready(r) != 0) return -1; /* previous batch's copy done? */
   memcpy(r->bs.raw_stage.mapped, raw, (size_t)n * BR_RAW_BYTES);
   if (!r->ink_active) return bricks_upload_raw(r, &r->brick_atlas, r->bs.sel_slot, n);
   {
@@ -4252,6 +4269,7 @@ static int bricks_ink_repair_exec(r3d_renderer *r, uint32_t n) {
   struct brdec job = {.r = r, .it = items, .raw = r->bs.raw_host, .zero_on_fail = true,
                       .ni_fallback = true, .ni_src = 1, .n = n};
   brdec_run(&job);
+  if (bricks_stage_ready(r) != 0) return -1;
   memcpy(r->bs.raw_stage.mapped, r->bs.raw_host, (size_t)n * BR_RAW_BYTES);
   return bricks_upload_raw(r, &r->ink_atlas, r->bs.sel_slot, n);
 }

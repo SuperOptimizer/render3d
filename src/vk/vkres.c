@@ -470,6 +470,40 @@ int r3d_vk_oneshot_end(r3d_vkctx *c, VkCommandPool pool, VkCommandBuffer cmd) {
   return r == VK_SUCCESS ? 0 : -1;
 }
 
+int r3d_vk_oneshot_end_async(r3d_vkctx *c, VkCommandPool pool, VkCommandBuffer cmd,
+                             VkFence *fence, VkCommandBuffer *keep) {
+  vkEndCommandBuffer(cmd);
+  VkFenceCreateInfo fci = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+  if (vkCreateFence(c->dev, &fci, NULL, fence) != VK_SUCCESS) {
+    vkFreeCommandBuffers(c->dev, pool, 1, &cmd);
+    return -1;
+  }
+  VkCommandBufferSubmitInfo csi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
+                                   .commandBuffer = cmd};
+  VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
+                      .commandBufferInfoCount = 1,
+                      .pCommandBufferInfos = &csi};
+  if (r3d_vkctx_queue_submit2(c, 1, &si, *fence) != VK_SUCCESS) {
+    vkDestroyFence(c->dev, *fence, NULL);
+    *fence = VK_NULL_HANDLE;
+    vkFreeCommandBuffers(c->dev, pool, 1, &cmd);
+    return -1;
+  }
+  *keep = cmd;
+  return 0;
+}
+
+int r3d_vk_oneshot_finish(r3d_vkctx *c, VkCommandPool pool, VkFence *fence,
+                          VkCommandBuffer *keep) {
+  if (!*fence) return 0;
+  VkResult r = vkWaitForFences(c->dev, 1, fence, VK_TRUE, UINT64_MAX);
+  vkDestroyFence(c->dev, *fence, NULL);
+  *fence = VK_NULL_HANDLE;
+  if (*keep) vkFreeCommandBuffers(c->dev, pool, 1, keep);
+  *keep = VK_NULL_HANDLE;
+  return r == VK_SUCCESS ? 0 : -1;
+}
+
 int r3d_vk_image_to_general(r3d_vkctx *c, VkCommandPool pool, r3d_vkimage *img) {
   VkCommandBuffer cmd = r3d_vk_oneshot_begin(c, pool);
   if (!cmd) return -1;

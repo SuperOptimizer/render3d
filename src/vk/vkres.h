@@ -58,6 +58,14 @@ void r3d_vkimage_destroy(r3d_vkctx *c, r3d_vkimage *im);
 /* One-shot command buffer helpers (submit + wait idle; init/upload paths only). */
 VkCommandBuffer r3d_vk_oneshot_begin(r3d_vkctx *c, VkCommandPool pool);
 int r3d_vk_oneshot_end(r3d_vkctx *c, VkCommandPool pool, VkCommandBuffer cmd);
+/* Deferred variant: submit signalling *fence (created here) and return
+ * without waiting; the caller waits with r3d_vk_oneshot_finish before
+ * touching the staging memory again. Queue order already places the work
+ * before later submissions, so consumers of the GPU result need no wait. */
+int r3d_vk_oneshot_end_async(r3d_vkctx *c, VkCommandPool pool, VkCommandBuffer cmd,
+                             VkFence *fence, VkCommandBuffer *keep);
+int r3d_vk_oneshot_finish(r3d_vkctx *c, VkCommandPool pool, VkFence *fence,
+                          VkCommandBuffer *keep);
 
 /* Portable fallback for streaming uploads when VK_EXT_host_image_copy is not
  * available. `host` contains h rows with `row_length` bytes between rows. */
