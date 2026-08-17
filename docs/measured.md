@@ -1964,3 +1964,18 @@ Bench (16-gen raw rows): folds 0 everywhere, kinks 2-25 (baseline
 ~150, and the same-build variance that survived every earlier phase is
 essentially gone); slant p95 ~0.15. 60-gen: kinks 3164 -> 385, slant
 2.4 -> 0.51, fullest coherent render of the session.
+
+## Auto-umbilicus: the whole winding frame turns on by itself
+
+The user's structural point - "segments grow in +-z and wind at a radius
+around the umbilicus" - was already encoded (spiral prior, winding
+numbers, wrap gates, signed spacing, werr QC), but ALL of it was inert
+without an umbilicus, and PHerc0343 had none. `mkumb <ct-lod> <out>`
+estimates it in seconds: per-slice intensity centroid of the masked CT
+at a coarse level (outside the scroll reads 0, so the centroid tracks
+the core), moving-average smoothed, Villa-format control points. The
+GUI auto-loads <bricks-root>/umbilicus.json; the bench passes it too.
+PHerc0343: 70 control points, axis ~(4300,4240) drifting with z.
+60-gen with the frame on: kinks 385 -> 172, twist 0.81, wrap-jump
+fraction 0.0000, werr p95 0.004 (the wrap QC finally measures), fullest
+render of the session. 16-gen matrix: folds 0-1, kinks 3-17 raw.

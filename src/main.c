@@ -1335,6 +1335,25 @@ int main(int argc, char **argv) {
 
   r3d_umbilicus umbilicus;
   r3d_umbilicus_init(&umbilicus);
+  if (!umbilicus_path && bricks_path) {
+    /* auto-discover: <bricks-root>/umbilicus.json (mkumb's output). The
+     * winding frame powers the spiral prior, wrap gates, signed spacing
+     * and werr QC - without it those defenses are silently inert. */
+    static char auto_umb[1200];
+    snprintf(auto_umb, sizeof auto_umb, "%s", bricks_path);
+    char *sl = strrchr(auto_umb, '/');
+    if (sl) {
+      snprintf(sl + 1, sizeof auto_umb - (size_t)(sl + 1 - auto_umb),
+               "umbilicus.json");
+      FILE *tf = fopen(auto_umb, "r");
+      if (tf) {
+        fclose(tf);
+        if (r3d_umbilicus_load(&umbilicus, auto_umb) == 0 && umbilicus.count >= 2)
+          printf("umbilicus: auto-loaded %s (%zu points) - winding frame on\n",
+                 auto_umb, umbilicus.count);
+      }
+    }
+  }
   int annotation_step = 100;
   int annotation_z = (int)vsz0;
   int annotation_last_z = annotation_z, annotation_bench_z = annotation_z, annotation_dir = 1;

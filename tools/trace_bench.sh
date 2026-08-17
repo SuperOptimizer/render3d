@@ -76,6 +76,7 @@ for rep in 1 2 3; do
     mkdir -p "$dir"
     log="$dir/trace.log"
     args=("$PRED" --seed "$sx" "$sy" "$sz" --gens "$GENS" --level 1 --out "$dir")
+    [ -f "$DATA/p343-lod/umbilicus.json" ] && args+=(--umbilicus "$DATA/p343-lod/umbilicus.json")
     [ "$mode" = fuse ] && args+=(--fuse "$DONOR")
     t0=$(date +%s.%N)
     "$BIN" "${args[@]}" >"$log" 2>&1 || echo "  $name-r$rep FAILED rc=$?"
