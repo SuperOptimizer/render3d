@@ -1891,3 +1891,21 @@ recorded before any behavior change.
 - G16 items landed earlier or deferred: seed-exit requirement already in
   the crossing scan; rollback/lateral-registration/dv-drift measured as
   follow-ups once a p343 umbilicus exists.
+
+## Regression found by eyes, not metrics: fold placement gate reverted
+
+User report ("still totally fucked") checked by rendering same-seed
+60-gen traces (rendseg) across builds:
+- pre-plan (b6dcb13): full, coherent surface, 14884 pts.
+- with fold placement gate: same point count but visually shredded -
+  deferred candidates get re-placed later from worse parents, the tear
+  mask cuts the mis-seated results, and the saved surface is fragmented.
+- R3D_FOLD_GATE=0: recovers the pre-plan look. R3D_CAND_ORDER=0 makes
+  it worse again - candidate ordering genuinely helps.
+- R3D_NCP_LEGACY=1: still fragmented - the frozen gradient was NOT the
+  cause.
+Verdict: fold gate DEFAULT OFF (flag kept for experiments); ordering
+stays on; the final-QC fold clamp keeps the "no doubled-back geometry
+in saves" guarantee. Lesson recorded: bench QC medians improved while
+the real surface got worse - the metrics were partly measuring their
+own exclusions. Rendered-image review is now part of the checklist.

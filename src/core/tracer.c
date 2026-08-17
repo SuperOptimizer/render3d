@@ -3988,7 +3988,19 @@ static bool tr_place_cand(r3d_tracer *t, tr_env *e, uint32_t cell, unsigned *rng
   tr_local_opt(t, e, i, j, 3, 3, false);
   const double *fp = t->pos + k * 3; /* the ONLY legitimate hole: the
                                       * point left the scroll volume */
-  { /* fold gate: a placement that STILL leaves a >90-degree turn through
+  static _Atomic int fold_gate = -1;
+  int fg = atomic_load_explicit(&fold_gate, memory_order_relaxed);
+  if (fg < 0) {
+    const char *ev = getenv("R3D_FOLD_GATE");
+    fg = ev ? atoi(ev) : 0; /* DEFAULT OFF: A/B at 60 gens showed the
+                             * deferral leaves mis-seated re-placements
+                             * the tear mask then cuts - visually a far
+                             * worse surface despite better fold counts.
+                             * The final-QC fold clamp (save honesty)
+                             * carries the do-not-ship-folds guarantee. */
+    atomic_store(&fold_gate, fg);
+  }
+  if (fg) { /* fold gate: a placement that STILL leaves a >90-degree turn through
      * this cell after its radius-1/radius-3 solves is measurably wrong
      * right now — defer it (EMPTY = retried when the neighbourhood
      * improves) instead of letting the next generation build on top of a
@@ -4016,6 +4028,7 @@ static bool tr_place_cand(r3d_tracer *t, tr_env *e, uint32_t cell, unsigned *rng
     if (folded) {
       pthread_mutex_lock(&t->mu);
       t->state[k] = R3D_TR_EMPTY; /* retryable, not FAIL */
+      /* (gated by R3D_FOLD_GATE) */
       if (t->gen_of) t->gen_of[k] = 0;
       if (t->nset) t->nset--;
       for (uint32_t s2 = 0; s2 < dsnap_n; s2++)
@@ -5114,7 +5127,14 @@ static void *tr_worker(void *ud) {
         cands[nc++] = (uint32_t)k;
       }
     }
-    if (nc > 1) {
+    static _Atomic int ord_on = -1;
+    int od2 = atomic_load_explicit(&ord_on, memory_order_relaxed);
+    if (od2 < 0) {
+      const char *ev = getenv("R3D_CAND_ORDER");
+      od2 = ev ? atoi(ev) : 1;
+      atomic_store(&ord_on, od2);
+    }
+    if (od2 && nc > 1) {
       /* certain territory first (vc3d CandidateOrdering): candidates with
        * more SET neighbours are solved first, so the front's schedule is
        * support-driven instead of raster-accidental — the source of the
