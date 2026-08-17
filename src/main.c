@@ -3091,6 +3091,14 @@ int main(int argc, char **argv) {
                mv_tr_done ? "  done"
                           : (mv_tr_ring >= mv_tr.cfg.max_ring ? "  optimizing..."
                                                               : "  growing..."));
+        if (mv_tr.qc_folds || mv_tr.qc_kinks)
+          igTextColored((ImVec4){1.0f, 0.55f, 0.3f, 1.0f},
+                        "QC: %u fold%s, %u kink%s, twist %.2f vox", mv_tr.qc_folds,
+                        mv_tr.qc_folds == 1 ? "" : "s", mv_tr.qc_kinks,
+                        mv_tr.qc_kinks == 1 ? "" : "s", (double)mv_tr.qc_twist);
+        else if (mv_tr_nset > 8)
+          igTextDisabled("QC clean: no folds/kinks, twist %.2f vox",
+                         (double)mv_tr.qc_twist);
         if (igButton(mv_tr_done ? "discard" : "stop", (ImVec2){0, 0})) {
           r3d_tracer_stop(&mv_tr);
           if (!mv_tr_done) { /* stopped mid-grow: keep result on screen */

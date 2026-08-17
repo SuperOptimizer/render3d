@@ -25,6 +25,9 @@
 #define TR_SDIR_EPS_ABS 1e-8
 #define TR_SDIR_EPS_REL 1e-2
 #define TR_DT_TH 128.0 /* prediction "on sheet" threshold for the DT */
+#define TR_W_FOLD 2.0     /* anti-double-back hinge (inactive above 90 deg) */
+#define TR_FOLD_COS 0.0   /* hinge threshold: cos(90 deg) */
+#define TR_W_PLANAR 0.25  /* quad twist: free corner vs other-3 plane */
 #define TR_W_ANC 2.0      /* user-anchor pull: "must pass through" — an order
                            * stronger than the donor pull (0.1) so it beats
                            * the data term when the sheet picked wrong */
@@ -2779,6 +2782,59 @@ static void tr_res_straight(tr_nlsq *acc, const double a[3], const double b[3],
   nq_add(acc, r, J);
 }
 
+/* Hard hinge against doubling back: consecutive grid edges must not turn
+ * past TR_FOLD_COS (90 deg). tr_res_straight's curvature cost is gentle
+ * enough that a 180-degree fold can still win when the data term prefers
+ * the wrong sheet; this hinge makes a fold an order of magnitude more
+ * expensive while costing nothing on a healthy grid. Same triple/role
+ * layout as tr_res_straight. */
+static void tr_res_fold(tr_nlsq *acc, const double a[3], const double b[3],
+                        const double c[3], int role, double w) {
+  double d1[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]};
+  double d2[3] = {c[0] - b[0], c[1] - b[1], c[2] - b[2]};
+  double l1s = d1[0] * d1[0] + d1[1] * d1[1] + d1[2] * d1[2];
+  double l2s = d2[0] * d2[0] + d2[1] * d2[1] + d2[2] * d2[2];
+  if (l1s <= 1e-24 || l2s <= 1e-24) return;
+  double l1 = sqrt(l1s), l2 = sqrt(l2s);
+  double dot = (d1[0] * d2[0] + d1[1] * d2[1] + d1[2] * d2[2]) / (l1 * l2);
+  if (dot >= TR_FOLD_COS) return; /* inactive on a healthy grid */
+  double r = w * (TR_FOLD_COS - dot), g = -w;
+  double gd1[3], gd2[3];
+  for (int k = 0; k < 3; k++) {
+    gd1[k] = d2[k] / (l1 * l2) - dot * d1[k] / l1s;
+    gd2[k] = d1[k] / (l1 * l2) - dot * d2[k] / l2s;
+  }
+  double J[3];
+  for (int k = 0; k < 3; k++) {
+    double dd;
+    if (role == 0) dd = -gd1[k];
+    else if (role == 1) dd = gd1[k] - gd2[k];
+    else dd = gd2[k];
+    J[k] = g * dd;
+  }
+  nq_add(acc, r, J);
+}
+
+/* Quad planarity (twist): distance of the free corner from the plane of
+ * the quad's other three corners, frozen for this evaluation (Jacobian =
+ * w*n). Curvature terms act along grid lines; a quad can still twist
+ * about its diagonal without paying — this keeps each quad near-planar
+ * without resisting the sheet's real bending (adjacent quads may tilt
+ * against each other freely). */
+static void tr_res_planar(tr_nlsq *acc, const double x[3], const double a[3],
+                          const double b[3], const double c[3], double w) {
+  double e1[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]};
+  double e2[3] = {c[0] - a[0], c[1] - a[1], c[2] - a[2]};
+  double n[3] = {e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2],
+                 e1[0] * e2[1] - e1[1] * e2[0]};
+  double ln = sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+  if (ln < 1e-12) return;
+  for (int k = 0; k < 3; k++) n[k] /= ln;
+  double r = w * (n[0] * (x[0] - a[0]) + n[1] * (x[1] - a[1]) + n[2] * (x[2] - a[2]));
+  double J[3] = {w * n[0], w * n[1], w * n[2]};
+  nq_add(acc, r, J);
+}
+
 /* SymmetricDirichletLoss over (p, pu, pv); role: 0=p 1=pu 2=pv.
  * Reference metric identity; Cauchy(1.0) robustifier applied as
  * sqrt(rho') scaling of residual + Jacobian. */
@@ -2930,7 +2986,28 @@ static void tr_eval(tr_ctx *c, const double x[3], tr_nlsq *acc) {
           continue;
         tr_res_straight(acc, tr_at(c, ai, aj, x), tr_at(c, bi, bj, x),
                         tr_at(c, ci, cj, x), -w0, TR_W_STRAIGHT);
+        if (a < 2) /* main axes: the sheet must not double back on itself */
+          tr_res_fold(acc, tr_at(c, ai, aj, x), tr_at(c, bi, bj, x),
+                      tr_at(c, ci, cj, x), -w0, TR_W_FOLD);
       }
+    /* quad planarity: for each full quad containing the free cell, keep the
+     * free corner on the plane of the other three */
+    static const int qoff2[4][2] = {{0, 0}, {-1, 0}, {0, -1}, {-1, -1}};
+    for (int q = 0; q < 4; q++) {
+      int qi = i + qoff2[q][0], qj = j + qoff2[q][1];
+      if (!tr_valid(t, qi, qj) || !tr_valid(t, qi + 1, qj) || !tr_valid(t, qi, qj + 1) ||
+          !tr_valid(t, qi + 1, qj + 1))
+        continue;
+      const double *o3[3];
+      int no3 = 0;
+      static const int cc[4][2] = {{0, 0}, {1, 0}, {0, 1}, {1, 1}};
+      for (int k2 = 0; k2 < 4 && no3 < 3; k2++) {
+        int ci2 = qi + cc[k2][0], cj2 = qj + cc[k2][1];
+        if (ci2 == i && cj2 == j) continue;
+        o3[no3++] = tr_at(c, ci2, cj2, x);
+      }
+      if (no3 == 3) tr_res_planar(acc, x, o3[0], o3[1], o3[2], TR_W_PLANAR);
+    }
   }
   if (c->flags & TRF_SDIR) {
     /* cells whose (p,pu,pv) triangle involves (i,j): base at p, p-(0,1),
@@ -3552,6 +3629,71 @@ static uint32_t tr_pool_run2(tr_pool *pl, tr_env *cenv, const uint32_t *items,
   return nout;
 }
 
+/* Mesh QC scan (generation boundary): count consecutive-edge pairs that
+ * turned past 90 deg (folds — the sheet doubling back) and past 30 deg
+ * (kinks), and measure quad twist as the rms distance of each quad's 4th
+ * corner from the plane of the other three. Display-only; the solve keeps
+ * these down via tr_res_fold / tr_res_planar. */
+static bool tr_qc_ok(const r3d_tracer *t, int i, int j) {
+  return tr_valid(t, i, j) && t->conf[(size_t)j * t->W + (size_t)i] > 0.25f;
+}
+static void tr_qc(r3d_tracer *t) {
+  uint32_t folds = 0, kinks = 0;
+  double tw2 = 0.0;
+  size_t ntw = 0;
+  int W = (int)t->W, H = (int)t->H;
+  static const int ax2[2][2] = {{1, 0}, {0, 1}};
+  for (int j = 0; j < H; j++)
+    for (int i = 0; i < W; i++) {
+      if (!tr_qc_ok(t, i, j)) continue;
+      const double *b = t->pos + ((size_t)j * t->W + (size_t)i) * 3;
+      for (int a = 0; a < 2; a++) {
+        int ai = i - ax2[a][0], aj = j - ax2[a][1];
+        int ci = i + ax2[a][0], cj = j + ax2[a][1];
+        if (!tr_qc_ok(t, ai, aj) || !tr_qc_ok(t, ci, cj)) continue;
+        const double *pa = t->pos + ((size_t)aj * t->W + (size_t)ai) * 3;
+        const double *pc = t->pos + ((size_t)cj * t->W + (size_t)ci) * 3;
+        double d1[3], d2[3], l1 = 0, l2 = 0, dot = 0;
+        for (int k = 0; k < 3; k++) {
+          d1[k] = b[k] - pa[k];
+          d2[k] = pc[k] - b[k];
+          l1 += d1[k] * d1[k];
+          l2 += d2[k] * d2[k];
+          dot += d1[k] * d2[k];
+        }
+        if (l1 < 1e-12 || l2 < 1e-12) continue;
+        dot /= sqrt(l1 * l2);
+        if (dot < 0.0) folds++;
+        else if (dot < TR_KINK_COS) kinks++;
+      }
+      if (tr_qc_ok(t, i + 1, j) && tr_qc_ok(t, i, j + 1) && tr_qc_ok(t, i + 1, j + 1)) {
+        const double *p10 = t->pos + ((size_t)j * t->W + (size_t)i + 1) * 3;
+        const double *p01 = t->pos + ((size_t)(j + 1) * t->W + (size_t)i) * 3;
+        const double *p11 = t->pos + ((size_t)(j + 1) * t->W + (size_t)i + 1) * 3;
+        double e1[3], e2[3], n[3], d[3];
+        for (int k = 0; k < 3; k++) {
+          e1[k] = p10[k] - b[k];
+          e2[k] = p01[k] - b[k];
+          d[k] = p11[k] - b[k];
+        }
+        n[0] = e1[1] * e2[2] - e1[2] * e2[1];
+        n[1] = e1[2] * e2[0] - e1[0] * e2[2];
+        n[2] = e1[0] * e2[1] - e1[1] * e2[0];
+        double ln = sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+        if (ln > 1e-12) {
+          double dist = (n[0] * d[0] + n[1] * d[1] + n[2] * d[2]) / ln;
+          tw2 += dist * dist;
+          ntw++;
+        }
+      }
+    }
+  pthread_mutex_lock(&t->mu);
+  t->qc_folds = folds;
+  t->qc_kinks = kinks;
+  t->qc_twist = ntw ? (float)sqrt(tw2 / (double)ntw) : 0.0f;
+  pthread_mutex_unlock(&t->mu);
+}
+
 /* Generation boundary (pool idle): adopt a staged anchor set and assign
  * each anchor to the nearest SET cell within the capture radius. Distant
  * anchors stay unassigned and are retried every generation, so an anchor
@@ -3945,6 +4087,7 @@ static void *tr_worker(void *ud) {
     tr_spiral_flag(t);
     tr_don_register(t);
     tr_sfx_build(t); /* refresh the self-overlap index (pool is idle) */
+    tr_qc(t);        /* refresh the mesh QC counters for the panel */
     tr_anc_assign(t); /* adopt/assign user anchors, then re-seat their
                        * neighborhoods so a correction shows immediately
                        * instead of waiting for the every-8th global solve */
@@ -4019,6 +4162,11 @@ static void *tr_worker(void *ud) {
   }
   /* final polish: one bounded pass so late cells see settled neighbors */
   if (!t->quit) tr_local_opt(t, &cenv, x0, y0, (int)W + (int)H, 4, true);
+  tr_qc(t); /* final QC state for the panel + log */
+  if (t->qc_folds || t->qc_kinks)
+    printf("tracer: QC %u fold%s, %u kink%s, twist rms %.2f vox\n", t->qc_folds,
+           t->qc_folds == 1 ? "" : "s", t->qc_kinks, t->qc_kinks == 1 ? "" : "s",
+           (double)t->qc_twist);
   free(fringe);
   free(nfringe);
   free(cands);

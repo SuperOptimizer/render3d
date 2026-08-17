@@ -107,6 +107,12 @@ typedef struct r3d_tracer {
   pthread_mutex_t mu;
   bool running, quit, done;
   bool refine; /* solve-only pass in flight (no growth) */
+  /* per-generation mesh QC (display; refreshed with the spiral fit):
+   * folds = consecutive-edge pairs turned past 90 deg (doubling back),
+   * kinks = pairs past 30 deg, twist = rms free-corner distance from the
+   * quad plane in voxels (planarity) */
+  uint32_t qc_folds, qc_kinks;
+  float qc_twist;
   uint32_t ring, nset;   /* ring = generations grown so far */
   double vdim[3];        /* scroll volume extent (growth hard-stops there) */
   uint32_t gens_done;    /* completed generations across resumes */
