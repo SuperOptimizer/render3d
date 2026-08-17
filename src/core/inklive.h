@@ -30,6 +30,7 @@ typedef struct r3d_inklive {
   float *req_xyz;     /* (rw+1)*(rh+1)*3 grid corner positions, -1 = invalid */
   uint32_t rw, rh;    /* rect size in grid CELLS */
   uint32_t ri0, rj0;  /* rect origin in grid coords */
+  uint32_t req_tta;   /* TTA/ensemble bitmask for the staged request */
   uint32_t up;        /* pixels per grid cell (= voxels per cell) */
 
   /* result (owner: worker under mu; consumed via r3d_inklive_poll) */
@@ -49,9 +50,12 @@ void r3d_inklive_stop(r3d_inklive *il);
 /* Ask for a prediction over grid cells [i0,i0+w)x[j0,j0+h). xyz is the
  * (w+1)x(h+1)x3 corner-position snapshot (row-major, invalid < 0); the call
  * copies nothing — ownership of the malloc'd xyz transfers to the module.
- * A request in flight is superseded (last write wins). */
+ * A request in flight is superseded (last write wins).
+ * tta is the server's TTA/ensemble bitmask (bit0 flips, bit1 depth
+ * shift, bit2 intensity, bit3 checkpoint ensemble; 0 = fast single pass;
+ * TTA multiplies inference cost ~4-16x, so keep the live view at 0). */
 void r3d_inklive_request(r3d_inklive *il, float *xyz, uint32_t i0, uint32_t j0,
-                         uint32_t w, uint32_t h, uint32_t up);
+                         uint32_t w, uint32_t h, uint32_t up, uint32_t tta);
 
 /* True once per fresh result; hands out the module-owned buffer (valid until
  * the next result is published). */

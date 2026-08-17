@@ -29,9 +29,10 @@ static int il_connect(int port) {
   }
   int one = 1;
   setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
-  /* never hang forever on a wedged server: inference of a max-size region is
-   * ~10-30 s on a laptop GPU, so allow generous but finite waits */
-  struct timeval rto = {.tv_sec = 180}, sto = {.tv_sec = 60};
+  /* never hang forever on a wedged server: inference of a max-size region
+   * is ~10-30 s on a laptop GPU, and a full TTA+ensemble pass multiplies
+   * that ~16x, so allow generous but finite waits */
+  struct timeval rto = {.tv_sec = 900}, sto = {.tv_sec = 60};
   setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rto, sizeof rto);
   setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &sto, sizeof sto);
   return fd;
@@ -233,6 +234,7 @@ static void *il_worker(void *ud) {
     float *xyz = il->req_xyz;
     il->req_xyz = NULL;
     uint32_t rw = il->rw, rh = il->rh, i0 = il->ri0, j0 = il->rj0, up = il->up;
+    uint32_t tta = il->req_tta;
     snprintf(il->status, sizeof il->status, "sampling %ux%u px...", rw * up, rh * up);
     pthread_mutex_unlock(&il->mu);
 
@@ -249,11 +251,14 @@ static void *il_worker(void *ud) {
       pthread_mutex_unlock(&il->mu);
       if (il->fd < 0) il->fd = il_connect(il->port);
       for (int attempt = 0; attempt < 2 && il->fd >= 0; attempt++) {
-        uint8_t hdr[16] = {'I', 'N', 'K', '1'};
-        uint32_t v[3] = {R3D_INKLIVE_LAYERS, H, W};
-        memcpy(hdr + 4, v, 12);
+        /* INK2 carries the TTA/ensemble bitmask; plain INK1 keeps old
+         * servers working for the fast path */
+        uint8_t hdr[20] = {'I', 'N', 'K', tta ? '2' : '1'};
+        uint32_t v[4] = {R3D_INKLIVE_LAYERS, H, W, tta};
+        size_t hlen = tta ? 20 : 16;
+        memcpy(hdr + 4, v, hlen - 4);
         uint8_t rhdr[12];
-        if (il_io(il->fd, hdr, sizeof hdr, true) == 0 &&
+        if (il_io(il->fd, hdr, hlen, true) == 0 &&
             il_io(il->fd, stack, (size_t)R3D_INKLIVE_LAYERS * W * H, true) == 0 &&
             il_io(il->fd, rhdr, sizeof rhdr, false) == 0 &&
             memcmp(rhdr, "INKR", 4) == 0) {
@@ -353,7 +358,7 @@ void r3d_inklive_stop(r3d_inklive *il) {
 }
 
 void r3d_inklive_request(r3d_inklive *il, float *xyz, uint32_t i0, uint32_t j0,
-                         uint32_t w, uint32_t h, uint32_t up) {
+                         uint32_t w, uint32_t h, uint32_t up, uint32_t tta) {
   if (!il->th_up) {
     free(xyz);
     return;
@@ -366,6 +371,7 @@ void r3d_inklive_request(r3d_inklive *il, float *xyz, uint32_t i0, uint32_t j0,
   il->rw = w;
   il->rh = h;
   il->up = up;
+  il->req_tta = tta;
   atomic_fetch_add(&il->req_gen, 1);
   pthread_cond_broadcast(&il->cv);
   pthread_mutex_unlock(&il->mu);

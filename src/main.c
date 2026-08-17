@@ -1179,6 +1179,11 @@ int main(int argc, char **argv) {
   float *inkmap = NULL;
   uint32_t inkmap_w = 0, inkmap_h = 0, inkmap_up = 1;
   bool inkmap_have = false, inkmap_uploaded = false, inkmap_job = false;
+  /* TTA/ensemble bitmask for full-map computes (bit0 flips, bit1 depth
+   * shift, bit2 intensity, bit3 checkpoint ensemble); live view stays at
+   * 0 unless explicitly opted in - TTA multiplies inference cost. */
+  uint32_t inkmap_tta = 0x9; /* flips + ensemble: best quality/cost */
+  bool inklive_tta_live = false;
   uint32_t im_tx = 0, im_ty = 0, im_ntx = 0, im_nty = 0, im_ts = 0;
   bool im_req_out = false;
   char inkmap_path[1200] = "";
@@ -2465,7 +2470,7 @@ int main(int argc, char **argv) {
                     dst[0] = dst[1] = dst[2] = -1.0f;
                   }
                 }
-              r3d_inklive_request(&inklive, xyz, r0x, r0y, rw, rh, up);
+              r3d_inklive_request(&inklive, xyz, r0x, r0y, rw, rh, up, inkmap_tta);
               im_req_out = true;
             } else {
               free(xyz);
@@ -2552,7 +2557,8 @@ int main(int argc, char **argv) {
                     dst[0] = dst[1] = dst[2] = -1.0f;
                   }
                 }
-              r3d_inklive_request(&inklive, xyz, (uint32_t)g0, (uint32_t)j0, rw, rh, up);
+              r3d_inklive_request(&inklive, xyz, (uint32_t)g0, (uint32_t)j0, rw, rh,
+                                  up, inklive_tta_live ? inkmap_tta : 0u);
               il_rect[0] = g0;
               il_rect[1] = j0;
               il_rect[2] = g1;
@@ -3471,6 +3477,20 @@ int main(int argc, char **argv) {
       }
     if (inklive_up && igCollapsingHeader_TreeNodeFlags("live ink", 0)) {
       igCheckbox("show ink on flattened view", &inklive_show);
+      if (igTreeNode_Str("TTA / ensemble")) {
+        /* applied to full-map computes; each option multiplies inference
+         * time (flips x4, depth +2, intensity +2, ensemble x models) */
+        bool b0 = inkmap_tta & 1u, b1 = inkmap_tta & 2u, b2 = inkmap_tta & 4u,
+             b3 = inkmap_tta & 8u;
+        if (igCheckbox("flips (x4)", &b0)) inkmap_tta ^= 1u;
+        if (igCheckbox("depth shift +-1 (+2)", &b1)) inkmap_tta ^= 2u;
+        if (igCheckbox("intensity x0.9/1.1 (+2)", &b2)) inkmap_tta ^= 4u;
+        if (igCheckbox("checkpoint ensemble (x2)", &b3)) inkmap_tta ^= 8u;
+        igCheckbox("also apply to live view (slow)", &inklive_tta_live);
+        igTextDisabled("used by 'compute full ink map'; recompute to re-run\n"
+                       "an existing map with new settings");
+        igTreePop();
+      }
       if (inkmap_have) {
         igTextDisabled("full ink map: %ux%u (cached, one-time)", inkmap_w, inkmap_h);
         igSameLine(0, 8);

@@ -200,6 +200,16 @@ sends it over TCP, and the prediction is painted into the surface-volume
 window (re-run whenever the view or the growing trace changes). The "live
 ink" panel section shows status; port defaults to 9743.
 
+**TTA / ensembling**: the live-ink panel's *TTA / ensemble* section picks
+deterministic test-time augmentations applied by the ink server: in-plane
+flips (x4), the model's 17-layer depth window slid +-1 inside the sampled
+21-layer slab (+2), intensity x0.9/1.1 (+2), and a checkpoint ensemble
+(seed 42 + 43, x2) - probabilities averaged after inverse transforms.
+Defaults to flips+ensemble; used by full-map computes ("recompute" re-runs
+an existing map with new settings), opt-in for the live view. Start the
+server with several checkpoints to enable the ensemble:
+`inkserver.py seed42.pth seed43.pth`.
+
 ### On-demand surface prediction (volumes without published predictions)
 
 `tools/surf/surfserver.py` serves nnU-Net `scrollprize/surface_m7_nnunet` — the
