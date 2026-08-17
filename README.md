@@ -108,6 +108,16 @@ background worker decodes decimated grids into a RAM-budgeted LRU cache,
 and the panel lists cache state, per-plane hit counts, and the surfaces
 nearest the focus.
 
+**Tracer anchors**: when the live tracer wanders onto the wrong sheet, tick
+*place anchors (Ctrl+click)* in the tracer panel and Ctrl+click the sheet the
+trace *should* pass through in any plane view (orange diamonds; dimmed when
+off the pane's slice). Each anchor pulls the nearest traced cell through the
+point with a strong solve term (an order above the fusion donor pull), so the
+local neighborhood re-seats onto the correct sheet — anchors placed ahead of
+the growth front engage automatically once growth comes within 3 grid steps.
+Anchors can be placed before seeding or live while growing; undo/clear from
+the panel. Headless: `R3D_ANCHOR_TEST="x,y,z;x,y,z"` with `R3D_TRACE_TEST`.
+
 Test data comes straight from the `vesuvius-challenge-open-data` S3 bucket
 (PHerc0172 pairs tifxyz segments with their exact source volume):
 

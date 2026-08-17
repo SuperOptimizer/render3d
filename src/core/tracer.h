@@ -54,8 +54,21 @@ typedef struct r3d_tracer_cfg {
                        * fitted sheet spacing so ~0.5 is a gentle prior. */
 } r3d_tracer_cfg;
 
+#define R3D_TR_MAX_ANCHORS 64
+
 typedef struct r3d_tracer {
   r3d_tracer_cfg cfg;
+  /* user anchors: world points the sheet must pass through (GUI
+   * corrections for wrong-sheet jumps). Staged under mu; the grow thread
+   * adopts them at each generation boundary, assigns each to the nearest
+   * grown cell within a capture radius, and a strong pull on that cell
+   * joins every solve until the sheet passes through the point. */
+  double anc[R3D_TR_MAX_ANCHORS * 3];
+  int32_t anc_cell[R3D_TR_MAX_ANCHORS]; /* grid index, -1 = unassigned */
+  uint32_t nanc;
+  double anc_new[R3D_TR_MAX_ANCHORS * 3]; /* staged replacement set */
+  uint32_t nanc_new;
+  bool anc_dirty;
   char root[1024]; /* prediction LOD tree */
   uint32_t W, H;   /* grid dims */
   double *pos;     /* [W*H*3], guarded by mu */
@@ -114,6 +127,11 @@ int r3d_tracer_start_fused(r3d_tracer *t, const char *pred_root,
                            const r3d_tracer_cfg *cfg, const r3d_umbilicus *umb,
                            const char *const *donor_dirs, uint32_t ndonors);
 void r3d_tracer_stop(r3d_tracer *t); /* request stop + join; result kept */
+
+/* Replace the anchor set (world voxels, n <= R3D_TR_MAX_ANCHORS; excess is
+ * dropped). Callable any time, including while growing — the grow thread
+ * adopts the new set at the next generation boundary. */
+void r3d_tracer_set_anchors(r3d_tracer *t, const double *pts, uint32_t n);
 /* Enlarge a finished (stopped) trace and resume growth for `extra` more
  * generations (vc3d resume path: existing cells persist and anchor the
  * solve). Grid buffers reallocate — callers must refetch W/H. */

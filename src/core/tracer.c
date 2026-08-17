@@ -25,6 +25,13 @@
 #define TR_SDIR_EPS_ABS 1e-8
 #define TR_SDIR_EPS_REL 1e-2
 #define TR_DT_TH 128.0 /* prediction "on sheet" threshold for the DT */
+#define TR_W_ANC 2.0      /* user-anchor pull: "must pass through" — an order
+                           * stronger than the donor pull (0.1) so it beats
+                           * the data term when the sheet picked wrong */
+#define TR_ANC_CAPTURE 3.0 /* capture radius, grid steps: an anchor farther
+                            * than this from every grown cell stays idle
+                            * until the front approaches (a hard pull across
+                            * half the scroll would rip the grid) */
 #define TR_CONF_R 12.0 /* conf = 1 - min(dt,R)/R */
 
 /* ================= distance-transform chunk cache ==================
@@ -3020,6 +3027,17 @@ static void tr_eval(tr_ctx *c, const double x[3], tr_nlsq *acc) {
       }
     }
   }
+  if (t->nanc) { /* user anchor owned by this cell: hard pull through it */
+    int32_t k32 = (int32_t)((size_t)j * t->W + (size_t)i);
+    for (uint32_t a = 0; a < t->nanc; a++) {
+      if (t->anc_cell[a] != k32) continue;
+      for (int ax = 0; ax < 3; ax++) {
+        double J[3] = {0, 0, 0};
+        J[ax] = TR_W_ANC;
+        nq_add(acc, TR_W_ANC * (x[ax] - t->anc[a * 3u + (uint32_t)ax]), J);
+      }
+    }
+  }
 }
 
 /* LM solve for one cell; updates pos in place (under mu), returns cost */
@@ -3534,6 +3552,60 @@ static uint32_t tr_pool_run2(tr_pool *pl, tr_env *cenv, const uint32_t *items,
   return nout;
 }
 
+/* Generation boundary (pool idle): adopt a staged anchor set and assign
+ * each anchor to the nearest SET cell within the capture radius. Distant
+ * anchors stay unassigned and are retried every generation, so an anchor
+ * dropped ahead of the front engages the moment growth reaches it. */
+static void tr_anc_assign(r3d_tracer *t) {
+  pthread_mutex_lock(&t->mu);
+  if (t->anc_dirty) {
+    memcpy(t->anc, t->anc_new, sizeof(double) * 3 * t->nanc_new);
+    t->nanc = t->nanc_new;
+    t->anc_dirty = false;
+  }
+  uint32_t n = t->nanc;
+  pthread_mutex_unlock(&t->mu);
+  if (!n) return;
+  double cap = TR_ANC_CAPTURE * t->cfg.step;
+  double cap2 = cap * cap;
+  for (uint32_t a = 0; a < n; a++) {
+    const double *P = t->anc + (size_t)a * 3;
+    double best = cap2;
+    int32_t bk = -1;
+    for (size_t k = 0; k < (size_t)t->W * t->H; k++) {
+      if (t->state[k] != R3D_TR_SET) continue;
+      const double *q = t->pos + k * 3;
+      double dx = q[0] - P[0], dy = q[1] - P[1], dz = q[2] - P[2];
+      double d2 = dx * dx + dy * dy + dz * dz;
+      if (d2 < best) {
+        best = d2;
+        bk = (int32_t)k;
+      }
+    }
+    if (t->anc_cell[a] != bk && bk >= 0)
+      printf("tracer: anchor %u (%.0f,%.0f,%.0f) -> cell (%u,%u), %.1f vox away\n",
+             a, P[0], P[1], P[2], (uint32_t)bk % t->W, (uint32_t)bk / t->W,
+             sqrt(best));
+    t->anc_cell[a] = bk;
+  }
+}
+
+void r3d_tracer_set_anchors(r3d_tracer *t, const double *pts, uint32_t n) {
+  if (n > R3D_TR_MAX_ANCHORS) n = R3D_TR_MAX_ANCHORS;
+  pthread_mutex_lock(&t->mu);
+  memcpy(t->anc_new, pts, sizeof(double) * 3 * n);
+  t->nanc_new = n;
+  t->anc_dirty = true;
+  if (!t->running) { /* no grow thread to adopt: take effect immediately
+                      * (r3d_tracer_grow reuses the set on resume) */
+    memcpy(t->anc, t->anc_new, sizeof(double) * 3 * n);
+    t->nanc = n;
+    for (uint32_t a = 0; a < R3D_TR_MAX_ANCHORS; a++) t->anc_cell[a] = -1;
+    t->anc_dirty = false;
+  }
+  pthread_mutex_unlock(&t->mu);
+}
+
 static void *tr_worker(void *ud) {
   r3d_tracer *t = ud;
   r3d_cpuvol vol;
@@ -3871,6 +3943,13 @@ static void *tr_worker(void *ud) {
     tr_spiral_flag(t);
     tr_don_register(t);
     tr_sfx_build(t); /* refresh the self-overlap index (pool is idle) */
+    tr_anc_assign(t); /* adopt/assign user anchors, then re-seat their
+                       * neighborhoods so a correction shows immediately
+                       * instead of waiting for the every-8th global solve */
+    for (uint32_t a = 0; a < t->nanc; a++)
+      if (t->anc_cell[a] >= 0)
+        tr_local_opt(t, &cenv, (int)((uint32_t)t->anc_cell[a] % W),
+                     (int)((uint32_t)t->anc_cell[a] / W), 3, 3, true);
     /* schedule: vc3d runs global solves only in the first 10 generations
      * (Ceres cost); our parallel sweeps are cheap enough to keep them
      * coming — every 8th generation, forever. This anneals away the
@@ -3926,6 +4005,18 @@ static void *tr_worker(void *ud) {
   printf("tracer: finished at generation %u with %u point%s (level L%u%s)\n", t->ring,
          t->nset, t->nset == 1 ? "" : "s", t->cfg.level,
          ng.active ? ", normal grids" : "");
+  for (uint32_t a = 0; a < t->nanc; a++) { /* how well each anchor held */
+    if (t->anc_cell[a] < 0) {
+      printf("tracer: anchor %u never captured (no cell within %.0f vox)\n", a,
+             TR_ANC_CAPTURE * t->cfg.step);
+      continue;
+    }
+    const double *q = t->pos + (size_t)t->anc_cell[a] * 3;
+    const double *P = t->anc + (size_t)a * 3;
+    double dx = q[0] - P[0], dy = q[1] - P[1], dz = q[2] - P[2];
+    printf("tracer: anchor %u final distance %.1f vox\n", a,
+           sqrt(dx * dx + dy * dy + dz * dz));
+  }
   if (t->sp_valid)
     printf("tracer: spiral fit omega %.2f vox/winding, rms %.2f vox\n", t->sp_omega,
            t->sp_rms);
@@ -3962,6 +4053,7 @@ int r3d_tracer_start_fused(r3d_tracer *t, const char *pred_root,
                            const r3d_tracer_cfg *cfg, const r3d_umbilicus *umb,
                            const char *const *donor_dirs, uint32_t ndonors) {
   memset(t, 0, sizeof *t);
+  for (uint32_t a = 0; a < R3D_TR_MAX_ANCHORS; a++) t->anc_cell[a] = -1;
   t->cfg = *cfg;
   if (t->cfg.max_ring < 4) t->cfg.max_ring = 4;
   if (t->cfg.max_ring > (t->cfg.rib_rows ? 40000u : 400u)) 
@@ -4054,6 +4146,8 @@ int r3d_tracer_grow(r3d_tracer *t, uint32_t extra) {
   t->dsup = nd;
   t->W = t->H = NW;
   t->cfg.max_ring = nr;
+  for (uint32_t a = 0; a < R3D_TR_MAX_ANCHORS; a++)
+    t->anc_cell[a] = -1; /* grid indices changed: reassign next generation */
   t->quit = false;
   t->done = false;
   t->gen++;

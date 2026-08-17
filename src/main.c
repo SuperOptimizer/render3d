@@ -1568,6 +1568,11 @@ int main(int argc, char **argv) {
   float mv_tr_step = 20.0f, mv_tr_thresh = 0.35f;
   int mv_tr_rings = 60, mv_tr_nsaved = 0;
   bool mv_tr_live = true;      /* render the growing grid in the seg pane */
+  /* tracer anchors: world points the sheet must pass through (placed by
+   * Ctrl+click in anchor mode; pushed to the tracer live) */
+  double mv_anchor[R3D_TR_MAX_ANCHORS * 3];
+  uint32_t mv_anchor_n = 0;
+  bool mv_anchor_mode = false;
   uint64_t mv_tr_live_ns = 0;  /* last live swap (throttle) */
   bool mv_tr_live_first = true;
   double sgc_near_focus[3] = {1e30, 1e30, 1e30};
@@ -2234,6 +2239,14 @@ int main(int argc, char **argv) {
             if (mv_focus[a] < 0.0) mv_focus[a] = 0.0;
             if (brick_shape[a] && mv_focus[a] > (double)brick_shape[a] - 1.0)
               mv_focus[a] = (double)brick_shape[a] - 1.0;
+          }
+          if (mv_anchor_mode && mv_anchor_n < R3D_TR_MAX_ANCHORS) {
+            memcpy(mv_anchor + (size_t)mv_anchor_n * 3, mv_focus,
+                   3 * sizeof(double));
+            mv_anchor_n++;
+            if (mv_tr_active) r3d_tracer_set_anchors(&mv_tr, mv_anchor, mv_anchor_n);
+            printf("tracer: anchor %u placed at (%.0f, %.0f, %.0f)\n", mv_anchor_n,
+                   mv_focus[0], mv_focus[1], mv_focus[2]);
           }
           if (!have_ij) {
             /* recenter the segment view on the surface point nearest the
@@ -3011,6 +3024,24 @@ int main(int argc, char **argv) {
       static bool mv_tr_fill = true;
       igSameLine(0, 10);
       igCheckbox("fill holes", &mv_tr_fill);
+      igCheckbox("place anchors (Ctrl+click)", &mv_anchor_mode);
+      if (mv_anchor_n) {
+        igSameLine(0, 10);
+        igTextDisabled("%u anchor%s", mv_anchor_n, mv_anchor_n == 1 ? "" : "s");
+        igSameLine(0, 10);
+        if (igSmallButton("undo##anc")) {
+          mv_anchor_n--;
+          if (mv_tr_active) r3d_tracer_set_anchors(&mv_tr, mv_anchor, mv_anchor_n);
+        }
+        igSameLine(0, 6);
+        if (igSmallButton("clear##anc")) {
+          mv_anchor_n = 0;
+          if (mv_tr_active) r3d_tracer_set_anchors(&mv_tr, mv_anchor, 0);
+        }
+      }
+      if (mv_anchor_mode)
+        igTextDisabled("click the sheet the trace SHOULD pass through; the\n"
+                       "nearest traced cell is pulled through each anchor");
       static bool mv_tr_spiral = true;
       if (umbilicus.count >= 2) {
         igCheckbox("spiral prior", &mv_tr_spiral);
@@ -3031,6 +3062,7 @@ int main(int argc, char **argv) {
                                .wind_weight =
                                    mv_tr_spiral && umbilicus.count >= 2 ? 0.5 : 0.0};
           if (r3d_tracer_start(&mv_tr, pr, &tc, &umbilicus) == 0) {
+            if (mv_anchor_n) r3d_tracer_set_anchors(&mv_tr, mv_anchor, mv_anchor_n);
             free(mv_tr_pos);
             free(mv_tr_st);
             free(mv_tr_cf);
@@ -3367,6 +3399,17 @@ int main(int argc, char **argv) {
         mv_tr_st = calloc((size_t)mv_tr.W * mv_tr.H, 1);
         mv_tr_cf = calloc((size_t)mv_tr.W * mv_tr.H, sizeof *mv_tr_cf);
         mv_tr_active = mv_tr_pos && mv_tr_st && mv_tr_cf;
+        if (mv_tr_active && getenv("R3D_ANCHOR_TEST")) {
+          /* headless: anchors as "x,y,z;x,y,z;..." (world voxels) */
+          const char *s = getenv("R3D_ANCHOR_TEST");
+          while (s && *s && mv_anchor_n < R3D_TR_MAX_ANCHORS) {
+            double *A = mv_anchor + (size_t)mv_anchor_n * 3;
+            if (sscanf(s, "%lf,%lf,%lf", &A[0], &A[1], &A[2]) == 3) mv_anchor_n++;
+            s = strchr(s, ';');
+            if (s) s++;
+          }
+          if (mv_anchor_n) r3d_tracer_set_anchors(&mv_tr, mv_anchor, mv_anchor_n);
+        }
       }
     }
     if (mv_tr_active) { /* live tracer snapshot when it grew */
@@ -3608,6 +3651,28 @@ int main(int argc, char **argv) {
         if (fx_ >= (float)mv[i].px && fx_ < (float)(mv[i].px + mv[i].pw) &&
             fy_ >= (float)mv[i].py && fy_ < (float)(mv[i].py + mv[i].ph))
           ImDrawList_AddCircle(draw, (ImVec2){fx_, fy_}, 10.0f, fc, 24, 2.0f);
+      }
+      if (mv_anchor_n) { /* tracer anchors: orange diamonds in the plane
+                          * panes, dimmed when off this pane's slice */
+        const ImU32 ab_ = 0xff000000u, ac_ = 0xff00a5ffu, ad_ = 0x8000a5ffu;
+        for (int i = 1; i < 4; i++) {
+          if (!(mv_mask & (1u << i)) || MV_IS3D(i)) continue;
+          for (uint32_t a = 0; a < mv_anchor_n; a++) {
+            double fu, fv, fs;
+            r3d_mv_w2b(mv_pb[i], mv_po[i], mv_anchor + (size_t)a * 3, &fu, &fv, &fs);
+            float ax_, ay_;
+            r3d_mv_project(&mv[i], fu, fv, &ax_, &ay_);
+            if (ax_ < (float)mv[i].px || ax_ >= (float)(mv[i].px + mv[i].pw) ||
+                ay_ < (float)mv[i].py || ay_ >= (float)(mv[i].py + mv[i].ph))
+              continue;
+            ImU32 col = fabs(fs - mv[i].slice) < 6.0 ? ac_ : ad_;
+            float r_ = 7.0f;
+            ImVec2 q[4] = {{ax_, ay_ - r_}, {ax_ + r_, ay_}, {ax_, ay_ + r_},
+                           {ax_ - r_, ay_}};
+            ImDrawList_AddQuad(draw, q[0], q[1], q[2], q[3], ab_, 3.5f);
+            ImDrawList_AddQuad(draw, q[0], q[1], q[2], q[3], col, 1.8f);
+          }
+        }
       }
       if (umbilicus_path && umbilicus.count) {
         /* umbilicus curve in every plane pane: connected control points
