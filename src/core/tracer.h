@@ -106,6 +106,7 @@ typedef struct r3d_tracer {
   pthread_t th;
   pthread_mutex_t mu;
   bool running, quit, done;
+  bool refine; /* solve-only pass in flight (no growth) */
   uint32_t ring, nset;   /* ring = generations grown so far */
   double vdim[3];        /* scroll volume extent (growth hard-stops there) */
   uint32_t gens_done;    /* completed generations across resumes */
@@ -132,6 +133,12 @@ void r3d_tracer_stop(r3d_tracer *t); /* request stop + join; result kept */
  * dropped). Callable any time, including while growing — the grow thread
  * adopts the new set at the next generation boundary. */
 void r3d_tracer_set_anchors(r3d_tracer *t, const double *pts, uint32_t n);
+
+/* Re-solve a finished (stopped) trace in place without growing: anchor
+ * neighborhoods are annealed through the user anchors, then a global
+ * polish smooths the seams. Existing cells persist; grid dims unchanged.
+ * Poll snapshots as usual; done goes true when the pass ends. */
+int r3d_tracer_refine(r3d_tracer *t);
 /* Enlarge a finished (stopped) trace and resume growth for `extra` more
  * generations (vc3d resume path: existing cells persist and anchor the
  * solve). Grid buffers reallocate — callers must refetch W/H. */

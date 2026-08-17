@@ -3847,7 +3847,9 @@ static void *tr_worker(void *ud) {
 
   static const int n8[8][2] = {{1, 0},  {0, 1},  {-1, 0}, {0, -1},
                                {1, 1},  {1, -1}, {-1, 1}, {-1, -1}};
-  uint32_t budget = t->cfg.max_ring > t->gens_done ? t->cfg.max_ring - t->gens_done : 0;
+  uint32_t budget =
+      t->refine ? 0
+                : (t->cfg.max_ring > t->gens_done ? t->cfg.max_ring - t->gens_done : 0);
   uint32_t gens_run = 0;
   while (nf > 0 && gens_run < budget && !t->quit) {
     gens_run++;
@@ -3994,6 +3996,27 @@ static void *tr_worker(void *ud) {
     pthread_mutex_unlock(&t->mu);
   }
   t->gens_done += gens_run;
+  if (t->refine && !t->quit) {
+    /* solve-only pass (no growth): fix the existing grid through the user
+     * anchors. Anchor neighborhoods are annealed hardest, re-assigning
+     * ownership between passes so the pull follows the sheet as it crosses
+     * to the right one; the global polish below then smooths the seams. */
+    tr_spiral_fit(t);
+    tr_spiral_flag(t);
+    tr_sfx_build(t);
+    tr_anc_assign(t);
+    for (int pass = 0; pass < 3 && !t->quit; pass++) {
+      for (uint32_t a = 0; a < t->nanc && !t->quit; a++)
+        if (t->anc_cell[a] >= 0)
+          tr_local_opt(t, &cenv, (int)((uint32_t)t->anc_cell[a] % W),
+                       (int)((uint32_t)t->anc_cell[a] / W), 8, 6, true);
+      tr_anc_assign(t);
+      pthread_mutex_lock(&t->mu);
+      t->gen++; /* live view: show each pass */
+      pthread_mutex_unlock(&t->mu);
+    }
+    t->refine = false;
+  }
   /* final polish: one bounded pass so late cells see settled neighbors */
   if (!t->quit) tr_local_opt(t, &cenv, x0, y0, (int)W + (int)H, 4, true);
   free(fringe);
@@ -4154,6 +4177,21 @@ int r3d_tracer_grow(r3d_tracer *t, uint32_t extra) {
   t->running = true;
   if (pthread_create(&t->th, NULL, tr_worker, t) != 0) {
     t->running = false;
+    return -1;
+  }
+  return 0;
+}
+
+int r3d_tracer_refine(r3d_tracer *t) {
+  if (t->running || !t->pos || !t->nset) return -1;
+  t->refine = true;
+  t->quit = false;
+  t->done = false;
+  t->gen++;
+  t->running = true;
+  if (pthread_create(&t->th, NULL, tr_worker, t) != 0) {
+    t->running = false;
+    t->refine = false;
     return -1;
   }
   return 0;

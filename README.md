@@ -115,8 +115,12 @@ slice). Each anchor pulls the nearest traced cell through the
 point with a strong solve term (an order above the fusion donor pull), so the
 local neighborhood re-seats onto the correct sheet — anchors placed ahead of
 the growth front engage automatically once growth comes within 3 grid steps.
-Anchors can be placed before seeding or live while growing; undo/clear from
-the panel. Headless: `R3D_ANCHOR_TEST="x,y,z;x,y,z"` with `R3D_TRACE_TEST`.
+Anchors work at any stage: place them before seeding, live while growing, or
+on a finished trace — the **re-solve** button (appears when a done trace has
+anchors) re-runs the solve over the existing grid without growing, annealing
+each anchor's neighborhood through its point and finishing with a global
+polish. Undo/clear from the panel. Headless: `R3D_ANCHOR_TEST="x,y,z;x,y,z"`
+with `R3D_TRACE_TEST`, plus `R3D_REFINE_TEST=1` for a post-finish re-solve.
 
 Test data comes straight from the `vesuvius-challenge-open-data` S3 bucket
 (PHerc0172 pairs tifxyz segments with their exact source volume):

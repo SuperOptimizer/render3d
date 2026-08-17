@@ -3106,6 +3106,22 @@ int main(int argc, char **argv) {
             mv_tr_active = false;
           }
         }
+        if (mv_tr_done && mv_tr_nset > 0 && mv_anchor_n) {
+          igSameLine(0, 8);
+          if (igButton("re-solve", (ImVec2){0, 0})) {
+            /* fix the segment in place: no growth, anneal the grid through
+             * the placed anchors (grid dims unchanged, buffers stay) */
+            r3d_tracer_stop(&mv_tr);
+            r3d_tracer_set_anchors(&mv_tr, mv_anchor, mv_anchor_n);
+            if (r3d_tracer_refine(&mv_tr) == 0) {
+              mv_tr_done = false;
+              mv_tr_gen = 0; /* force a fresh snapshot/live swap */
+            }
+          }
+          if (igIsItemHovered(0))
+            igSetTooltip("re-run the solve through the %u anchor%s without growing",
+                         mv_anchor_n, mv_anchor_n == 1 ? "" : "s");
+        }
         if (mv_tr_done && mv_tr_nset > 0) {
           igSameLine(0, 8);
           if (igButton("grow", (ImVec2){0, 0})) { /* extend by half again;
@@ -3419,6 +3435,18 @@ int main(int argc, char **argv) {
           }
           if (mv_anchor_n) r3d_tracer_set_anchors(&mv_tr, mv_anchor, mv_anchor_n);
         }
+      }
+    }
+    static bool refine_test_done = false;
+    if (mv_tr_active && mv_tr_done && mv_anchor_n && getenv("R3D_REFINE_TEST") &&
+        !refine_test_done) { /* headless: one solve-only pass after finish */
+      refine_test_done = true;
+      r3d_tracer_stop(&mv_tr);
+      r3d_tracer_set_anchors(&mv_tr, mv_anchor, mv_anchor_n);
+      if (r3d_tracer_refine(&mv_tr) == 0) {
+        mv_tr_done = false;
+        mv_tr_gen = 0;
+        printf("tracer: refine test started\n");
       }
     }
     if (mv_tr_active) { /* live tracer snapshot when it grew */
