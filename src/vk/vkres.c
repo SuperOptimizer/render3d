@@ -87,6 +87,39 @@ fail:
   return -1;
 }
 
+int r3d_vkbuf_create_device(r3d_vkctx *c, VkDeviceSize size, VkBufferUsageFlags usage,
+                            r3d_vkbuf *b) {
+  memset(b, 0, sizeof *b);
+  bool reserved = false;
+  VkBufferCreateInfo bci = {
+      .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = size, .usage = usage};
+  if (vkCreateBuffer(c->dev, &bci, NULL, &b->buf) != VK_SUCCESS) return -1;
+  VkMemoryRequirements mr;
+  vkGetBufferMemoryRequirements(c->dev, b->buf, &mr);
+  uint32_t idx = r3d_vk_find_mem(c, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+  if (idx == UINT32_MAX) goto fail;
+  if (mr.size > c->caps.max_alloc_bytes || !(reserved = reserve_mem(c, mr.size))) {
+    fprintf(stderr, "vkres: device buffer exceeds allocation/budget limit (%llu requested)\n",
+            (unsigned long long)mr.size);
+    goto fail;
+  }
+  VkMemoryAllocateInfo mai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                              .allocationSize = mr.size,
+                              .memoryTypeIndex = idx};
+  if (vkAllocateMemory(c->dev, &mai, NULL, &b->mem) != VK_SUCCESS ||
+      vkBindBufferMemory(c->dev, b->buf, b->mem, 0) != VK_SUCCESS)
+    goto fail;
+  b->size = size;
+  b->alloc_size = mr.size;
+  return 0;
+fail:
+  if (b->buf) vkDestroyBuffer(c->dev, b->buf, NULL);
+  if (b->mem) vkFreeMemory(c->dev, b->mem, NULL);
+  if (reserved) release_mem_reservation(c, mr.size);
+  memset(b, 0, sizeof *b);
+  return -1;
+}
+
 void r3d_vkbuf_destroy(r3d_vkctx *c, r3d_vkbuf *b) {
   if (b->buf) vkDestroyBuffer(c->dev, b->buf, NULL);
   if (b->mem) vkFreeMemory(c->dev, b->mem, NULL);

@@ -271,10 +271,10 @@ int r3d_vkctx_create(r3d_vkctx *c, const char *const *inst_exts, uint32_t n_inst
        * ~20x per sample vs native non-uniform indexing on this hardware) */
       .shaderSampledImageArrayNonUniformIndexing = f12.shaderSampledImageArrayNonUniformIndexing,
       .runtimeDescriptorArray = f12.runtimeDescriptorArray,
-      /* Dozen only goes bindless (no per-dispatch copy of the whole 1024-entry
-       * descriptor set into the shader-visible heap) when the app enables
-       * descriptorIndexing itself; harmless elsewhere */
-      .descriptorIndexing = f12.descriptorIndexing && !getenv("R3D_NO_BINDLESS"),
+      /* R3D_BINDLESS=1: descriptorIndexing makes Dozen go bindless. Measured
+       * on the RTX 5080/WSL2: record 0.37 -> 2.07 ms per 4-dispatch frame and
+       * no GPU win, so it stays opt-in. */
+      .descriptorIndexing = f12.descriptorIndexing && getenv("R3D_BINDLESS") != NULL,
   };
   float prio = 1.0f;
   VkDeviceQueueCreateInfo qci = {

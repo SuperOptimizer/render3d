@@ -175,6 +175,24 @@ runs the standard suite and writes mean/p50/p95/p99/max timing files.
 the default six-tap shading with half-resolution motion, or the measured
 four-tap tetrahedral gradient plus half-resolution motion.
 
+### Live 2.5D ink detection in the viewer
+
+`tools/ink9/inkserver.py` is a persistent inference server for the scrollprize
+`ink_9um` hybrid_3d2d checkpoints (run it from villa's `ink-detection` env:
+`uv run python tools/ink9/inkserver.py step-075000.pth`). Add `--inklive` to a
+multiview session and the flattened pane gets a green ink-probability layer:
+a worker samples the visible segment rect as a 21-layer surface volume,
+sends it over TCP, and the prediction is painted into the surface-volume
+window (re-run whenever the view or the growing trace changes). The "live
+ink" panel section shows status; port defaults to 9743.
+
+### Headless benchmarks
+
+`--headless` renders without a window, surface, swapchain or present (the
+offscreen is still captured by `--shot`); `--seconds S` ends a run by wall
+time. `tools/perf_headless.sh <manifest> <tifxyz> [overlay] [segstore]` runs
+the multiview scenario matrix unattended and diffs against a baseline dir.
+
 ## Development
 
 Presets: `dev` (ASan+UBSan RelWithDebInfo) / `release` (portable ThinLTO) /

@@ -11,6 +11,7 @@
 #include <math.h>
 #include <pthread.h>
 #include <sys/stat.h>
+#include <sys/resource.h>
 #include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -139,7 +140,21 @@ struct r3d_renderer {
   r3d_vkimage brick_atlas;
   VkImageView brick_atlas_mip0; /* single-mip storage view for the pack kernel */
   r3d_vkimage brick_occ;        /* 8^3-block occupancy reduced from the atlas */
-  r3d_vkbuf page_buf;
+  r3d_vkbuf page_buf; /* DEVICE-LOCAL page table (bricks) / validity table (vslab) */
+  /* host shadow of page_buf + dirty tracking: every CPU write goes to the
+   * shadow, and the next frame's command buffer copies the dirty words into
+   * the device buffer queue-ordered. Frames in flight keep a consistent view
+   * (no render-thread drains, no CPU-vs-shader races), and the GPU reads the
+   * table from VRAM instead of an upload heap. */
+  uint32_t *page_shadow;
+  uint32_t page_words;
+  uint32_t *page_dirty;   /* word indices */
+  uint32_t page_ndirty, page_dirty_cap;
+  bool page_dirty_all;    /* (re)initialized: copy everything */
+  r3d_vkbuf page_stage[2]; /* per-slot staging for whole-table copies */
+  bool page_host;          /* default: host-visible table, write-through (measured
+                            * 5-8% faster than device-local + queue-ordered copies on
+                            * Dozen); R3D_DEVICE_PAGE=1 selects the device path */
   uint32_t bricks_bpa, bricks_abpa, bricks_amips;
   bool bricks_identity; /* atlas layout == world layout: direct sampling */
   bool bricks_lod;
@@ -187,6 +202,16 @@ struct r3d_renderer {
     float q02;
     _Atomic uint8_t *have2;
     _Atomic uint64_t fetched2;
+    /* raw-brick ring: freshly fetched bricks are published here BEFORE the
+     * c5d encode + file write (have = 3), so the first display of a cold
+     * region skips encode->write->read->decode entirely (that round trip
+     * was ~10% of cold-session CPU and the bulk of first-visible latency).
+     * The disk cache still gets written; later sessions decode from it. */
+    pthread_mutex_t rc_mu;
+    uint8_t *rc_data;   /* NI_RAW_RING slots of BR_RAW_BYTES */
+    uint64_t *rc_key;   /* nsrc<<32 | global brick, UINT64_MAX = free */
+    uint32_t rc_next;   /* FIFO cursor */
+    bool rc_up;
   } ni;
   r3d_brlod_level bricks_lev[BR_LOD_MAX];
   r3d_brlod_reader *bricks_readers;
@@ -391,6 +416,117 @@ static int create_compute_pipeline(r3d_renderer *r, const char *name, VkPipeline
 static void pres_start(r3d_renderer *r);
 static void pres_stop(r3d_renderer *r);
 static void pres_drain(r3d_renderer *r);
+
+/* ---- page table shadow ---- */
+static int page_alloc(r3d_renderer *r, uint32_t words) {
+  r3d_vkbuf_destroy(&r->vk, &r->page_buf);
+  free(r->page_shadow);
+  free(r->page_dirty);
+  r->page_shadow = NULL;
+  r->page_dirty = NULL;
+  r->page_words = 0;
+  r->page_ndirty = 0;
+  r->page_dirty_all = false;
+  if (!words) words = 1;
+  r->page_host = getenv("R3D_DEVICE_PAGE") == NULL;
+  if (r->page_host ? r3d_vkbuf_create_host(&r->vk, (VkDeviceSize)words * 4,
+                                           VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &r->page_buf)
+                   : r3d_vkbuf_create_device(&r->vk, (VkDeviceSize)words * 4,
+                                             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                                 VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                             &r->page_buf)) {
+    return -1;
+  }
+  r->page_shadow = calloc(words, 4);
+  r->page_dirty_cap = 8192;
+  r->page_dirty = malloc((size_t)r->page_dirty_cap * 4);
+  if (!r->page_shadow || !r->page_dirty) return -1;
+  r->page_words = words;
+  r->page_dirty_all = true;
+  return 0;
+}
+static inline void page_set(r3d_renderer *r, uint32_t idx, uint32_t val) {
+  if (idx >= r->page_words || r->page_shadow[idx] == val) return;
+  r->page_shadow[idx] = val;
+  if (r->page_dirty_all) return;
+  if (r->page_ndirty < r->page_dirty_cap) r->page_dirty[r->page_ndirty++] = idx;
+  else r->page_dirty_all = true;
+}
+static int page_cmp_u32(const void *a, const void *b) {
+  uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
+  return x < y ? -1 : x > y;
+}
+/* record the dirty words into cmd (queue-ordered before this frame's reads) */
+static int page_flush(r3d_renderer *r, VkCommandBuffer cmd, uint32_t slot) {
+  if (!r->page_buf.buf || !r->page_shadow) return 0;
+  if (!r->page_dirty_all && !r->page_ndirty) return 0;
+  if (r->page_host) { /* write-through; evictions drain the readers first
+                       * (r3d_bricks_stream_submit), publications into free
+                       * slots are safe either way */
+    if (r->vsl.active && r->timeline_value) {
+      /* vslab validity words flip while earlier frames may still sample
+       * through them (the audit's host/GPU race): drain those readers on the
+       * (rare) frames that actually change the table */
+      VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
+                                .semaphoreCount = 1,
+                                .pSemaphores = &r->timeline,
+                                .pValues = &r->timeline_value};
+      if (vkWaitSemaphores(r->vk.dev, &wi, UINT64_MAX) != VK_SUCCESS) return -1;
+    }
+    if (r->page_dirty_all)
+      memcpy(r->page_buf.mapped, r->page_shadow, (size_t)r->page_words * 4);
+    else
+      for (uint32_t i = 0; i < r->page_ndirty; i++)
+        ((uint32_t *)r->page_buf.mapped)[r->page_dirty[i]] = r->page_shadow[r->page_dirty[i]];
+    r->page_ndirty = 0;
+    r->page_dirty_all = false;
+    return 0;
+  }
+  if (r->page_dirty_all) {
+    VkDeviceSize bytes = (VkDeviceSize)r->page_words * 4;
+    r3d_vkbuf *st = &r->page_stage[slot & 1u];
+    if (st->size < bytes) {
+      r3d_vkbuf_destroy(&r->vk, st);
+      if (r3d_vkbuf_create_host(&r->vk, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, st) != 0)
+        return -1;
+    }
+    memcpy(st->mapped, r->page_shadow, bytes);
+    VkBufferCopy reg = {.size = bytes};
+    vkCmdCopyBuffer(cmd, st->buf, r->page_buf.buf, 1, &reg);
+  } else {
+    qsort(r->page_dirty, r->page_ndirty, 4, page_cmp_u32);
+    uint32_t i = 0;
+    while (i < r->page_ndirty) {
+      uint32_t i0 = r->page_dirty[i], i1 = i0;
+      uint32_t j = i + 1;
+      /* coalesce runs with gaps of <= 8 words (UpdateBuffer has per-call
+       * overhead; a few extra words are free), cap 16 KB per call */
+      while (j < r->page_ndirty && r->page_dirty[j] <= i1 + 9u && r->page_dirty[j] - i0 < 4096u) {
+        i1 = r->page_dirty[j];
+        j++;
+      }
+      vkCmdUpdateBuffer(cmd, r->page_buf.buf, (VkDeviceSize)i0 * 4, (VkDeviceSize)(i1 - i0 + 1) * 4,
+                        r->page_shadow + i0);
+      i = j;
+    }
+  }
+  r->page_ndirty = 0;
+  r->page_dirty_all = false;
+  VkBufferMemoryBarrier2 bb = {.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
+                               .srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                               .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                               .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                               .dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+                               .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                               .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                               .buffer = r->page_buf.buf,
+                               .size = VK_WHOLE_SIZE};
+  VkDependencyInfo dep = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+                          .bufferMemoryBarrierCount = 1,
+                          .pBufferMemoryBarriers = &bb};
+  vkCmdPipelineBarrier2(cmd, &dep);
+  return 0;
+}
 
 static int create_offscreen(r3d_renderer *r) {
   VkExtent3D e = {r->swap.extent.width, r->swap.extent.height, 1};
@@ -878,9 +1014,9 @@ int r3d_create(SDL_Window *win, const r3d_config *cfg, r3d_renderer **out) {
   }
   /* bricks-mode dummies: atlas = dummy volume view; page = 4-byte buffer */
   {
-    if (r3d_vkbuf_create_host(&r->vk, 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &r->page_buf) != 0)
+    if (page_alloc(r, 1) != 0)
       goto fail;
-    ((uint32_t *)r->page_buf.mapped)[0] = 0xFFFFFFFFu;
+    page_set(r, 0, 0xFFFFFFFFu);
     write_image_dset(r, 4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, r->volume.view,
                      r->samp_vol, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     VkDescriptorBufferInfo pbi = {.buffer = r->page_buf.buf, .range = VK_WHOLE_SIZE};
@@ -943,6 +1079,11 @@ static void bricks_teardown(r3d_renderer *r) {
   }
   free((void *)r->ni.have);
   free((void *)r->ni.have2);
+  if (r->ni.rc_up) {
+    free(r->ni.rc_data);
+    free(r->ni.rc_key);
+    r->ni.rc_up = false;
+  }
   if (r->vk.dev) r3d_vkctx_device_wait_idle(&r->vk);
   if (r->bs.upload_pool) vkDestroyCommandPool(r->vk.dev, r->bs.upload_pool, NULL);
   if (r->c5d) r3d_vkc5d_destroy(r->c5d);
@@ -952,6 +1093,13 @@ static void bricks_teardown(r3d_renderer *r) {
   r3d_vkimage_destroy(&r->vk, &r->brick_atlas);
   r3d_vkimage_destroy(&r->vk, &r->brick_occ);
   r3d_vkbuf_destroy(&r->vk, &r->page_buf);
+  r3d_vkbuf_destroy(&r->vk, &r->page_stage[0]);
+  r3d_vkbuf_destroy(&r->vk, &r->page_stage[1]);
+  free(r->page_shadow);
+  free(r->page_dirty);
+  r->page_shadow = NULL;
+  r->page_dirty = NULL;
+  r->page_words = 0;
   r3d_vkbuf_destroy(&r->vk, &r->bs.raw_stage);
   if (r->bs.comp_ready) {
     r3d_vkcomp_destroy(&r->vk, &r->bs.omax);
@@ -1078,6 +1226,13 @@ void r3d_destroy(r3d_renderer *r) {
   r3d_vkimage_destroy(&r->vk, &r->brick_atlas);
   r3d_vkimage_destroy(&r->vk, &r->brick_occ);
   r3d_vkbuf_destroy(&r->vk, &r->page_buf);
+  r3d_vkbuf_destroy(&r->vk, &r->page_stage[0]);
+  r3d_vkbuf_destroy(&r->vk, &r->page_stage[1]);
+  free(r->page_shadow);
+  free(r->page_dirty);
+  r->page_shadow = NULL;
+  r->page_dirty = NULL;
+  r->page_words = 0;
   r3d_vkbuf_destroy(&r->vk, &r->bs.raw_stage);
   if (r->bs.comp_ready) {
     r3d_vkcomp_destroy(&r->vk, &r->bs.omax);
@@ -2281,8 +2436,51 @@ static int ni_abort_cb(void *ud, curl_off_t dt, curl_off_t dn, curl_off_t ut,
   return r->ni.quit ? 1 : 0; /* nonzero aborts the transfer promptly */
 }
 
+#define NI_RAW_RING 96u /* 192 MB: several seconds of fetch throughput */
+
+static void ni_raw_put(r3d_renderer *r, int nsrc, uint32_t gb, const uint8_t *raw) {
+  pthread_mutex_lock(&r->ni.rc_mu);
+  if (!r->ni.rc_up) {
+    r->ni.rc_data = malloc((size_t)NI_RAW_RING * BR_RAW_BYTES);
+    r->ni.rc_key = malloc(NI_RAW_RING * sizeof *r->ni.rc_key);
+    if (r->ni.rc_data && r->ni.rc_key) {
+      for (uint32_t i = 0; i < NI_RAW_RING; i++) r->ni.rc_key[i] = UINT64_MAX;
+      r->ni.rc_up = true;
+    }
+  }
+  if (r->ni.rc_up) {
+    uint32_t i = r->ni.rc_next;
+    r->ni.rc_next = (i + 1) % NI_RAW_RING;
+    memcpy(r->ni.rc_data + (size_t)i * BR_RAW_BYTES, raw, BR_RAW_BYTES);
+    r->ni.rc_key[i] = ((uint64_t)(uint32_t)nsrc << 32) | gb;
+  }
+  pthread_mutex_unlock(&r->ni.rc_mu);
+}
+
+/* copy a ring entry into dst; false when it was never published or has
+ * already been recycled (the caller falls back to the .c5b file) */
+static bool ni_raw_take(r3d_renderer *r, int nsrc, uint32_t gb, uint8_t *dst) {
+  if (!r->ni.rc_up) return false;
+  uint64_t key = ((uint64_t)(uint32_t)nsrc << 32) | gb;
+  bool hit = false;
+  pthread_mutex_lock(&r->ni.rc_mu);
+  if (r->ni.rc_up)
+    for (uint32_t i = 0; i < NI_RAW_RING; i++)
+      if (r->ni.rc_key[i] == key) {
+        memcpy(dst, r->ni.rc_data + (size_t)i * BR_RAW_BYTES, BR_RAW_BYTES);
+        hit = true;
+        break;
+      }
+  pthread_mutex_unlock(&r->ni.rc_mu);
+  return hit;
+}
+
 static void *ni_worker(void *arg) {
   r3d_renderer *r = arg;
+  /* fetch + transcode are background work: keep them behind the render
+   * thread and the decode pool when cores are contended (Linux applies
+   * setpriority to the calling thread) */
+  setpriority(PRIO_PROCESS, 0, 5);
   CURL *curl = curl_easy_init();
   struct { uint8_t *p; size_t n, cap; } buf = {0};
   uint8_t *chunk = NULL, *cellbuf = NULL,
@@ -2477,6 +2675,10 @@ static void *ni_worker(void *arg) {
               atomic_store(&hvm[gb], 2u);
               continue;
             }
+            /* publish the raw voxels first: the streamer can display them
+             * now; the encode below only feeds the on-disk cache */
+            ni_raw_put(r, nsrc, gb, raw);
+            atomic_store(&hvm[gb], 3u);
             c5d_brick_params bp = c5d_brick_defaults(1.0f);
             bp.q = q;
             uint8_t *enc = NULL;
@@ -2852,14 +3054,19 @@ static void *brdec_worker(void *arg) {
     const uint8_t *blob = j->it[i].blob;
     size_t bn = j->it[i].bn;
     uint8_t *owned = NULL;
-    if (!blob && j->ni_fallback) {
-      owned = ni_load_brick(j->r, j->it[i].b, &bn, j->ni_src);
-      blob = owned;
+    int rc;
+    if (!blob && j->ni_fallback && ni_raw_take(j->r, j->ni_src, j->it[i].b, dst)) {
+      rc = 0; /* freshly fetched: raw voxels straight from the ring, no decode */
+    } else {
+      if (!blob && j->ni_fallback) {
+        owned = ni_load_brick(j->r, j->it[i].b, &bn, j->ni_src);
+        blob = owned;
+      }
+      /* small batches leave most of the pool idle when each brick decodes on
+       * one thread (8-brick jobs on 22 threads measured ~75 ms/job): split
+       * the brick itself across c5d's own persistent pool */
+      rc = blob ? c5d_brick_decode_par(blob, bn, dst, BR_SLOT_DIM, j->par) : -1;
     }
-    /* small batches leave most of the pool idle when each brick decodes on
-     * one thread (8-brick jobs on 22 threads measured ~75 ms/job): split the
-     * brick itself across c5d's own persistent pool */
-    int rc = blob ? c5d_brick_decode_par(blob, bn, dst, BR_SLOT_DIM, j->par) : -1;
     free(owned);
     if (j->loaded) j->loaded[i] = rc == 0;
     if (rc != 0) {
@@ -2912,6 +3119,10 @@ static void *dpool_thread(void *arg) {
     }
     seen = g_dpool.gen;
     struct brdec *j = g_dpool.job;
+    if (!j) { /* woke after the job already completed: nothing to do */
+      pthread_mutex_unlock(&g_dpool.mu);
+      continue;
+    }
     g_dpool.busy++;
     pthread_mutex_unlock(&g_dpool.mu);
     brdec_worker(j);
@@ -3224,6 +3435,7 @@ int r3d_bricks_begin(r3d_renderer *r, const char *c5s_path, uint32_t pool_bpa,
       if (ok) {
         pthread_mutex_init(&r->ni.mu, NULL);
         pthread_cond_init(&r->ni.cv, NULL);
+        pthread_mutex_init(&r->ni.rc_mu, NULL);
         /* remote chunk fetch is latency-bound: one fetcher per hardware
          * thread; R3D_FETCHERS=N overrides (1..64) */
         long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
@@ -3365,13 +3577,9 @@ int r3d_bricks_begin(r3d_renderer *r, const char *c5s_path, uint32_t pool_bpa,
   }
 
   /* page table + CPU residency state */
-  r3d_vkbuf_destroy(&r->vk, &r->page_buf);
   uint32_t page_words = nb + (r->bricks_lod ? BR_PAGE_HEADER : 0u);
-  if (r3d_vkbuf_create_host(&r->vk, (VkDeviceSize)page_words * 4,
-                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                            &r->page_buf) != 0)
-    return -1;
-  uint32_t *page = r->page_buf.mapped;
+  if (page_alloc(r, page_words) != 0) return -1;
+  uint32_t *page = r->page_shadow; /* whole table is dirty after page_alloc */
   for (uint32_t b = 0; b < page_words; b++) page[b] = BR_INVALID;
   if (r->bricks_lod) {
     memset(page, 0, BR_PAGE_HEADER * sizeof *page);
@@ -3447,7 +3655,7 @@ int r3d_bricks_begin(r3d_renderer *r, const char *c5s_path, uint32_t pool_bpa,
     if (bricks_post_fill(r, r->bs.sel_slot, r->bs.sel_b, np) != 0) return -1;
     for (uint32_t k = 0; k < np; k++) {
       uint32_t b = r->bs.sel_b[k];
-      page[bricks_page_index(r, b)] = b | ((uint32_t)r->bs.maxes[k] << 24);
+      page_set(r, bricks_page_index(r, b), b | ((uint32_t)r->bs.maxes[k] << 24));
       r->bs.slot_brick[b] = b;
       r->bs.brick_slot[b] = b;
       r->bs.brick_maxk[b] = r->bs.maxes[k];
@@ -3500,7 +3708,7 @@ int r3d_bricks_begin(r3d_renderer *r, const char *c5s_path, uint32_t pool_bpa,
             r->bs.sel_slot[np++] = s;
             r->bs.brick_maxk[b] = m;
             if (m >= BR_NOISE_FLOOR) {
-              page[bricks_page_index(r, b)] = s | ((uint32_t)m << 24u);
+              page_set(r, bricks_page_index(r, b), s | ((uint32_t)m << 24u));
               r->bs.slot_brick[s] = b;
               r->bs.slot_use[s] = r->bs.frame;
               r->bs.brick_slot[b] = s;
@@ -3525,7 +3733,7 @@ int r3d_bricks_begin(r3d_renderer *r, const char *c5s_path, uint32_t pool_bpa,
               if (s != BR_INVALID) r->bs.slot_brick[s] = BR_INVALID;
               r->bs.brick_slot[b] = BR_INVALID;
               r->bs.brick_maxk[b] = -1;
-              page[bricks_page_index(r, b)] = BR_INVALID;
+              page_set(r, bricks_page_index(r, b), BR_INVALID);
             }
             next_slot = 0;
           }
@@ -3589,7 +3797,7 @@ int r3d_bricks_begin(r3d_renderer *r, const char *c5s_path, uint32_t pool_bpa,
           uint8_t m = r->bs.maxes[i];
           r->bs.brick_maxk[b] = m;
           if (m < BR_NOISE_FLOOR) continue;
-          page[bricks_page_index(r, b)] = s | ((uint32_t)m << 24u);
+          page_set(r, bricks_page_index(r, b), s | ((uint32_t)m << 24u));
           r->bs.slot_brick[s] = b;
           r->bs.slot_use[s] = r->bs.frame;
           r->bs.brick_slot[b] = s;
@@ -3995,6 +4203,7 @@ static bool bricks_ink_repair_post(r3d_renderer *r) {
     if (hv == 0u) continue; /* still fetching */
     r->bs.ink_missing[s] = 0;
     if (hv == 2u) continue; /* definitively absent: zeros are correct */
+    /* 1 = on disk, 3 = raw ring: both decodable by the worker */
     r->bs.sel_b[nb_] = b;
     r->bs.sel_slot[nb_] = s;
     nb_++;
@@ -4039,26 +4248,17 @@ bool r3d_bricks_stream_begin(r3d_renderer *r) {
   }
   pthread_mutex_lock(&r->bs.mu);
   if (r->bs.job_state == 3) {
-    uint64_t timeline = r->timeline_value;
-    pthread_mutex_unlock(&r->bs.mu);
-    if (timeline) {
-      VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
-                                .semaphoreCount = 1,
-                                .pSemaphores = &r->timeline,
-                                .pValues = &timeline};
-      if (vkWaitSemaphores(r->vk.dev, &wi, UINT64_MAX) != VK_SUCCESS) return false;
-    }
-    /* No previously submitted shader can still read these host-coherent page
-     * entries. Publish the finished batch before this frame is submitted. */
-    pthread_mutex_lock(&r->bs.mu);
+    /* Publish the finished batch: entries go to the host shadow and reach
+     * the device table in this frame's command buffer, queue-ordered after
+     * every earlier frame — no drain needed (the old host-coherent table
+     * forced a full GPU wait here on every publication). */
     if (r->bs.job_state == 3 && r->bs.job_rc == 0) {
-      uint32_t *page = r->page_buf.mapped;
       uint32_t published = 0;
       for (uint32_t i = 0; i < r->bs.job_n; i++) {
         uint32_t b = r->bs.sel_b[i], s = r->bs.sel_slot[i];
         uint8_t m = r->bs.maxes[i];
         if (m >= BR_NOISE_FLOOR) {
-          page[bricks_page_index(r, b)] = s | ((uint32_t)m << 24);
+          page_set(r, bricks_page_index(r, b), s | ((uint32_t)m << 24));
           published++;
         }
       }
@@ -4319,8 +4519,9 @@ void r3d_bricks_stream_submit(r3d_renderer *r, uint32_t budget) {
     size_t bn = 0;
     const uint8_t *blob = warm_get(r, b, &bn);
     bool from_cache = false;
-    if (!blob && r->ni.active && atomic_load(&r->ni.have[b]) == 1u)
-      from_cache = true; /* on disk; the decode worker reads it (no IO here) */
+    uint8_t hv0 = r->ni.active ? atomic_load(&r->ni.have[b]) : 0u;
+    if (!blob && (hv0 == 1u || hv0 == 3u))
+      from_cache = true; /* on disk or in the raw ring; the worker resolves it */
     if (!blob && !from_cache) {
       /* not in any local tier: net-ingest it (stays a candidate until the
        * fetch pool caches it), or mark definitively absent */
@@ -4352,24 +4553,26 @@ void r3d_bricks_stream_submit(r3d_renderer *r, uint32_t budget) {
    * writes to a mapped descriptor buffer must not overlap shader reads, so
    * first drain the frames that could still observe the old entries. This
    * waits at most the normal frames-in-flight latency, never the decode. */
+  /* Evictions with the write-through host table: drain the in-flight
+   * readers before their entries flip to invalid (a shader mid-frame must
+   * not follow an entry into a slot the worker is about to refill). The
+   * device-local path is queue-ordered and needs none of this. */
   uint64_t timeline = r->timeline_value;
-  if (timeline && nevict) { /* only evictions need the readers drained: a
-                             * batch into free slots touches no live entry */
+  if (r->page_host && timeline && nevict) {
     VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
                               .semaphoreCount = 1,
                               .pSemaphores = &r->timeline,
                               .pValues = &timeline};
     if (vkWaitSemaphores(r->vk.dev, &wi, UINT64_MAX) != VK_SUCCESS) return;
   }
-  uint32_t *page = r->page_buf.mapped;
   for (uint32_t i = 0; i < nevict; i++)
-    page[bricks_page_index(r, evict[i])] = BR_INVALID;
+    page_set(r, bricks_page_index(r, evict[i]), BR_INVALID);
   if (nevict) r->scene_gen++;
   pthread_mutex_lock(&r->bs.mu);
   memcpy(r->bs.job_evict, evict, (size_t)nevict * sizeof *evict);
   r->bs.job_nevict = nevict;
   r->bs.job_n = n;
-  r->bs.job_timeline = 0; /* the render-thread drain above already completed */
+  r->bs.job_timeline = 0; /* uploads are queue-ordered behind in-flight frames */
   r->bs.job_rc = 0;
   r->bs.job_state = 1;
   r->bs.last_inflight = n;
@@ -4431,13 +4634,12 @@ void r3d_bricks_flush(r3d_renderer *r) {
   }
   pthread_mutex_lock(&r->bs.mu);
   if (r->bs.job_state == 3 && r->bs.job_rc == 0) {
-    uint32_t *page = r->page_buf.mapped;
     uint32_t published = 0;
     for (uint32_t i = 0; i < r->bs.job_n; i++) {
       uint32_t b = r->bs.sel_b[i], s = r->bs.sel_slot[i];
       uint8_t m = r->bs.maxes[i];
       if (m >= BR_NOISE_FLOOR) {
-        page[bricks_page_index(r, b)] = s | ((uint32_t)m << 24);
+        page_set(r, bricks_page_index(r, b), s | ((uint32_t)m << 24));
         published++;
       }
     }
@@ -5096,11 +5298,7 @@ int r3d_vslab_begin(r3d_renderer *r, const r3d_vslab_desc *d) {
    * base slot = {key, za, zb, pad} — the z range lets partial fills render
    * and gates in-progress strip writes out of the sampled set */
   uint32_t nslot = v->lv[0].gx * v->lv[0].gy;
-  r3d_vkbuf_destroy(&r->vk, &r->page_buf);
-  if (r3d_vkbuf_create_host(&r->vk, (VkDeviceSize)nslot * 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                            &r->page_buf) != 0)
-    return -1;
-  memset(r->page_buf.mapped, 0, (size_t)nslot * 16);
+  if (page_alloc(r, nslot * 4u) != 0) return -1; /* zero-filled + all dirty */
   VkDescriptorBufferInfo pbi = {.buffer = r->page_buf.buf, .range = VK_WHOLE_SIZE};
   VkWriteDescriptorSet pw = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
                              .dstSet = r->dset,
@@ -5192,7 +5390,6 @@ void r3d_vslab_frame(r3d_renderer *r, double fx, double fy, int64_t z0, uint32_t
   v->y0 = y0;
   v->z0 = z0;
 
-  uint32_t *page = r->page_buf.mapped;
   pthread_mutex_lock(&r->vsl.mu);
   /* apply completed fills: fold into the cell ledger, publish validity (key +
    * z range; partial z coverage renders immediately, the rest samples 0) */
@@ -5214,9 +5411,9 @@ void r3d_vslab_frame(r3d_renderer *r, double fx, double fy, int64_t z0, uint32_t
         if (c->za < za_want) c->za = za_want;
         if (c->zb > zb_want) c->zb = zb_want;
         if (c->zb < c->za) c->zb = c->za;
-        page[slot * 4 + 1] = (uint32_t)c->za;
-        page[slot * 4 + 2] = (uint32_t)c->zb;
-        page[slot * 4] = r3d_vs_key(cx, cy);
+        page_set(r, slot * 4 + 1, (uint32_t)c->za);
+        page_set(r, slot * 4 + 2, (uint32_t)c->zb);
+        page_set(r, slot * 4, r3d_vs_key(cx, cy));
       }
     j->st = 0;
   }
@@ -5324,7 +5521,7 @@ void r3d_vslab_frame(r3d_renderer *r, double fx, double fy, int64_t z0, uint32_t
           uint32_t slot = r3d_vs_phys(cy, v->lv[0].gy) * v->lv[0].gx + r3d_vs_phys(cx, v->lv[0].gx);
           struct vscell *c = &r->vsl.cells[slot];
           if (c->cx != cx || c->cy != cy)
-            page[slot * 4] = 0; /* fresh tile: invalidate BEFORE the worker writes */
+            page_set(r, slot * 4, 0); /* fresh tile: invalidate BEFORE the worker writes */
         }
       r->vsl.q[fi] = (struct vsjob){.cx = bx0,
                                     .cy = by0,
@@ -5350,7 +5547,7 @@ void r3d_vslab_frame(r3d_renderer *r, double fx, double fy, int64_t z0, uint32_t
         r3d_vs_phys(jobs[k].cy, v->lv[0].gy) * v->lv[0].gx + r3d_vs_phys(jobs[k].cx, v->lv[0].gx);
     struct vscell *c = &r->vsl.cells[slot];
     if (c->cx != jobs[k].cx || c->cy != jobs[k].cy)
-      page[slot * 4] = 0; /* fresh tile: invalidate BEFORE the worker writes */
+      page_set(r, slot * 4, 0); /* fresh tile: invalidate BEFORE the worker writes */
     r->vsl.q[fi] = (struct vsjob){.cx = jobs[k].cx,
                                   .cy = jobs[k].cy,
                                   .cx1 = jobs[k].cx,
@@ -5397,7 +5594,7 @@ void r3d_vslab_frame(r3d_renderer *r, double fx, double fy, int64_t z0, uint32_t
       }
       if (dup) continue;
       if (fi < 0) break;
-      if (c->cx != pf[k].cx || c->cy != pf[k].cy) page[slot * 4] = 0;
+      if (c->cx != pf[k].cx || c->cy != pf[k].cy) page_set(r, slot * 4, 0);
       r->vsl.q[fi] = (struct vsjob){.cx = pf[k].cx,
                                     .cy = pf[k].cy,
                                     .cx1 = pf[k].cx,
@@ -5672,6 +5869,8 @@ int r3d_frame_views(r3d_renderer *r, const r3d_frame_params *views, uint32_t nvi
     vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, r->query, slot * 4);
   }
   bool sv_baked_now = false;
+  if (page_flush(r, cmd, slot) != 0) return -1; /* page table edits land here,
+                                                  * queue-ordered before reads */
 
   if (r->sv.active && r->sv.step > 0.0f && !r->sv.dirty && !r->sv.shift_pending &&
       r->sv.prog_row == UINT32_MAX && r->sv.baked) {

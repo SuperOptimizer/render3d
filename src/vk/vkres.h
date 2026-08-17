@@ -41,6 +41,9 @@ uint32_t r3d_vk_find_mem(const r3d_vkctx *c, uint32_t type_bits, VkMemoryPropert
 int r3d_vkbuf_create_host(r3d_vkctx *c, VkDeviceSize size, VkBufferUsageFlags usage,
                           r3d_vkbuf *b);
 void r3d_vkbuf_destroy(r3d_vkctx *c, r3d_vkbuf *b);
+/* Device-local (unmapped) buffer; fill it with vkCmdUpdateBuffer/CopyBuffer. */
+int r3d_vkbuf_create_device(r3d_vkctx *c, VkDeviceSize size, VkBufferUsageFlags usage,
+                            r3d_vkbuf *b);
 
 /* Device-local image + view (2D if extent.depth==1, else 3D). Dedicated allocation. */
 int r3d_vkimage_create(r3d_vkctx *c, VkFormat format, VkExtent3D extent, uint32_t mips,

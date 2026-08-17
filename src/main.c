@@ -1101,6 +1101,7 @@ int main(int argc, char **argv) {
   float cam0[5] = {0.5f, 0.5f, -1.5f, 0.0f, 0.0f}; /* pos, yaw, pitch */
   bool no_vsync = false;
   bool headless = false; /* --headless: no window/swapchain, offscreen only */
+  double run_seconds = 0.0; /* --seconds S: exit after S s of wall time (with --frames: whichever first) */
   float lowcut0 = 0.0f;
   const char *bench = NULL; /* scripted camera path: orbit | zoom | fly */
   const char *bench_name = NULL;
@@ -1142,6 +1143,7 @@ int main(int argc, char **argv) {
   bool vsz_given = false;
   for (int i = 1; i < argc; i++) {
     if (i < argc - 1 && strcmp(argv[i], "--frames") == 0) exit_frames = (uint32_t)atoi(argv[i + 1]);
+    if (i < argc - 1 && strcmp(argv[i], "--seconds") == 0) run_seconds = atof(argv[i + 1]);
     if (i < argc - 1 && strcmp(argv[i], "--warmup") == 0)
       warmup_frames = (uint32_t)atoi(argv[i + 1]);
     if (i < argc - 1 && strcmp(argv[i], "--bench-json") == 0) bench_json = argv[i + 1];
@@ -1235,7 +1237,9 @@ int main(int argc, char **argv) {
     return EXIT_FAILURE;
   }
   if (bench && exit_frames == 0) exit_frames = 300;
-  if (headless && !exit_frames) exit_frames = 1000; /* never run unattended forever */
+  if (headless && !exit_frames && run_seconds <= 0.0)
+    exit_frames = 1000; /* never run unattended forever */
+  if (run_seconds > 0.0 && !exit_frames) exit_frames = 2000000u; /* time decides (cap keeps the per-frame sample buffer sane) */
   if (!exit_frames) warmup_frames = 0;
   if (exit_frames > UINT32_MAX - warmup_frames) {
     fprintf(stderr, "--frames + --warmup is too large\n");
@@ -1693,8 +1697,12 @@ int main(int argc, char **argv) {
   uint64_t prev_ns = r3d_now_ns();
 
   bool running = true;
+  uint64_t run_start_ns = r3d_now_ns();
   while (running) {
     uint64_t t0 = r3d_now_ns();
+    if (run_seconds > 0.0 && (double)(t0 - run_start_ns) * 1e-9 >= run_seconds &&
+        frame_index > warmup_frames)
+      total_frames = frame_index; /* time is up: this frame is the last */
     if (exit_frames && frame_index == warmup_frames) {
       r3d_stats_init(&stats);
       memset(&prof_sum, 0, sizeof prof_sum);

@@ -1673,3 +1673,38 @@ WSI (fence wait + 8 MB memcpy per present: the remaining ~1-2 ms "submit"),
 descriptorIndexing for bindless dzn, raw fast-path for freshly fetched
 uncompressed chunks (fetch->c5d encode->decode is ~10% of cold-session CPU),
 device-local double-buffered page table, vslab validity-table race (audit).
+
+## 2026-08-17 — round 2: raw fast-path, page-table shadow, headless bench
+
+Headless mode (`--headless`, no window/surface/swapchain/present; ImGui runs
+without a platform backend; `--seconds S` ends a run by wall time) exists so
+the whole multiview/streaming stack can be profiled unattended and without
+WSLg's software present in the numbers. `tools/perf_headless.sh` runs the
+scenario matrix (static / static-nocache / exercise / exercise-nocache /
+optional cold-cache) for a fixed time each, writes bench JSON, prints a
+table, and diffs against a baseline dir.
+
+Headless numbers (RTX 5080 / Dozen, 1920x1080, PHerc0343 warm cache):
+static (pane cache on) ~1000-2600 fps (nothing to draw); static with every
+pane redrawn ~300-450 fps, gpu 1.8-3.1 ms; exercised ~400-570 fps. Same
+binary windowed: 250 / 200 fps — the remainder is WSLg present + SDL poll.
+Run-to-run spread on this laptop is +-25% (GPU clocks, WSL scheduling):
+compare medians of repeated runs, not single numbers.
+
+Decisions measured this round (each has an env switch for re-checking):
+- Fresh fetches display straight from a raw-brick ring published BEFORE the
+  c5d encode+write (have=3); the .c5b still gets written for later sessions.
+  Cold-cache decode jobs 40-77 -> ~6 ms/job; fetch/encode threads run at
+  nice 5. (`ni_raw_put/take`)
+- Page/validity table now goes through a host shadow with dirty tracking.
+  Default: host-visible write-through + eviction-only drain (measured 5-8%
+  faster than the device-local, queue-ordered copy path on Dozen —
+  `R3D_DEVICE_PAGE=1` keeps that path, which needs no drains at all).
+  vslab validity edits drain in-flight readers only on frames that change
+  the table (the audit's host/GPU race).
+- descriptorIndexing (bindless on Dozen): record 0.37 -> 2.07 ms per
+  4-dispatch frame, no GPU gain -> opt-in `R3D_BINDLESS=1`.
+- Presenter thread: slower on Dozen (present contends with recording inside
+  the driver): opt-in `R3D_PRESENT_THREAD=1`.
+- Decode pool bug fixed en route: a late-waking worker could run a NULL job.
+- Live-ink sampler fans out across cores (cpuvol is now thread-safe).
