@@ -1773,3 +1773,39 @@ finer levels by nearest upsampling of the cell (loaded from the tree's own
 files when already predicted). PHercParis4 2.4 um at P=2: 50 predictions,
 tracer at L2 grew 196 pts in 6 gens (527 s: L2 CT chunk fetches dominate);
 plane views show the sheets via upsampled L1 bricks.
+
+## Tracer improvement plan, phases 0-3a (vc3d gap review)
+
+Harness: `tools/trace_bench.sh` — tracecli (pure CPU), 3 pinned raw seeds +
+1 fused seed on PHerc0343 L1, 16 gens, 3 reps; medians below. Baseline
+recorded before any behavior change.
+
+| metric (median of 12) | baseline | P1 (G1+G2+G3) | P2 (+G7,ordering,L) |
+|---|---|---|---|
+| folds | 6 | 0.5 | 2 |
+| kinks | 148 | 63 | 42 |
+| twist rms (vox) | 0.88 | 0.77 | 0.76 |
+| slant p95 | 0.78 | 0.42 | 0.36 |
+| wall (s) | 6.0 | 4.9 | 5.0 |
+| fused donor mean (vox) | 2.0 | 1.6 | 1.7 |
+
+- P0: QC extended (area/bbox/fill/hole/slant + donor agreement + NG cap
+  bind counters), all into meta.json + finish log. Baseline captured.
+- P1 G1: pre-solve veto (xyz box + volume + ribbon CT at parent mean)
+  BEFORE commit; radius-3 disc snapshot restored on post-solve failure.
+  G2: ncp gradient configuration frozen at the base pose (aw, straddle
+  corner, slice, ROI membership, 1/d² weights, snap target) — kills the
+  wrap-jump pull and the quad-flattening torque; R3D_NCP_LEGACY=1 keeps
+  the old path. G3: zero residual on no-coverage. Fold median 6 -> 0.5,
+  kinks halved, 20% faster.
+- P2 G7: seed snapped to the nearest DT minimum (aborts cleanly when no
+  sheet within 40 vox). G6.1: candidates sorted most-supported-first.
+  G6.3: L-shape spur rejection after gen 30 (inert at 16-gen bench).
+- P3a G4: winding relaxed as a field each generation (tr_wind_relax);
+  werr = |causal - relaxed| detects wrong-wrap captures; conf clamped to
+  0.25 where werr > 0.3 (R3D_WERR_CLAMP=0 disables); wrap_frac/werr_p95
+  in QC + meta. Unit-tested in the spiral selftest (clean spiral reads
+  clean; corrupted-winding cell detected + clamped). Bench seeds carry no
+  umbilicus, so wrap metrics are GUI-only until a p343 umbilicus exists.
+- Residual run-to-run variance (kinks 0..300 same build) persists: the
+  pool's claim scheduling, not candidate order. Revisit with G6 retry.

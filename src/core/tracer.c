@@ -425,6 +425,10 @@ static uint32_t ng_query(const ng_grid *g, double cx, double cy, double radius,
 /* phase timers, atomic ns: accumulated from every worker thread */
 static _Atomic uint64_t tr_tm_ns[6]; /* 0 place 1 lopt 2 conf 3 ngfetch
                                       * 4 ngeval 5 hoodbuild */
+/* truncation-cap bind counters: how often a neighborhood query filled
+ * NG_QMAX paths or NG_HOODSEG segments (decides whether the caps ever
+ * cost accuracy on real slices before we spend on distance-ranked cuts) */
+static _Atomic uint64_t ng_qmax_binds, ng_hoodseg_binds;
 static double tr_now(void) {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -932,6 +936,7 @@ static ng_hood *ng_hood_get(tr_env *e, ng_grid *g, int plane, int slice, double 
   double R = 92.0; /* query radius 80 + 16-px quantization slack */
   uint32_t paths[NG_QMAX];
   uint32_t np = ng_query(g, cx, cy, R, paths, NG_QMAX);
+  if (np == NG_QMAX) atomic_fetch_add(&ng_qmax_binds, 1);
   static _Thread_local float *dec = NULL;
   static _Thread_local uint32_t dec_cap = 0;
   for (uint32_t p = 0; p < np && h->nseg < NG_HOODSEG; p++) {
@@ -982,6 +987,7 @@ static ng_hood *ng_hood_get(tr_env *e, ng_grid *g, int plane, int slice, double 
       h->nseg++;
     }
   }
+  if (h->nseg == NG_HOODSEG) atomic_fetch_add(&ng_hoodseg_binds, 1);
   tr_tm_add(5, t0);
   return h;
 }
@@ -1152,8 +1158,181 @@ static double ncp_residual(tr_env *e, int plane, const double A[3],
  * near-identical chords — so all four run through ONE pass over the
  * segment neighborhood with 4-wide math instead of four passes with
  * four hood lookups. out[0]=r(x), out[1..3]=r(x + h e_k). */
+/* G2/G3 (vc3d parity): the finite difference must differentiate ONLY what
+ * vc3d's autodiff differentiates. vc3d freezes every configuration-
+ * selecting quantity on the scalar part (.val()): the straddle decision,
+ * the corner Bn, the slice, the angular weight, ROI membership, the 1/d^2
+ * distance weights, and the snap-target identity. Differentiating through
+ * those (as the legacy path below does) adds a translational pull toward
+ * whichever nearby polyline is best aligned — a direct wrap-jump force —
+ * plus a quad-flattening torque through aw and step discontinuities
+ * where ROI/snap identities flip between probes. And where the grids have
+ * no coverage at all, the residual must be exactly 0, not a constant
+ * orientation penalty. R3D_NCP_LEGACY=1 restores the old behavior. */
+static void ncp_residual4_legacy(tr_env *e, int plane, const double Qr[4][3],
+                                 int fxr, double h, double out[4]);
+
 static void ncp_residual4(tr_env *e, int plane, const double Qr[4][3], int fxr,
                           double h, double out[4]) {
+  static _Atomic int legacy = -1;
+  int lg = atomic_load_explicit(&legacy, memory_order_relaxed);
+  if (lg < 0) {
+    lg = getenv("R3D_NCP_LEGACY") ? 1 : 0;
+    atomic_store(&legacy, lg);
+  }
+  if (lg) {
+    ncp_residual4_legacy(e, plane, Qr, fxr, h, out);
+    return;
+  }
+  int axis = 2 - plane;
+  for (int v = 0; v < 4; v++) out[v] = 0.0;
+  /* base-pose configuration (variant 0 = unperturbed) */
+  const double *A0 = Qr[0], *B10 = Qr[1], *B20 = Qr[2], *C0 = Qr[3];
+  double b1r = B10[axis] - A0[axis], b2r = B20[axis] - A0[axis],
+         cr0 = C0[axis] - A0[axis];
+  if ((b1r > 0 && b2r > 0 && cr0 > 0) || (b1r < 0 && b2r < 0 && cr0 < 0)) return;
+  int bn_idx = 0; /* frozen straddle corner: 1=B1, 2=B2 */
+  if (fabs(cr0) < 1e-9) {
+    if (fabs(b1r) > 1e-9) bn_idx = 1;
+    else if (fabs(b2r) > 1e-9) bn_idx = 2;
+  } else {
+    if (b1r * cr0 <= 0.0) bn_idx = 1;
+    else if (b2r * cr0 <= 0.0) bn_idx = 2;
+  }
+  if (!bn_idx) return;
+  double aw_base;
+  { /* frozen angular weight from the base quad */
+    const double *Bn0 = bn_idx == 1 ? B10 : B20;
+    double v1_[3], v2_[3], nq[3];
+    for (int a = 0; a < 3; a++) {
+      v1_[a] = Bn0[a] - A0[a];
+      v2_[a] = Bn0[a] - C0[a];
+    }
+    nq[0] = v1_[1] * v2_[2] - v1_[2] * v2_[1];
+    nq[1] = v1_[2] * v2_[0] - v1_[0] * v2_[2];
+    nq[2] = v1_[0] * v2_[1] - v1_[1] * v2_[0];
+    double nl2 = nq[0] * nq[0] + nq[1] * nq[1] + nq[2] * nq[2];
+    if (nl2 < 1e-18) return;
+    double na = nq[axis] / sqrt(nl2);
+    aw_base = 0.5 * (1.0 - na * na);
+  }
+  double aw0 = aw_base;
+  int s0 = (int)llround(A0[axis]); /* frozen slice */
+  /* per-variant chord geometry with the FROZEN Bn identity */
+  bool ok[4];
+  float vax[4], vay[4], vex4[4], vey4[4], venx[4], veny[4];
+  double m0x = 0, m0y = 0;
+  for (int v = 0; v < 4; v++) {
+    double V[3];
+    memcpy(V, Qr[fxr], sizeof V);
+    if (v) V[v - 1] += h;
+    const double *cor[4];
+    for (int c = 0; c < 4; c++) cor[c] = c == fxr ? V : Qr[c];
+    const double *A = cor[0], *Bn = cor[bn_idx], *C = cor[3];
+    ok[v] = false;
+    double bnr = Bn[axis] - A[axis], cr = C[axis] - A[axis];
+    if (fabs(bnr - cr) < 1e-9) continue;
+    double t = -cr / (bnr - cr);
+    double E[3];
+    for (int a = 0; a < 3; a++) E[a] = C[a] + t * (Bn[a] - C[a]);
+    double a2[2], e2[2];
+    ncp_2d(plane, A, a2);
+    ncp_2d(plane, E, e2);
+    double ex = e2[0] - a2[0], ey = e2[1] - a2[1];
+    double el = sqrt(ex * ex + ey * ey);
+    if (el < 1e-9) continue;
+    vax[v] = (float)a2[0];
+    vay[v] = (float)a2[1];
+    vex4[v] = (float)e2[0];
+    vey4[v] = (float)e2[1];
+    venx[v] = (float)(ey / el);
+    veny[v] = (float)(-ex / el);
+    if (v == 0) {
+      m0x = (a2[0] + e2[0]) * 0.5;
+      m0y = (a2[1] + e2[1]) * 0.5;
+    }
+    ok[v] = true;
+  }
+  if (!ok[0]) return; /* config comes from the base: no base, no residual */
+  int slot;
+  ng_grid *g = ng_eget(e, plane, s0, &slot);
+  (void)slot;
+  if (!g || g->empty) return; /* G3: no coverage -> exactly 0 */
+  ng_hood *hd = ng_hood_get(e, g, plane, s0, m0x, m0y);
+  if (!hd || !hd->nseg) return; /* G3 */
+  float fm0x = (float)m0x, fm0y = (float)m0y;
+  double wsum = 0.0; /* frozen: identical for every variant */
+  double nsum[4] = {0, 0, 0, 0};
+  uint32_t nacc = 0;
+  const float *bsg = NULL; /* frozen snap target */
+  int bdsn = 0;
+  float bscore = -1.0f;
+  for (uint32_t k = 0; k < hd->nseg; k++) {
+    const float *sg = hd->sg[k];
+    float smx = (sg[0] + sg[2]) * 0.5f, smy = (sg[1] + sg[3]) * 0.5f;
+    float dmx = smx - fm0x, dmy = smy - fm0y;
+    float d2 = dmx * dmx + dmy * dmy; /* BASE distance: frozen ROI + weight */
+    if (d2 <= (float)NCP_ROI2) {
+      float dd = d2 < 10.0f ? 10.0f : d2;
+      nacc++;
+      wsum += (double)(1.0f / dd);
+      for (int v = 0; v < 4; v++) /* only the alignment differentiates */
+        if (ok[v]) {
+          float dot = fabsf(venx[v] * sg[4] + veny[v] * sg[5]);
+          nsum[v] += (double)((1.0f - dot) / dd);
+        }
+    }
+    /* snap-target selection from the BASE pose only */
+    float tt = ((vex4[0] - sg[0]) * sg[10] + (vey4[0] - sg[1]) * sg[11]) * sg[12];
+    tt = tt < 0.0f ? 0.0f : (tt > 1.0f ? 1.0f : tt);
+    float qex = sg[0] + tt * sg[10] - vex4[0], qey = sg[1] + tt * sg[11] - vey4[0];
+    float d2e = qex * qex + qey * qey;
+    if (d2e < (float)(NCP_SNAP_TRIG * NCP_SNAP_TRIG)) {
+      for (int dsn = 0; dsn < 2; dsn++) {
+        if (!(hd->nb[k] & (dsn ? 2u : 1u))) continue;
+        double qax = dsn ? (double)sg[2] : (double)sg[6];
+        double qay = dsn ? (double)sg[3] : (double)sg[7];
+        double qbx = dsn ? (double)sg[8] : (double)sg[0];
+        double qby = dsn ? (double)sg[9] : (double)sg[1];
+        double d2a = ncp_pt_seg_d2((double)vax[0], (double)vay[0], qax, qay, qbx, qby);
+        if (d2a < NCP_SNAP_RANGE * NCP_SNAP_RANGE) {
+          double d1n = sqrt(d2a) / NCP_SNAP_RANGE,
+                 d2n = sqrt((double)d2e) / NCP_SNAP_TRIG;
+          float score = (float)(0.5 * (d1n + d2n));
+          if (bscore < 0.0f || score < bscore) {
+            bscore = score;
+            bsg = sg;
+            bdsn = dsn;
+          }
+        }
+      }
+    }
+  }
+  if (!nacc) return; /* G3: nothing in the ROI -> no evidence, no penalty */
+  for (int v = 0; v < 4; v++) {
+    if (!ok[v]) continue;
+    double normal_loss = wsum > 1e-9 ? nsum[v] / wsum : 0.0;
+    double snap_loss = 1.0;
+    if (bsg) { /* distances to the FROZEN segment carry the derivative */
+      const float *sg = bsg;
+      float tt = ((vex4[v] - sg[0]) * sg[10] + (vey4[v] - sg[1]) * sg[11]) * sg[12];
+      tt = tt < 0.0f ? 0.0f : (tt > 1.0f ? 1.0f : tt);
+      float qex = sg[0] + tt * sg[10] - vex4[v], qey = sg[1] + tt * sg[11] - vey4[v];
+      double d2e = (double)(qex * qex + qey * qey);
+      double qax = bdsn ? (double)sg[2] : (double)sg[6];
+      double qay = bdsn ? (double)sg[3] : (double)sg[7];
+      double qbx = bdsn ? (double)sg[8] : (double)sg[0];
+      double qby = bdsn ? (double)sg[9] : (double)sg[1];
+      double d2a = ncp_pt_seg_d2((double)vax[v], (double)vay[v], qax, qay, qbx, qby);
+      double d1n = sqrt(d2a) / NCP_SNAP_RANGE, d2n = sqrt(d2e) / NCP_SNAP_TRIG;
+      snap_loss = d1n * (1.0 - d2n) + d2n;
+    }
+    out[v] = (NCP_W_NORMAL * normal_loss + NCP_W_SNAP * snap_loss) * aw0;
+  }
+}
+
+static void ncp_residual4_legacy(tr_env *e, int plane, const double Qr[4][3],
+                                 int fxr, double h, double out[4]) {
   int axis = 2 - plane;
   double V[4][3]; /* free-corner variants */
   for (int v = 0; v < 4; v++) {
@@ -3322,6 +3501,69 @@ static bool tr_place_cand(r3d_tracer *t, tr_env *e, uint32_t cell, unsigned *rng
   if (bi < 0) return false;
   size_t k = (size_t)j * W + (size_t)i;
   if (t->state[k] == R3D_TR_SET) return false;
+  { /* pre-solve veto (vc3d GrowPatch.cpp:4851): test the mean of the
+     * candidate's valid 3x3 neighbours against the xyz boxes, the volume,
+     * and (ribbon) CT validity BEFORE committing — a doomed candidate must
+     * never be placed, solved, and allowed to drag its disc first */
+    double pm[3] = {0, 0, 0};
+    int pn = 0;
+    for (int dj = -1; dj <= 1; dj++)
+      for (int di = -1; di <= 1; di++) {
+        if (!tr_valid(t, i + di, j + dj)) continue;
+        const double *q = t->pos + ((size_t)(j + dj) * W + (size_t)(i + di)) * 3;
+        for (int a = 0; a < 3; a++) pm[a] += q[a];
+        pn++;
+      }
+    if (pn) {
+      for (int a = 0; a < 3; a++) pm[a] /= pn;
+      bool veto = false;
+      if (t->cfg.z_max > t->cfg.z_min && (pm[2] < t->cfg.z_min || pm[2] > t->cfg.z_max))
+        veto = true;
+      if (t->cfg.x_max > t->cfg.x_min && (pm[0] < t->cfg.x_min || pm[0] > t->cfg.x_max))
+        veto = true;
+      if (t->cfg.y_max > t->cfg.y_min && (pm[1] < t->cfg.y_min || pm[1] > t->cfg.y_max))
+        veto = true;
+      if (t->vdim[0] > 0 && (pm[0] < 0 || pm[1] < 0 || pm[2] < 0 ||
+                             pm[0] >= t->vdim[0] || pm[1] >= t->vdim[1] ||
+                             pm[2] >= t->vdim[2]))
+        veto = true;
+      if (!veto && t->cfg.rib_rows) {
+        /* ribbon boundary: stop at TRUE nothingness at the parent position
+         * (was a whole generation late as a post-placement pass) */
+        if (t->bnd_ct) {
+          double v = r3d_cpuvol_tri(t->bnd_ct, t->bnd_lv, pm, NULL);
+          for (int o = 0; o < 6 && v < t->bnd_min; o++) {
+            static const double off[6][3] = {{2, 0, 0}, {-2, 0, 0}, {0, 2, 0},
+                                             {0, -2, 0}, {0, 0, 2}, {0, 0, -2}};
+            double q2[3] = {pm[0] + off[o][0], pm[1] + off[o][1], pm[2] + off[o][2]};
+            double v2 = r3d_cpuvol_tri(t->bnd_ct, t->bnd_lv, q2, NULL);
+            if (v2 > v) v = v2;
+          }
+          veto = v < t->bnd_min;
+        } else if (e->dt) {
+          veto = td_tri(e->dt, pm, NULL) > 50.0 + t->cfg.step;
+        }
+      }
+      if (veto) {
+        pthread_mutex_lock(&t->mu);
+        t->state[k] = R3D_TR_FAIL; /* pos untouched, nset untouched */
+        pthread_mutex_unlock(&t->mu);
+        return false;
+      }
+    }
+  }
+  /* snapshot the radius-3 disc so a post-solve failure can retract without
+   * leaving a scar (neighbours pulled toward a point that then dies) */
+  double dsnap[49 * 3];
+  uint32_t dsnap_k[49], dsnap_n = 0;
+  for (int dj = -3; dj <= 3; dj++)
+    for (int di = -3; di <= 3; di++) {
+      int ii = i + di, jj = j + dj;
+      if ((di == 0 && dj == 0) || !tr_valid(t, ii, jj)) continue;
+      size_t k2 = (size_t)jj * W + (size_t)ii;
+      memcpy(dsnap + (size_t)dsnap_n * 3, t->pos + k2 * 3, 3 * sizeof(double));
+      dsnap_k[dsnap_n++] = (uint32_t)k2;
+    }
   const double *bp = t->pos + ((size_t)bj * W + (size_t)bi) * 3;
   pthread_mutex_lock(&t->mu);
   for (int a = 0; a < 3; a++) t->pos[k * 3 + (size_t)a] = bp[a] + tr_urand(rng);
@@ -3398,6 +3640,12 @@ static bool tr_place_cand(r3d_tracer *t, tr_env *e, uint32_t cell, unsigned *rng
     pthread_mutex_lock(&t->mu);
     t->state[k] = R3D_TR_FAIL;
     if (t->nset) t->nset--;
+    /* retract: restore the radius-3 disc the placement solve dragged
+     * toward the now-dead point (vc3d never lets the point exist; our
+     * second line of defence must at least not leave a scar) */
+    for (uint32_t s2 = 0; s2 < dsnap_n; s2++)
+      memcpy(t->pos + (size_t)dsnap_k[s2] * 3, dsnap + (size_t)s2 * 3,
+             3 * sizeof(double));
     pthread_mutex_unlock(&t->mu);
     return false;
   }
@@ -3637,15 +3885,73 @@ static uint32_t tr_pool_run2(tr_pool *pl, tr_env *cenv, const uint32_t *items,
 static bool tr_qc_ok(const r3d_tracer *t, int i, int j) {
   return tr_valid(t, i, j) && t->conf[(size_t)j * t->W + (size_t)i] > 0.25f;
 }
+
+/* Flood-fill the exterior: mark every cell reachable 4-connected from the
+ * grid border without crossing a blocked cell. What remains unblocked and
+ * unmarked is enclosed (a hole). Shared by the QC hole metric and the
+ * inpaint interiority gate. */
+static void tr_flood_exterior(uint32_t W, uint32_t H, const uint8_t *blocked,
+                              uint8_t *ext) {
+  memset(ext, 0, (size_t)W * H);
+  uint32_t *q = malloc((size_t)W * H * sizeof *q);
+  if (!q) return;
+  uint32_t qn = 0;
+  for (uint32_t i = 0; i < W; i++) {
+    if (!blocked[i] && !ext[i]) ext[i] = 1, q[qn++] = i;
+    size_t b = (size_t)(H - 1) * W + i;
+    if (!blocked[b] && !ext[b]) ext[b] = 1, q[qn++] = (uint32_t)b;
+  }
+  for (uint32_t j = 0; j < H; j++) {
+    size_t l = (size_t)j * W, r = l + W - 1;
+    if (!blocked[l] && !ext[l]) ext[l] = 1, q[qn++] = (uint32_t)l;
+    if (!blocked[r] && !ext[r]) ext[r] = 1, q[qn++] = (uint32_t)r;
+  }
+  while (qn) {
+    uint32_t k = q[--qn];
+    uint32_t i = k % W, j = k / W;
+    static const int o4[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+    for (int o = 0; o < 4; o++) {
+      int ii = (int)i + o4[o][0], jj = (int)j + o4[o][1];
+      if (ii < 0 || jj < 0 || ii >= (int)W || jj >= (int)H) continue;
+      size_t k2 = (size_t)jj * W + (size_t)ii;
+      if (blocked[k2] || ext[k2]) continue;
+      ext[k2] = 1;
+      q[qn++] = (uint32_t)k2;
+    }
+  }
+  free(q);
+}
+
+static int tr_fcmp(const void *a, const void *b) {
+  float x = *(const float *)a, y = *(const float *)b;
+  return x < y ? -1 : x > y ? 1 : 0;
+}
+static int tr_u64cmp(const void *a, const void *b) {
+  uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+  return x < y ? -1 : x > y ? 1 : 0;
+}
+
+/* Donor-agreement QC (fused runs): distance from <=2000 sampled trusted
+ * cells to their nearest donor point. The donors are free ground truth —
+ * a trace drifting a wrap away from them shows up here first. */
+static void tr_qc_donor(r3d_tracer *t);
 static void tr_qc(r3d_tracer *t) {
   uint32_t folds = 0, kinks = 0;
-  double tw2 = 0.0;
-  size_t ntw = 0;
+  double tw2 = 0.0, area = 0.0;
+  size_t ntw = 0, ntrust = 0;
+  uint32_t bb[4] = {t->W, t->H, 0, 0}; /* i0,j0,i1,j1 */
   int W = (int)t->W, H = (int)t->H;
+  float *slant = malloc((size_t)W * (size_t)H * sizeof *slant);
+  size_t nsl = 0;
   static const int ax2[2][2] = {{1, 0}, {0, 1}};
   for (int j = 0; j < H; j++)
     for (int i = 0; i < W; i++) {
       if (!tr_qc_ok(t, i, j)) continue;
+      ntrust++;
+      if ((uint32_t)i < bb[0]) bb[0] = (uint32_t)i;
+      if ((uint32_t)j < bb[1]) bb[1] = (uint32_t)j;
+      if ((uint32_t)i > bb[2]) bb[2] = (uint32_t)i;
+      if ((uint32_t)j > bb[3]) bb[3] = (uint32_t)j;
       const double *b = t->pos + ((size_t)j * t->W + (size_t)i) * 3;
       for (int a = 0; a < 2; a++) {
         int ai = i - ax2[a][0], aj = j - ax2[a][1];
@@ -3685,13 +3991,191 @@ static void tr_qc(r3d_tracer *t) {
           tw2 += dist * dist;
           ntw++;
         }
+        /* two-triangle quad area: (b,p10,p01) + (p10,p11,p01) */
+        double f1[3], f2[3], cx[3];
+        for (int k = 0; k < 3; k++) {
+          f1[k] = p11[k] - p10[k];
+          f2[k] = p01[k] - p10[k];
+        }
+        cx[0] = f1[1] * f2[2] - f1[2] * f2[1];
+        cx[1] = f1[2] * f2[0] - f1[0] * f2[2];
+        cx[2] = f1[0] * f2[1] - f1[1] * f2[0];
+        area += 0.5 * (ln + sqrt(cx[0] * cx[0] + cx[1] * cx[1] + cx[2] * cx[2]));
+        /* slant: shear of the local uv frame */
+        double luu = e1[0] * e1[0] + e1[1] * e1[1] + e1[2] * e1[2];
+        if (slant && luu > 1e-12)
+          slant[nsl++] =
+              (float)(fabs(e1[0] * e2[0] + e1[1] * e2[1] + e1[2] * e2[2]) / luu);
       }
     }
+  float sl95 = 0.0f;
+  if (slant && nsl) {
+    qsort(slant, nsl, sizeof *slant, tr_fcmp);
+    sl95 = slant[nsl - 1 - nsl / 20];
+  }
+  free(slant);
+  /* enclosed holes: untrusted cells unreachable from the grid border */
+  uint32_t holes = 0;
+  uint64_t bba = 0;
+  if (ntrust) {
+    bba = (uint64_t)(bb[2] - bb[0] + 1) * (bb[3] - bb[1] + 1);
+    uint8_t *blocked = malloc((size_t)W * (size_t)H), *ext = malloc((size_t)W * (size_t)H);
+    if (blocked && ext) {
+      for (int j = 0; j < H; j++)
+        for (int i = 0; i < W; i++)
+          blocked[(size_t)j * (size_t)W + (size_t)i] = tr_qc_ok(t, i, j) ? 1 : 0;
+      tr_flood_exterior(t->W, t->H, blocked, ext);
+      for (size_t k = 0; k < (size_t)W * (size_t)H; k++)
+        if (!blocked[k] && !ext[k]) holes++;
+    }
+    free(blocked);
+    free(ext);
+  }
   pthread_mutex_lock(&t->mu);
   t->qc_folds = folds;
   t->qc_kinks = kinks;
   t->qc_twist = ntw ? (float)sqrt(tw2 / (double)ntw) : 0.0f;
+  t->qc_area_vx2 = area;
+  memcpy(t->qc_bbox, bb, sizeof bb);
+  t->qc_fill = bba ? (float)((double)ntrust / (double)bba) : 0.0f;
+  t->qc_hole = bba ? (float)((double)holes / (double)bba) : 0.0f;
+  t->qc_slant_p95 = sl95;
   pthread_mutex_unlock(&t->mu);
+  if (t->don) tr_qc_donor(t);
+}
+
+static void tr_qc_donor(r3d_tracer *t) {
+  size_t n = (size_t)t->W * t->H;
+  float d[2000];
+  uint32_t nd = 0, tried = 0;
+  double rad = 2.0 * t->cfg.step;
+  size_t stride = n / 2000 + 1;
+  for (size_t k = 0; k < n && tried < 2000; k += stride) {
+    if (!tr_qc_ok(t, (int)(k % t->W), (int)(k / t->W))) continue;
+    tried++;
+    double q[3], dwnd;
+    if (tr_don_closest(t->don, t->pos + k * 3, rad, q, &dwnd) < 0) continue;
+    double s = 0;
+    for (int a = 0; a < 3; a++) {
+      double dd = t->pos[k * 3 + (size_t)a] - q[a];
+      s += dd * dd;
+    }
+    d[nd++] = (float)sqrt(s);
+  }
+  float mean = 0, rms = 0, p95 = 0;
+  if (nd) {
+    double s1 = 0, s2 = 0;
+    for (uint32_t i = 0; i < nd; i++) {
+      s1 += (double)d[i];
+      s2 += (double)d[i] * (double)d[i];
+    }
+    mean = (float)(s1 / nd);
+    rms = (float)sqrt(s2 / nd);
+    qsort(d, nd, sizeof *d, tr_fcmp);
+    p95 = d[nd - 1 - nd / 20];
+  }
+  pthread_mutex_lock(&t->mu);
+  t->qc_don_mean = mean;
+  t->qc_don_rms = rms;
+  t->qc_don_p95 = p95;
+  t->qc_don_cov = tried ? (float)nd / (float)tried : 0.0f;
+  pthread_mutex_unlock(&t->mu);
+}
+
+/* G4 (vc3d vc_tifxyz_winding relax): the causal winding is assigned at
+ * placement and never follows the cell as later solves move it — one cell
+ * dragged across a wrap boundary keeps a stale winding forever, blinding
+ * the self-overlap hinge, the spacing pull, the donor gates and the
+ * sibling stop all at once. Relax winding as a FIELD over the grown grid:
+ * w[k] <- mean over 4-neighbours of (w[n] + dtheta/2pi), the seed pinned
+ * at 0, edges with |dtheta/2pi| > 0.25 rejected (a quarter winding per
+ * grid step is a cross-wrap link, not a sheet step). |wind - relaxed| is
+ * then an intrinsic wrong-wrap detector needing no spiral model; with
+ * R3D_WERR_CLAMP=1 cells with werr > 0.3 have conf clamped to 0.25 so
+ * the save cutoff and the QC trust gate both see the capture. */
+static void tr_wind_relax(r3d_tracer *t, int iters) {
+  if (!t->uc || !t->werr || t->nset < 16) return;
+  size_t n = (size_t)t->W * t->H;
+  float *th = malloc(n * sizeof *th);
+  float *w0 = malloc(n * sizeof *w0);
+  float *w1 = malloc(n * sizeof *w1);
+  if (!th || !w0 || !w1) {
+    free(th);
+    free(w0);
+    free(w1);
+    return;
+  }
+  for (size_t k = 0; k < n; k++) {
+    th[k] = -1e30f;
+    w0[k] = t->state[k] == R3D_TR_SET ? t->wind[k] : 0.0f;
+    if (t->state[k] == R3D_TR_SET) {
+      double a;
+      if (tr_theta_of(t, t->pos + k * 3, &a)) th[k] = (float)a;
+    }
+  }
+  uint32_t seed_k = (t->H / 2) * t->W + t->W / 2;
+  int W = (int)t->W, H = (int)t->H;
+  for (int it = 0; it < iters; it++) {
+    for (int j = 0; j < H; j++)
+      for (int i = 0; i < W; i++) {
+        size_t k = (size_t)j * (size_t)W + (size_t)i;
+        w1[k] = w0[k];
+        if (t->state[k] != R3D_TR_SET || th[k] < -1e29f || k == seed_k) continue;
+        double acc = 0.0;
+        int cnt = 0;
+        static const int o4[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+        for (int o = 0; o < 4; o++) {
+          int ii = i + o4[o][0], jj = j + o4[o][1];
+          if (ii < 0 || jj < 0 || ii >= W || jj >= H) continue;
+          size_t k2 = (size_t)jj * (size_t)W + (size_t)ii;
+          if (t->state[k2] != R3D_TR_SET || th[k2] < -1e29f) continue;
+          double d = (double)th[k] - (double)th[k2];
+          while (d > M_PI) d -= 2.0 * M_PI;
+          while (d < -M_PI) d += 2.0 * M_PI;
+          double dw = d / (2.0 * M_PI);
+          if (fabs(dw) > 0.25) continue; /* cross-wrap link */
+          acc += (double)w0[k2] + dw;
+          cnt++;
+        }
+        if (cnt) w1[k] = (float)(acc / (double)cnt);
+      }
+    float *tmp = w0;
+    w0 = w1;
+    w1 = tmp;
+  }
+  static _Atomic int clamp_on = -1;
+  int cl = atomic_load_explicit(&clamp_on, memory_order_relaxed);
+  if (cl < 0) {
+    const char *ev = getenv("R3D_WERR_CLAMP");
+    cl = ev ? atoi(ev) : 1;
+    atomic_store(&clamp_on, cl);
+  }
+  float we[4096];
+  size_t nwe = 0, ntr = 0, nwrap = 0;
+  pthread_mutex_lock(&t->mu);
+  for (size_t k = 0; k < n; k++) {
+    if (t->state[k] != R3D_TR_SET || th[k] < -1e29f) {
+      t->werr[k] = 0.0f;
+      continue;
+    }
+    float err = fabsf(t->wind[k] - w0[k]);
+    t->werr[k] = err;
+    if (t->conf[k] > 0.25f) {
+      ntr++;
+      if (err > 0.3f) nwrap++;
+      if (nwe < sizeof we / sizeof *we && (k % 3) == 0) we[nwe++] = err;
+    }
+    if (cl && err > 0.3f && t->conf[k] > 0.25f) t->conf[k] = 0.25f;
+  }
+  if (nwe) {
+    qsort(we, nwe, sizeof *we, tr_fcmp);
+    t->qc_werr_p95 = we[nwe - 1 - nwe / 20];
+  }
+  t->qc_wrap_frac = ntr ? (float)nwrap / (float)ntr : 0.0f;
+  pthread_mutex_unlock(&t->mu);
+  free(th);
+  free(w0);
+  free(w1);
 }
 
 /* Generation boundary (pool idle): adopt a staged anchor set and assign
@@ -3783,6 +4267,9 @@ static void *tr_worker(void *ud) {
   if (t->cfg.ct_root[0]) {
     ctv_ok = r3d_cpuvol_open(&ctv, t->cfg.ct_root, 64) == 0;
     if (ctv_ok && ct_lv >= ctv.nlev) ct_lv = ctv.nlev - 1;
+    t->bnd_ct = ctv_ok ? &ctv : NULL; /* placement pre-veto CT access */
+    t->bnd_lv = ct_lv;
+    t->bnd_min = ct_min;
     if (!ctv_ok)
       printf("tracer: CT tree %s failed to open (boundary pass falls back "
              "to predictions)\n",
@@ -3843,6 +4330,71 @@ static void *tr_worker(void *ud) {
       dt->level = lv + 1;
       dt->memo_key = 0;
       for (int s2 = 0; s2 < TD_SLOTS; s2++) dt->s[s2].key = 0;
+    }
+    { /* seed snap (vc3d vc_grow_seg_from_seed): the GUI seed is wherever
+       * the camera focus landed — often a voxel or two off mid-sheet,
+       * sometimes in inter-sheet air, and the first ~10 generations of
+       * global solves lock in the sheet choice made from that start.
+       * Walk to the nearest DT local minimum < 2.5 along the umbilicus
+       * radial (or the coordinate axes) and start there instead. */
+      double sv = td_tri(dt, t->cfg.seed, NULL);
+      if (sv > 1.5) {
+        double dirs[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
+        int ndir = 3;
+        double cx2, cy2;
+        if (t->uc && tr_uc_at(t, t->cfg.seed[2], &cx2, &cy2, NULL, NULL)) {
+          double ux = t->cfg.seed[0] - cx2, uy = t->cfg.seed[1] - cy2;
+          double rr = hypot(ux, uy);
+          if (rr > 1e-6) {
+            dirs[0][0] = ux / rr;
+            dirs[0][1] = uy / rr;
+            dirs[0][2] = 0;
+            ndir = 1; /* radial crosses the wraps perpendicular-ish */
+          }
+        }
+        double bs = 1e30, bq[3];
+        for (int d = 0; d < ndir; d++) {
+          double prev = 1e30, pprev = 1e30;
+          for (double sm = -40.0; sm <= 40.0; sm += 1.0) {
+            double q[3] = {t->cfg.seed[0] + sm * dirs[d][0],
+                           t->cfg.seed[1] + sm * dirs[d][1],
+                           t->cfg.seed[2] + sm * dirs[d][2]};
+            double dv = td_tri(dt, q, NULL);
+            if (pprev > prev && dv >= prev && prev < 2.5 &&
+                fabs(sm - 1.0) < fabs(bs)) {
+              bs = sm - 1.0;
+              for (int a = 0; a < 3; a++)
+                bq[a] = t->cfg.seed[a] + (sm - 1.0) * dirs[d][a];
+            }
+            pprev = prev;
+            prev = dv;
+          }
+        }
+        if (bs < 1e29) {
+          printf("tracer: seed snapped %.1f vox onto the sheet (DT %.2f -> %.2f)\n",
+                 fabs(bs), sv, td_tri(dt, bq, NULL));
+          memcpy(t->cfg.seed, bq, sizeof bq);
+        } else {
+          printf("tracer: seed is not on a sheet (DT %.2f, no crossing within "
+                 "40 vox) — aborting instead of growing garbage\n", sv);
+          free(fringe);
+          free(nfringe);
+          free(cands);
+          tr_pool_destroy(&pool);
+          tr_env_flush(&cenv);
+          free(cenv.hood);
+          ng_close(&ng);
+          td_close(dt);
+          t->bnd_ct = NULL;
+          if (ctv_ok) r3d_cpuvol_close(&ctv);
+          r3d_cpuvol_close(&vol);
+          pthread_mutex_lock(&t->mu);
+          t->done = true;
+          t->running = false;
+          pthread_mutex_unlock(&t->mu);
+          return NULL;
+        }
+      }
     }
     static const int off4[4][2] = {{0, 0}, {1, 0}, {0, 1}, {1, 1}};
     /* multi-wrap ribbons: one seed per radial sheet crossing */
@@ -4007,8 +4559,48 @@ static void *tr_worker(void *ud) {
         if (ii < 2 || jj < mv || ii >= (int)W - 2 || jj >= (int)H - mv) continue;
         size_t k = (size_t)jj * W + (size_t)ii;
         if (t->state[k] != R3D_TR_EMPTY) continue;
+        if (generation > 30) {
+          /* L-shape rule (vc3d GrowSurface): a candidate that closes no
+           * 2x2 block with SET cells is a 1-cell spur the anti-fold term
+           * would otherwise have to fight; left EMPTY it is re-offered
+           * naturally once its neighbourhood fills in */
+          bool closes = false;
+          static const int qo[4][2] = {{0, 0}, {-1, 0}, {0, -1}, {-1, -1}};
+          for (int q = 0; q < 4 && !closes; q++) {
+            int qi = ii + qo[q][0], qj = jj + qo[q][1];
+            closes = true;
+            for (int c = 0; c < 4; c++) {
+              int ci2 = qi + (c & 1), cj2 = qj + (c >> 1);
+              if (ci2 == ii && cj2 == jj) continue;
+              if (!tr_valid(t, ci2, cj2)) {
+                closes = false;
+                break;
+              }
+            }
+          }
+          if (!closes) continue;
+        }
         t->state[k] = R3D_TR_PROC; /* offered once, ever (vc3d) */
         cands[nc++] = (uint32_t)k;
+      }
+    }
+    if (nc > 1) {
+      /* certain territory first (vc3d CandidateOrdering): candidates with
+       * more SET neighbours are solved first, so the front's schedule is
+       * support-driven instead of raster-accidental — the source of the
+       * same-build QC variance the periodic global solve pays to anneal */
+      uint64_t *keys = malloc((size_t)nc * sizeof *keys);
+      if (keys) {
+        for (uint32_t c = 0; c < nc; c++) {
+          int i2 = (int)(cands[c] % W), j2 = (int)(cands[c] / W);
+          uint32_t nbr = 0;
+          for (int o = 0; o < 8; o++)
+            if (tr_valid(t, i2 + n8[o][0], j2 + n8[o][1])) nbr++;
+          keys[c] = ((uint64_t)(8u - nbr) << 32) | cands[c];
+        }
+        qsort(keys, nc, sizeof *keys, tr_u64cmp);
+        for (uint32_t c = 0; c < nc; c++) cands[c] = (uint32_t)keys[c];
+        free(keys);
       }
     }
     ng_prefetch_reset(&ng);
@@ -4087,6 +4679,8 @@ static void *tr_worker(void *ud) {
     tr_spiral_flag(t);
     tr_don_register(t);
     tr_sfx_build(t); /* refresh the self-overlap index (pool is idle) */
+    tr_wind_relax(t, 30); /* winding follows the moved cells; werr = the
+                           * wrong-wrap detector (clamps conf when on) */
     tr_qc(t);        /* refresh the mesh QC counters for the panel */
     tr_anc_assign(t); /* adopt/assign user anchors, then re-seat their
                        * neighborhoods so a correction shows immediately
@@ -4162,11 +4756,27 @@ static void *tr_worker(void *ud) {
   }
   /* final polish: one bounded pass so late cells see settled neighbors */
   if (!t->quit) tr_local_opt(t, &cenv, x0, y0, (int)W + (int)H, 4, true);
+  tr_wind_relax(t, 30);
   tr_qc(t); /* final QC state for the panel + log */
-  if (t->qc_folds || t->qc_kinks)
-    printf("tracer: QC %u fold%s, %u kink%s, twist rms %.2f vox\n", t->qc_folds,
-           t->qc_folds == 1 ? "" : "s", t->qc_kinks, t->qc_kinks == 1 ? "" : "s",
-           (double)t->qc_twist);
+  printf("tracer: QC %u folds, %u kinks, twist %.2f | area %.3g vx2, "
+         "bbox %ux%u, fill %.2f, holes %.3f, slant p95 %.3f\n",
+         t->qc_folds, t->qc_kinks, (double)t->qc_twist, t->qc_area_vx2,
+         t->qc_bbox[2] >= t->qc_bbox[0] ? t->qc_bbox[2] - t->qc_bbox[0] + 1 : 0,
+         t->qc_bbox[3] >= t->qc_bbox[1] ? t->qc_bbox[3] - t->qc_bbox[1] + 1 : 0,
+         (double)t->qc_fill, (double)t->qc_hole, (double)t->qc_slant_p95);
+  if (t->uc)
+    printf("tracer: QC wrap-jump fraction %.4f, werr p95 %.3f\n",
+           (double)t->qc_wrap_frac, (double)t->qc_werr_p95);
+  if (t->don)
+    printf("tracer: QC donor mean %.2f rms %.2f p95 %.2f vox, coverage %.2f\n",
+           (double)t->qc_don_mean, (double)t->qc_don_rms, (double)t->qc_don_p95,
+           (double)t->qc_don_cov);
+  {
+    uint64_t qb = atomic_load(&ng_qmax_binds), hb = atomic_load(&ng_hoodseg_binds);
+    if (qb || hb)
+      printf("tracer: ng caps bound: NG_QMAX %llu, NG_HOODSEG %llu times\n",
+             (unsigned long long)qb, (unsigned long long)hb);
+  }
   free(fringe);
   free(nfringe);
   free(cands);
@@ -4197,6 +4807,7 @@ static void *tr_worker(void *ud) {
          TR_TM(3));
   ng_close(&ng);
   td_close(dt);
+  t->bnd_ct = NULL; /* worker-owned sampler dies with the worker */
   if (ctv_ok) r3d_cpuvol_close(&ctv);
   r3d_cpuvol_close(&vol);
   pthread_mutex_lock(&t->mu);
@@ -4244,6 +4855,7 @@ int r3d_tracer_start_fused(r3d_tracer *t, const char *pred_root,
   t->state = calloc((size_t)t->W * t->H, 1);
   t->conf = calloc((size_t)t->W * t->H, sizeof *t->conf);
   t->wind = calloc((size_t)t->W * t->H, sizeof *t->wind);
+  t->werr = calloc((size_t)t->W * t->H, sizeof *t->werr);
   t->rng = 0x1234567u;
   if (!t->pos || !t->state || !t->conf || !t->wind) {
     r3d_tracer_free(t);
@@ -4314,6 +4926,8 @@ int r3d_tracer_grow(r3d_tracer *t, uint32_t extra) {
   t->state = ns;
   t->conf = nc;
   t->wind = nw;
+  free(t->werr);
+  t->werr = calloc((size_t)NW * NW, sizeof *t->werr);
   t->dsup = nd;
   t->W = t->H = NW;
   t->cfg.max_ring = nr;
@@ -4358,6 +4972,7 @@ void r3d_tracer_free(r3d_tracer *t) {
   free(t->state);
   free(t->conf);
   free(t->wind);
+  free(t->werr);
   free(t->dsup);
   free(t->uc);
   tr_sfx_free(t->sfx);
@@ -4537,8 +5152,20 @@ int r3d_tracer_save(r3d_tracer *t, const char *dir, float cutoff, bool fill) {
   fprintf(mf,
           "{\n  \"format\": \"tifxyz\",\n  \"type\": \"seg\",\n  \"scale\": [\n"
           "    %.6f,\n    %.6f\n  ],\n  \"source\": \"render3d-tracer\",\n"
-          "  \"donor_segments\": %u\n}\n",
-          sc, sc, t->ndon);
+          "  \"donor_segments\": %u,\n"
+          "  \"area_vx2\": %.1f,\n  \"bbox\": [%u, %u, %u, %u],\n"
+          "  \"fill\": %.4f,\n  \"hole\": %.4f,\n"
+          "  \"qc\": {\"folds\": %u, \"kinks\": %u, \"twist\": %.3f, "
+          "\"slant_p95\": %.4f, \"wrap_frac\": %.4f, \"werr_p95\": %.4f},\n"
+          "  \"donor_qc\": {\"mean\": %.2f, \"rms\": %.2f, \"p95\": %.2f, "
+          "\"coverage\": %.3f},\n"
+          "  \"max_gen\": %u\n}\n",
+          sc, sc, t->ndon, t->qc_area_vx2, t->qc_bbox[0], t->qc_bbox[1],
+          t->qc_bbox[2], t->qc_bbox[3], (double)t->qc_fill, (double)t->qc_hole,
+          t->qc_folds, t->qc_kinks, (double)t->qc_twist, (double)t->qc_slant_p95,
+          (double)t->qc_wrap_frac, (double)t->qc_werr_p95,
+          (double)t->qc_don_mean, (double)t->qc_don_rms, (double)t->qc_don_p95,
+          (double)t->qc_don_cov, t->gens_done);
   fclose(mf);
   if (t->sp_valid) { /* spiral model, for fusion / winding registration */
     snprintf(mp, sizeof mp, "%s/spiral.json", dir);
@@ -4609,6 +5236,28 @@ int r3d_tracer_spiral_selftest(void) {
   }
   tr_spiral_fit(&t);
   if (!t.sp_valid || fabs(t.sp_omega - om) > 0.5 || t.sp_rms > 1.0) goto out;
+  { /* winding relaxation: clean spiral -> werr ~ 0 everywhere; a cell
+     * with a corrupted causal winding must light up as a wrong-wrap */
+    t.werr = calloc(N, sizeof *t.werr);
+    if (!t.werr) goto out;
+    t.nset = (uint32_t)N;
+    for (uint64_t k = 0; k < N; k++) t.conf[k] = 1.0f;
+    tr_wind_relax(&t, 40);
+    for (uint64_t k = 0; k < N; k++)
+      if (t.werr[k] > 0.05f) goto out; /* clean grid must read clean */
+    if (t.qc_wrap_frac != 0.0f) goto out;
+    size_t bad = (size_t)(t.H / 2) * t.W + 10;
+    float saved_w = t.wind[bad];
+    t.wind[bad] += 1.0f; /* a wrap-jump capture: same pos, wrong winding */
+    float saved_conf = t.conf[bad];
+    tr_wind_relax(&t, 40);
+    if (t.werr[bad] < 0.5f) goto out;     /* must be detected */
+    if (t.conf[bad] > 0.26f) goto out;    /* clamp must fire (default on) */
+    if (t.qc_wrap_frac <= 0.0f) goto out;
+    t.wind[bad] = saved_w;
+    t.conf[bad] = saved_conf;
+    for (uint64_t k = 0; k < N; k++) t.conf[k] = 1.0f;
+  }
   { /* narrow-span patch (0.16 windings): joint omega is unidentifiable,
      * the measured-gap path must carry it */
     for (uint32_t j = 0; j < t.H; j++)

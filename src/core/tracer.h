@@ -41,6 +41,8 @@ typedef struct r3d_tracer_cfg {
                        * sibling on the same winding) */
   double z_min, z_max; /* z_max > z_min: hard z clamp (vc3d z_range);
                         * solved points outside FAIL like a volume exit */
+  double x_min, x_max; /* optional x/y boxes, same convention as z */
+  double y_min, y_max;
   char ct_root[1024]; /* optional raw-CT LOD tree: ribbon fronts stop
                        * where the CT says there is no scroll. Predictions
                        * may be weak where papyrus continues — the CT is
@@ -77,6 +79,10 @@ typedef struct r3d_tracer {
   float *wind;     /* [W*H] winding number about the umbilicus (spiral
                     * frame; seed = 0, accumulated combinatorially at
                     * placement, never rewritten by solves) */
+  float *werr;     /* [W*H] |wind - relaxed wind field|: cells whose
+                    * placement-time winding disagrees with the winding
+                    * their neighbourhood geometry implies (wrong-wrap
+                    * capture detector; refreshed with the spiral fit) */
   r3d_umbilicus umb; /* winding guide (spiral frame origin per slice) */
   /* smoothed umbilicus centerline, x,y per z slice (sigma = 75 slices,
    * vc3d spiral-service convention); NULL when no/degenerate umbilicus */
@@ -107,12 +113,30 @@ typedef struct r3d_tracer {
   pthread_mutex_t mu;
   bool running, quit, done;
   bool refine; /* solve-only pass in flight (no growth) */
-  /* per-generation mesh QC (display; refreshed with the spiral fit):
+  /* worker-owned raw-CT sampler exposed to the placement pre-veto (ribbon
+   * boundary test before commit instead of a generation later) */
+  struct r3d_cpuvol *bnd_ct;
+  uint32_t bnd_lv;
+  double bnd_min;
+  /* per-generation mesh QC (display + meta.json; refreshed with the
+   * spiral fit, trusted cells only = SET && conf > 0.25):
    * folds = consecutive-edge pairs turned past 90 deg (doubling back),
    * kinks = pairs past 30 deg, twist = rms free-corner distance from the
    * quad plane in voxels (planarity) */
   uint32_t qc_folds, qc_kinks;
   float qc_twist;
+  double qc_area_vx2;  /* two-triangle quad area over all-trusted quads */
+  uint32_t qc_bbox[4]; /* i0,j0,i1,j1 inclusive over trusted cells */
+  float qc_fill;       /* trusted cells / bbox area */
+  float qc_hole;       /* enclosed (border-unreachable) untrusted / bbox */
+  float qc_slant_p95;  /* |e_u.e_v|/|e_u|^2 — coherent shear detector */
+  /* donor agreement (fused runs only; <=2000 sampled trusted cells) */
+  float qc_don_mean, qc_don_rms, qc_don_p95; /* voxels */
+  float qc_don_cov; /* fraction with a donor within 2 grid steps */
+  /* winding consistency (needs an umbilicus): werr = |causal winding -
+   * relaxed winding field|; wrap_frac = fraction of trusted cells with
+   * werr > 0.3 (likely wrong-wrap captures) */
+  float qc_werr_p95, qc_wrap_frac;
   uint32_t ring, nset;   /* ring = generations grown so far */
   double vdim[3];        /* scroll volume extent (growth hard-stops there) */
   uint32_t gens_done;    /* completed generations across resumes */
