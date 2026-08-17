@@ -3863,11 +3863,13 @@ int main(int argc, char **argv) {
         .threshold = low_cut / 255.0f,
         .skip_gate = fmaxf(low_cut, tf_min_v - 0.5f) / 255.0f,
         .overlay_gain = overlay_gain,
-        /* live 2.5D ink shows even without a 3D overlay tree, in ink green */
+        /* live 2.5D ink shows even without a 3D overlay tree. The palette
+         * follows the source: bit 8 = surface-prediction cyan for the plane
+         * views' overlay tree, bit 1 = the flat pane carries live ink and
+         * tints green regardless of that tree's palette */
         .overlay_flags = ((overlay_path && overlay_show) || inklive_have ? 1u : 0u) |
-                         (overlay_path && !strstr(overlay_path, "ink") && !inklive_have
-                              ? 256u
-                              : 0u),
+                         (inklive_have ? 2u : 0u) |
+                         (overlay_path && !strstr(overlay_path, "ink") ? 256u : 0u),
     };
     memcpy(p.vol_r0, &vm.r0, 12);
     memcpy(p.vol_r1, &vm.r1, 12);
@@ -4073,7 +4075,12 @@ int main(int argc, char **argv) {
         q.viewport[0] = (uint32_t)mv[i].pw;
         q.viewport[1] = (uint32_t)mv[i].ph;
         q.view_org = (uint32_t)mv[i].px | ((uint32_t)mv[i].py << 16);
-        if (!(mv_ov_mask & (1u << i))) q.overlay_flags &= ~1u; /* pane opts out */
+        if (!(mv_ov_mask & (1u << i)) &&
+            !(i == R3D_MV_SEG && inklive_have)) /* live ink on the flat pane
+                                                 * outlives the pane's overlay
+                                                 * checkbox: unchecking it must
+                                                 * not silently hide the ink */
+          q.overlay_flags &= ~1u;
         if (i == R3D_MV_SEG) {
           /* flattened segment: raycast the surface-volume window. Camera in
            * FLATTENED VOXELS (grid / scale); window mapping from the backend. */

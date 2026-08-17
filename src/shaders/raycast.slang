@@ -36,6 +36,12 @@ float3 overlay_color() {
   return ((pc.overlay_flags >> 8) & 0xffu) == 1u ? float3(0.3, 0.72, 1.0)
                                                  : float3(0.25, 1.0, 0.55);
 }
+/* the flat (segment) pane: live 2.5D ink replaces the overlay values inside
+ * its rect, so the pane tints ink green while live ink is up (bit 1), the
+ * tree palette otherwise */
+float3 flat_overlay_color() {
+  return (pc.overlay_flags & 2u) != 0u ? float3(0.25, 1.0, 0.55) : overlay_color();
+}
 
 float bricks_fetch_ink(float3 slot_org, float3 bl_off, float lod, float inv_adim) {
   float inset = max(0.5 * exp2(lod), 0.5);
@@ -536,7 +542,7 @@ void main(uint3 tid_in: SV_DispatchThreadID) {
         }
       }
       if (overlay_on())
-        col = lerp(col, overlay_color(), saturate(vk.g * pc.overlay_gain));
+        col = lerp(col, flat_overlay_color(), saturate(vk.g * pc.overlay_gain));
       acc.rgb += (1.0 - acc.a) * a * col;
       acc.a += (1.0 - acc.a) * a;
       if (acc.a >= ALPHA_CUTOFF) break;
@@ -544,7 +550,7 @@ void main(uint3 tid_in: SV_DispatchThreadID) {
     float3 color = composite ? acc.rgb + (1.0 - acc.a) * bg.rgb
                              : float3(mip_max * pc.density);
     if (!composite && overlay_on())
-      color = lerp(color, overlay_color(), saturate(ink_max * pc.overlay_gain));
+      color = lerp(color, flat_overlay_color(), saturate(ink_max * pc.overlay_gain));
     store_px(opix, tid.xy, half, float4(color, 1));
     return;
   }
