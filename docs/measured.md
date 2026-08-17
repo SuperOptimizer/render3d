@@ -1745,3 +1745,21 @@ exercise +153%, static all-panes +83% (285 -> 522 fps), decode job 51 -> 22 ms.
   and 4x fewer rays are no faster; 4K exercised 185 -> 254 fps.
 Lesson for the ledger: below ~2 ms/frame this GPU's timestamps mostly
 measure clock state, not work — compare heavier scenes or repeated runs.
+
+## 2026-08-17 — on-demand surface prediction + live ink on traced segments
+
+surface_m7_nnunet (nnU-Net v2 ResEnc-L, 192^3 patches, spacing 1) served
+locally: 320^3 block (256^3 cell + 32 margin) 10 s at tile step 0.5 (27
+patches), 3.0 s at 0.75 (8 patches); IoU vs the bucket's binary th0.2 tree at
+the matching threshold 0.49 / 0.44 (thin sheets; single fold, no TTA). Cell =
+2x2x2 L0 bricks = one L1 brick, so a prediction yields 8 L0 + 1 L1 brick.
+Both consumers (tracer cpuvol, renderer overlay ingest) branch on the
+predict:// url and call core/surfpred; the CT block comes from a cpuvol on
+the CT tree; results are c5d-encoded into the tree like fetched cells.
+End to end on PHerc0343: tracecli on an EMPTY predict tree, 10 gens: 484 pts,
+230 s (44 predictions — prediction-bound, vs 30 s on the bucket tree); GUI
+chain headless (R3D_TRACE_TEST, empty segment, predict overlay, --inklive):
+trace grew on live predictions and the flattened pane received live ink
+predictions at 280x200 .. 800x600 as rings were added. Open: prefetch cells
+ahead of the tracer frontier in parallel with the frontier's own requests;
+coarse LODs (>= L2) of predict trees stay empty.

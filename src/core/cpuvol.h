@@ -58,6 +58,9 @@ typedef struct r3d_cpuvol {
   bool raw[R3D_CPUVOL_LEVELS];
   void *curl;        /* lazy CURL handle */
   uint64_t net_cool; /* backoff: no fetches until this tick-time (s) */
+  /* predict source (url predict://): misses are produced by the surface
+   * predictor instead of fetched (see core/surfpred.h) */
+  struct r3d_surfpred *sp;
 } r3d_cpuvol;
 
 int r3d_cpuvol_open(r3d_cpuvol *v, const char *root, uint32_t cache_bricks);
@@ -79,5 +82,16 @@ double r3d_cpuvol_tri(r3d_cpuvol *v, uint32_t li, const double p[3], double grad
  * number of cells fetched, or -1. */
 int r3d_cpuvol_prefetch(r3d_cpuvol *v, uint32_t li, const uint32_t *bxyz, uint32_t n,
                         uint32_t threads);
+
+/* Copy an axis-aligned block of level-li voxels (base-level index space of
+ * that level; may extend outside the volume — those voxels read 0; absent
+ * bricks read 0). Bulk brick copies, not per-voxel sampling. */
+void r3d_cpuvol_read_block(r3d_cpuvol *v, uint32_t li, int64_t x0, int64_t y0, int64_t z0,
+                           uint32_t nx, uint32_t ny, uint32_t nz, uint8_t *out);
+
+/* Insert a raw 128^3 brick into the decode cache (e.g. one just produced by
+ * the predictor) so the next sample hits without touching the disk. */
+void r3d_cpuvol_cache_put(r3d_cpuvol *v, uint32_t li, uint32_t bx, uint32_t by, uint32_t bz,
+                          const uint8_t *raw);
 
 #endif /* R3D_CPUVOL_H */

@@ -13,6 +13,8 @@
 #include <sys/stat.h>
 #include <sys/resource.h>
 #include <unistd.h>
+
+#include "core/surfpred.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -202,6 +204,9 @@ struct r3d_renderer {
     float q02;
     _Atomic uint8_t *have2;
     _Atomic uint64_t fetched2;
+    /* overlay source is a predict tree (url predict://): cells are produced
+     * by the surface predictor instead of fetched (core/surfpred.h) */
+    r3d_surfpred *sp2;
     /* raw-brick ring: freshly fetched bricks are published here BEFORE the
      * c5d encode + file write (have = 3), so the first display of a cold
      * region skips encode->write->read->decode entirely (that round trip
@@ -1082,6 +1087,11 @@ static void bricks_teardown(r3d_renderer *r) {
   }
   free((void *)r->ni.have);
   free((void *)r->ni.have2);
+  if (r->ni.sp2) {
+    r3d_surfpred_close(r->ni.sp2);
+    free(r->ni.sp2);
+    r->ni.sp2 = NULL;
+  }
   if (r->ni.rc_up) {
     free(r->ni.rc_data);
     free(r->ni.rc_key);
@@ -2563,6 +2573,17 @@ static void *ni_worker(void *arg) {
         netfail = true;
     }
     if (!netfail) memset(cellbuf, 0, cell_bytes);
+    r3d_surfpred *spred = nsrc ? r->ni.sp2 : NULL;
+    if (spred && !netfail) {
+      /* predict tree: the predictor writes every brick of the cell (and its
+       * L1 parent) itself; levels it does not serve fall through as absent.
+       * cell for L0 is 256^3 (2x2x2 bricks), for L1 one brick — both match
+       * the predictor's cell definition */
+      int prc = r3d_surfpred_cell(spred, li, cx * cb, cy * cb, cz * cb, cellbuf, NULL);
+      have = prc == 1;
+      if (prc < 0) netfail = true;
+      cc = 0; /* nothing to fetch */
+    }
     for (uint32_t icz = 0; icz < cc && !netfail && !quitting; icz++)
       for (uint32_t icy = 0; icy < cc && !netfail && !quitting; icy++)
         for (uint32_t icx = 0; icx < cc; icx++) {
@@ -3981,6 +4002,23 @@ static void ni_overlay_source(r3d_renderer *r) {
     lp += 9;
   }
   snprintf(r->ni.root2, sizeof r->ni.root2, "%s", r->ink_root);
+  if (r->ni.sp2) {
+    r3d_surfpred_close(r->ni.sp2);
+    free(r->ni.sp2);
+    r->ni.sp2 = NULL;
+  }
+  if (r3d_surfpred_url(r->ni.url2)) {
+    r->ni.sp2 = malloc(sizeof *r->ni.sp2);
+    if (!r->ni.sp2 || r3d_surfpred_open(r->ni.sp2, r->ink_root) != 0) {
+      fprintf(stderr, "bricks: overlay predict source %s unusable\n", r->ink_root);
+      free(r->ni.sp2);
+      r->ni.sp2 = NULL;
+      r->ni.url2[0] = 0;
+      return;
+    }
+    printf("bricks: overlay predicts surfaces on demand (CT %s, port %d)\n",
+           r->ni.sp2->ct_root, r->ni.sp2->port);
+  }
   if (!r->ni.have2) r->ni.have2 = calloc(r->bs.nb, 1);
   else memset((void *)r->ni.have2, 0, r->bs.nb);
   if (!r->bs.ink_missing) r->bs.ink_missing = calloc(r->bs.nslots, 1);

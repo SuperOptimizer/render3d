@@ -186,6 +186,23 @@ sends it over TCP, and the prediction is painted into the surface-volume
 window (re-run whenever the view or the growing trace changes). The "live
 ink" panel section shows status; port defaults to 9743.
 
+### On-demand surface prediction (volumes without published predictions)
+
+`tools/surf/surfserver.py` serves nnU-Net `scrollprize/surface_m7_nnunet` — the
+model behind the bucket's `surface-m7-L0` trees — over TCP (run it from villa's
+`ink-detection` env with `nnunetv2` installed: `uv run python
+tools/surf/surfserver.py <model-dir>`; ~3 s per 8-brick cell on an RTX 5080).
+`tools/surf/mkpredtree.py <ct-lod> <out>` creates a *predict tree*: a c5d LOD
+tree with the CT's geometry and no data whose `source.json` points at the
+server (`predict://127.0.0.1:9744` + `ct_root`). Use it anywhere a prediction
+tree goes — `--overlay <out>` for the tint, `tracecli <out>` / the GUI tracer
+for growing segments: bricks are predicted on demand from CT blocks (with a
+32-voxel context margin), thresholded like the bucket (p >= 0.2), and cached
+under `<out>/bricks/L0` (+ the L1 parent). Levels >= 2 are not produced, so
+the overlay tint appears once the view is zoomed to L0/L1. Together with
+`--inklive`, a fresh volume goes: empty 2x2 -> trace on live surface
+predictions -> live 2.5D ink on the growing trace.
+
 ### Headless benchmarks
 
 `--headless` renders without a window, surface, swapchain or present (the
