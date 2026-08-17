@@ -205,10 +205,11 @@ deterministic test-time augmentations applied by the ink server: in-plane
 flips (x4), the model's 17-layer depth window slid +-1 inside the sampled
 21-layer slab (+2), intensity x0.9/1.1 (+2), and a checkpoint ensemble
 (seed 42 + 43, x2) - probabilities averaged after inverse transforms.
-Defaults to flips+ensemble; used by full-map computes ("recompute" re-runs
-an existing map with new settings), opt-in for the live view. Start the
-server with several checkpoints to enable the ensemble:
-`inkserver.py seed42.pth seed43.pth`.
+Defaults to flips+ensemble; "recompute" re-runs an existing map with new
+settings. Start the server with several checkpoints to enable the
+ensemble: `inkserver.py seed42.pth seed43.pth`. Ink inference only ever
+runs when asked: the one-time full-surface map is the sole path (results
+cached per segment; there is no automatic per-view inference).
 
 ### On-demand surface prediction (volumes without published predictions)
 

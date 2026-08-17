@@ -1183,14 +1183,9 @@ int main(int argc, char **argv) {
    * shift, bit2 intensity, bit3 checkpoint ensemble); live view stays at
    * 0 unless explicitly opted in - TTA multiplies inference cost. */
   uint32_t inkmap_tta = 0x9; /* flips + ensemble: best quality/cost */
-  bool inklive_tta_live = false;
   uint32_t im_tx = 0, im_ty = 0, im_ntx = 0, im_nty = 0, im_ts = 0;
   bool im_req_out = false;
   char inkmap_path[1200] = "";
-  int64_t il_rect[4] = {-1, -1, -1, -1}; /* last requested grid rect */
-  int64_t il_view[4] = {-2, -2, -2, -2}; /* rect currently under the view */
-  uint32_t il_stable = 0;
-  uint64_t il_last_nvalid = 0;
   const char *seg_store_path = NULL; /* segpack store: draw ALL surfaces */
   const char *overlay_path = NULL;   /* active overlay c5d LOD root */
   const char *overlay_paths[8];      /* all --overlay trees (ink, surface preds...) */
@@ -2481,6 +2476,12 @@ int main(int argc, char **argv) {
           uint32_t pw2, ph2, pi0, pj0, pup;
           if (im_req_out &&
               r3d_inklive_poll(&inklive, &pred, &pw2, &ph2, &pi0, &pj0, &pup)) {
+            { /* accept only THIS tile's result (a superseded request from
+                 an aborted pass could still be in flight) */
+              uint32_t e0x = im_tx * im_ts, e0y = im_ty * im_ts;
+              uint32_t er0x = e0x > 2 ? e0x - 2 : 0, er0y = e0y > 2 ? e0y - 2 : 0;
+              if (pi0 != er0x || pj0 != er0y) goto ink_poll_done;
+            }
             im_req_out = false;
             uint32_t c0x = im_tx * im_ts, c0y = im_ty * im_ts;
             uint32_t c1x = c0x + im_ts, c1y = c0y + im_ts;
@@ -2514,72 +2515,12 @@ int main(int argc, char **argv) {
                      im_ntx * im_nty);
             }
           }
-        } else if (inklive_up) { /* live 2.5D ink over the visible grid rect:
-             * request when the view has been stable for ~1s and the rect
-             * (or the traced grid) changed since the last request */
-          uint32_t up = (uint32_t)lround(1.0 / (double)mv_seg.sx);
-          if (up < 1) up = 1;
-          uint32_t max_cells = R3D_INKLIVE_MAX_PX / up;
-          if (max_cells < 2) max_cells = 2;
-          double hwg = (double)sv->pw * 0.5 / sv->zoom, hhg = (double)sv->ph * 0.5 / sv->zoom;
-          if (hwg > max_cells * 0.5) hwg = max_cells * 0.5;
-          if (hhg > max_cells * 0.5) hhg = max_cells * 0.5;
-          int64_t g0 = (int64_t)(sv->cu - hwg), g1 = (int64_t)(sv->cu + hwg) + 1;
-          int64_t j0 = (int64_t)(sv->cv - hhg), j1 = (int64_t)(sv->cv + hhg) + 1;
-          if (g0 < 0) g0 = 0;
-          if (j0 < 0) j0 = 0;
-          if (g1 > (int64_t)mv_seg.w - 1) g1 = (int64_t)mv_seg.w - 1;
-          if (j1 > (int64_t)mv_seg.h - 1) j1 = (int64_t)mv_seg.h - 1;
-          bool same_view = g0 == il_view[0] && j0 == il_view[1] && g1 == il_view[2] &&
-                           j1 == il_view[3];
-          il_view[0] = g0;
-          il_view[1] = j0;
-          il_view[2] = g1;
-          il_view[3] = j1;
-          il_stable = same_view ? il_stable + 1 : 0;
-          bool rect_new = g0 != il_rect[0] || j0 != il_rect[1] || g1 != il_rect[2] ||
-                          j1 != il_rect[3];
-          bool grid_new = mv_seg.nvalid != il_last_nvalid;
-          if (g1 > g0 + 1 && j1 > j0 + 1 && il_stable >= 60 && (rect_new || grid_new)) {
-            uint32_t rw = (uint32_t)(g1 - g0), rh = (uint32_t)(j1 - j0);
-            float *xyz = malloc((size_t)(rw + 1) * (rh + 1) * 3 * sizeof *xyz);
-            if (xyz) {
-              for (uint32_t cj = 0; cj <= rh; cj++)
-                for (uint32_t ci = 0; ci <= rw; ci++) {
-                  const float *sp =
-                      r3d_tifxyz_at(&mv_seg, (uint32_t)g0 + ci, (uint32_t)j0 + cj);
-                  float *dst = xyz + ((size_t)cj * (rw + 1) + ci) * 3;
-                  if (r3d_tifxyz_valid(sp)) {
-                    dst[0] = sp[0];
-                    dst[1] = sp[1];
-                    dst[2] = sp[2];
-                  } else {
-                    dst[0] = dst[1] = dst[2] = -1.0f;
-                  }
-                }
-              r3d_inklive_request(&inklive, xyz, (uint32_t)g0, (uint32_t)j0, rw, rh,
-                                  up, inklive_tta_live ? inkmap_tta : 0u);
-              il_rect[0] = g0;
-              il_rect[1] = j0;
-              il_rect[2] = g1;
-              il_rect[3] = j1;
-              il_last_nvalid = mv_seg.nvalid;
-            }
-          }
-          const float *pred;
-          uint32_t pw2, ph2, pi0, pj0, pup;
-          if (r3d_inklive_poll(&inklive, &pred, &pw2, &ph2, &pi0, &pj0, &pup)) {
-            if (r3d_surfvol_inkpred(renderer, pred, pw2, ph2, (float)pi0, (float)pj0,
-                                    (float)pup) == 0) {
-              if (!inklive_have)
-                printf("inklive: displaying %ux%u at grid (%u,%u), %u px/cell\n", pw2,
-                       ph2, pi0, pj0, pup);
-              inklive_have = true;
-            } else {
-              fprintf(stderr, "inklive: prediction upload failed (%ux%u)\n", pw2, ph2);
-            }
-          }
+        ink_poll_done:;
         }
+        /* NOTE: there is deliberately no view-driven inference. 2.5D ink
+         * runs only when the user asks for it (the full-map compute); the
+         * old live mode re-inferred every viewport rect forever and threw
+         * the results away. */
       }
     }
 
@@ -3486,7 +3427,6 @@ int main(int argc, char **argv) {
         if (igCheckbox("depth shift +-1 (+2)", &b1)) inkmap_tta ^= 2u;
         if (igCheckbox("intensity x0.9/1.1 (+2)", &b2)) inkmap_tta ^= 4u;
         if (igCheckbox("checkpoint ensemble (x2)", &b3)) inkmap_tta ^= 8u;
-        igCheckbox("also apply to live view (slow)", &inklive_tta_live);
         igTextDisabled("used by 'compute full ink map'; recompute to re-run\n"
                        "an existing map with new settings");
         igTreePop();
@@ -3533,9 +3473,6 @@ int main(int argc, char **argv) {
       }
       igTextDisabled("server 127.0.0.1:%d", inklive_port);
       igTextDisabled("%s", inklive.status);
-      if (il_rect[0] >= 0)
-        igTextDisabled("rect (%lld,%lld)-(%lld,%lld)", (long long)il_rect[0],
-                       (long long)il_rect[1], (long long)il_rect[2], (long long)il_rect[3]);
     }
     if (overlay_path && igCollapsingHeader_TreeNodeFlags("overlay", 0)) {
         {
