@@ -1606,3 +1606,70 @@ consensus instead of cutting them. The grid always completes (14641/
 14641 on the test seed); the confidence cutoff decides at display/save
 time what survives, so "no holes" and "only trusted surface" are the
 same trace at different slider positions. All 5 suites green.
+
+## 2026-08-14 — WSL2/Dozen bring-up + perf audit round (multiview 2x2 @1920x1080)
+
+Platform: RTX 5080 laptop via Mesa 25.3.4 Dozen (Vulkan 1.2 over D3D12) in
+WSL2; vkctx accepts 1.2 + KHR sync2/dynamic_rendering. Local Mesa patch lifts
+dzn's 2 GiB maxMemoryAllocationSize clamp (spec minimum, not the hw limit) so
+the brick atlas reaches 12^3. Test scene: PHerc0343 8.64um (net-streamed),
+m7-L0 surface overlay, one traced segment. Numbers from --frames 1500 (static)
+and R3D_MV_EXERCISE=1 --frames 2400 (exercised), release build.
+
+Three adversarial audits (perf + code) found the frame was CPU/driver bound
+with the GPU nearly idle, and the streaming side doing duplicate work:
+
+| | before | after |
+|---|---|---|
+| static fps / cpu ms / gpu ms | 118 / 7.4 / 1.5 | 286 / 3.5 / 0.26 |
+| exercised fps / cpu ms / p99 | 87 / 11.5 / 61.6 | 242 / 4.1 / 11.9 |
+| render-thread record / submit | 3.04 / 3.01 ms | 0.28 / 1.19 ms |
+| frame max (static / exercised) | 119 / 131 ms | 19 / 19 ms |
+| stream phase max | 113-121 ms | ~1 ms |
+| distinct threads in 11 s | 1054 | 39 |
+| decode job latency (8 bricks) | 71-79 ms | 37-44 ms |
+| raw 4-pane raycast (cache off) | 4.21 ms | 2.41 ms |
+
+Fixes, in impact order:
+- Per-frame vkCmdClearColorImage of the 8 MB offscreen: on Dozen the image
+  lacked TRANSFER_DST so the driver CPU-filled a fresh 12 MB D3D12 upload
+  resource every frame (~2.7 ms of "record"). Usage flag added (spec fix too);
+  clear only when the pane layout changes.
+- Pane cache: the offscreen now persists (layout tracked, never UNDEFINED
+  after first write); each view hashes its params (minus jitter seed) +
+  pipeline + a renderer scene_gen bumped at every GPU-visible data change
+  (page publication, eviction, uploads, dset writes, surfvol bake, overlay
+  switch, tf, surf swap...) and skips its dispatch when unchanged. Static
+  frames record blit + GUI only. R3D_NO_PANE_CACHE=1 for A/B.
+- Overlay repair off the render thread: bricks_ink_repair decoded on the
+  render thread (spawning 24 pthreads) and fence-waited a 64 MB upload —
+  the 100+ ms stream spikes. Now a worker job kind; and only bricks that
+  actually failed to load are flagged (every non-local ink brick was being
+  re-decoded although the .c5b cache decoded it fine: ~1/3 of decode CPU).
+- Persistent decode pool (brdec_run spawned+joined ncpu threads per batch)
+  plus intra-brick c5d_brick_decode_par when the batch is small.
+- Publication-driven surfvol re-bake (the decode-counter poll in main fired
+  a frame early and missed publications) and lazy per-layer staleness:
+  progressive passes bake only the visible layer band (+-8) instead of all
+  128 layers (1 GB) per pass; scrubbed-to layers bake on demand.
+- Raycast LOD locate cache: reuse the resolved brick while consecutive
+  samples stay inside it (a 24-voxel ortho slab ray re-walked the 4-level
+  page table every step).
+- Timestamp 0 moved before the surfvol bake (its cost was invisible).
+- Eviction drain skipped when nothing was evicted; brlod_blob memoizes
+  failed shard opens (net-streamed trees have none: ENOENT per candidate
+  per frame); fetchers capped at 16 with an inflight table that covers them
+  (dedupe broke past 8) and thread-unique temp files.
+- cpuvol: hash index (was a linear scan per non-memo lookup), negative
+  cache for absent/air bricks (trilinear taps into empty space cost 8 file
+  probes), and thread safety (index lock, IO lock, decode outside) so the
+  live-ink sampler fans out across cores; sampler + socket timeouts +
+  supersede-abort.
+- surfvol default 2048x2048x128 clamped to the single-allocation limit and
+  remaining budget (a 4 GiB request on a 4 GiB-cap driver failed init).
+
+Not done yet (measured/known): vkQueuePresentKHR blocks on WSLg's software
+WSI (fence wait + 8 MB memcpy per present: the remaining ~1-2 ms "submit"),
+descriptorIndexing for bindless dzn, raw fast-path for freshly fetched
+uncompressed chunks (fetch->c5d encode->decode is ~10% of cold-session CPU),
+device-local double-buffered page table, vslab validity-table race (audit).

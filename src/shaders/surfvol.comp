@@ -16,6 +16,7 @@ layout(binding = 2) uniform sampler2D normals; /* unit normals */
 layout(binding = 3) readonly buffer Page { uint page[]; };
 layout(binding = 4) uniform sampler3D atlas;
 layout(binding = 5) uniform sampler3D ink; /* overlay atlas (CT atlas if off) */
+layout(binding = 6) uniform sampler2D inkpred; /* live 2.5D prediction (r32f) */
 
 layout(push_constant) uniform Push {
   float u0, v0, step, zoff0; /* window origin + xy texel pitch (voxels), base offset */
@@ -25,6 +26,8 @@ layout(push_constant) uniform Push {
   float lstep;               /* layer pitch along the normal (voxels; zoom-independent) */
   uint use_ink;              /* sample the overlay atlas into G */
   uint x0, y0, z0;           /* window origin of the band this dispatch covers */
+  uint use_pred;             /* live prediction is bound and mapped */
+  float pg0u, pg0v, pppg;    /* pred origin (grid coords), pred pixels per grid unit */
 } pc;
 
 const float BR_SLOT = 128.0;
@@ -89,6 +92,16 @@ void main() {
           v = bricks_sample(wp, shape, md);
       }
     }
+  }
+  if (pc.use_pred != 0u) {
+    /* live 2.5D ink: one probability per (u,v) column, painted across all
+     * layers so it survives normal-offset scrubbing */
+    vec2 pp = (g - vec2(pc.pg0u, pc.pg0v)) * pc.pppg;
+    vec2 psz = vec2(textureSize(inkpred, 0));
+    if (pp.x >= 0.0 && pp.y >= 0.0 && pp.x < psz.x && pp.y < psz.y)
+      v.y = textureLod(inkpred, (pp + 0.5) / psz, 0.0).r; /* live ink replaces
+        the 3D overlay inside the predicted rect (a surface-prediction tree
+        would otherwise wash out the readable signal) */
   }
   imageStore(out_vol, ivec3(t), vec4(v, 0.0, 0.0));
 }

@@ -7,11 +7,24 @@
 #include "cimgui_impl.h"
 
 static VkFormat g_color_format; /* must outlive Init (pipeline info points at it) */
+static bool g_headless;         /* no SDL platform backend: synthetic io */
+static float g_hw = 1280.0f, g_hh = 720.0f;
+
+void r3d_vkgui_set_display(uint32_t w, uint32_t h) {
+  g_hw = (float)(w ? w : 1u);
+  g_hh = (float)(h ? h : 1u);
+}
 
 int r3d_vkgui_init(r3d_vkctx *c, SDL_Window *win, VkFormat color_format, uint32_t image_count) {
   g_color_format = color_format;
+  g_headless = win == NULL;
   igCreateContext(NULL);
-  if (!ImGui_ImplSDL3_InitForVulkan(win)) {
+  if (g_headless) {
+    ImGuiIO *io = igGetIO_Nil();
+    io->DisplaySize = (ImVec2){g_hw, g_hh};
+    io->DeltaTime = 1.0f / 60.0f;
+    /* the Vulkan backend needs the font atlas either way */
+  } else if (!ImGui_ImplSDL3_InitForVulkan(win)) {
     fprintf(stderr, "vkgui: SDL3 backend init failed\n");
     return -1;
   }
@@ -44,15 +57,23 @@ int r3d_vkgui_init(r3d_vkctx *c, SDL_Window *win, VkFormat color_format, uint32_
 
 void r3d_vkgui_shutdown(void) {
   ImGui_ImplVulkan_Shutdown();
-  ImGui_ImplSDL3_Shutdown();
+  if (!g_headless) ImGui_ImplSDL3_Shutdown();
   igDestroyContext(NULL);
 }
 
-void r3d_vkgui_event(const SDL_Event *ev) { ImGui_ImplSDL3_ProcessEvent(ev); }
+void r3d_vkgui_event(const SDL_Event *ev) {
+  if (!g_headless) ImGui_ImplSDL3_ProcessEvent(ev);
+}
 
 void r3d_vkgui_new_frame(void) {
   ImGui_ImplVulkan_NewFrame();
-  ImGui_ImplSDL3_NewFrame();
+  if (g_headless) {
+    ImGuiIO *io = igGetIO_Nil();
+    io->DisplaySize = (ImVec2){g_hw, g_hh};
+    io->DeltaTime = 1.0f / 60.0f;
+  } else {
+    ImGui_ImplSDL3_NewFrame();
+  }
   igNewFrame();
 }
 

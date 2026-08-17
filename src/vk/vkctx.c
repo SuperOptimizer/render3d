@@ -168,9 +168,14 @@ int r3d_vkctx_create(r3d_vkctx *c, const char *const *inst_exts, uint32_t n_inst
   c->caps.max_alloc_bytes = m3.maxMemoryAllocationSize;
   c->caps.ts_period_ns = (double)p2.properties.limits.timestampPeriod;
   memcpy(c->caps.dev_name, p2.properties.deviceName, sizeof c->caps.dev_name);
-  if (p2.properties.apiVersion < VK_API_VERSION_1_3) {
-    fprintf(stderr, "vk: %s is Vulkan %u.%u, need 1.3\n", c->caps.dev_name,
-            VK_API_VERSION_MAJOR(p2.properties.apiVersion),
+  /* 1.3 native, or 1.2 + the KHR extensions we actually use (sync2 +
+   * dynamic rendering — e.g. Mesa Dozen on WSL2, a 1.2 driver) */
+  bool vk12_compat = p2.properties.apiVersion < VK_API_VERSION_1_3;
+  if (p2.properties.apiVersion < VK_API_VERSION_1_2 ||
+      (vk12_compat && (!dev_has_ext(c->phys, VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME) ||
+                       !dev_has_ext(c->phys, VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME)))) {
+    fprintf(stderr, "vk: %s is Vulkan %u.%u, need 1.3 (or 1.2 + sync2/dynrender)\n",
+            c->caps.dev_name, VK_API_VERSION_MAJOR(p2.properties.apiVersion),
             VK_API_VERSION_MINOR(p2.properties.apiVersion));
     return -1;
   }
@@ -185,15 +190,24 @@ int r3d_vkctx_create(r3d_vkctx *c, const char *const *inst_exts, uint32_t n_inst
   VkPhysicalDeviceVulkan13Features f13 = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
       .pNext = want_hic ? &hicf : NULL};
+  VkPhysicalDeviceSynchronization2FeaturesKHR fs2 = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES_KHR,
+      .pNext = want_hic ? &hicf : NULL};
+  VkPhysicalDeviceDynamicRenderingFeaturesKHR fdr = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES_KHR,
+      .pNext = &fs2};
   VkPhysicalDeviceVulkan12Features f12 = {
-      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, .pNext = &f13};
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+      .pNext = vk12_compat ? (void *)&fdr : (void *)&f13};
   VkPhysicalDeviceFeatures2 f2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
                                   .pNext = &f12};
   vkGetPhysicalDeviceFeatures2(c->phys, &f2);
-  if (!f12.timelineSemaphore || !f13.synchronization2 || !f13.maintenance4 ||
-      !f13.dynamicRendering) {
-    fprintf(stderr, "vk: missing core features (timeline=%u sync2=%u maint4=%u dynrender=%u)\n",
-            f12.timelineSemaphore, f13.synchronization2, f13.maintenance4, f13.dynamicRendering);
+  bool have_sync2 = vk12_compat ? fs2.synchronization2 : f13.synchronization2;
+  bool have_dynrender = vk12_compat ? fdr.dynamicRendering : f13.dynamicRendering;
+  if (!f12.timelineSemaphore || !have_sync2 || !have_dynrender ||
+      (!vk12_compat && !f13.maintenance4)) {
+    fprintf(stderr, "vk: missing core features (timeline=%u sync2=%u dynrender=%u)\n",
+            f12.timelineSemaphore, have_sync2, have_dynrender);
     return -1;
   }
   c->caps.host_image_copy = want_hic && hicf.hostImageCopy;
@@ -219,12 +233,16 @@ int r3d_vkctx_create(r3d_vkctx *c, const char *const *inst_exts, uint32_t n_inst
   }
 
   /* --- device --- */
-  const char *dev_exts[4];
+  const char *dev_exts[6];
   uint32_t ndev_exts = 0;
   if (dev_has_ext(c->phys, VK_KHR_SWAPCHAIN_EXTENSION_NAME))
     dev_exts[ndev_exts++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
   if (c->caps.host_image_copy) dev_exts[ndev_exts++] = VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME;
   if (c->caps.memory_budget) dev_exts[ndev_exts++] = VK_EXT_MEMORY_BUDGET_EXTENSION_NAME;
+  if (vk12_compat) {
+    dev_exts[ndev_exts++] = VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME;
+    dev_exts[ndev_exts++] = VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME;
+  }
 
   VkPhysicalDeviceHostImageCopyFeaturesEXT en_hic = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES_EXT,
@@ -236,15 +254,27 @@ int r3d_vkctx_create(r3d_vkctx *c, const char *const *inst_exts, uint32_t n_inst
       .maintenance4 = VK_TRUE,
       .dynamicRendering = VK_TRUE, /* GUI pass renders without render passes */
   };
+  VkPhysicalDeviceSynchronization2FeaturesKHR en_s2 = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES_KHR,
+      .pNext = c->caps.host_image_copy ? &en_hic : NULL,
+      .synchronization2 = VK_TRUE};
+  VkPhysicalDeviceDynamicRenderingFeaturesKHR en_dr = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES_KHR,
+      .pNext = &en_s2,
+      .dynamicRendering = VK_TRUE};
   VkPhysicalDeviceVulkan12Features en12 = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
-      .pNext = &en13,
+      .pNext = vk12_compat ? (void *)&en_dr : (void *)&en13,
       .timelineSemaphore = VK_TRUE,
       .hostQueryReset = f12.hostQueryReset,
       /* slab tiles are dynamically indexed (a 544-case literal switch costs
        * ~20x per sample vs native non-uniform indexing on this hardware) */
       .shaderSampledImageArrayNonUniformIndexing = f12.shaderSampledImageArrayNonUniformIndexing,
       .runtimeDescriptorArray = f12.runtimeDescriptorArray,
+      /* Dozen only goes bindless (no per-dispatch copy of the whole 1024-entry
+       * descriptor set into the shader-visible heap) when the app enables
+       * descriptorIndexing itself; harmless elsewhere */
+      .descriptorIndexing = f12.descriptorIndexing && !getenv("R3D_NO_BINDLESS"),
   };
   float prio = 1.0f;
   VkDeviceQueueCreateInfo qci = {

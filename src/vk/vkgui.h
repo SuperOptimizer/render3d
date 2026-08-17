@@ -11,7 +11,9 @@ int r3d_vkgui_init(r3d_vkctx *c, SDL_Window *win, VkFormat color_format, uint32_
 void r3d_vkgui_shutdown(void);
 
 void r3d_vkgui_event(const SDL_Event *ev);
-void r3d_vkgui_new_frame(void); /* backend NewFrame + igNewFrame */
+void r3d_vkgui_new_frame(void);
+/* headless (win == NULL at init): logical display size for ImGui */
+void r3d_vkgui_set_display(uint32_t w, uint32_t h); /* backend NewFrame + igNewFrame */
 void r3d_vkgui_discard(void);   /* end an opened frame without drawing (skipped frame) */
 /* igRender + draw into `view` (already COLOR_ATTACHMENT_OPTIMAL, loadOp=LOAD). */
 void r3d_vkgui_render(VkCommandBuffer cmd, VkImageView view, VkExtent2D extent);

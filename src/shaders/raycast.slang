@@ -112,8 +112,22 @@ BrickCtx bricks_locate(float3 p) {
  * footprint.  The streamer keeps the immediate parent warm, so desired,
  * parent, grandparent, and the pinned coarsest level cover both steady-state
  * and cold-start sampling with at most four page probes. */
-BrickCtx bricks_lod_locate(float3 p, float lod) {
+/* Per-ray locate cache: while consecutive samples stay inside the same
+ * brick at the same desired level, the 4-level page walk is skipped and only
+ * the brick-local offset is recomputed (an ortho slab ray of 24 voxels
+ * crosses at most two bricks — previously every step re-walked). */
+struct LodCache {
+  bool valid;
+  int desired;
+  uint scale;
+  uint3 bc;
   BrickCtx c;
+};
+
+BrickCtx bricks_lod_locate_ex(float3 p, float lod, out uint scale_out, out uint3 bc_out) {
+  BrickCtx c;
+  scale_out = 1u;
+  bc_out = uint3(0);
   c.ok = false;
   c.maxv = 0.0;
   c.bl = float3(0);
@@ -154,8 +168,42 @@ BrickCtx bricks_lod_locate(float3 p, float lod) {
       c.atlas_lod = 0.0;
       c.grad_vox = exp2(lod) / float(scale);
       c.world_brick = BR_SLOT * float(scale) / maxdim;
+      scale_out = scale;
+      bc_out = bc;
       return c;
   }
+  return c;
+}
+
+BrickCtx bricks_lod_locate(float3 p, float lod) {
+  uint sc_;
+  uint3 bc_;
+  return bricks_lod_locate_ex(p, lod, sc_, bc_);
+}
+
+BrickCtx bricks_lod_locate_cached(float3 p, float lod, inout LodCache lc) {
+  uint nlev = page[0];
+  int desired = int(clamp(floor(lod), 0.0, float(nlev - 1u)));
+  if (lc.valid && lc.desired == desired) {
+    float3 base_shape = float3(page[1], page[2], page[3]);
+    float maxdim = max(base_shape.x, max(base_shape.y, base_shape.z));
+    float3 base_v = clamp(p * maxdim, float3(0), max(base_shape - 0.001, float3(0)));
+    float3 lv = base_v / float(lc.scale);
+    uint3 bc = uint3(lv) >> 7u;
+    if (all(bc == lc.bc)) {
+      BrickCtx c = lc.c;
+      c.bl = lv - float3(bc << 7u);
+      return c;
+    }
+  }
+  uint scale;
+  uint3 bc;
+  BrickCtx c = bricks_lod_locate_ex(p, lod, scale, bc);
+  lc.valid = c.ok;
+  lc.desired = desired;
+  lc.scale = scale;
+  lc.bc = bc;
+  lc.c = c;
   return c;
 }
 
@@ -604,6 +652,11 @@ void main(uint3 tid: SV_DispatchThreadID) {
   float3 b_slot = float3(0);
   float b_grad_vox = 1.0;
   float b_world_brick = 128.0 * voxel;
+  LodCache b_lc;
+  b_lc.valid = false;
+  b_lc.desired = -1;
+  b_lc.scale = 1u;
+  b_lc.bc = uint3(0);
 
   while (t < tf_ && steps < ray_budget) {
     steps++;
@@ -629,7 +682,7 @@ void main(uint3 tid: SV_DispatchThreadID) {
       v = cl_lvl < 0 ? 0.0 : sample_clip_level(uint(cl_lvl), p);
     } else if (is_bricks()) {
       if (bricks_is_lod()) {
-        BrickCtx bc = bricks_lod_locate(p, lod);
+        BrickCtx bc = bricks_lod_locate_cached(p, lod, b_lc);
         b_ok = bc.ok;
         b_max = bc.maxv;
         b_slot = bc.slot_org;

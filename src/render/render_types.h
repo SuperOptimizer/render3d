@@ -13,6 +13,12 @@ typedef struct r3d_config {
   bool vsync;          /* FIFO (true) vs MAILBOX/IMMEDIATE if available */
   const char *spv_dir; /* directory holding compiled .spv shaders */
   uint64_t gpu_budget_bytes; /* 0 = derive conservatively from the device heap */
+  /* headless: no window, surface, swapchain or present. Frames render into
+   * the offscreen only (r3d_read_frame captures it); ImGui runs without a
+   * platform backend so the panel code still executes. For automated perf
+   * runs and CI on machines without a display. */
+  bool headless;
+  uint32_t headless_w, headless_h;
 } r3d_config;
 
 /* Debug/render modes (mirrors shader `pc.mode`). */
@@ -102,6 +108,7 @@ typedef struct r3d_frame_stats {
   uint64_t gpu_raycast_ns; /* compute dispatch */
   uint64_t gpu_blit_ns;    /* offscreen -> swapchain blit */
   uint64_t gpu_gui_ns;     /* ImGui color pass (0 when no GUI drawn) */
+  uint32_t panes_drawn;    /* views re-raycast this frame (pane cache misses) */
   /* CPU phases inside r3d_frame, current frame */
   uint64_t cpu_wait_ns;    /* timeline wait for slot reuse */
   uint64_t cpu_acquire_ns; /* vkAcquireNextImageKHR */

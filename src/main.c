@@ -23,6 +23,7 @@
 #include "core/segstore.h"
 #include "core/tracer.h"
 #include "core/segtrace.h"
+#include "core/inklive.h"
 #include "core/stats.h"
 #include "core/tifxyz.h"
 #include "core/umbilicus.h"
@@ -1099,6 +1100,7 @@ int main(int argc, char **argv) {
   int win_w = 1280, win_h = 720;
   float cam0[5] = {0.5f, 0.5f, -1.5f, 0.0f, 0.0f}; /* pos, yaw, pitch */
   bool no_vsync = false;
+  bool headless = false; /* --headless: no window/swapchain, offscreen only */
   float lowcut0 = 0.0f;
   const char *bench = NULL; /* scripted camera path: orbit | zoom | fly */
   const char *bench_name = NULL;
@@ -1121,13 +1123,20 @@ int main(int argc, char **argv) {
   const char *vscache = "band", *vsurl = NULL;
   const char *umbilicus_path = NULL;
   const char *multiview_path = NULL; /* tifxyz dir: vc3d-style 2x2 viewer */
+  int inklive_port = 0;             /* --inklive: live 2.5D ink on the seg view */
+  r3d_inklive inklive = {.fd = -1};
+  bool inklive_up = false, inklive_have = false;
+  int64_t il_rect[4] = {-1, -1, -1, -1}; /* last requested grid rect */
+  int64_t il_view[4] = {-2, -2, -2, -2}; /* rect currently under the view */
+  uint32_t il_stable = 0;
+  uint64_t il_last_nvalid = 0;
   const char *seg_store_path = NULL; /* segpack store: draw ALL surfaces */
   const char *overlay_path = NULL;   /* active overlay c5d LOD root */
   const char *overlay_paths[8];      /* all --overlay trees (ink, surface preds...) */
   uint32_t n_overlays = 0;
   int overlay_sel = 0;
   bool od_browse = false;            /* start with the open-data browser window */
-  int sv_w = 2048, sv_h = 2048, sv_l = 96; /* flattened surface-volume window */
+  int sv_w = 2048, sv_h = 2048, sv_l = 128; /* flattened surface-volume window (1 GiB RG8) */
   int annotation_prefetch = 5; /* annotation steps ahead; one slot is kept behind */
   int annotation_z_prefetch = 32; /* contiguous GPU-resident fine-scroll margin */
   bool vsz_given = false;
@@ -1146,6 +1155,7 @@ int main(int argc, char **argv) {
     if (i < argc - 5 && strcmp(argv[i], "--cam") == 0)
       for (int k = 0; k < 5; k++) cam0[k] = (float)atof(argv[i + 1 + k]);
     if (strcmp(argv[i], "--no-vsync") == 0) no_vsync = true;
+    if (strcmp(argv[i], "--headless") == 0) headless = true;
     if (i < argc - 1 && strcmp(argv[i], "--lowcut") == 0) lowcut0 = (float)atof(argv[i + 1]);
     if (i < argc - 1 && strcmp(argv[i], "--bench") == 0) bench = argv[i + 1];
     if (i < argc - 1 && strcmp(argv[i], "--bench-name") == 0) bench_name = argv[i + 1];
@@ -1177,6 +1187,11 @@ int main(int argc, char **argv) {
     }
     if (i < argc - 1 && strcmp(argv[i], "--umbilicus") == 0) umbilicus_path = argv[i + 1];
     if (i < argc - 1 && strcmp(argv[i], "--multiview") == 0) multiview_path = argv[i + 1];
+    if (strcmp(argv[i], "--inklive") == 0) {
+      inklive_port = 9743;
+      if (i < argc - 1 && argv[i + 1][0] >= '1' && argv[i + 1][0] <= '9')
+        inklive_port = atoi(argv[i + 1]);
+    }
     if (i < argc - 1 && strcmp(argv[i], "--overlay") == 0 &&
         n_overlays < sizeof overlay_paths / sizeof *overlay_paths)
       overlay_paths[n_overlays++] = argv[i + 1];
@@ -1220,6 +1235,7 @@ int main(int argc, char **argv) {
     return EXIT_FAILURE;
   }
   if (bench && exit_frames == 0) exit_frames = 300;
+  if (headless && !exit_frames) exit_frames = 1000; /* never run unattended forever */
   if (!exit_frames) warmup_frames = 0;
   if (exit_frames > UINT32_MAX - warmup_frames) {
     fprintf(stderr, "--frames + --warmup is too large\n");
@@ -1265,26 +1281,35 @@ int main(int argc, char **argv) {
   annotation_last_z = annotation_z;
   annotation_bench_z = annotation_z;
 
-  if (!SDL_Init(SDL_INIT_VIDEO)) {
+  /* headless: events subsystem only (the poll loop still runs), no window;
+   * the renderer skips surface/swapchain/present and the GUI runs without a
+   * platform backend. Everything else — streaming, bake, panes, GUI logic,
+   * bench scripts, --shot, --bench-json — is identical to a windowed run. */
+  if (!SDL_Init(headless ? SDL_INIT_EVENTS : SDL_INIT_VIDEO)) {
     fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
     return EXIT_FAILURE;
   }
-  SDL_Window *win = SDL_CreateWindow("render3d", win_w, win_h,
-                                     SDL_WINDOW_RESIZABLE | SDL_WINDOW_VULKAN);
-  if (!win) {
-    fprintf(stderr, "SDL_CreateWindow: %s\n", SDL_GetError());
-    SDL_Quit();
-    return EXIT_FAILURE;
+  SDL_Window *win = NULL;
+  if (!headless) {
+    win = SDL_CreateWindow("render3d", win_w, win_h, SDL_WINDOW_RESIZABLE | SDL_WINDOW_VULKAN);
+    if (!win) {
+      fprintf(stderr, "SDL_CreateWindow: %s\n", SDL_GetError());
+      SDL_Quit();
+      return EXIT_FAILURE;
+    }
   }
 
   r3d_config cfg = {.validate = false,
                     .vsync = !no_vsync,
                     .spv_dir = R3D_SPV_DIR,
-                    .gpu_budget_bytes = gpu_budget_bytes};
+                    .gpu_budget_bytes = gpu_budget_bytes,
+                    .headless = headless,
+                    .headless_w = (uint32_t)win_w,
+                    .headless_h = (uint32_t)win_h};
   r3d_renderer *renderer = NULL;
   if (r3d_create(win, &cfg, &renderer) != 0) {
     fprintf(stderr, "renderer init failed\n");
-    SDL_DestroyWindow(win);
+    if (win) SDL_DestroyWindow(win);
     SDL_Quit();
     return EXIT_FAILURE;
   }
@@ -1370,8 +1395,6 @@ int main(int argc, char **argv) {
   int mv_thick = 1;               /* plane-view slab thickness (voxels) */
   int mv_drag_view = -1;
   float *mv_normals = NULL; /* per-vertex normals kept for overlays/zoff shell */
-  uint64_t mv_sv_decoded = 0; /* residency-driven surfvol rebuild bookkeeping */
-  int mv_sv_cool = 0;
   uint32_t mv_visible = 0xfu; /* per-view visibility; collapsed views cost nothing */
   uint32_t mv_ov_mask = 0xfu; /* which panes display the overlay tint */
   /* bottom panes pick from {XZ, YZ, 3D}: at most two of the three are live
@@ -1481,6 +1504,19 @@ int main(int argc, char **argv) {
                           (uint32_t)sv_l / 2, mv_seg.sx, mv_seg.sy) != 0) {
       fprintf(stderr, "multiview: surface-volume window init failed\n");
       return EXIT_FAILURE;
+    }
+    if (inklive_port) { /* live 2.5D ink worker (CT sampled via cpuvol on the
+                         * same cache tree; predictions from inkserver.py) */
+      char ilroot[1024];
+      snprintf(ilroot, sizeof ilroot, "%s", bricks_path);
+      char *mslash = strrchr(ilroot, '/');
+      if (mslash && strcmp(mslash + 1, "manifest.json") == 0) *mslash = 0;
+      if (r3d_inklive_start(&inklive, ilroot, inklive_port) == 0) {
+        inklive_up = true;
+        printf("inklive: worker up (CT %s, server port %d)\n", ilroot, inklive_port);
+      } else {
+        fprintf(stderr, "inklive: start failed (CT %s)\n", ilroot);
+      }
     }
   }
 
@@ -1809,7 +1845,12 @@ int main(int argc, char **argv) {
     }
 
     int w = 0, h = 0;
-    SDL_GetWindowSizeInPixels(win, &w, &h);
+    if (win) {
+      SDL_GetWindowSizeInPixels(win, &w, &h);
+    } else {
+      w = win_w;
+      h = win_h;
+    }
     if (w <= 0 || h <= 0) {
       SDL_Delay(50);
       continue;
@@ -2196,13 +2237,67 @@ int main(int argc, char **argv) {
                             (uint32_t)(ty1 > 0.0 ? ty1 + 1.0 : 0.0),
                             (uint32_t)(lz1 > 0 ? lz1 : 0));
         r3d_surfvol_window(renderer, u0, v0, (float)stepd, (float)z0);
-        r3d_bricks_stats svst;
-        r3d_bricks_get_stats(renderer, &svst);
-        if (mv_sv_cool > 0) mv_sv_cool--;
-        if (svst.decoded != mv_sv_decoded && mv_sv_cool == 0) {
-          mv_sv_decoded = svst.decoded;
-          mv_sv_cool = 20; /* at most one residency rebuild per ~1/3 s */
-          r3d_surfvol_mark(renderer);
+        /* residency-arrival re-bakes are now triggered by the renderer at
+         * page-table publication (the only moment the new bricks are actually
+         * visible to the bake kernel); the old decode-counter poll here fired
+         * a frame early, missed publications, and cost two stats locks/frame */
+        if (inklive_up) { /* live 2.5D ink over the visible grid rect: request
+             * when the view has been stable for ~1s and the rect (or the
+             * traced grid) changed since the last request */
+          uint32_t up = (uint32_t)lround(1.0 / (double)mv_seg.sx);
+          if (up < 1) up = 1;
+          uint32_t max_cells = R3D_INKLIVE_MAX_PX / up;
+          if (max_cells < 2) max_cells = 2;
+          double hwg = (double)sv->pw * 0.5 / sv->zoom, hhg = (double)sv->ph * 0.5 / sv->zoom;
+          if (hwg > max_cells * 0.5) hwg = max_cells * 0.5;
+          if (hhg > max_cells * 0.5) hhg = max_cells * 0.5;
+          int64_t g0 = (int64_t)(sv->cu - hwg), g1 = (int64_t)(sv->cu + hwg) + 1;
+          int64_t j0 = (int64_t)(sv->cv - hhg), j1 = (int64_t)(sv->cv + hhg) + 1;
+          if (g0 < 0) g0 = 0;
+          if (j0 < 0) j0 = 0;
+          if (g1 > (int64_t)mv_seg.w - 1) g1 = (int64_t)mv_seg.w - 1;
+          if (j1 > (int64_t)mv_seg.h - 1) j1 = (int64_t)mv_seg.h - 1;
+          bool same_view = g0 == il_view[0] && j0 == il_view[1] && g1 == il_view[2] &&
+                           j1 == il_view[3];
+          il_view[0] = g0;
+          il_view[1] = j0;
+          il_view[2] = g1;
+          il_view[3] = j1;
+          il_stable = same_view ? il_stable + 1 : 0;
+          bool rect_new = g0 != il_rect[0] || j0 != il_rect[1] || g1 != il_rect[2] ||
+                          j1 != il_rect[3];
+          bool grid_new = mv_seg.nvalid != il_last_nvalid;
+          if (g1 > g0 + 1 && j1 > j0 + 1 && il_stable >= 60 && (rect_new || grid_new)) {
+            uint32_t rw = (uint32_t)(g1 - g0), rh = (uint32_t)(j1 - j0);
+            float *xyz = malloc((size_t)(rw + 1) * (rh + 1) * 3 * sizeof *xyz);
+            if (xyz) {
+              for (uint32_t cj = 0; cj <= rh; cj++)
+                for (uint32_t ci = 0; ci <= rw; ci++) {
+                  const float *sp =
+                      r3d_tifxyz_at(&mv_seg, (uint32_t)g0 + ci, (uint32_t)j0 + cj);
+                  float *dst = xyz + ((size_t)cj * (rw + 1) + ci) * 3;
+                  if (r3d_tifxyz_valid(sp)) {
+                    dst[0] = sp[0];
+                    dst[1] = sp[1];
+                    dst[2] = sp[2];
+                  } else {
+                    dst[0] = dst[1] = dst[2] = -1.0f;
+                  }
+                }
+              r3d_inklive_request(&inklive, xyz, (uint32_t)g0, (uint32_t)j0, rw, rh, up);
+              il_rect[0] = g0;
+              il_rect[1] = j0;
+              il_rect[2] = g1;
+              il_rect[3] = j1;
+              il_last_nvalid = mv_seg.nvalid;
+            }
+          }
+          const float *pred;
+          uint32_t pw2, ph2, pi0, pj0, pup;
+          if (r3d_inklive_poll(&inklive, &pred, &pw2, &ph2, &pi0, &pj0, &pup) &&
+              r3d_surfvol_inkpred(renderer, pred, pw2, ph2, (float)pi0, (float)pj0,
+                                  (float)pup) == 0)
+            inklive_have = true;
         }
       }
     }
@@ -3016,6 +3111,13 @@ int main(int argc, char **argv) {
           }
     }
       }
+    if (inklive_up && igCollapsingHeader_TreeNodeFlags("live ink", 0)) {
+      igTextDisabled("server 127.0.0.1:%d", inklive_port);
+      igTextDisabled("%s", inklive.status);
+      if (il_rect[0] >= 0)
+        igTextDisabled("rect (%lld,%lld)-(%lld,%lld)", (long long)il_rect[0],
+                       (long long)il_rect[1], (long long)il_rect[2], (long long)il_rect[3]);
+    }
     if (overlay_path && igCollapsingHeader_TreeNodeFlags("overlay", 0)) {
         {
           igCheckbox("show##ovshow", &overlay_show);
@@ -3665,8 +3767,11 @@ int main(int argc, char **argv) {
         .threshold = low_cut / 255.0f,
         .skip_gate = fmaxf(low_cut, tf_min_v - 0.5f) / 255.0f,
         .overlay_gain = overlay_gain,
-        .overlay_flags = (overlay_path && overlay_show ? 1u : 0u) |
-                         (overlay_path && !strstr(overlay_path, "ink") ? 256u : 0u),
+        /* live 2.5D ink shows even without a 3D overlay tree, in ink green */
+        .overlay_flags = ((overlay_path && overlay_show) || inklive_have ? 1u : 0u) |
+                         (overlay_path && !strstr(overlay_path, "ink") && !inklive_have
+                              ? 256u
+                              : 0u),
     };
     memcpy(p.vol_r0, &vm.r0, 12);
     memcpy(p.vol_r1, &vm.r1, 12);
@@ -4076,6 +4181,7 @@ int main(int argc, char **argv) {
   if (umbilicus_path && umbilicus.dirty)
     save_umbilicus(&umbilicus, umbilicus_path, annotation_status);
   r3d_umbilicus_free(&umbilicus);
+  if (inklive_up) r3d_inklive_stop(&inklive);
   if (multiview_path) {
     r3d_tifxyz_free(&mv_seg);
     r3d_segrows_free(&mv_rows);
@@ -4134,7 +4240,7 @@ int main(int argc, char **argv) {
     pthread_join(od.fth, NULL);
   }
   r3d_destroy(renderer);
-  SDL_DestroyWindow(win);
+  if (win) SDL_DestroyWindow(win);
   SDL_Quit();
   return EXIT_SUCCESS;
 }

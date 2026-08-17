@@ -6,6 +6,7 @@
 #ifndef R3D_CPUVOL_H
 #define R3D_CPUVOL_H
 
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -32,6 +33,20 @@ typedef struct r3d_cpuvol {
   uint64_t *use;     /* LRU ticks */
   uint32_t nslots;
   uint64_t tick;
+  /* hash index over keys (open addressing, slot+1, 0 = empty) so a hit is
+   * O(1) instead of a linear scan of every slot per non-memo lookup */
+  uint32_t *hidx;
+  uint32_t hmask;
+  /* negative cache: bricks known absent (empty cache file = air, permanent)
+   * or unavailable right now (fetch/decode failed: expires) — trilinear
+   * taps into empty space no longer cost 8 file probes per sample */
+  uint64_t *neg_key;
+  uint64_t *neg_exp;  /* expiry, seconds since epoch; UINT64_MAX = permanent */
+  uint32_t nneg;      /* power of two */
+  /* thread safety: mu guards the index/LRU/negative cache; io_mu serializes
+   * shard reads + demand fetches. Decodes run outside both. Concurrent
+   * r3d_cpuvol_tri/at callers on one volume are supported. */
+  pthread_mutex_t mu, io_mu;
   /* demand fetch (source.json): brick misses pull the owning zarr cell,
    * transcode, and land in <root>/bricks/L* — the same cache the
    * renderer's net ingest fills, so either side feeds the other. The

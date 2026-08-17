@@ -59,6 +59,7 @@ add_library(r3d_core STATIC
   src/core/segstore.c
   src/core/cpuvol.c
   src/core/tracer.c
+  src/core/inklive.c
   src/core/odbrowse.c
   src/core/screenshot.c)
 # hot numeric TUs: fast-math (finite data by construction; the tracer's

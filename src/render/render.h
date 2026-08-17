@@ -168,6 +168,11 @@ void r3d_surfvol_window(r3d_renderer *r, double u0, double v0, float step, float
 void r3d_surfvol_visible(r3d_renderer *r, uint32_t x0, uint32_t y0, uint32_t z0, uint32_t x1,
                          uint32_t y1, uint32_t z1);
 void r3d_surfvol_mark(r3d_renderer *r);
+/* Live 2.5D ink prediction for the flattened view: w*h float probabilities,
+ * texel (0,0) at grid coords (g0u,g0v), px_per_grid texels per grid unit.
+ * The bake writes max(overlay, pred) into the window's G channel. */
+int r3d_surfvol_inkpred(r3d_renderer *r, const float *pred, uint32_t w, uint32_t h,
+                        float g0u, float g0v, float px_per_grid);
 void r3d_surfvol_params(const r3d_renderer *r, r3d_frame_params *p);
 
 /* Device limit for 3D image dimensions (e.g. the surfvol window's W/H/L). */

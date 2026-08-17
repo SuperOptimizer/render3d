@@ -48,6 +48,9 @@ typedef struct r3d_brlod_level {
 typedef struct r3d_brlod_reader {
   c5d_shard_reader sr;
   bool open;
+  bool failed; /* open() failed: never retry (net-streamed trees have no local
+                * shards below the coarsest level -- previously every candidate
+                * cost an ENOENT syscall on the render thread every frame) */
 } r3d_brlod_reader;
 
 struct r3d_renderer {
@@ -57,6 +60,29 @@ struct r3d_renderer {
   r3d_vkswap swap;
 
   r3d_vkimage offscreen; /* RGBA8 storage image at drawable size */
+  /* pane cache: the offscreen persists across frames, so a view whose
+   * inputs (params + GPU-visible scene generation) are unchanged keeps last
+   * frame's pixels and skips its raycast dispatch entirely */
+  VkImageLayout os_layout;         /* current offscreen layout (UNDEFINED at start) */
+  uint64_t os_layout_key;          /* nviews/origins/viewports of the last clear */
+  uint64_t pane_key[R3D_MAX_VIEWS]; /* per-view input hash of the last render */
+  uint64_t scene_gen;              /* bumped whenever GPU-visible data changes */
+  bool pane_cache_off;             /* R3D_NO_PANE_CACHE=1 */
+  /* presenter thread: vkQueuePresentKHR blocks on WSLg's software WSI (it
+   * fence-waits the frame and memcpys the 8 MB image) — moving it off the
+   * render thread lets the next frame's poll/GUI/record overlap that wait.
+   * Presents are strictly serialized (one outstanding). */
+  struct {
+    pthread_t th;
+    bool up, quit;
+    pthread_mutex_t mu;
+    pthread_cond_t cv, done_cv;
+    bool pending, busy;
+    uint32_t img;
+    VkResult last;      /* result of the most recent present */
+    bool need_resize;   /* OUT_OF_DATE/SUBOPTIMAL seen */
+    bool failed;        /* other error */
+  } pres;
   r3d_vkimage volume;    /* R8 3D + full mip chain (dummy 2^3 until upload) */
   r3d_vkimage tf;        /* 256x1 RGBA8 transfer function */
   r3d_vkimage occ;       /* per-8^3-block max (dilated), for empty-space skip */
@@ -68,10 +94,20 @@ struct r3d_renderer {
     bool active, dirty;
     r3d_vkimage vol;
     r3d_vkcomp comp;
+    r3d_vkimage pred;  /* live 2.5D ink prediction (R32F 2D; 1x1 until fed) */
+    bool pred_on;
+    float pred_g0u, pred_g0v, pred_ppg; /* grid-space mapping of pred texels */
     uint32_t W, H, L, nback;
     float u0, v0, step, zoff0;
     float sx, sy;      /* tifxyz grid scale (kernel push) */
     uint32_t prog_row; /* residency-arrival re-bake cursor (UINT32_MAX idle) */
+    bool rebake_again; /* residency landed mid-pass: run one more full pass */
+    /* per-layer staleness: a progressive pass only bakes the visible layer
+     * band (+-8), so 128-layer windows stop paying 1 GB of writes per pass;
+     * layers scrubbed into view later bake lazily. bit l set = layer l may
+     * hold pre-arrival content */
+    uint64_t stale[4];
+    uint32_t pass_z0, pass_z1; /* layer band of the running pass */
     bool baked;        /* window content valid (a full bake has been recorded) */
     bool shift_pending; /* integer-texel window move: shift + bake exposed bands */
     int32_t sh_u, sh_v, sh_z;
@@ -126,7 +162,7 @@ struct r3d_renderer {
     uint32_t chsz[BR_LOD_MAX];
     bool raw[BR_LOD_MAX];
     float q0;
-    pthread_t th[4];
+    pthread_t th[64];
     uint32_t nth;
     pthread_mutex_t mu;
     pthread_cond_t cv;
@@ -135,7 +171,7 @@ struct r3d_renderer {
     uint32_t qins; /* insertion cursor: reset each pump pass so the newest
                     * view's chunks jump ahead of the older backlog while
                     * keeping the pass's own nearest-first order */
-    uint64_t inflight[8];  /* chunks being fetched right now */
+    uint64_t inflight[64]; /* chunks being fetched right now (>= max fetchers) */
     uint32_t nin;
     _Atomic uint64_t fetched, absent_chunks, encoded;
     /* per-brick cache state, written by workers only: 0 unknown,
@@ -203,6 +239,7 @@ struct r3d_renderer {
     pthread_cond_t cv;
     bool worker_up, quit;
     uint32_t job_state; /* 0 idle, 1 ready, 2 running, 3 complete */
+    uint32_t job_kind;  /* 0 decode batch, 1 overlay repair (no page writes) */
     uint32_t job_n, job_nevict, job_evict[32]; /* matches BR_MAX_BATCH */
     uint64_t job_timeline;
     int job_rc;
@@ -351,12 +388,21 @@ static int create_compute_pipeline(r3d_renderer *r, const char *name, VkPipeline
   return res == VK_SUCCESS ? 0 : -1;
 }
 
+static void pres_start(r3d_renderer *r);
+static void pres_stop(r3d_renderer *r);
+static void pres_drain(r3d_renderer *r);
+
 static int create_offscreen(r3d_renderer *r) {
   VkExtent3D e = {r->swap.extent.width, r->swap.extent.height, 1};
   if (r3d_vkimage_create(&r->vk, VK_FORMAT_R8G8B8A8_UNORM, e, 1,
-                         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                             VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                          &r->offscreen) != 0)
     return -1;
+  r->os_layout = VK_IMAGE_LAYOUT_UNDEFINED; /* fresh image: contents undefined */
+  r->pane_cache_off = getenv("R3D_NO_PANE_CACHE") && *getenv("R3D_NO_PANE_CACHE") == '1';
+  r->os_layout_key = 0;
+  memset(r->pane_key, 0, sizeof r->pane_key);
   VkDescriptorImageInfo ii = {.imageView = r->offscreen.view,
                               .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
   VkWriteDescriptorSet w = {
@@ -614,6 +660,7 @@ static void write_volume_dset(r3d_renderer *r, VkImageView views[R3D_SLAB_TILES]
 
 static void write_image_dset(r3d_renderer *r, uint32_t binding, VkDescriptorType type,
                              VkImageView view, VkSampler sampler, VkImageLayout layout) {
+  r->scene_gen++;
   VkDescriptorImageInfo ii = {.sampler = sampler, .imageView = view, .imageLayout = layout};
   VkWriteDescriptorSet w = {
       .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
@@ -707,7 +754,7 @@ int r3d_create(SDL_Window *win, const r3d_config *cfg, r3d_renderer **out) {
   r->cfg = *cfg;
 
   uint32_t next = 0;
-  const char *const *exts = SDL_Vulkan_GetInstanceExtensions(&next);
+  const char *const *exts = cfg->headless ? NULL : SDL_Vulkan_GetInstanceExtensions(&next);
   if (r3d_vkctx_create(&r->vk, exts, next, cfg->validate) != 0) goto fail;
   r3d_vkctx_set_budget(&r->vk, cfg->gpu_budget_bytes);
   VkFormatFeatureFlags r8 = r->vk.caps.r8_optimal;
@@ -720,9 +767,19 @@ int r3d_create(SDL_Window *win, const r3d_config *cfg, r3d_renderer **out) {
   /* Tiles are numerous but individually small. A 64 MiB growth quantum keeps
    * allocation counts low without reserving hundreds of MiB for a tiny slab. */
   r3d_vkarena_init(&r->tile_arena, (VkDeviceSize)64 << 20);
-  if (r3d_vkswap_create(&r->vk, win, cfg->vsync, &r->swap) != 0) goto fail;
+  if (cfg->headless) { /* no surface/swapchain: the offscreen is the target */
+    memset(&r->swap, 0, sizeof r->swap);
+    r->swap.extent.width = cfg->headless_w ? cfg->headless_w : 1280u;
+    r->swap.extent.height = cfg->headless_h ? cfg->headless_h : 720u;
+    r->swap.format = VK_FORMAT_R8G8B8A8_UNORM;
+    r->swap.nimages = 2;
+    r3d_vkgui_set_display(r->swap.extent.width, r->swap.extent.height);
+  } else if (r3d_vkswap_create(&r->vk, win, cfg->vsync, &r->swap) != 0) {
+    goto fail;
+  }
   if (create_pipeline(r) != 0) goto fail;
   if (create_offscreen(r) != 0) goto fail;
+  if (!cfg->headless && getenv("R3D_PRESENT_THREAD")) pres_start(r);
   r->fp_transition = (PFN_vkTransitionImageLayoutEXT)(void (*)(void))vkGetDeviceProcAddr(
       r->vk.dev, "vkTransitionImageLayoutEXT");
   r->fp_copy_mem = (PFN_vkCopyMemoryToImageEXT)(void (*)(void))vkGetDeviceProcAddr(
@@ -836,7 +893,8 @@ int r3d_create(SDL_Window *win, const r3d_config *cfg, r3d_renderer **out) {
     vkUpdateDescriptorSets(r->vk.dev, 1, &pw, 0, NULL);
   }
 
-  if (r3d_vkgui_init(&r->vk, win, r->swap.format, r->swap.nimages) != 0) goto fail;
+  if (r3d_vkgui_init(&r->vk, cfg->headless ? NULL : win, r->swap.format, r->swap.nimages) != 0)
+    goto fail;
   r->gui_up = true;
 
   *out = r;
@@ -936,6 +994,7 @@ static void bricks_teardown(r3d_renderer *r) {
   r3d_vkimage_destroy(&r->vk, &r->surf_normals);
   r->surf_active = false;
   r3d_vkimage_destroy(&r->vk, &r->sv.vol);
+  r3d_vkimage_destroy(&r->vk, &r->sv.pred);
   r3d_vkcomp_destroy(&r->vk, &r->sv.comp);
   memset(&r->sv, 0, sizeof r->sv);
   r->bricks_lod = false;
@@ -958,6 +1017,7 @@ int r3d_bricks_end(r3d_renderer *r) {
 
 void r3d_destroy(r3d_renderer *r) {
   if (!r) return;
+  pres_stop(r);
   if (r->bs.worker_up) {
     pthread_mutex_lock(&r->bs.mu);
     r->bs.quit = true;
@@ -1079,6 +1139,7 @@ void r3d_destroy(r3d_renderer *r) {
   r3d_vkimage_destroy(&r->vk, &r->surf_coords);
   r3d_vkimage_destroy(&r->vk, &r->surf_normals);
   r3d_vkimage_destroy(&r->vk, &r->sv.vol);
+  r3d_vkimage_destroy(&r->vk, &r->sv.pred);
   r3d_vkcomp_destroy(&r->vk, &r->sv.comp);
   r3d_vkimage_destroy(&r->vk, &r->offscreen);
   r3d_vkswap_destroy(&r->vk, &r->swap);
@@ -1086,7 +1147,72 @@ void r3d_destroy(r3d_renderer *r) {
   free(r);
 }
 
+static void *pres_thread(void *arg) {
+  r3d_renderer *r = arg;
+  for (;;) {
+    pthread_mutex_lock(&r->pres.mu);
+    while (!r->pres.quit && !r->pres.pending) pthread_cond_wait(&r->pres.cv, &r->pres.mu);
+    if (r->pres.quit) {
+      pthread_mutex_unlock(&r->pres.mu);
+      return NULL;
+    }
+    uint32_t img = r->pres.img;
+    r->pres.pending = false;
+    r->pres.busy = true;
+    pthread_mutex_unlock(&r->pres.mu);
+    VkPresentInfoKHR pi = {
+        .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+        .waitSemaphoreCount = 1,
+        .pWaitSemaphores = &r->swap.render_done[img],
+        .swapchainCount = 1,
+        .pSwapchains = &r->swap.swapchain,
+        .pImageIndices = &img,
+    };
+    VkResult pr = r3d_vkctx_queue_present(&r->vk, &pi);
+    pthread_mutex_lock(&r->pres.mu);
+    r->pres.last = pr;
+    if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR) r->pres.need_resize = true;
+    else if (pr != VK_SUCCESS) r->pres.failed = true;
+    r->pres.busy = false;
+    pthread_cond_broadcast(&r->pres.done_cv);
+    pthread_mutex_unlock(&r->pres.mu);
+  }
+}
+
+/* wait until no present is queued or in flight (swapchain about to change,
+ * shutdown, or the next present is about to be queued) */
+static void pres_drain(r3d_renderer *r) {
+  if (!r->pres.up) return;
+  pthread_mutex_lock(&r->pres.mu);
+  while (r->pres.pending || r->pres.busy) pthread_cond_wait(&r->pres.done_cv, &r->pres.mu);
+  pthread_mutex_unlock(&r->pres.mu);
+}
+
+static void pres_start(r3d_renderer *r) {
+  if (r->pres.up || getenv("R3D_NO_PRESENT_THREAD")) return;
+  pthread_mutex_init(&r->pres.mu, NULL);
+  pthread_cond_init(&r->pres.cv, NULL);
+  pthread_cond_init(&r->pres.done_cv, NULL);
+  if (pthread_create(&r->pres.th, NULL, pres_thread, r) == 0) r->pres.up = true;
+}
+
+static void pres_stop(r3d_renderer *r) {
+  if (!r->pres.up) return;
+  pres_drain(r);
+  pthread_mutex_lock(&r->pres.mu);
+  r->pres.quit = true;
+  pthread_cond_broadcast(&r->pres.cv);
+  pthread_mutex_unlock(&r->pres.mu);
+  pthread_join(r->pres.th, NULL);
+  pthread_mutex_destroy(&r->pres.mu);
+  pthread_cond_destroy(&r->pres.cv);
+  pthread_cond_destroy(&r->pres.done_cv);
+  r->pres.up = false;
+}
+
 int r3d_resize(r3d_renderer *r) {
+  if (r->cfg.headless) return 0; /* fixed offscreen, nothing to recreate */
+  pres_drain(r); /* no present may reference the old swapchain */
   int rc = r3d_vkswap_recreate(&r->vk, r->win, r->cfg.vsync, &r->swap);
   if (rc != 0) return rc; /* rc==1: minimized, keep old resources */
   r3d_vkimage_destroy(&r->vk, &r->offscreen);
@@ -1094,6 +1220,7 @@ int r3d_resize(r3d_renderer *r) {
 }
 
 int r3d_upload_volume(r3d_renderer *r, const r3d_volume_desc *d, const uint8_t *voxels) {
+  r->scene_gen++; /* GPU-visible data changes: pane cache must miss */
   uint32_t maxdim = d->nx > d->ny ? d->nx : d->ny;
   if (d->nz > maxdim) maxdim = d->nz;
   if (maxdim > r->vk.caps.max_dim_3d) {
@@ -1260,6 +1387,7 @@ fail:
 
 int r3d_surf_begin(r3d_renderer *r, uint32_t w, uint32_t h, const float *coords_rgba,
                    const float *normals_rgba) {
+  r->scene_gen++; /* GPU-visible data changes: pane cache must miss */
   if (!w || !h || !coords_rgba || !normals_rgba || r->surf_active) return -1;
   VkExtent3D e = {w, h, 1};
   VkDeviceSize n = (VkDeviceSize)w * h * 4 * sizeof(float);
@@ -1283,8 +1411,10 @@ int r3d_surf_begin(r3d_renderer *r, uint32_t w, uint32_t h, const float *coords_
 
 int r3d_surf_swap(r3d_renderer *r, uint32_t w, uint32_t h, const float *coords_rgba,
                   const float *normals_rgba, float sx, float sy) {
+  r->scene_gen++; /* GPU-visible data changes: pane cache must miss */
   if (!r->surf_active || !w || !h || !coords_rgba || !normals_rgba) return -1;
   /* rare, user-triggered: idle the device so the old grid images retire */
+  pres_drain(r); /* queue ops need external sync */
   vkDeviceWaitIdle(r->vk.dev);
   r3d_vkimage_destroy(&r->vk, &r->surf_coords);
   r3d_vkimage_destroy(&r->vk, &r->surf_normals);
@@ -1335,6 +1465,8 @@ typedef struct sv_push {
   float lstep;
   uint32_t use_ink;
   uint32_t x0, y0, z0;
+  uint32_t use_pred;
+  float pg0u, pg0v, pppg;
 } sv_push;
 
 int r3d_surfvol_begin(r3d_renderer *r, uint32_t w, uint32_t h, uint32_t layers,
@@ -1345,6 +1477,23 @@ int r3d_surfvol_begin(r3d_renderer *r, uint32_t w, uint32_t h, uint32_t layers,
   if (h > cap) h = cap;
   if (layers > cap) layers = cap;
   if (nback >= layers) nback = layers / 2;
+  /* fit the single allocation limit and the remaining device budget (never
+   * request an image the driver cannot allocate; shrink depth first, then
+   * the xy extent, keeping the window usable) */
+  {
+    uint64_t acap = r->vk.caps.max_alloc_bytes;
+    uint64_t avail = r3d_vkctx_budget_available(&r->vk);
+    if (avail > (512ull << 20)) avail -= 256ull << 20; /* keep slack for staging */
+    if (acap > avail && avail) acap = avail;
+    if (!acap) acap = 1ull << 30;
+    while ((uint64_t)w * h * layers * 2u > acap) {
+      if (layers > 48) layers = layers * 3 / 4;
+      else if (w >= h && w > 512) w /= 2;
+      else if (h > 512) h /= 2;
+      else break;
+    }
+    if (nback >= layers) nback = layers / 2;
+  }
   printf("surfvol: %ux%ux%u window (%.0f MB, %u layers behind)\n", w, h, layers,
          (double)w * h * layers * 2.0 / 1048576.0, nback);
   r->sv.W = w;
@@ -1358,13 +1507,14 @@ int r3d_surfvol_begin(r3d_renderer *r, uint32_t w, uint32_t h, uint32_t layers,
                          &r->sv.vol) != 0)
     return -1;
   if (r3d_vk_image_to_general(&r->vk, r->pool, &r->sv.vol) != 0) return -1;
-  static const VkDescriptorType tt[6] = {
+  static const VkDescriptorType tt[7] = {
       VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
       VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-      VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER};
+      VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+      VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER};
   char sp[1024];
   snprintf(sp, sizeof sp, "%s/surfvol.spv", r->cfg.spv_dir);
-  if (r3d_vkcomp_create(&r->vk, sp, tt, 6, sizeof(sv_push), &r->sv.comp) != 0) return -1;
+  if (r3d_vkcomp_create(&r->vk, sp, tt, 7, sizeof(sv_push), &r->sv.comp) != 0) return -1;
   r3d_vkcomp_bind_image(&r->vk, &r->sv.comp, 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                         r->sv.vol.view, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL);
   r3d_vkcomp_bind_image(&r->vk, &r->sv.comp, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
@@ -1380,6 +1530,15 @@ int r3d_surfvol_begin(r3d_renderer *r, uint32_t w, uint32_t h, uint32_t layers,
   r3d_vkcomp_bind_image(&r->vk, &r->sv.comp, 5, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                         r->ink_active ? r->ink_atlas.view : r->brick_atlas.view, r->samp_vol,
                         VK_IMAGE_LAYOUT_GENERAL);
+  /* live 2.5D ink prediction: 1x1 placeholder until r3d_surfvol_inkpred */
+  if (r3d_vkimage_create(&r->vk, VK_FORMAT_R32_SFLOAT, (VkExtent3D){1, 1, 1}, 1,
+                         VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                         &r->sv.pred) != 0)
+    return -1;
+  if (r3d_vk_image_to_general(&r->vk, r->pool, &r->sv.pred) != 0) return -1;
+  r3d_vkcomp_bind_image(&r->vk, &r->sv.comp, 6, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                        r->sv.pred.view, r->samp_vol, VK_IMAGE_LAYOUT_GENERAL);
+  r->sv.pred_on = false;
   write_image_dset(r, 9, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, r->sv.vol.view,
                    r->samp_vol, VK_IMAGE_LAYOUT_GENERAL);
   r->sv.step = 0.0f; /* no window yet */
@@ -1447,11 +1606,82 @@ void r3d_surfvol_visible(r3d_renderer *r, uint32_t x0, uint32_t y0, uint32_t z0,
   r->sv.vz1 = z1 < r->sv.L ? z1 : r->sv.L;
 }
 
+int r3d_surfvol_inkpred(r3d_renderer *r, const float *pred, uint32_t w, uint32_t h,
+                        float g0u, float g0v, float px_per_grid) {
+  if (!r->sv.active || !w || !h) return -1;
+  /* size change: recreate the texture and rebind (device-idle is acceptable
+   * here — predictions arrive at most every few seconds) */
+  if (r->sv.pred.extent.width != w || r->sv.pred.extent.height != h) {
+    pres_drain(r); /* queue ops need external sync */
+  vkDeviceWaitIdle(r->vk.dev);
+    r3d_vkimage_destroy(&r->vk, &r->sv.pred);
+    if (r3d_vkimage_create(&r->vk, VK_FORMAT_R32_SFLOAT, (VkExtent3D){w, h, 1}, 1,
+                           VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                           &r->sv.pred) != 0)
+      return -1;
+    if (r3d_vk_image_to_general(&r->vk, r->pool, &r->sv.pred) != 0) return -1;
+    r3d_vkcomp_bind_image(&r->vk, &r->sv.comp, 6, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                          r->sv.pred.view, r->samp_vol, VK_IMAGE_LAYOUT_GENERAL);
+  }
+  { /* tightly packed R32F upload (the staged helper assumes 1-byte texels) */
+    r3d_vkbuf stage = {0};
+    VkDeviceSize bytes = (VkDeviceSize)w * h * 4u;
+    if (r3d_vkbuf_create_host(&r->vk, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &stage) != 0)
+      return -1;
+    memcpy(stage.mapped, pred, bytes);
+    VkCommandBuffer cmd = r3d_vk_oneshot_begin(&r->vk, r->pool);
+    if (!cmd) {
+      r3d_vkbuf_destroy(&r->vk, &stage);
+      return -1;
+    }
+    r3d_vk_image_barrier(cmd, r->sv.pred.img, VK_IMAGE_LAYOUT_GENERAL,
+                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                         VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT,
+                         VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, 0, 1);
+    VkBufferImageCopy reg = {
+        .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+        .imageExtent = {w, h, 1},
+    };
+    vkCmdCopyBufferToImage(cmd, stage.buf, r->sv.pred.img,
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &reg);
+    r3d_vk_image_barrier(cmd, r->sv.pred.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                         VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_COPY_BIT,
+                         VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                         VK_ACCESS_2_SHADER_SAMPLED_READ_BIT, 0, 1);
+    int urc = r3d_vk_oneshot_end(&r->vk, r->pool, cmd);
+    r3d_vkbuf_destroy(&r->vk, &stage);
+    if (urc != 0) return -1;
+  }
+  r->sv.pred_g0u = g0u;
+  r->sv.pred_g0v = g0v;
+  r->sv.pred_ppg = px_per_grid;
+  r->sv.pred_on = true;
+  r3d_surfvol_mark(r); /* repaint the window with the new probabilities */
+  r->scene_gen++;
+  return 0;
+}
+
 void r3d_surfvol_mark(r3d_renderer *r) {
   /* Residency arrival with an unchanged window mapping: rewriting any texel
    * subset in place is exactly correct, so re-bake progressively (a row band
-   * per frame) instead of hitching one frame with the full-window dispatch. */
-  if (r->sv.active && r->sv.step > 0.0f && !r->sv.dirty) r->sv.prog_row = 0;
+   * per frame) instead of hitching one frame with the full-window dispatch.
+   * If a pass is already running, let it finish and queue one more full pass
+   * (restarting on every arrival would starve the bottom rows under heavy
+   * streaming). */
+  if (!r->sv.active || r->sv.step <= 0.0f || r->sv.dirty) return;
+  memset(r->sv.stale, 0xff, sizeof r->sv.stale); /* every layer may be stale */
+  if (r->sv.prog_row != UINT32_MAX)
+    r->sv.rebake_again = true; /* the running pass's band must be redone too */
+  /* else: the frame loop starts a pass over the visible band next frame */
+}
+
+static bool sv_layers_stale(const r3d_renderer *r, uint32_t z0, uint32_t z1) {
+  for (uint32_t z = z0; z < z1 && z < 256u; z++)
+    if (r->sv.stale[z >> 6] & (1ull << (z & 63u))) return true;
+  return false;
+}
+static void sv_layers_clear(r3d_renderer *r, uint32_t z0, uint32_t z1) {
+  for (uint32_t z = z0; z < z1 && z < 256u; z++) r->sv.stale[z >> 6] &= ~(1ull << (z & 63u));
 }
 
 void r3d_surfvol_params(const r3d_renderer *r, r3d_frame_params *p) {
@@ -1470,11 +1700,13 @@ void r3d_surfvol_params(const r3d_renderer *r, r3d_frame_params *p) {
 }
 
 int r3d_set_transfer(r3d_renderer *r, const uint8_t rgba[256][4]) {
+  r->scene_gen++; /* GPU-visible data changes: pane cache must miss */
   r3d_vkctx_device_wait_idle(&r->vk);
   return upload_small_image(r, &r->tf, rgba, 256 * 4);
 }
 
 void r3d_set_quality(r3d_renderer *r, uint32_t quality) {
+  r->scene_gen++; /* GPU-visible data changes: pane cache must miss */
   r->quality = quality < R3D_QUALITY_COUNT ? quality : R3D_QUALITY_FULL;
 }
 
@@ -1571,6 +1803,7 @@ static int slab_upload_tile_slice(r3d_renderer *r, const r3d_slab_layout *l,
 #define R3D_SLAB_TILE_BUDGET ((VkDeviceSize)1 << 30)
 
 int r3d_slab_init(r3d_renderer *r, const r3d_slab_desc *d) {
+  r->scene_gen++; /* GPU-visible data changes: pane cache must miss */
   if (!r->tiled_modes) {
     fprintf(stderr, "slab: device lacks native non-uniform descriptor indexing\n");
     return -1;
@@ -1674,6 +1907,7 @@ int r3d_slab_init(r3d_renderer *r, const r3d_slab_desc *d) {
 }
 
 int r3d_slab_window(r3d_renderer *r, const r3d_volume *src, uint32_t z0) {
+  r->scene_gen++; /* GPU-visible data changes: pane cache must miss */
   if (!r->slab_mode) return -1;
   if (z0 > r3d_slab_z0_max(&r->slab)) z0 = r3d_slab_z0_max(&r->slab);
   if ((int64_t)z0 == r->slab_z0) return 0;
@@ -1882,13 +2116,18 @@ static const uint8_t *brlod_blob(r3d_renderer *r, const char *root,
   uint32_t ri = l->shard_off + (sz * l->sy + sy) * l->sx + sx;
   if (ri >= r->bricks_nreaders) return NULL;
   r3d_brlod_reader *rd = &readers[ri];
+  if (rd->failed) return NULL;
   if (!rd->open) {
     char path[1400];
     int pn = snprintf(path, sizeof path, "%s/c5d/L%u/%u_%u_%u.c5s", root, li, sz, sy, sx);
-    if (pn < 0 || (size_t)pn >= sizeof path || c5d_shard_open(path, &rd->sr) != 0) return NULL;
+    if (pn < 0 || (size_t)pn >= sizeof path || c5d_shard_open(path, &rd->sr) != 0) {
+      rd->failed = true;
+      return NULL;
+    }
     if (rd->sr.foot.brick_dim != BR_SLOT_DIM || rd->sr.foot.shard_dim != 1024u ||
         rd->sr.foot.lod_level != li) {
       c5d_shard_close_reader(&rd->sr);
+      rd->failed = true;
       return NULL;
     }
     rd->open = true;
@@ -2020,7 +2259,8 @@ static size_t ni_curl_write(const void *data, size_t sz, size_t nm, void *ud) {
 
 static int ni_write_file(const char *path, const void *data, size_t n) {
   char tmp[1460];
-  int pn = snprintf(tmp, sizeof tmp, "%s.tmp.%ld", path, (long)getpid());
+  int pn = snprintf(tmp, sizeof tmp, "%s.tmp.%ld.%lx", path, (long)getpid(),
+                    (unsigned long)pthread_self());
   if (pn < 0 || (size_t)pn >= sizeof tmp) return -1;
   FILE *f = fopen(tmp, "wb");
   if (!f) return -1;
@@ -2067,7 +2307,7 @@ static void *ni_worker(void *arg) {
     uint64_t id = r->ni.queue[0]; /* newest pass first, nearest-first within */
     memmove(r->ni.queue, r->ni.queue + 1, --r->ni.qn * sizeof id);
     if (r->ni.qins) r->ni.qins--;
-    if (r->ni.nin < 8u) r->ni.inflight[r->ni.nin++] = id;
+    if (r->ni.nin < 64u) r->ni.inflight[r->ni.nin++] = id;
     pthread_mutex_unlock(&r->ni.mu);
 
     int nsrc = (int)(id >> 63);
@@ -2593,6 +2833,8 @@ struct brdec {
   const struct brdec_item *it;
   uint8_t *raw;    /* n consecutive BR_RAW_BYTES slabs */
   uint8_t *maxes;  /* optional per-brick max out */
+  uint8_t *loaded; /* optional per-brick out: 1 = decoded from a real source */
+  unsigned par;    /* c5d threads per brick (set by brdec_run) */
   bool zero_on_fail; /* overlay semantics: absent/failed brick = zeros */
   bool ni_fallback;
   int ni_src; /* net-ingest cache to fall back on (0 = CT, 1 = overlay) */
@@ -2614,8 +2856,12 @@ static void *brdec_worker(void *arg) {
       owned = ni_load_brick(j->r, j->it[i].b, &bn, j->ni_src);
       blob = owned;
     }
-    int rc = blob ? c5d_brick_decode(blob, bn, dst, BR_SLOT_DIM) : -1;
+    /* small batches leave most of the pool idle when each brick decodes on
+     * one thread (8-brick jobs on 22 threads measured ~75 ms/job): split the
+     * brick itself across c5d's own persistent pool */
+    int rc = blob ? c5d_brick_decode_par(blob, bn, dst, BR_SLOT_DIM, j->par) : -1;
     free(owned);
+    if (j->loaded) j->loaded[i] = rc == 0;
     if (rc != 0) {
       if (j->zero_on_fail) {
         memset(dst, 0, BR_RAW_BYTES);
@@ -2635,19 +2881,82 @@ static void *brdec_worker(void *arg) {
   }
 }
 
-static int brdec_run(struct brdec *j) {
+/* Persistent decode pool: brdec_run used to spawn+join up to ncpu pthreads
+ * per batch (2-3 batches per job) -- ~1000 thread creations in an 11 s
+ * session, each paying stack mmap + first-touch zeroing (clear_page_erms in
+ * the profile). Workers now park on a condvar and pick up jobs by
+ * generation; the caller participates and waits for stragglers. */
+static struct {
+  pthread_mutex_t mu;
+  pthread_cond_t cv, done_cv;
+  pthread_t th[64];
+  uint32_t nth;
+  bool up, quit;
+  struct brdec *job;
+  uint64_t gen;      /* bumped per job */
+  uint32_t busy;     /* workers still inside the current job */
+} g_dpool = {.mu = PTHREAD_MUTEX_INITIALIZER,
+             .cv = PTHREAD_COND_INITIALIZER,
+             .done_cv = PTHREAD_COND_INITIALIZER};
+static pthread_mutex_t g_dpool_run_mu = PTHREAD_MUTEX_INITIALIZER; /* one job at a time */
+
+static void *dpool_thread(void *arg) {
+  (void)arg;
+  uint64_t seen = 0;
+  for (;;) {
+    pthread_mutex_lock(&g_dpool.mu);
+    while (!g_dpool.quit && g_dpool.gen == seen) pthread_cond_wait(&g_dpool.cv, &g_dpool.mu);
+    if (g_dpool.quit) {
+      pthread_mutex_unlock(&g_dpool.mu);
+      return NULL;
+    }
+    seen = g_dpool.gen;
+    struct brdec *j = g_dpool.job;
+    g_dpool.busy++;
+    pthread_mutex_unlock(&g_dpool.mu);
+    brdec_worker(j);
+    pthread_mutex_lock(&g_dpool.mu);
+    if (--g_dpool.busy == 0) pthread_cond_broadcast(&g_dpool.done_cv);
+    pthread_mutex_unlock(&g_dpool.mu);
+  }
+}
+
+static void dpool_ensure(void) {
+  if (g_dpool.up) return;
   long nc = sysconf(_SC_NPROCESSORS_ONLN);
-  if (nc < 1) nc = 4;
-  uint32_t nt = j->n < (uint32_t)nc ? j->n : (uint32_t)nc;
-  if (nt > 32) nt = 32;
-  pthread_t th[32];
-  uint32_t spawned = 0;
+  if (nc < 2) nc = 2;
+  /* leave two hardware threads for the render thread + fetchers */
+  uint32_t want = (uint32_t)(nc > 3 ? nc - 2 : 1);
+  if (want > 64) want = 64;
+  const char *ev = getenv("R3D_DECODE_THREADS");
+  if (ev && atoi(ev) > 0) want = atoi(ev) > 64 ? 64u : (uint32_t)atoi(ev);
+  for (uint32_t t = 0; t < want; t++)
+    if (pthread_create(&g_dpool.th[g_dpool.nth], NULL, dpool_thread, NULL) == 0) g_dpool.nth++;
+  g_dpool.up = true;
+}
+
+static int brdec_run(struct brdec *j) {
+  pthread_mutex_lock(&g_dpool_run_mu);
   atomic_store(&j->next, 0);
   atomic_store(&j->rc, 0);
-  for (uint32_t t = 0; t + 1 < nt; t++)
-    if (pthread_create(&th[spawned], NULL, brdec_worker, j) == 0) spawned++;
-  brdec_worker(j);
-  for (uint32_t t = 0; t < spawned; t++) pthread_join(th[t], NULL);
+  pthread_mutex_lock(&g_dpool.mu);
+  dpool_ensure();
+  { /* threads per brick: fill the pool, cap at 4 (diminishing returns) */
+    unsigned per = j->n ? (g_dpool.nth + 1u + j->n - 1u) / j->n : 1u;
+    j->par = per < 1u ? 1u : per > 4u ? 4u : per;
+  }
+  g_dpool.job = j;
+  g_dpool.gen++;
+  pthread_cond_broadcast(&g_dpool.cv);
+  pthread_mutex_unlock(&g_dpool.mu);
+  brdec_worker(j); /* the caller works too */
+  /* wait until every worker that entered this job has left it; workers that
+   * never woke in time see next==n and return immediately */
+  pthread_mutex_lock(&g_dpool.mu);
+  while (g_dpool.busy) pthread_cond_wait(&g_dpool.done_cv, &g_dpool.mu);
+  g_dpool.job = NULL;
+  pthread_mutex_unlock(&g_dpool.mu);
+  pthread_mutex_unlock(&g_dpool_run_mu);
   return atomic_load(&j->rc);
 }
 
@@ -2674,16 +2983,21 @@ static int bricks_decode_batch(r3d_renderer *r, uint32_t n) {
       items[i].bn = bn;
       items[i].b = r->bs.sel_b[i];
     }
+    uint8_t loaded[BR_MAX_BATCH] = {0};
+    struct brdec ijob = {.r = r, .it = items, .raw = raw, .loaded = loaded,
+                         .zero_on_fail = true, .ni_fallback = r->ni.url2[0] != 0,
+                         .ni_src = 1, .n = n};
+    brdec_run(&ijob);
+    /* Only bricks that neither the local tree nor the net cache could supply
+     * are flagged for repair + demand-fetched. Previously every non-local
+     * brick was flagged even when the .c5b cache decoded it fine, so the
+     * repair pass re-decoded correct bricks on the render thread (~1/3 of
+     * all decode CPU in a warm session, and 100+ ms frame hitches). */
     for (uint32_t i = 0; i < n; i++)
-      if (!items[i].blob && r->ni.url2[0]) { /* absent locally: demand-fetch
-             * from the overlay source; the repair pass fills the slot when
-             * the chunk lands */
+      if (!loaded[i] && r->ni.url2[0]) {
         bricks_net_request(r, r->bs.sel_b[i], 1);
         if (r->bs.ink_missing) r->bs.ink_missing[r->bs.sel_slot[i]] = 1;
       }
-    struct brdec ijob = {.r = r, .it = items, .raw = raw, .zero_on_fail = true,
-                         .ni_fallback = r->ni.url2[0] != 0, .ni_src = 1, .n = n};
-    brdec_run(&ijob);
     memcpy(r->bs.raw_stage.mapped, raw, (size_t)n * BR_RAW_BYTES);
     if (bricks_upload_raw(r, &r->ink_atlas, r->bs.sel_slot, n) != 0) return -1;
   }
@@ -2694,6 +3008,8 @@ static int bricks_decode_batch(r3d_renderer *r, uint32_t n) {
  * The render thread drains and invalidates evicted page entries before the job
  * starts. It also publishes completed entries after another timeline drain;
  * the worker never writes mapped memory while a shader may read it. */
+static int bricks_ink_repair_exec(r3d_renderer *r, uint32_t n);
+
 static void *bricks_worker(void *arg) {
   r3d_renderer *r = arg;
   for (;;) {
@@ -2704,12 +3020,25 @@ static void *bricks_worker(void *arg) {
       return NULL;
     }
     uint32_t n = r->bs.job_n;
+    uint32_t kind = r->bs.job_kind;
     uint64_t timeline = r->bs.job_timeline;
     r->bs.job_state = 2;
     pthread_mutex_unlock(&r->bs.mu);
 
     uint64_t started = now_ns();
     int rc = 0;
+    if (kind == 1) { /* overlay repair: upload only, slots stay as they are */
+      rc = bricks_ink_repair_exec(r, n);
+      pthread_mutex_lock(&r->bs.mu);
+      r->bs.jobs++;
+      r->bs.stream_ns += now_ns() - started;
+      if (rc != 0) r->bs.failures++;
+      r->bs.job_rc = rc;
+      r->bs.job_state = 3;
+      pthread_cond_broadcast(&r->bs.cv);
+      pthread_mutex_unlock(&r->bs.mu);
+      continue;
+    }
     if (timeline) {
       VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
                                 .semaphoreCount = 1,
@@ -2895,7 +3224,12 @@ int r3d_bricks_begin(r3d_renderer *r, const char *c5s_path, uint32_t pool_bpa,
       if (ok) {
         pthread_mutex_init(&r->ni.mu, NULL);
         pthread_cond_init(&r->ni.cv, NULL);
-        r->ni.nth = 4;
+        /* remote chunk fetch is latency-bound: one fetcher per hardware
+         * thread; R3D_FETCHERS=N overrides (1..64) */
+        long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+        r->ni.nth = ncpu > 0 ? (ncpu > 16 ? 16u : (uint32_t)ncpu) : 8u;
+        const char *fe = getenv("R3D_FETCHERS");
+        if (fe && atoi(fe) > 0) r->ni.nth = atoi(fe) > 64 ? 64u : (uint32_t)atoi(fe);
         for (uint32_t t = 0; t < r->ni.nth; t++)
           if (pthread_create(&r->ni.th[t], NULL, ni_worker, r) != 0) {
             r->ni.nth = t;
@@ -2923,11 +3257,11 @@ int r3d_bricks_begin(r3d_renderer *r, const char *c5s_path, uint32_t pool_bpa,
   uint32_t abpa = pool_bpa ? pool_bpa : (r->bricks_lod ? 8u : (bpa < 8u ? bpa : 8u));
   if (!r->bricks_lod && abpa > bpa) abpa = bpa;
   /* Warm-tier size, decided up front because the atlas ceiling budgets around
-   * it: explicit --warm wins, else 1/8 of the memory budget in [256 MB, 3 GiB]
+   * it: explicit --warm wins, else 1/6 of the memory budget in [256 MB, 3 GiB]
    * (the allocator's u32 offsets cap it at 3 GiB). */
   uint64_t warm_want = warm_mb ? (uint64_t)warm_mb << 20 : 0;
   if (!warm_want) {
-    warm_want = r3d_vkctx_budget_available(&r->vk) / 8;
+    warm_want = r3d_vkctx_budget_available(&r->vk) / 6;
     if (warm_want < (256ull << 20)) warm_want = 256ull << 20;
   }
   if (warm_want > (3ull << 30)) warm_want = 3ull << 30;
@@ -2948,6 +3282,13 @@ int r3d_bricks_begin(r3d_renderer *r, const char *c5s_path, uint32_t pool_bpa,
   while (max_abpa > 4u &&
          (uint64_t)max_abpa * max_abpa * max_abpa * BR_RAW_BYTES > for_atlas)
     max_abpa--;
+  if (r->bricks_lod && !pool_bpa) {
+    /* no explicit --pool: spend the headroom. The atlas is the streaming
+     * working set (a bigger pool means fewer evictions/re-decodes when
+     * zoomed in), so default to the budget-derived ceiling rather than 8^3:
+     * a 16 GB card lands at 12^3 = 3.4 GiB, an 8 GB card around 9^3. */
+    abpa = max_abpa;
+  }
   if (r->bricks_lod) {
     /* the coarsest level is permanently pinned in the atlas; grow the pool so
      * streaming still has headroom (a 6-level 81 TB volume pins 1216 slots,
@@ -3402,6 +3743,7 @@ static void ni_overlay_source(r3d_renderer *r) {
 }
 
 int r3d_bricks_overlay_switch(r3d_renderer *r, const char *lod_root) {
+  r->scene_gen++; /* GPU-visible data changes: pane cache must miss */
   if (!r->ink_active) return r3d_bricks_overlay(r, lod_root);
   if (strcmp(r->ink_root, lod_root) == 0) return 0;
   /* drain the async decode job — its worker reads the overlay readers */
@@ -3431,6 +3773,7 @@ int r3d_bricks_overlay_switch(r3d_renderer *r, const char *lod_root) {
     if (r->ink_readers[i].open) c5d_shard_close_reader(&r->ink_readers[i].sr);
   free(r->ink_readers);
   r->ink_readers = NULL;
+  pres_drain(r); /* queue ops need external sync */
   vkDeviceWaitIdle(r->vk.dev); /* the atlas is bound to in-flight frames */
   r3d_vkimage_destroy(&r->vk, &r->ink_atlas);
   r->ink_active = false;
@@ -3450,6 +3793,7 @@ int r3d_bricks_overlay_switch(r3d_renderer *r, const char *lod_root) {
 }
 
 int r3d_bricks_overlay(r3d_renderer *r, const char *lod_root) {
+  r->scene_gen++; /* GPU-visible data changes: pane cache must miss */
   if (!r->bricks_lod || !r->bs.cpu_decode || r->ink_active) {
     fprintf(stderr, "bricks: overlay needs an active CPU-decode LOD manifest\n");
     return -1;
@@ -3632,9 +3976,14 @@ void r3d_bricks_shape(const r3d_renderer *r, uint32_t shape[3]) {
 /* Fill resident slots whose overlay decode zero-filled while the chunk was
  * still upstream; runs on the render thread with the decode job idle, a
  * batch per fetch event. */
-static void bricks_ink_repair(r3d_renderer *r) {
-  uint32_t sel[BR_MAX_BATCH], nb_ = 0;
-  struct brdec_item items[BR_MAX_BATCH];
+/* Render-thread half of the overlay repair: scan the waiting slots whose
+ * chunk has landed and post them as a worker job (kind 1). Decoding used to
+ * run right here — spawning 24 threads from the render thread and then
+ * fence-waiting a 64 MB upload behind the in-flight frame: the 100+ ms
+ * "stream" hitches in the profile. Caller holds no lock; the worker must be
+ * idle (job_state == 0). Returns true when a job was posted. */
+static bool bricks_ink_repair_post(r3d_renderer *r) {
+  uint32_t nb_ = 0;
   for (uint32_t s = 0; s < r->bs.nslots && nb_ < BR_MAX_BATCH; s++) {
     if (!r->bs.ink_missing[s]) continue;
     uint32_t b = r->bs.slot_brick[s];
@@ -3646,17 +3995,35 @@ static void bricks_ink_repair(r3d_renderer *r) {
     if (hv == 0u) continue; /* still fetching */
     r->bs.ink_missing[s] = 0;
     if (hv == 2u) continue; /* definitively absent: zeros are correct */
-    items[nb_].blob = NULL;  /* the decode worker resolves the cache file */
-    items[nb_].bn = 0;
-    items[nb_].b = b;
-    sel[nb_++] = s;
+    r->bs.sel_b[nb_] = b;
+    r->bs.sel_slot[nb_] = s;
+    nb_++;
   }
-  if (!nb_) return;
+  if (!nb_) return false;
+  pthread_mutex_lock(&r->bs.mu);
+  r->bs.job_kind = 1;
+  r->bs.job_n = nb_;
+  r->bs.job_nevict = 0;
+  r->bs.job_timeline = 0;
+  r->bs.job_rc = 0;
+  r->bs.job_state = 1;
+  pthread_cond_signal(&r->bs.cv);
+  pthread_mutex_unlock(&r->bs.mu);
+  return true;
+}
+
+/* Worker half: decode the posted overlay bricks from the net cache and
+ * upload them into their (already CT-resident) slots. No page-table entry
+ * changes, so the render thread's publish step only re-bakes/invalidates. */
+static int bricks_ink_repair_exec(r3d_renderer *r, uint32_t n) {
+  struct brdec_item items[BR_MAX_BATCH];
+  for (uint32_t i = 0; i < n; i++)
+    items[i] = (struct brdec_item){NULL, 0, r->bs.sel_b[i]};
   struct brdec job = {.r = r, .it = items, .raw = r->bs.raw_host, .zero_on_fail = true,
-                      .ni_fallback = true, .ni_src = 1, .n = nb_};
+                      .ni_fallback = true, .ni_src = 1, .n = n};
   brdec_run(&job);
-  memcpy(r->bs.raw_stage.mapped, r->bs.raw_host, (size_t)nb_ * BR_RAW_BYTES);
-  bricks_upload_raw(r, &r->ink_atlas, sel, nb_);
+  memcpy(r->bs.raw_stage.mapped, r->bs.raw_host, (size_t)n * BR_RAW_BYTES);
+  return bricks_upload_raw(r, &r->ink_atlas, r->bs.sel_slot, n);
 }
 
 bool r3d_bricks_stream_begin(r3d_renderer *r) {
@@ -3686,14 +4053,24 @@ bool r3d_bricks_stream_begin(r3d_renderer *r) {
     pthread_mutex_lock(&r->bs.mu);
     if (r->bs.job_state == 3 && r->bs.job_rc == 0) {
       uint32_t *page = r->page_buf.mapped;
+      uint32_t published = 0;
       for (uint32_t i = 0; i < r->bs.job_n; i++) {
         uint32_t b = r->bs.sel_b[i], s = r->bs.sel_slot[i];
         uint8_t m = r->bs.maxes[i];
-        if (m >= BR_NOISE_FLOOR)
+        if (m >= BR_NOISE_FLOOR) {
           page[bricks_page_index(r, b)] = s | ((uint32_t)m << 24);
+          published++;
+        }
+      }
+      /* residency changed under the views: the surfvol re-bakes (only now
+       * are the entries visible to its kernel) and every pane re-renders */
+      if (published || r->bs.job_kind == 1) {
+        r3d_surfvol_mark(r);
+        r->scene_gen++;
       }
     }
     r->bs.job_state = 0;
+    r->bs.job_kind = 0;
   }
   if (r->bs.job_state != 0) {
     r->bs.last_inflight = r->bs.job_n;
@@ -3705,7 +4082,12 @@ bool r3d_bricks_stream_begin(r3d_renderer *r) {
     uint64_t f2 = atomic_load(&r->ni.fetched2);
     if (f2 != r->bs.ink_fetch_seen) {
       r->bs.ink_fetch_seen = f2;
-      bricks_ink_repair(r); /* overlay chunks landed: fill waiting slots */
+      /* overlay chunks landed: hand the waiting slots to the worker; this
+       * frame's collect is skipped (the worker owns sel_b/sel_slot now) */
+      if (bricks_ink_repair_post(r)) {
+        r->bs.last_inflight = r->bs.job_n;
+        return false;
+      }
     }
   }
   r->bs.frame++;
@@ -3971,7 +4353,8 @@ void r3d_bricks_stream_submit(r3d_renderer *r, uint32_t budget) {
    * first drain the frames that could still observe the old entries. This
    * waits at most the normal frames-in-flight latency, never the decode. */
   uint64_t timeline = r->timeline_value;
-  if (timeline) {
+  if (timeline && nevict) { /* only evictions need the readers drained: a
+                             * batch into free slots touches no live entry */
     VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
                               .semaphoreCount = 1,
                               .pSemaphores = &r->timeline,
@@ -3981,6 +4364,7 @@ void r3d_bricks_stream_submit(r3d_renderer *r, uint32_t budget) {
   uint32_t *page = r->page_buf.mapped;
   for (uint32_t i = 0; i < nevict; i++)
     page[bricks_page_index(r, evict[i])] = BR_INVALID;
+  if (nevict) r->scene_gen++;
   pthread_mutex_lock(&r->bs.mu);
   memcpy(r->bs.job_evict, evict, (size_t)nevict * sizeof *evict);
   r->bs.job_nevict = nevict;
@@ -4048,11 +4432,21 @@ void r3d_bricks_flush(r3d_renderer *r) {
   pthread_mutex_lock(&r->bs.mu);
   if (r->bs.job_state == 3 && r->bs.job_rc == 0) {
     uint32_t *page = r->page_buf.mapped;
+    uint32_t published = 0;
     for (uint32_t i = 0; i < r->bs.job_n; i++) {
       uint32_t b = r->bs.sel_b[i], s = r->bs.sel_slot[i];
       uint8_t m = r->bs.maxes[i];
-      if (m >= BR_NOISE_FLOOR)
+      if (m >= BR_NOISE_FLOOR) {
         page[bricks_page_index(r, b)] = s | ((uint32_t)m << 24);
+        published++;
+      }
+    }
+    /* re-bake the flattened surface volume only once the new entries are
+     * actually visible to its kernel (the decode-counter trigger in the app
+     * loop can fire a frame early and then miss the publication) */
+    if (published) {
+      r3d_surfvol_mark(r);
+      r->scene_gen++; /* plane views sample the newly resident bricks */
     }
   }
   r->bs.job_state = 0;
@@ -4615,6 +5009,7 @@ static int vs_mkdirs(const char *path) {
 }
 
 int r3d_vslab_begin(r3d_renderer *r, const r3d_vslab_desc *d) {
+  r->scene_gen++; /* GPU-visible data changes: pane cache must miss */
   if (!d || !d->cache_dir || !d->nx || !d->ny || !d->nz || !d->W || !d->H || !d->D ||
       strlen(d->cache_dir) >= sizeof r->vsl.band_dir ||
       (d->shard_url && strlen(d->shard_url) >= sizeof r->vsl.shard_url)) {
@@ -5090,6 +5485,7 @@ void r3d_vslab_prefetch_get(r3d_renderer *r, r3d_vslab_prefetch_stats *st) {
 
 int r3d_clip_begin(r3d_renderer *r, const char *band_dir, const char *pyramid_dir,
                    uint32_t band_z, uint32_t depth_max) {
+  r->scene_gen++; /* GPU-visible data changes: pane cache must miss */
   if (!r->tiled_modes) {
     fprintf(stderr, "clip: device lacks native non-uniform descriptor indexing\n");
     return -1;
@@ -5227,9 +5623,26 @@ int r3d_frame_views(r3d_renderer *r, const r3d_frame_params *views, uint32_t nvi
   }
 
   tp = now_ns();
+  if (r->pres.up) { /* a deferred present may have asked for a resize */
+    pthread_mutex_lock(&r->pres.mu);
+    bool nr = r->pres.need_resize, failed = r->pres.failed;
+    r->pres.need_resize = false;
+    pthread_mutex_unlock(&r->pres.mu);
+    if (failed) return -1;
+    if (nr) {
+      if (r->gui_open) {
+        r3d_vkgui_discard();
+        r->gui_open = false;
+      }
+      int rc = r3d_resize(r);
+      return rc == 0 ? 1 : rc;
+    }
+  }
   uint32_t img = 0;
-  VkResult ar = vkAcquireNextImageKHR(r->vk.dev, r->swap.swapchain, UINT64_MAX,
-                                      r->acquire[slot], VK_NULL_HANDLE, &img);
+  bool headless = r->cfg.headless;
+  VkResult ar = headless ? VK_SUCCESS
+                         : vkAcquireNextImageKHR(r->vk.dev, r->swap.swapchain, UINT64_MAX,
+                                                 r->acquire[slot], VK_NULL_HANDLE, &img);
   if (st) st->cpu_acquire_ns = now_ns() - tp;
   if (ar == VK_ERROR_OUT_OF_DATE_KHR) {
     if (r->gui_open) {
@@ -5252,7 +5665,29 @@ int r3d_frame_views(r3d_renderer *r, const r3d_frame_params *views, uint32_t nvi
                                  .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
   vkBeginCommandBuffer(cmd, &bi);
 
-  if (r->query) vkCmdResetQueryPool(cmd, r->query, slot * 4, 4);
+  if (r->query) {
+    vkCmdResetQueryPool(cmd, r->query, slot * 4, 4);
+    /* ts0 here (not after the bake) so "raycast" GPU time includes the
+     * surfvol bake bands - previously they were invisible to the profile */
+    vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, r->query, slot * 4);
+  }
+  bool sv_baked_now = false;
+
+  if (r->sv.active && r->sv.step > 0.0f && !r->sv.dirty && !r->sv.shift_pending &&
+      r->sv.prog_row == UINT32_MAX && r->sv.baked) {
+    /* lazy layer refresh: only bake the band the view can currently see */
+    uint32_t vz0 = r->sv.vz0 > 8u ? r->sv.vz0 - 8u : 0;
+    uint32_t vz1 = r->sv.vz1 + 8u < r->sv.L ? r->sv.vz1 + 8u : r->sv.L;
+    if (vz1 <= vz0) {
+      vz0 = 0;
+      vz1 = r->sv.L;
+    }
+    if (sv_layers_stale(r, vz0, vz1)) {
+      r->sv.pass_z0 = vz0;
+      r->sv.pass_z1 = vz1;
+      r->sv.prog_row = 0;
+    }
+  }
 
   if (r->sv.active && r->sv.step > 0.0f &&
       (r->sv.dirty || r->sv.prog_row != UINT32_MAX || r->sv.shift_pending)) {
@@ -5286,9 +5721,13 @@ int r3d_frame_views(r3d_renderer *r, const r3d_frame_params *views, uint32_t nvi
           ((size_t)(x1 - x0) * (y1 - y0) * (z1 - z0)) * 2u <
               (size_t)r->sv.W * r->sv.H * r->sv.L) {
         bands[nband++] = (struct svband){x0, y0, z0, x1 - x0, y1 - y0, z1 - z0};
-        r->sv.prog_row = 0; /* the progressive pass rebakes the whole window */
+        /* the rest of the window still holds the old mapping: every layer is
+         * stale; the lazy pass bakes the visible band first, others on scrub */
+        memset(r->sv.stale, 0xff, sizeof r->sv.stale);
+        r->sv.prog_row = UINT32_MAX;
       } else { /* no useful visibility hint: the whole window in one go */
         bands[nband++] = (struct svband){0, 0, 0, r->sv.W, r->sv.H, r->sv.L};
+        memset(r->sv.stale, 0, sizeof r->sv.stale);
         r->sv.prog_row = UINT32_MAX;
       }
     } else if (r->sv.shift_pending) {
@@ -5308,9 +5747,21 @@ int r3d_frame_views(r3d_renderer *r, const r3d_frame_params *views, uint32_t nvi
                                          r->sv.W, r->sv.H, (uint32_t)labs(sz)};
     } else {
       uint32_t y0 = r->sv.prog_row, rows = r->sv.H - y0;
-      if (rows > SV_PROG_ROWS) rows = SV_PROG_ROWS;
+      /* keep the per-frame texel budget of the old full-depth band */
+      uint32_t lz = r->sv.pass_z1 > r->sv.pass_z0 ? r->sv.pass_z1 - r->sv.pass_z0 : r->sv.L;
+      uint32_t budget_rows = SV_PROG_ROWS * (r->sv.L / (lz ? lz : 1u));
+      if (budget_rows < SV_PROG_ROWS) budget_rows = SV_PROG_ROWS;
+      if (rows > budget_rows) rows = budget_rows;
       r->sv.prog_row = y0 + rows >= r->sv.H ? UINT32_MAX : y0 + rows;
-      bands[nband++] = (struct svband){0, y0, 0, r->sv.W, rows, r->sv.L};
+      if (r->sv.prog_row == UINT32_MAX) {
+        if (r->sv.rebake_again) {
+          r->sv.rebake_again = false; /* residency landed mid-pass: the band is
+                                       * still stale; the frame loop restarts */
+        } else {
+          sv_layers_clear(r, r->sv.pass_z0, r->sv.pass_z1);
+        }
+      }
+      bands[nband++] = (struct svband){0, y0, r->sv.pass_z0, r->sv.W, rows, lz};
     }
     r3d_vk_image_barrier(cmd, r->sv.vol.img, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
                          VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
@@ -5336,7 +5787,11 @@ int r3d_frame_views(r3d_renderer *r, const r3d_frame_params *views, uint32_t nvi
                     .abpa = r->bricks_abpa,
                     .lod = lodq,
                     .lstep = 1.0f, /* depth stays native-res regardless of xy zoom */
-                    .use_ink = r->ink_active ? 1u : 0u};
+                    .use_ink = r->ink_active ? 1u : 0u,
+                    .use_pred = r->sv.pred_on ? 1u : 0u,
+                    .pg0u = r->sv.pred_g0u,
+                    .pg0v = r->sv.pred_g0v,
+                    .pppg = r->sv.pred_ppg};
     for (uint32_t b = 0; b < nband; b++) {
       push.x0 = bands[b].x0;
       push.y0 = bands[b].y0;
@@ -5344,6 +5799,7 @@ int r3d_frame_views(r3d_renderer *r, const r3d_frame_params *views, uint32_t nvi
       r3d_vkcomp_dispatch(cmd, &r->sv.comp, &push, sizeof push, (bands[b].w + 7) / 8,
                           (bands[b].h + 7) / 8, (bands[b].l + 3) / 4);
     }
+    sv_baked_now = nband > 0 || shifted;
     r3d_vk_image_barrier(cmd, r->sv.vol.img, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
                          VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
                              VK_PIPELINE_STAGE_2_TRANSFER_BIT,
@@ -5362,8 +5818,26 @@ int r3d_frame_views(r3d_renderer *r, const r3d_frame_params *views, uint32_t nvi
    * would stretch the pane across the window and shear it off the ImGui
    * overlays. */
   bool region_upscale = nviews == 1 && views[0].view_org == 0;
-  if (!region_upscale) {
-    r3d_vk_image_barrier(cmd, r->offscreen.img, VK_IMAGE_LAYOUT_UNDEFINED,
+  /* Pane cache is only meaningful for in-place multiview rendering; the
+   * single-view upscale path renders every pixel every frame anyway. The
+   * offscreen keeps its contents between frames (layout tracked in
+   * os_layout, never discarded via UNDEFINED once written). */
+  bool cache_panes = !region_upscale && !r->pane_cache_off;
+  uint64_t lay_key = 1469598103934665603ull ^ nviews;
+  for (uint32_t v = 0; v < nviews; v++) {
+    lay_key = (lay_key ^ views[v].view_org) * 1099511628211ull;
+    lay_key = (lay_key ^ views[v].viewport[0]) * 1099511628211ull;
+    lay_key = (lay_key ^ views[v].viewport[1]) * 1099511628211ull;
+  }
+  lay_key = (lay_key ^ r->offscreen.extent.width) * 1099511628211ull;
+  lay_key = (lay_key ^ r->offscreen.extent.height) * 1099511628211ull;
+  bool need_clear = !region_upscale && (lay_key != r->os_layout_key || !cache_panes);
+  if (need_clear) {
+    /* uncovered regions (panel strip, gutters) only change with the layout:
+     * clear once per layout change instead of every frame (on Dozen a full
+     * clear was a CPU fill of the whole 8 MB image into a fresh D3D12
+     * upload resource - ~2-3 ms of render-thread time per frame) */
+    r3d_vk_image_barrier(cmd, r->offscreen.img, r->os_layout,
                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                          VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0,
                          VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, 0, 1);
@@ -5375,15 +5849,21 @@ int r3d_frame_views(r3d_renderer *r, const r3d_frame_params *views, uint32_t nvi
                          VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_CLEAR_BIT,
                          VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                          VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, 0, 1);
+    r->os_layout_key = lay_key;
+    memset(r->pane_key, 0, sizeof r->pane_key); /* every pane re-renders */
   } else {
-    r3d_vk_image_barrier(cmd, r->offscreen.img, VK_IMAGE_LAYOUT_UNDEFINED,
-                         VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0,
+    /* single view: contents fully overwritten (discard is fine); multiview
+     * cached: keep the previous pixels, just move to GENERAL for writes */
+    r3d_vk_image_barrier(cmd, r->offscreen.img,
+                         cache_panes ? r->os_layout : VK_IMAGE_LAYOUT_UNDEFINED,
+                         VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                         VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
                          VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                          VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, 0, 1);
   }
-
-  if (r->query)
-    vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, r->query, slot * 4);
+  r->os_layout = VK_IMAGE_LAYOUT_GENERAL;
+  if (sv_baked_now) r->scene_gen++; /* the surf view samples fresh texels */
+  uint32_t panes_drawn = 0;
   /* p->viewport may be smaller than the drawable (adaptive resolution while
    * the camera moves, single-view only): render into the top-left region,
    * blit upscales. Multi-view renders each view into its view_org rect and
@@ -5419,6 +5899,23 @@ int r3d_frame_views(r3d_renderer *r, const r3d_frame_params *views, uint32_t nvi
       pipeline = r->raycast_cube_8x8;
       wgx = wgy = 8;
     }
+    if (cache_panes) {
+      /* input hash: every param byte except frame_index (per-frame jitter
+       * seed - a cached pane keeps its last jitter, which is exactly a
+       * static image), plus the GPU-visible scene generation and pipeline */
+      r3d_frame_params hp = *vp;
+      hp.frame_index = 0;
+      const uint8_t *hb = (const uint8_t *)&hp;
+      uint64_t k = 1469598103934665603ull;
+      for (size_t i = 0; i < sizeof hp; i++) k = (k ^ hb[i]) * 1099511628211ull;
+      k = (k ^ r->scene_gen) * 1099511628211ull;
+      k = (k ^ (uint64_t)(uintptr_t)pipeline) * 1099511628211ull;
+      k = (k ^ ((uint64_t)wgx << 32 | wgy)) * 1099511628211ull;
+      if (k == 0) k = 1;
+      if (r->pane_key[v] == k) continue; /* unchanged: keep the pixels */
+      r->pane_key[v] = k;
+    }
+    panes_drawn++;
     if (pipeline != bound) {
       vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
       bound = pipeline;
@@ -5428,6 +5925,7 @@ int r3d_frame_views(r3d_renderer *r, const r3d_frame_params *views, uint32_t nvi
                             1, &ubo_offset);
     vkCmdDispatch(cmd, (vw + wgx - 1) / wgx, (vh + wgy - 1) / wgy, 1);
   }
+  if (st) st->panes_drawn = panes_drawn;
   if (!region_upscale) { /* views render in place; blit is identity */
     rw = r->offscreen.extent.width;
     rh = r->offscreen.extent.height;
@@ -5441,6 +5939,39 @@ int r3d_frame_views(r3d_renderer *r, const r3d_frame_params *views, uint32_t nvi
                        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, VK_PIPELINE_STAGE_2_BLIT_BIT,
                        VK_ACCESS_2_TRANSFER_READ_BIT, 0, 1);
+  r->os_layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL; /* where the frame leaves it */
+  if (headless) {
+    /* no swapchain: the frame ends here. ImGui's frame is closed without a
+     * draw so the panel logic still ran; timestamps stay well-formed. */
+    if (r->query) {
+      vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_BLIT_BIT, r->query, slot * 4 + 2);
+      vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, r->query, slot * 4 + 3);
+    }
+    if (r->gui_open) {
+      r3d_vkgui_discard();
+      r->gui_open = false;
+    }
+    vkEndCommandBuffer(cmd);
+    if (st) st->cpu_record_ns = now_ns() - tp;
+    tp = now_ns();
+    uint64_t hv = ++r->timeline_value;
+    VkSemaphoreSubmitInfo hsig = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+                                  .semaphore = r->timeline,
+                                  .value = hv,
+                                  .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
+    VkCommandBufferSubmitInfo hcsi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
+                                      .commandBuffer = cmd};
+    VkSubmitInfo2 hsi = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
+                         .commandBufferInfoCount = 1,
+                         .pCommandBufferInfos = &hcsi,
+                         .signalSemaphoreInfoCount = 1,
+                         .pSignalSemaphoreInfos = &hsig};
+    if (r3d_vkctx_queue_submit2(&r->vk, 1, &hsi, VK_NULL_HANDLE) != VK_SUCCESS) return -1;
+    r->slot_value[slot] = hv;
+    if (st) st->cpu_submit_ns = now_ns() - tp;
+    r->slot = (slot + 1) % FRAMES_IN_FLIGHT;
+    return 0;
+  }
   r3d_vk_image_barrier(cmd, r->swap.images[img], VK_IMAGE_LAYOUT_UNDEFINED,
                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                        0, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, 0, 1);
@@ -5524,19 +6055,32 @@ int r3d_frame_views(r3d_renderer *r, const r3d_frame_params *views, uint32_t nvi
   if (r3d_vkctx_queue_submit2(&r->vk, 1, &si, VK_NULL_HANDLE) != VK_SUCCESS) return -1;
   r->slot_value[slot] = signal_value;
 
-  VkPresentInfoKHR pi = {
-      .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
-      .waitSemaphoreCount = 1,
-      .pWaitSemaphores = &r->swap.render_done[img],
-      .swapchainCount = 1,
-      .pSwapchains = &r->swap.swapchain,
-      .pImageIndices = &img,
-  };
-  VkResult pr = r3d_vkctx_queue_present(&r->vk, &pi);
-  if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR) {
-    if (r3d_resize(r) != 0) return -1;
-  } else if (pr != VK_SUCCESS) {
-    return -1;
+  if (r->pres.up) {
+    /* strictly one present outstanding: wait for the previous one (usually
+     * long done — it overlapped this frame's poll/GUI/record), then queue */
+    pthread_mutex_lock(&r->pres.mu);
+    while (r->pres.pending || r->pres.busy) pthread_cond_wait(&r->pres.done_cv, &r->pres.mu);
+    bool failed = r->pres.failed;
+    r->pres.img = img;
+    r->pres.pending = true;
+    pthread_cond_broadcast(&r->pres.cv);
+    pthread_mutex_unlock(&r->pres.mu);
+    if (failed) return -1;
+  } else {
+    VkPresentInfoKHR pi = {
+        .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+        .waitSemaphoreCount = 1,
+        .pWaitSemaphores = &r->swap.render_done[img],
+        .swapchainCount = 1,
+        .pSwapchains = &r->swap.swapchain,
+        .pImageIndices = &img,
+    };
+    VkResult pr = r3d_vkctx_queue_present(&r->vk, &pi);
+    if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR) {
+      if (r3d_resize(r) != 0) return -1;
+    } else if (pr != VK_SUCCESS) {
+      return -1;
+    }
   }
 
   if (st) st->cpu_submit_ns = now_ns() - tp;
