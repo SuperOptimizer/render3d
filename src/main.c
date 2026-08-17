@@ -1720,6 +1720,7 @@ int main(int argc, char **argv) {
   uint64_t prev_ns = r3d_now_ns();
 
   bool running = true;
+  uint32_t frame_fail = 0;
   uint64_t run_start_ns = r3d_now_ns();
   while (running) {
     uint64_t t0 = r3d_now_ns();
@@ -1887,6 +1888,16 @@ int main(int argc, char **argv) {
       continue;
     }
 
+    if (sgc.open && getenv("R3D_ACTIVATE_TEST") &&
+        frame_index == (uint32_t)atoi(getenv("R3D_ACTIVATE_TEST")) && sgc.st.n) {
+      /* headless: activate store segment 0 at this frame (repro/testing) */
+      pthread_mutex_lock(&sgc.mu);
+      if (sgc.act_req == UINT32_MAX && !sgc.act_busy) {
+        sgc.act_req = 0;
+        pthread_cond_signal(&sgc.cv);
+      }
+      pthread_mutex_unlock(&sgc.mu);
+    }
     if (sgc.open) { /* apply a finished activation: swap the flattened view
        * to the worker-prepared segment (decode/grids were built off-thread;
        * only the GPU upload happens here) */
@@ -1934,6 +1945,16 @@ int main(int argc, char **argv) {
             mv[i].cv = fv;
             mv[i].slice = fs;
           }
+          inklive_have = false; /* prediction of the previous segment is stale */
+          if (r3d_tifxyz_valid(mc2) &&
+              (mc2[0] >= (float)brick_shape[0] || mc2[1] >= (float)brick_shape[1] ||
+               mc2[2] >= (float)brick_shape[2]))
+            fprintf(stderr,
+                    "warning: segment %s center (%.0f,%.0f,%.0f) lies outside this "
+                    "volume (%ux%ux%u) - traced on a different scroll?\n",
+                    sgc_active, (double)mc2[0], (double)mc2[1], (double)mc2[2],
+                    brick_shape[0], brick_shape[1],
+                    brick_shape[2]);
           printf("activated segment %s (%ux%u)\n", sgc_active, mv_seg.w, mv_seg.h);
           pthread_mutex_lock(&sgc.mu); /* refresh overlap-vs-active */
           sgc.ov_req = ai;
@@ -3291,6 +3312,14 @@ int main(int argc, char **argv) {
 
     od_browser_window(&od, &od_window, od_next_bricks, sizeof od_next_bricks, od_next_seg,
                       sizeof od_next_seg, &od_swap);
+    if (getenv("R3D_SWAP_TEST") && frame_index == 300 && !od_swap) {
+      /* headless repro of a browser dataset swap: R3D_SWAP_TEST=<manifest.json>
+       * (volume-only swap; the segment store and --inklive stay) */
+      snprintf(od_next_bricks, sizeof od_next_bricks, "%s", getenv("R3D_SWAP_TEST"));
+      od_next_seg[0] = 0;
+      od_swap = true;
+      frame_index = 0; /* so later frame-keyed test hooks fire again */
+    }
     if (od_swap) running = false; /* teardown + reopen in the dataset loop */
 
     if (umbilicus_path) {
@@ -4135,6 +4164,17 @@ int main(int argc, char **argv) {
       frc = r3d_frame_views(renderer, vp4, nvp, &st);
     } else {
       frc = r3d_frame(renderer, &p, &st);
+    }
+    if (frc < 0) { /* device lost / unrecoverable frame: don't spin forever
+                    * (Dozen can drop the device under heavy load, and every
+                    * later frame then fails) */
+      if (++frame_fail >= 4) {
+        fprintf(stderr, "render3d: renderer failed %u frames in a row "
+                        "(device lost?); exiting\n", frame_fail);
+        break;
+      }
+    } else {
+      frame_fail = 0;
     }
     bool measuring = !exit_frames || frame_index > warmup_frames;
     if (frc == 0 && measuring) {
