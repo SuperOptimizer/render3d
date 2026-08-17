@@ -108,10 +108,10 @@ background worker decodes decimated grids into a RAM-budgeted LRU cache,
 and the panel lists cache state, per-plane hit counts, and the surfaces
 nearest the focus.
 
-**Tracer anchors**: when the live tracer wanders onto the wrong sheet, tick
-*place anchors (Ctrl+click)* in the tracer panel and Ctrl+click the sheet the
-trace *should* pass through in any plane view (orange diamonds; dimmed when
-off the pane's slice). Each anchor pulls the nearest traced cell through the
+**Tracer anchors**: when the live tracer wanders onto the wrong sheet, hover
+the sheet the trace *should* pass through in any plane view and press **X**
+to drop an anchor at the cursor (orange diamonds; dimmed when off the pane's
+slice). Each anchor pulls the nearest traced cell through the
 point with a strong solve term (an order above the fusion donor pull), so the
 local neighborhood re-seats onto the correct sheet — anchors placed ahead of
 the growth front engage automatically once growth comes within 3 grid steps.

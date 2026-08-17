@@ -1572,7 +1572,6 @@ int main(int argc, char **argv) {
    * Ctrl+click in anchor mode; pushed to the tracer live) */
   double mv_anchor[R3D_TR_MAX_ANCHORS * 3];
   uint32_t mv_anchor_n = 0;
-  bool mv_anchor_mode = false;
   uint64_t mv_tr_live_ns = 0;  /* last live swap (throttle) */
   bool mv_tr_live_first = true;
   double sgc_near_focus[3] = {1e30, 1e30, 1e30};
@@ -2163,6 +2162,28 @@ int main(int argc, char **argv) {
         snprintf(annotation_status, sizeof annotation_status, "redo (%u back, %u fwd)",
                  mv_umb_undo_n, mv_umb_redo_n);
       }
+      if (in.anchor_place && !io->WantCaptureMouse) {
+        /* X over a plane pane = drop a tracer anchor at the voxel under the
+         * cursor (on that pane's slice); the sheet must pass through it */
+        int av = r3d_mv_hit(mv, in.mouse_xy[0], in.mouse_xy[1]);
+        if (av > 0 && !MV_IS3D(av) && av != R3D_MV_SEG &&
+            mv_anchor_n < R3D_TR_MAX_ANCHORS) {
+          double u, vq, A[3];
+          r3d_mv_unproject(&mv[av], in.mouse_xy[0], in.mouse_xy[1], &u, &vq);
+          r3d_mv_b2w(mv_pb[av], mv_po[av], u, vq, mv[av].slice, A);
+          bool inside = true;
+          for (int a = 0; a < 3; a++)
+            if (A[a] < 0.0 || (brick_shape[a] && A[a] > (double)brick_shape[a] - 1.0))
+              inside = false;
+          if (inside) {
+            memcpy(mv_anchor + (size_t)mv_anchor_n * 3, A, sizeof A);
+            mv_anchor_n++;
+            if (mv_tr_active) r3d_tracer_set_anchors(&mv_tr, mv_anchor, mv_anchor_n);
+            printf("tracer: anchor %u placed at (%.0f, %.0f, %.0f)\n", mv_anchor_n,
+                   A[0], A[1], A[2]);
+          }
+        }
+      }
       if (in.annotate_click && in.click_ctrl) { /* Ctrl+click = set focus POI */
         int cv_ = r3d_mv_hit(mv, in.click_xy[0], in.click_xy[1]);
         bool focused = false, have_ij = false;
@@ -2239,14 +2260,6 @@ int main(int argc, char **argv) {
             if (mv_focus[a] < 0.0) mv_focus[a] = 0.0;
             if (brick_shape[a] && mv_focus[a] > (double)brick_shape[a] - 1.0)
               mv_focus[a] = (double)brick_shape[a] - 1.0;
-          }
-          if (mv_anchor_mode && mv_anchor_n < R3D_TR_MAX_ANCHORS) {
-            memcpy(mv_anchor + (size_t)mv_anchor_n * 3, mv_focus,
-                   3 * sizeof(double));
-            mv_anchor_n++;
-            if (mv_tr_active) r3d_tracer_set_anchors(&mv_tr, mv_anchor, mv_anchor_n);
-            printf("tracer: anchor %u placed at (%.0f, %.0f, %.0f)\n", mv_anchor_n,
-                   mv_focus[0], mv_focus[1], mv_focus[2]);
           }
           if (!have_ij) {
             /* recenter the segment view on the surface point nearest the
@@ -3024,10 +3037,9 @@ int main(int argc, char **argv) {
       static bool mv_tr_fill = true;
       igSameLine(0, 10);
       igCheckbox("fill holes", &mv_tr_fill);
-      igCheckbox("place anchors (Ctrl+click)", &mv_anchor_mode);
+      igTextDisabled("X over a plane view: anchor the sheet through the cursor");
       if (mv_anchor_n) {
-        igSameLine(0, 10);
-        igTextDisabled("%u anchor%s", mv_anchor_n, mv_anchor_n == 1 ? "" : "s");
+        igText("%u anchor%s", mv_anchor_n, mv_anchor_n == 1 ? "" : "s");
         igSameLine(0, 10);
         if (igSmallButton("undo##anc")) {
           mv_anchor_n--;
@@ -3039,9 +3051,6 @@ int main(int argc, char **argv) {
           if (mv_tr_active) r3d_tracer_set_anchors(&mv_tr, mv_anchor, 0);
         }
       }
-      if (mv_anchor_mode)
-        igTextDisabled("click the sheet the trace SHOULD pass through; the\n"
-                       "nearest traced cell is pulled through each anchor");
       static bool mv_tr_spiral = true;
       if (umbilicus.count >= 2) {
         igCheckbox("spiral prior", &mv_tr_spiral);
