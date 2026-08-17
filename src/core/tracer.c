@@ -856,7 +856,16 @@ typedef struct tr_env { /* one per solving thread */
   struct { int plane, slice, slot; ng_grid *g; } gc[12]; /* held grid refs:
       * one mutexed acquire per (slice, cell-solve) instead of per residual */
   uint32_t gcn;
+  /* staged weight relaxation (G9, vc3d correction/inpaint continuation
+   * schedule): scale factors on DistLoss, StraightLoss(+planar) and the
+   * ncp snap component. 0 means "not set" and reads as 1.0 — envs are
+   * zero-initialized all over. */
+  double ws_dist, ws_straight, ws_snap;
 } tr_env;
+
+/* 0 = unset (1.0); negative = literal zero (a schedule pass with the
+ * term fully off) */
+static inline double tr_ws(double v) { return v == 0.0 ? 1.0 : (v < 0.0 ? 0.0 : v); }
 
 /* segment neighborhood lookup/build; center quantized to 16 px so the
  * full-path scan amortizes across residual evals and LM iterations */
@@ -1150,7 +1159,8 @@ static double ncp_residual(tr_env *e, int plane, const double A[3],
   if (nl2 < 1e-18) return 0.0;
   double na = nq[axis] / sqrt(nl2);
   double aw = 0.5 * (1.0 - na * na);
-  return (NCP_W_NORMAL * normal_loss + NCP_W_SNAP * snap_loss) * aw;
+  return (NCP_W_NORMAL * normal_loss + NCP_W_SNAP * tr_ws(e->ws_snap) * snap_loss) *
+         aw;
 }
 
 /* Fused residual + forward-difference gradient: the base evaluation and
@@ -1327,7 +1337,8 @@ static void ncp_residual4(tr_env *e, int plane, const double Qr[4][3], int fxr,
       double d1n = sqrt(d2a) / NCP_SNAP_RANGE, d2n = sqrt(d2e) / NCP_SNAP_TRIG;
       snap_loss = d1n * (1.0 - d2n) + d2n;
     }
-    out[v] = (NCP_W_NORMAL * normal_loss + NCP_W_SNAP * snap_loss) * aw0;
+    out[v] = (NCP_W_NORMAL * normal_loss +
+              NCP_W_SNAP * tr_ws(e->ws_snap) * snap_loss) * aw0;
   }
 }
 
@@ -1481,7 +1492,8 @@ static void ncp_residual4_legacy(tr_env *e, int plane, const double Qr[4][3],
     if (!ok[v]) continue;
     double normal_loss = wsum[v] > 1e-9f ? (double)(nsum[v] / wsum[v]) : 0.0;
     double snap_loss = best_snap[v] >= 0.0f ? (double)best_snap[v] : 1.0;
-    out[v] = (NCP_W_NORMAL * normal_loss + NCP_W_SNAP * snap_loss) * aw[v];
+    out[v] = (NCP_W_NORMAL * normal_loss +
+              NCP_W_SNAP * tr_ws(e->ws_snap) * snap_loss) * aw[v];
   }
 }
 
@@ -1536,6 +1548,7 @@ static int nq_step(const double A[9], const double b[3], double lm, double d[3])
 typedef struct tr_wf tr_wf; /* winding-potential field (defined below) */
 static bool tr_wf_at(const tr_wf *w, double x, double y, double *val, double g2[2]);
 static double tr_om_eff(const r3d_tracer *t);
+static inline bool tr_valid(const r3d_tracer *t, int i, int j);
 
 #define TR_SP_KMAX 64    /* r0(z) knots (piecewise linear) */
 #define TR_SP_KNOT 256.0 /* knot spacing, slices */
@@ -2290,24 +2303,57 @@ static int tr_dcmp(const void *a, const void *b) {
  * Median over samples = omega for the fixed-omega fit. */
 static double tr_omega_measure(r3d_tracer *t, td_cache *dt) {
   if (!t->uc || !dt) return 0.0;
-  double gaps[512];
+  double gaps[512], gpos[512][3];
   int ngap = 0;
   uint64_t N = (uint64_t)t->W * t->H;
   for (uint64_t k = 0; k < N && ngap < 512; k += 97) { /* coprime stride */
     if (t->state[k] != R3D_TR_SET) continue;
     const double *P = t->pos + k * 3;
-    double cx, cy;
-    if (!tr_uc_at(t, P[2], &cx, &cy, NULL, NULL)) continue;
-    double ux = P[0] - cx, uy = P[1] - cy;
-    double rho = hypot(ux, uy);
-    if (rho < 8.0) continue;
-    ux /= rho;
-    uy /= rho;
+    /* gap ray along the LOCAL GRID NORMAL (G5b): the umbilicus radial
+     * overestimates by 1/cos on pancaked sections where the sheet is not
+     * perpendicular to the radial */
+    double ux, uy, uz = 0.0;
+    int i = (int)(k % t->W), j = (int)(k / t->W);
+    bool have_n = false;
+    if (tr_valid(t, i - 1, j) && tr_valid(t, i + 1, j) && tr_valid(t, i, j - 1) &&
+        tr_valid(t, i, j + 1)) {
+      const double *pu0 = t->pos + ((size_t)j * t->W + (size_t)i - 1) * 3;
+      const double *pu1 = t->pos + ((size_t)j * t->W + (size_t)i + 1) * 3;
+      const double *pv0 = t->pos + ((size_t)(j - 1) * t->W + (size_t)i) * 3;
+      const double *pv1 = t->pos + ((size_t)(j + 1) * t->W + (size_t)i) * 3;
+      double eu[3], ev[3], n[3];
+      for (int a = 0; a < 3; a++) {
+        eu[a] = pu1[a] - pu0[a];
+        ev[a] = pv1[a] - pv0[a];
+      }
+      n[0] = eu[1] * ev[2] - eu[2] * ev[1];
+      n[1] = eu[2] * ev[0] - eu[0] * ev[2];
+      n[2] = eu[0] * ev[1] - eu[1] * ev[0];
+      double l = sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+      if (l > 1e-9) {
+        ux = n[0] / l;
+        uy = n[1] / l;
+        uz = n[2] / l;
+        have_n = true;
+      }
+    }
+    if (!have_n) { /* fallback: the radial */
+      double cx, cy;
+      if (!tr_uc_at(t, P[2], &cx, &cy, NULL, NULL)) continue;
+      ux = P[0] - cx;
+      uy = P[1] - cy;
+      double rho = hypot(ux, uy);
+      if (rho < 8.0) continue;
+      ux /= rho;
+      uy /= rho;
+      uz = 0.0;
+    }
     double best = 0.0;
     for (int dir = -1; dir <= 1; dir += 2) {
       double m = 0.0;
       for (int s = 1; s <= 64; s++) {
-        double q[3] = {P[0] + dir * s * ux, P[1] + dir * s * uy, P[2]};
+        double q[3] = {P[0] + dir * s * ux, P[1] + dir * s * uy,
+                       P[2] + dir * s * uz};
         double d = td_tri(dt, q, NULL);
         if (d > m) m = d;
         if (d < 1.5 && m > 3.0) { /* left the sheet, hit the next one */
@@ -2316,11 +2362,111 @@ static double tr_omega_measure(r3d_tracer *t, td_cache *dt) {
         }
       }
     }
-    if (best >= 4.0 && best <= 60.0) gaps[ngap++] = best;
+    if (best >= 4.0 && best <= 60.0) {
+      memcpy(gpos[ngap], P, sizeof gpos[ngap]);
+      gaps[ngap++] = best;
+    }
   }
   if (ngap < 32) return 0.0;
+  { /* coarse gap field (G5a): 64-vox cells over the sample bbox,
+     * cell-median filled, nearest-filled, one 3^3 box smooth */
+    double lo[3] = {1e30, 1e30, 1e30}, hi[3] = {-1e30, -1e30, -1e30};
+    for (int g = 0; g < ngap; g++)
+      for (int a = 0; a < 3; a++) {
+        if (gpos[g][a] < lo[a]) lo[a] = gpos[g][a];
+        if (gpos[g][a] > hi[a]) hi[a] = gpos[g][a];
+      }
+    double cs = 64.0;
+    uint32_t nn[3];
+    for (int a = 0; a < 3; a++) {
+      nn[a] = (uint32_t)((hi[a] - lo[a]) / cs) + 1;
+      if (nn[a] > 64) nn[a] = 64;
+    }
+    size_t nc = (size_t)nn[0] * nn[1] * nn[2];
+    float *acc = calloc(nc, sizeof *acc);
+    uint16_t *cnt = calloc(nc, sizeof *cnt);
+    float *fld = malloc(nc * sizeof *fld);
+    if (acc && cnt && fld) {
+      for (int g = 0; g < ngap; g++) {
+        uint32_t ci[3];
+        for (int a = 0; a < 3; a++) {
+          long v = (long)((gpos[g][a] - lo[a]) / cs);
+          ci[a] = v < 0 ? 0 : (v >= (long)nn[a] ? nn[a] - 1 : (uint32_t)v);
+        }
+        size_t idx = ((size_t)ci[2] * nn[1] + ci[1]) * nn[0] + ci[0];
+        acc[idx] += (float)gaps[g];
+        cnt[idx]++;
+      }
+      for (size_t c = 0; c < nc; c++) fld[c] = cnt[c] ? acc[c] / (float)cnt[c] : 0.0f;
+      for (int pass = 0; pass < 4; pass++) { /* nearest-fill by dilation */
+        bool any = false;
+        for (uint32_t z = 0; z < nn[2]; z++)
+          for (uint32_t y = 0; y < nn[1]; y++)
+            for (uint32_t x2 = 0; x2 < nn[0]; x2++) {
+              size_t idx = ((size_t)z * nn[1] + y) * nn[0] + x2;
+              if (fld[idx] > 0.0f) continue;
+              float s2 = 0.0f;
+              int n2 = 0;
+              for (int a = 0; a < 6; a++) {
+                static const int o6[6][3] = {{1, 0, 0},  {-1, 0, 0}, {0, 1, 0},
+                                             {0, -1, 0}, {0, 0, 1},  {0, 0, -1}};
+                long qx = (long)x2 + o6[a][0], qy = (long)y + o6[a][1],
+                     qz = (long)z + o6[a][2];
+                if (qx < 0 || qy < 0 || qz < 0 || qx >= (long)nn[0] ||
+                    qy >= (long)nn[1] || qz >= (long)nn[2])
+                  continue;
+                float v = fld[((size_t)qz * nn[1] + (size_t)qy) * nn[0] + (size_t)qx];
+                if (v > 0.0f) {
+                  s2 += v;
+                  n2++;
+                }
+              }
+              if (n2) {
+                acc[idx] = s2 / (float)n2; /* stage into acc to keep the
+                                            * dilation isotropic */
+                any = true;
+              } else {
+                acc[idx] = 0.0f;
+              }
+            }
+        for (size_t c = 0; c < nc; c++)
+          if (fld[c] <= 0.0f && acc[c] > 0.0f) fld[c] = acc[c];
+        if (!any) break;
+      }
+      pthread_mutex_lock(&t->mu);
+      free(t->omf);
+      t->omf = fld;
+      memcpy(t->omf_o, lo, sizeof lo);
+      t->omf_cs = cs;
+      memcpy(t->omf_n, nn, sizeof nn);
+      pthread_mutex_unlock(&t->mu);
+      fld = NULL;
+    }
+    free(acc);
+    free(cnt);
+    free(fld);
+  }
   qsort(gaps, (size_t)ngap, sizeof *gaps, tr_dcmp);
   return gaps[ngap / 2];
+}
+
+/* position-dependent sheet gap: field value when covered, global scalar
+ * otherwise */
+static double tr_om_at(const r3d_tracer *t, const double p[3]) {
+  if (t->omf) {
+    long ci[3];
+    bool in = true;
+    for (int a = 0; a < 3; a++) {
+      ci[a] = (long)((p[a] - t->omf_o[a]) / t->omf_cs);
+      if (ci[a] < 0 || ci[a] >= (long)t->omf_n[a]) in = false;
+    }
+    if (in) {
+      float v = t->omf[((size_t)ci[2] * t->omf_n[1] + (size_t)ci[1]) * t->omf_n[0] +
+                       (size_t)ci[0]];
+      if (v > 0.0f) return (double)v;
+    }
+  }
+  return tr_om_eff(t);
 }
 
 /* ==================== self-overlap index + hinge ====================
@@ -2392,7 +2538,7 @@ static void tr_res_self(tr_nlsq *acc, const r3d_tracer *t, const double x[3],
                         size_t self_k) {
   const tr_sfx *sx = t->sfx;
   if (!sx || !sx->nent) return;
-  double rmin = 0.55 * tr_om_eff(t);
+  double rmin = 0.55 * tr_om_at(t, x); /* per-region gap (G5a) */
   double wself = (double)t->wind[self_k];
   long c0[3], c1[3];
   for (int a = 0; a < 3; a++) {
@@ -2431,7 +2577,7 @@ static void tr_res_self(tr_nlsq *acc, const r3d_tracer *t, const double x[3],
   /* two-sided wrap spacing (geometry-agnostic, unlike the global rho
    * model): the nearest cell exactly one winding away should sit ~omega
    * from here. Weak Cauchy pull — real gaps vary. */
-  double om = tr_om_eff(t);
+  double om = tr_om_at(t, x);
   double rad2 = 1.6 * om;
   long d0[3], d1[3];
   for (int a = 0; a < 3; a++) {
@@ -2462,11 +2608,45 @@ static void tr_res_self(tr_nlsq *acc, const r3d_tracer *t, const double x[3],
   if (nq) {
     double d = sqrt(nd2);
     if (d > 1e-6) {
+      /* signed spacing (G5c, vc3d spiral_ceres): unsigned |d| holds a
+       * cell that slipped PAST its inner neighbour at perfect spacing on
+       * the wrong side — the exact failure this term exists to catch.
+       * Sign the distance by radial order: outward reference x the
+       * winding order; when inverted the residual is ~-2 instead of 0,
+       * and the Cauchy robustifier is skipped so the repair force is not
+       * robustified away. R3D_SIGNED_SPACING=0 restores unsigned. */
+      static _Atomic int signed_on = -1;
+      int sg = atomic_load_explicit(&signed_on, memory_order_relaxed);
+      if (sg < 0) {
+        const char *ev = getenv("R3D_SIGNED_SPACING");
+        sg = ev ? atoi(ev) : 1;
+        atomic_store(&signed_on, sg);
+      }
+      double s = 1.0;
+      if (sg && t->uc) {
+        double cx3, cy3;
+        if (tr_uc_at(t, x[2], &cx3, &cy3, NULL, NULL)) {
+          double rx = x[0] - cx3, ry = x[1] - cy3;
+          double rl = hypot(rx, ry);
+          if (rl > 1e-6) {
+            /* winding grows inward or outward consistently: the sign of
+             * (x-Q).radial must match the sign of (w_self - w_nb) times
+             * the spiral's handedness (om_eff sign carries it via the
+             * fit; use the observed order: higher winding = smaller rho
+             * for an inward spiral — take the fit's slope sign) */
+            double dot = ((x[0] - nq[0]) * rx + (x[1] - nq[1]) * ry) / rl;
+            double worder = (double)t->wind[self_k] - (double)t->wind[
+                (size_t)(nq - t->pos) / 3];
+            double hand = t->sp_valid && t->sp_omega < 0 ? -1.0 : 1.0;
+            s = (dot > 0 ? 1.0 : -1.0) * (worder > 0 ? 1.0 : -1.0) * hand;
+          }
+        }
+      }
       double w2 = 0.3;
-      double r = w2 * (d - om) / om;
-      double sc = sqrt(1.0 / (1.0 + r * r)); /* Cauchy(1) */
+      double r = w2 * (s * d - om) / om;
+      double sc = s < 0 ? 1.0 : sqrt(1.0 / (1.0 + r * r)); /* Cauchy(1) */
       double J[3];
-      for (int a = 0; a < 3; a++) J[a] = sc * w2 * (x[a] - nq[a]) / (d * om);
+      for (int a = 0; a < 3; a++) J[a] = sc * s * w2 * (x[a] - nq[a]) / (d * om);
       nq_add(acc, r * sc, J);
     }
   }
@@ -2856,6 +3036,7 @@ static void tr_rib_seed_contour(r3d_tracer *t, const tr_wf *wf, td_cache *dt,
         P[1] = p[1] + 0.1 * (q % 2) * ty;
         P[2] = t->cfg.seed[2] + 0.1 * (q / 2);
         t->state[k] = R3D_TR_SET;
+        if (t->gen_of) t->gen_of[k] = 1;
         t->conf[k] = 1.0f;
         t->wind[k] = w0;
         fringe[(*nf)++] = (uint32_t)k;
@@ -3152,7 +3333,7 @@ static void tr_eval(tr_ctx *c, const double x[3], tr_nlsq *acc) {
       int ii = i + n8[o][0], jj = j + n8[o][1];
       if (!tr_valid(t, ii, jj)) continue;
       double D = unit * sqrt((double)(n8[o][0] * n8[o][0] + n8[o][1] * n8[o][1]));
-      tr_res_dist(acc, x, tr_at(c, ii, jj, x), D, TR_W_DIST);
+      tr_res_dist(acc, x, tr_at(c, ii, jj, x), D, TR_W_DIST * tr_ws(e->ws_dist));
     }
   if (c->flags & TRF_STRAIGHT) {
     static const int ax[4][2] = {{1, 0}, {0, 1}, {1, 1}, {1, -1}};
@@ -3164,7 +3345,8 @@ static void tr_eval(tr_ctx *c, const double x[3], tr_nlsq *acc) {
         if (!tr_valid(t, ai, aj) || !tr_valid(t, bi, bj) || !tr_valid(t, ci, cj))
           continue;
         tr_res_straight(acc, tr_at(c, ai, aj, x), tr_at(c, bi, bj, x),
-                        tr_at(c, ci, cj, x), -w0, TR_W_STRAIGHT);
+                        tr_at(c, ci, cj, x), -w0,
+                        TR_W_STRAIGHT * tr_ws(e->ws_straight));
         if (a < 2) /* main axes: the sheet must not double back on itself */
           tr_res_fold(acc, tr_at(c, ai, aj, x), tr_at(c, bi, bj, x),
                       tr_at(c, ci, cj, x), -w0, TR_W_FOLD);
@@ -3185,7 +3367,9 @@ static void tr_eval(tr_ctx *c, const double x[3], tr_nlsq *acc) {
         if (ci2 == i && cj2 == j) continue;
         o3[no3++] = tr_at(c, ci2, cj2, x);
       }
-      if (no3 == 3) tr_res_planar(acc, x, o3[0], o3[1], o3[2], TR_W_PLANAR);
+      if (no3 == 3)
+        tr_res_planar(acc, x, o3[0], o3[1], o3[2],
+                      TR_W_PLANAR * tr_ws(e->ws_straight));
     }
   }
   if (c->flags & TRF_SDIR) {
@@ -3283,14 +3467,80 @@ static void tr_eval(tr_ctx *c, const double x[3], tr_nlsq *acc) {
       }
     }
   }
-  if (t->nanc) { /* user anchor owned by this cell: hard pull through it */
+  if (t->nanc) {
+    /* user anchor owned by this cell (G10b, vc3d PointsCorrectionLoss):
+     * pull along the LOCAL SHEET NORMAL only — a correction is about
+     * which sheet, not which uv. The old per-axis pull fought
+     * Dist/Straight/Dirichlet directly: either it won and left a dimple,
+     * or lost and the anchor never engaged. Normal frozen from the
+     * current grid tangents; falls back to the full pull when the
+     * neighbourhood is too degenerate to define one. */
     int32_t k32 = (int32_t)((size_t)j * t->W + (size_t)i);
     for (uint32_t a = 0; a < t->nanc; a++) {
       if (t->anc_cell[a] != k32) continue;
-      for (int ax = 0; ax < 3; ax++) {
-        double J[3] = {0, 0, 0};
-        J[ax] = TR_W_ANC;
-        nq_add(acc, TR_W_ANC * (x[ax] - t->anc[a * 3u + (uint32_t)ax]), J);
+      const double *P = t->anc + (size_t)a * 3;
+      double nrm[3] = {0, 0, 0};
+      bool have_n = false;
+      if (tr_valid(t, i - 1, j) && tr_valid(t, i + 1, j) && tr_valid(t, i, j - 1) &&
+          tr_valid(t, i, j + 1)) {
+        const double *pu0 = t->pos + ((size_t)j * t->W + (size_t)i - 1) * 3;
+        const double *pu1 = t->pos + ((size_t)j * t->W + (size_t)i + 1) * 3;
+        const double *pv0 = t->pos + ((size_t)(j - 1) * t->W + (size_t)i) * 3;
+        const double *pv1 = t->pos + ((size_t)(j + 1) * t->W + (size_t)i) * 3;
+        double eu[3], ev[3];
+        for (int a2 = 0; a2 < 3; a2++) {
+          eu[a2] = pu1[a2] - pu0[a2];
+          ev[a2] = pv1[a2] - pv0[a2];
+        }
+        nrm[0] = eu[1] * ev[2] - eu[2] * ev[1];
+        nrm[1] = eu[2] * ev[0] - eu[0] * ev[2];
+        nrm[2] = eu[0] * ev[1] - eu[1] * ev[0];
+        double l = sqrt(nrm[0] * nrm[0] + nrm[1] * nrm[1] + nrm[2] * nrm[2]);
+        if (l > 1e-9) {
+          for (int a2 = 0; a2 < 3; a2++) nrm[a2] /= l;
+          have_n = true;
+        }
+      }
+      double dv[3] = {x[0] - P[0], x[1] - P[1], x[2] - P[2]};
+      double dist = sqrt(dv[0] * dv[0] + dv[1] * dv[1] + dv[2] * dv[2]);
+      double cap = TR_ANC_CAPTURE * t->cfg.step;
+      double fall = dist < cap ? 1.0 - dist / cap * 0.5 : 0.5; /* gentle */
+      if (have_n) {
+        double dn = dv[0] * nrm[0] + dv[1] * nrm[1] + dv[2] * nrm[2];
+        double w = TR_W_ANC * fall;
+        double J[3] = {w * nrm[0], w * nrm[1], w * nrm[2]};
+        nq_add(acc, w * dn, J);
+      } else {
+        for (int ax = 0; ax < 3; ax++) {
+          double J[3] = {0, 0, 0};
+          J[ax] = TR_W_ANC * fall;
+          nq_add(acc, TR_W_ANC * fall * (x[ax] - P[ax]), J);
+        }
+      }
+    }
+  }
+  if (t->reopt_on && t->reopt_pos && t->reopt_nrm) {
+    /* tangential position memory during re-optimisation (G10a, vc3d
+     * NormalOnlyPenalty): each cell in a refine disc remembers where it
+     * was, tangentially only — free to move along its own normal (the
+     * sheet-choice direction), pinned in uv so a 6-sweep anneal cannot
+     * translate the disc along the sheet and shear the parameterisation
+     * against the untouched region. */
+    size_t kc = (size_t)j * t->W + (size_t)i;
+    const float *n0f = t->reopt_nrm + kc * 3;
+    double n0[3] = {(double)n0f[0], (double)n0f[1], (double)n0f[2]};
+    double nl = n0[0] * n0[0] + n0[1] * n0[1] + n0[2] * n0[2];
+    if (nl > 0.25) {
+      const double *p0 = t->reopt_pos + kc * 3;
+      double d[3] = {x[0] - p0[0], x[1] - p0[1], x[2] - p0[2]};
+      double dn = d[0] * n0[0] + d[1] * n0[1] + d[2] * n0[2];
+      const double w = 10.0;
+      for (int a2 = 0; a2 < 3; a2++) {
+        double r = w * (d[a2] - dn * n0[a2]);
+        double J[3];
+        for (int b2 = 0; b2 < 3; b2++)
+          J[b2] = w * ((a2 == b2 ? 1.0 : 0.0) - n0[a2] * n0[b2]);
+        nq_add(acc, r, J);
       }
     }
   }
@@ -3568,6 +3818,7 @@ static bool tr_place_cand(r3d_tracer *t, tr_env *e, uint32_t cell, unsigned *rng
   pthread_mutex_lock(&t->mu);
   for (int a = 0; a < 3; a++) t->pos[k * 3 + (size_t)a] = bp[a] + tr_urand(rng);
   t->state[k] = R3D_TR_SET; /* committed before the solve (vc3d) */
+  if (t->gen_of) t->gen_of[k] = t->cur_gen ? t->cur_gen : 1;
   t->nset++;
   pthread_mutex_unlock(&t->mu);
   tr_wind_assign(t, k, i, j); /* preliminary: the donor gates in the
@@ -4497,6 +4748,7 @@ static void *tr_worker(void *ud) {
         P[0] += s_off * rdir[0];
         P[1] += s_off * rdir[1];
         t->state[k] = R3D_TR_SET;
+        if (t->gen_of) t->gen_of[k] = 1;
         t->conf[k] = 1.0f;
         t->wind[k] = w0;
         fringe[nf++] = (uint32_t)k;
@@ -4548,6 +4800,7 @@ static void *tr_worker(void *ud) {
   while (nf > 0 && gens_run < budget && !t->quit) {
     gens_run++;
     uint32_t generation = t->gens_done + gens_run;
+    t->cur_gen = (uint16_t)(generation > 65535 ? 65535 : generation);
     bool global_opt = generation <= 10 && !resume;
     /* candidates: 8-neighborhood of the fringe */
     uint32_t nc = 0;
@@ -4559,6 +4812,8 @@ static void *tr_worker(void *ud) {
         if (ii < 2 || jj < mv || ii >= (int)W - 2 || jj >= (int)H - mv) continue;
         size_t k = (size_t)jj * W + (size_t)ii;
         if (t->state[k] != R3D_TR_EMPTY) continue;
+        if (t->cfg.grow_dirs && !(t->cfg.grow_dirs & (1u << o))) continue;
+        if (t->grow_mask && !t->grow_mask[k]) continue;
         if (generation > 30) {
           /* L-shape rule (vc3d GrowSurface): a candidate that closes no
            * 2x2 block with SET cells is a 1-cell spur the anti-fold term
@@ -4742,16 +4997,88 @@ static void *tr_worker(void *ud) {
     tr_spiral_flag(t);
     tr_sfx_build(t);
     tr_anc_assign(t);
+    { /* tangential position memory (G10a): snapshot pos + normals so the
+       * anneal can move cells across wraps but not along the sheet */
+      size_t n2 = (size_t)W * H;
+      free(t->reopt_pos);
+      free(t->reopt_nrm);
+      t->reopt_pos = malloc(n2 * 3 * sizeof *t->reopt_pos);
+      t->reopt_nrm = calloc(n2 * 3, sizeof *t->reopt_nrm);
+      if (t->reopt_pos && t->reopt_nrm) {
+        memcpy(t->reopt_pos, t->pos, n2 * 3 * sizeof *t->reopt_pos);
+        for (int j2 = 0; j2 < (int)H; j2++)
+          for (int i2 = 0; i2 < (int)W; i2++) {
+            if (!tr_valid(t, i2 - 1, j2) || !tr_valid(t, i2 + 1, j2) ||
+                !tr_valid(t, i2, j2 - 1) || !tr_valid(t, i2, j2 + 1))
+              continue;
+            const double *pu0 = t->pos + ((size_t)j2 * W + (size_t)i2 - 1) * 3;
+            const double *pu1 = t->pos + ((size_t)j2 * W + (size_t)i2 + 1) * 3;
+            const double *pv0 = t->pos + ((size_t)(j2 - 1) * W + (size_t)i2) * 3;
+            const double *pv1 = t->pos + ((size_t)(j2 + 1) * W + (size_t)i2) * 3;
+            double eu[3], ev[3], nr[3];
+            for (int a = 0; a < 3; a++) {
+              eu[a] = pu1[a] - pu0[a];
+              ev[a] = pv1[a] - pv0[a];
+            }
+            nr[0] = eu[1] * ev[2] - eu[2] * ev[1];
+            nr[1] = eu[2] * ev[0] - eu[0] * ev[2];
+            nr[2] = eu[0] * ev[1] - eu[1] * ev[0];
+            double l = sqrt(nr[0] * nr[0] + nr[1] * nr[1] + nr[2] * nr[2]);
+            if (l > 1e-9)
+              for (int a = 0; a < 3; a++)
+                t->reopt_nrm[((size_t)j2 * W + (size_t)i2) * 3 + (size_t)a] =
+                    (float)(nr[a] / l);
+          }
+        t->reopt_on = true;
+      }
+    }
+    /* staged weight relaxation (G9, vc3d correction schedule): a
+     * correction asking the sheet to move a wrap over must cross a
+     * barrier — the snap term holds it on its current polyline and
+     * DIST/STRAIGHT resist the transition stretch. At full weights the
+     * refine converges straight back into the wrong-sheet basin. */
+    static const double sched[3][3] = {/* dist, straight, snap */
+                                       {0.3, 0.1, -1.0}, /* -1 = off */
+                                       {0.3, 0.1, 1.0},
+                                       {1.0, 1.0, 1.0}};
+    int rad = 8; /* widen to cover the anchor spread */
+    for (uint32_t a = 0; a < t->nanc; a++)
+      for (uint32_t b = a + 1; b < t->nanc; b++) {
+        if (t->anc_cell[a] < 0 || t->anc_cell[b] < 0) continue;
+        int dai = abs((int)((uint32_t)t->anc_cell[a] % W) -
+                      (int)((uint32_t)t->anc_cell[b] % W));
+        int daj = abs((int)((uint32_t)t->anc_cell[a] / W) -
+                      (int)((uint32_t)t->anc_cell[b] / W));
+        int sp = (dai > daj ? dai : daj) / 2;
+        if (8 + sp > rad) rad = 8 + sp;
+      }
+    if (rad > 48) rad = 48;
     for (int pass = 0; pass < 3 && !t->quit; pass++) {
+      cenv.ws_dist = sched[pass][0];
+      cenv.ws_straight = sched[pass][1];
+      cenv.ws_snap = sched[pass][2];
+      for (uint32_t pe = 0; pe < pool.nth; pe++) {
+        pool.env[pe].ws_dist = sched[pass][0];
+        pool.env[pe].ws_straight = sched[pass][1];
+        pool.env[pe].ws_snap = sched[pass][2];
+      }
       for (uint32_t a = 0; a < t->nanc && !t->quit; a++)
         if (t->anc_cell[a] >= 0)
           tr_local_opt(t, &cenv, (int)((uint32_t)t->anc_cell[a] % W),
-                       (int)((uint32_t)t->anc_cell[a] / W), 8, 6, true);
+                       (int)((uint32_t)t->anc_cell[a] / W), rad, 6, true);
       tr_anc_assign(t);
       pthread_mutex_lock(&t->mu);
       t->gen++; /* live view: show each pass */
       pthread_mutex_unlock(&t->mu);
     }
+    cenv.ws_dist = cenv.ws_straight = cenv.ws_snap = 0.0; /* back to 1.0 */
+    for (uint32_t pe = 0; pe < pool.nth; pe++)
+      pool.env[pe].ws_dist = pool.env[pe].ws_straight = pool.env[pe].ws_snap = 0.0;
+    t->reopt_on = false;
+    free(t->reopt_pos);
+    free(t->reopt_nrm);
+    t->reopt_pos = NULL;
+    t->reopt_nrm = NULL;
     t->refine = false;
   }
   /* final polish: one bounded pass so late cells see settled neighbors */
@@ -4795,8 +5122,35 @@ static void *tr_worker(void *ud) {
     const double *q = t->pos + (size_t)t->anc_cell[a] * 3;
     const double *P = t->anc + (size_t)a * 3;
     double dx = q[0] - P[0], dy = q[1] - P[1], dz = q[2] - P[2];
-    printf("tracer: anchor %u final distance %.1f vox\n", a,
-           sqrt(dx * dx + dy * dy + dz * dz));
+    /* the pull is sheet-normal only (the cell slides tangentially), so
+     * report the normal component separately — that is the "does the
+     * sheet pass through the point" number */
+    double nd = -1.0;
+    int ai = (int)((uint32_t)t->anc_cell[a] % t->W),
+        aj = (int)((uint32_t)t->anc_cell[a] / t->W);
+    if (tr_valid(t, ai - 1, aj) && tr_valid(t, ai + 1, aj) &&
+        tr_valid(t, ai, aj - 1) && tr_valid(t, ai, aj + 1)) {
+      const double *pu0 = t->pos + ((size_t)aj * t->W + (size_t)ai - 1) * 3;
+      const double *pu1 = t->pos + ((size_t)aj * t->W + (size_t)ai + 1) * 3;
+      const double *pv0 = t->pos + ((size_t)(aj - 1) * t->W + (size_t)ai) * 3;
+      const double *pv1 = t->pos + ((size_t)(aj + 1) * t->W + (size_t)ai) * 3;
+      double eu[3], ev[3], nr[3];
+      for (int c2 = 0; c2 < 3; c2++) {
+        eu[c2] = pu1[c2] - pu0[c2];
+        ev[c2] = pv1[c2] - pv0[c2];
+      }
+      nr[0] = eu[1] * ev[2] - eu[2] * ev[1];
+      nr[1] = eu[2] * ev[0] - eu[0] * ev[2];
+      nr[2] = eu[0] * ev[1] - eu[1] * ev[0];
+      double l = sqrt(nr[0] * nr[0] + nr[1] * nr[1] + nr[2] * nr[2]);
+      if (l > 1e-9) nd = fabs((dx * nr[0] + dy * nr[1] + dz * nr[2]) / l);
+    }
+    if (nd >= 0.0)
+      printf("tracer: anchor %u off-sheet %.1f vox (3D %.1f, rest tangential)\n",
+             a, nd, sqrt(dx * dx + dy * dy + dz * dz));
+    else
+      printf("tracer: anchor %u final distance %.1f vox\n", a,
+             sqrt(dx * dx + dy * dy + dz * dz));
   }
   if (t->sp_valid)
     printf("tracer: spiral fit omega %.2f vox/winding, rms %.2f vox\n", t->sp_omega,
@@ -4808,6 +5162,11 @@ static void *tr_worker(void *ud) {
   ng_close(&ng);
   td_close(dt);
   t->bnd_ct = NULL; /* worker-owned sampler dies with the worker */
+  if (t->mask_once) { /* reopt region regrown: lift the confinement */
+    free(t->grow_mask);
+    t->grow_mask = NULL;
+    t->mask_once = false;
+  }
   if (ctv_ok) r3d_cpuvol_close(&ctv);
   r3d_cpuvol_close(&vol);
   pthread_mutex_lock(&t->mu);
@@ -4856,6 +5215,7 @@ int r3d_tracer_start_fused(r3d_tracer *t, const char *pred_root,
   t->conf = calloc((size_t)t->W * t->H, sizeof *t->conf);
   t->wind = calloc((size_t)t->W * t->H, sizeof *t->wind);
   t->werr = calloc((size_t)t->W * t->H, sizeof *t->werr);
+  t->gen_of = calloc((size_t)t->W * t->H, sizeof *t->gen_of);
   t->rng = 0x1234567u;
   if (!t->pos || !t->state || !t->conf || !t->wind) {
     r3d_tracer_free(t);
@@ -4886,6 +5246,227 @@ int r3d_tracer_start_fused(r3d_tracer *t, const char *pred_root,
   return 0;
 }
 
+/* probe a plane's dimensions */
+static bool tr_plane_dims(const char *path, uint32_t *w, uint32_t *h) {
+  TIFF *tf = TIFFOpen(path, "r");
+  if (!tf) return false;
+  uint32_t tw = 0, th2 = 0;
+  TIFFGetField(tf, TIFFTAG_IMAGEWIDTH, &tw);
+  TIFFGetField(tf, TIFFTAG_IMAGELENGTH, &th2);
+  TIFFClose(tf);
+  if (!tw || !th2) return false;
+  *w = tw;
+  *h = th2;
+  return true;
+}
+
+int r3d_tracer_load(r3d_tracer *t, const char *dir, const char *pred_root) {
+  char path[1200];
+  snprintf(path, sizeof path, "%s/x.tif", dir);
+  uint32_t w, h;
+  if (!tr_plane_dims(path, &w, &h)) return -1;
+  memset(t, 0, sizeof *t);
+  for (uint32_t a = 0; a < R3D_TR_MAX_ANCHORS; a++) t->anc_cell[a] = -1;
+  t->W = w;
+  t->H = h;
+  snprintf(t->root, sizeof t->root, "%s", pred_root);
+  t->cfg.step = 20.0;
+  t->cfg.level = 1;
+  t->cfg.thresh = 0.35f;
+  t->cfg.max_ring = w > 50 ? (w - 50) / 2 : 4;
+  { /* scale from meta.json (scale = 1/step) */
+    snprintf(path, sizeof path, "%s/meta.json", dir);
+    FILE *f = fopen(path, "r");
+    if (f) {
+      char buf[4096];
+      size_t rd = fread(buf, 1, sizeof buf - 1, f);
+      buf[rd] = 0;
+      fclose(f);
+      const char *sc = strstr(buf, "\"scale\"");
+      double sv;
+      if (sc && sscanf(sc, "\"scale\": [ %lf", &sv) == 1 && sv > 1e-6)
+        t->cfg.step = 1.0 / sv;
+      else if (sc) {
+        const char *br = strchr(sc, '[');
+        if (br && sscanf(br + 1, " %lf", &sv) == 1 && sv > 1e-6)
+          t->cfg.step = 1.0 / sv;
+      }
+    }
+  }
+  uint64_t n = (uint64_t)w * h;
+  t->pos = calloc(n * 3, sizeof *t->pos);
+  t->state = calloc(n, 1);
+  t->conf = calloc(n, sizeof *t->conf);
+  t->wind = calloc(n, sizeof *t->wind);
+  t->werr = calloc(n, sizeof *t->werr);
+  t->gen_of = calloc(n, sizeof *t->gen_of);
+  if (!t->pos || !t->state || !t->conf || !t->wind || !t->gen_of) {
+    r3d_tracer_free(t);
+    return -1;
+  }
+  float *px = NULL, *py = NULL, *pz = NULL, *pw = NULL, *pg = NULL;
+  snprintf(path, sizeof path, "%s/x.tif", dir);
+  px = tr_read_plane(path, w, h);
+  snprintf(path, sizeof path, "%s/y.tif", dir);
+  py = tr_read_plane(path, w, h);
+  snprintf(path, sizeof path, "%s/z.tif", dir);
+  pz = tr_read_plane(path, w, h);
+  snprintf(path, sizeof path, "%s/winding.tif", dir);
+  pw = tr_read_plane(path, w, h); /* optional */
+  snprintf(path, sizeof path, "%s/generations.tif", dir);
+  pg = tr_read_plane(path, w, h); /* optional */
+  if (!px || !py || !pz) {
+    free(px);
+    free(py);
+    free(pz);
+    free(pw);
+    free(pg);
+    r3d_tracer_free(t);
+    return -1;
+  }
+  uint32_t maxgen = 1;
+  for (uint64_t k = 0; k < n; k++) {
+    if (px[k] <= 0.0f) continue; /* tifxyz invalid encoding */
+    t->pos[k * 3 + 0] = (double)px[k];
+    t->pos[k * 3 + 1] = (double)py[k];
+    t->pos[k * 3 + 2] = (double)pz[k];
+    t->state[k] = R3D_TR_SET;
+    t->conf[k] = 1.0f;
+    t->wind[k] = pw && pw[k] > -1e29f ? pw[k] : 0.0f;
+    uint16_t g = pg && pg[k] > 0.0f ? (uint16_t)pg[k] : 1;
+    t->gen_of[k] = g;
+    if (g > maxgen) maxgen = g;
+    t->nset++;
+  }
+  free(px);
+  free(py);
+  free(pz);
+  free(pw);
+  free(pg);
+  t->gens_done = maxgen;
+  t->ring = maxgen;
+  pthread_mutex_init(&t->mu, NULL);
+  r3d_umbilicus_init(&t->umb);
+  t->done = true; /* loaded = a finished, stopped trace */
+  printf("tracer: loaded %s (%ux%u, %u points, max gen %u)\n", dir, w, h, t->nset,
+         maxgen);
+  return 0;
+}
+
+int r3d_tracer_rewind(r3d_tracer *t, uint32_t gen) {
+  if (t->running || !t->pos || !t->gen_of || !gen) return -1;
+  uint32_t dropped = 0;
+  pthread_mutex_lock(&t->mu);
+  uint64_t n = (uint64_t)t->W * t->H;
+  for (uint64_t k = 0; k < n; k++) {
+    if (t->state[k] == R3D_TR_FAIL || t->state[k] == R3D_TR_PROC) {
+      t->state[k] = R3D_TR_EMPTY; /* everything is retryable after rewind */
+      t->gen_of[k] = 0;
+      continue;
+    }
+    if (t->state[k] != R3D_TR_SET || t->gen_of[k] <= gen) continue;
+    t->state[k] = R3D_TR_EMPTY;
+    t->gen_of[k] = 0;
+    t->conf[k] = 0.0f;
+    if (t->nset) t->nset--;
+    dropped++;
+  }
+  if (t->gens_done > gen) t->gens_done = gen;
+  if (t->ring > gen) t->ring = gen;
+  t->gen++;
+  pthread_mutex_unlock(&t->mu);
+  printf("tracer: rewound to generation %u (%u cells dropped)\n", gen, dropped);
+  return 0;
+}
+
+int r3d_tracer_reopt(r3d_tracer *t, const double p[3], int radius) {
+  if (t->running || !t->pos || !t->nset) return -1;
+  if (radius < 3) radius = 3;
+  uint64_t n = (uint64_t)t->W * t->H;
+  /* nearest SET cell to the correction point */
+  int64_t bk = -1;
+  double bd2 = 1e30;
+  for (uint64_t k = 0; k < n; k++) {
+    if (t->state[k] != R3D_TR_SET) continue;
+    const double *q = t->pos + k * 3;
+    double d2 = 0;
+    for (int a = 0; a < 3; a++) {
+      double dd = q[a] - p[a];
+      d2 += dd * dd;
+    }
+    if (d2 < bd2) {
+      bd2 = d2;
+      bk = (int64_t)k;
+    }
+  }
+  if (bk < 0) return -1;
+  int ci = (int)((uint64_t)bk % t->W), cj = (int)((uint64_t)bk / t->W);
+  /* flood the suspect region: low conf or wrong-wrap werr, plus an
+   * unconditional core of radius 2 around the correction */
+  uint8_t *reg = calloc(n, 1);
+  uint32_t *q2 = malloc(n * sizeof *q2);
+  if (!reg || !q2) {
+    free(reg);
+    free(q2);
+    return -1;
+  }
+  uint32_t qn = 0, nreg = 0;
+  reg[bk] = 1;
+  q2[qn++] = (uint32_t)bk;
+  bool border = false;
+  while (qn) {
+    uint32_t k = q2[--qn];
+    nreg++;
+    int i = (int)(k % t->W), j = (int)(k / t->W);
+    if (i <= 1 || j <= 1 || i >= (int)t->W - 2 || j >= (int)t->H - 2) border = true;
+    static const int o4[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+    for (int o = 0; o < 4; o++) {
+      int ii = i + o4[o][0], jj = j + o4[o][1];
+      if (ii < 0 || jj < 0 || ii >= (int)t->W || jj >= (int)t->H) continue;
+      size_t k2 = (size_t)jj * t->W + (size_t)ii;
+      if (reg[k2] || t->state[k2] != R3D_TR_SET) continue;
+      int chev = abs(ii - ci) > abs(jj - cj) ? abs(ii - ci) : abs(jj - cj);
+      if (chev > radius) continue;
+      bool core = chev <= 2;
+      bool suspect = t->conf[k2] < 0.5f || (t->werr && t->werr[k2] > 0.3f);
+      if (!core && !suspect) continue;
+      reg[k2] = 1;
+      q2[qn++] = (uint32_t)k2;
+    }
+  }
+  free(q2);
+  if (border) { /* reached the rim: this is a rewind case, not a reopt */
+    free(reg);
+    return -1;
+  }
+  pthread_mutex_lock(&t->mu);
+  for (uint64_t k = 0; k < n; k++) {
+    if (!reg[k]) continue;
+    t->state[k] = R3D_TR_EMPTY;
+    if (t->gen_of) t->gen_of[k] = 0;
+    t->conf[k] = 0.0f;
+    if (t->nset) t->nset--;
+  }
+  free(t->grow_mask);
+  t->grow_mask = reg; /* growth confined to the reopened region */
+  t->mask_once = true;
+  /* budget: enough generations to cross the region */
+  uint32_t need = (uint32_t)radius + 5;
+  t->gens_done = t->cfg.max_ring > need ? t->cfg.max_ring - need : 0;
+  t->quit = false;
+  t->done = false;
+  t->gen++;
+  t->running = true;
+  pthread_mutex_unlock(&t->mu);
+  printf("tracer: reopened %u cells around (%.0f,%.0f,%.0f), regrowing\n", nreg,
+         p[0], p[1], p[2]);
+  if (pthread_create(&t->th, NULL, tr_worker, t) != 0) {
+    t->running = false;
+    return -1;
+  }
+  return 0;
+}
+
 int r3d_tracer_grow(r3d_tracer *t, uint32_t extra) {
   if (t->running || !t->pos || !extra) return -1;
   uint32_t nr = t->cfg.max_ring + extra;
@@ -4897,12 +5478,14 @@ int r3d_tracer_grow(r3d_tracer *t, uint32_t extra) {
   float *nc = calloc((size_t)NW * NW, sizeof *nc);
   float *nw = calloc((size_t)NW * NW, sizeof *nw);
   uint8_t *nd = t->dsup ? calloc((size_t)NW * NW, 1) : NULL;
+  uint16_t *ng2 = calloc((size_t)NW * NW, sizeof *ng2);
   if (!np || !ns || !nc || !nw || (t->dsup && !nd)) {
     free(np);
     free(ns);
     free(nc);
     free(nw);
     free(nd);
+    free(ng2);
     return -1;
   }
   for (uint32_t j = 0; j < t->H; j++)
@@ -4914,6 +5497,7 @@ int r3d_tracer_grow(r3d_tracer *t, uint32_t extra) {
         nc[nk] = t->conf[ok];
         nw[nk] = t->wind[ok];
         if (nd) nd[nk] = t->dsup[ok];
+        if (ng2 && t->gen_of) ng2[nk] = t->gen_of[ok];
         memcpy(np + nk * 3, t->pos + ok * 3, 3 * sizeof(double));
       }
     }
@@ -4929,6 +5513,8 @@ int r3d_tracer_grow(r3d_tracer *t, uint32_t extra) {
   free(t->werr);
   t->werr = calloc((size_t)NW * NW, sizeof *t->werr);
   t->dsup = nd;
+  free(t->gen_of);
+  t->gen_of = ng2;
   t->W = t->H = NW;
   t->cfg.max_ring = nr;
   for (uint32_t a = 0; a < R3D_TR_MAX_ANCHORS; a++)
@@ -4973,6 +5559,11 @@ void r3d_tracer_free(r3d_tracer *t) {
   free(t->conf);
   free(t->wind);
   free(t->werr);
+  free(t->omf);
+  free(t->reopt_pos);
+  free(t->reopt_nrm);
+  free(t->gen_of);
+  free(t->grow_mask);
   free(t->dsup);
   free(t->uc);
   tr_sfx_free(t->sfx);
@@ -5138,6 +5729,12 @@ int r3d_tracer_save(r3d_tracer *t, const char *dir, float cutoff, bool fill) {
                              * NAN is unusable under -ffast-math) */
     char path[1200];
     snprintf(path, sizeof path, "%s/winding.tif", dir);
+    rc = tr_write_plane(path, pl, t->W, t->H);
+  }
+  if (rc == 0 && t->gen_of) { /* generation stamps: the rewind substrate */
+    for (uint64_t k = 0; k < n; k++) pl[k] = (float)t->gen_of[k];
+    char path[1200];
+    snprintf(path, sizeof path, "%s/generations.tif", dir);
     rc = tr_write_plane(path, pl, t->W, t->H);
   }
   pthread_mutex_unlock(&t->mu);

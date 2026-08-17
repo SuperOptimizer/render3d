@@ -1809,3 +1809,33 @@ recorded before any behavior change.
   umbilicus, so wrap metrics are GUI-only until a p343 umbilicus exists.
 - Residual run-to-run variance (kinks 0..300 same build) persists: the
   pool's claim scheduling, not candidate order. Revisit with G6 retry.
+
+## Tracer improvement plan, phases 3b-4
+
+- G5: per-region sheet-gap field (64-vox cells from the omega samples,
+  nearest-filled + smoothed) behind tr_om_at(); gap rays cast along the
+  local grid normal (radial overestimates 1/cos on pancaked sections);
+  spacing residual SIGNED by radial order x winding order — an inverted
+  wrap now reads ~-2 instead of "perfect", and skips the Cauchy
+  robustifier so the repair force survives (R3D_SIGNED_SPACING=0
+  reverts). Inert on the umbilicus-less bench; engages in GUI sessions.
+- G9: staged weight relaxation through the solve envs (ws_dist/straight/
+  snap); refine passes run {0.3,0.1,0} -> {0.3,0.1,1} -> {1,1,1} with
+  radius widened to the anchor spread — corrections can now cross the
+  snap/stretch barrier instead of converging back into the wrong basin.
+- G10a: tangential position memory during refine (w=10): the anneal can
+  move cells across wraps but not slide the disc along the sheet.
+- G10b: anchors pull along the LOCAL SHEET NORMAL only. Exit test:
+  off-sheet distance 0.1 vox (3D 3.0 — tangential, free by design);
+  the old per-axis pull left a dimple or never engaged.
+- G10c: r3d_tracer_reopt — flood the suspect region (low conf / high
+  werr) around a correction point, empty it against a frozen ring,
+  regrow confined to the region (grow_mask, auto-lifted at finish).
+- G11: per-cell generation stamps -> generations.tif; r3d_tracer_load /
+  r3d_tracer_rewind; tracecli --load/--rewind/--regrow; GUI rewind
+  slider. Verified: 16-gen trace saved, loaded, rewound to 8, regrown
+  to 28 (1156 -> 3364 pts).
+- G13: cfg.grow_dirs bitmask + grow_mask candidate gates.
+- Bench: no regression (medians within noise of P2).
+- NG_QMAX bind counter: 251 binds on a 28-gen run — the truncation cap
+  IS hit on real slices; distance-ranked cut queued as follow-up.

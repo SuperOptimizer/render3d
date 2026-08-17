@@ -26,8 +26,8 @@ int main(int argc, char **argv) {
     return 2;
   }
   const char *root = argv[1], *out = NULL, *umbp = NULL;
-  const char *fuse[16];
-  uint32_t nfuse = 0;
+  const char *fuse[16], *loadp = NULL;
+  uint32_t nfuse = 0, rewind_gen = 0, regrow = 0;
   double zspan = 0.0;
   bool fill = true, spiral = true;
   r3d_tracer_cfg cfg = {.step = 20.0, .thresh = 0.35f, .max_ring = 60, .level = 1};
@@ -66,6 +66,12 @@ int main(int argc, char **argv) {
       cfg.ct_min = strtod(argv[++i], NULL);
     else if (strcmp(argv[i], "--zspan") == 0 && i + 1 < argc)
       zspan = strtod(argv[++i], NULL);
+    else if (strcmp(argv[i], "--load") == 0 && i + 1 < argc)
+      loadp = argv[++i];
+    else if (strcmp(argv[i], "--rewind") == 0 && i + 1 < argc)
+      rewind_gen = (uint32_t)strtoul(argv[++i], NULL, 10);
+    else if (strcmp(argv[i], "--regrow") == 0 && i + 1 < argc)
+      regrow = (uint32_t)strtoul(argv[++i], NULL, 10);
     else {
       fprintf(stderr, "tracecli: bad arg %s\n", argv[i]);
       return 2;
@@ -97,7 +103,22 @@ int main(int argc, char **argv) {
          cfg.seed[0], cfg.seed[1], cfg.seed[2], cfg.step, cfg.max_ring, cfg.level,
          cfg.wind_weight > 0 ? "on" : "off");
   r3d_tracer tr;
-  if (r3d_tracer_start_fused(&tr, root, &cfg, &umb, fuse, nfuse) != 0) {
+  if (loadp) {
+    /* load -> optional rewind -> regrow (vc3d --resume/--rewind-gen) */
+    if (r3d_tracer_load(&tr, loadp, root) != 0) {
+      fprintf(stderr, "tracecli: cannot load %s\n", loadp);
+      return 1;
+    }
+    if (rewind_gen && r3d_tracer_rewind(&tr, rewind_gen) != 0) {
+      fprintf(stderr, "tracecli: rewind failed\n");
+      return 1;
+    }
+    if (!regrow) regrow = 10;
+    if (r3d_tracer_grow(&tr, regrow) != 0) {
+      fprintf(stderr, "tracecli: regrow failed\n");
+      return 1;
+    }
+  } else if (r3d_tracer_start_fused(&tr, root, &cfg, &umb, fuse, nfuse) != 0) {
     fprintf(stderr, "tracecli: tracer start failed\n");
     return 1;
   }

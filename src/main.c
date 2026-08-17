@@ -3114,6 +3114,22 @@ int main(int argc, char **argv) {
             mv_tr_active = false;
           }
         }
+        if (mv_tr_done && mv_tr_nset > 0 && mv_tr.gen_of && mv_tr.gens_done > 4) {
+          static int mv_tr_rewind_to = 0;
+          if (mv_tr_rewind_to <= 0 || mv_tr_rewind_to >= (int)mv_tr.gens_done)
+            mv_tr_rewind_to = (int)mv_tr.gens_done / 2;
+          igSetNextItemWidth(140);
+          igSliderInt("##rewind", &mv_tr_rewind_to, 1, (int)mv_tr.gens_done - 1,
+                      "rewind to gen %d", 0);
+          igSameLine(0, 6);
+          if (igButton("rewind##tr", (ImVec2){0, 0})) {
+            /* drop everything placed after the chosen generation; grow
+             * then regrows it (drop an anchor first to steer) */
+            r3d_tracer_stop(&mv_tr);
+            r3d_tracer_rewind(&mv_tr, (uint32_t)mv_tr_rewind_to);
+            mv_tr_gen = 0; /* refresh the live view */
+          }
+        }
         if (mv_tr_done && mv_tr_nset > 0 && mv_anchor_n) {
           igSameLine(0, 8);
           if (igButton("re-solve", (ImVec2){0, 0})) {

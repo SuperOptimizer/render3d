@@ -54,6 +54,8 @@ typedef struct r3d_tracer_cfg {
   double wind_weight; /* spiral winding prior weight (0 = off). Needs an
                        * umbilicus; the residual is normalized by the
                        * fitted sheet spacing so ~0.5 is a gentle prior. */
+  uint8_t grow_dirs;  /* growth-direction bitmask over the 8-neighbour
+                       * order {+u,+v,-u,-v,diag...}; 0 = all (G13) */
 } r3d_tracer_cfg;
 
 #define R3D_TR_MAX_ANCHORS 64
@@ -91,6 +93,14 @@ typedef struct r3d_tracer {
   /* global spiral fit rho ~ r0(z) + omega*w over the grown points,
    * refit each generation (piecewise-linear r0, IRLS/Cauchy) */
   double sp_omega, sp_rms;
+  /* coarse per-region sheet-gap field (G5): real cross-sections vary
+   * 2-3x in gap; one global median shoves genuine wraps apart where the
+   * gap is tight and lets them interpenetrate where it is wide. Filled
+   * from the same samples as sp_om_meas, nearest-filled + box-smoothed;
+   * tr_om_at() falls back to the global scalar outside coverage. */
+  float *omf;
+  double omf_o[3], omf_cs;
+  uint32_t omf_n[3];
   double sp_om_meas; /* inter-sheet gap measured on radial DT rays; lets
                       * the fit run fixed-omega before the patch spans a
                       * full winding (where joint omega is unidentifiable) */
@@ -109,10 +119,21 @@ typedef struct r3d_tracer {
   void *don;      /* donor segments + spatial index (fusion), owned */
   uint32_t ndon;
   uint8_t *dsup;  /* [W*H] donor-support count per cell (0 = raw-traced) */
+  uint16_t *gen_of; /* [W*H] generation each cell was placed (seed = 1);
+                     * saved as generations.tif — the rewind substrate */
+  uint8_t *grow_mask; /* optional: candidates allowed only where nonzero
+                       * (region regrow); owned, freed on tracer_free */
+  bool mask_once;     /* grow_mask set by reopt: cleared at worker finish */
+  uint16_t cur_gen;   /* generation being grown (worker-internal) */
   pthread_t th;
   pthread_mutex_t mu;
   bool running, quit, done;
   bool refine; /* solve-only pass in flight (no growth) */
+  /* re-optimisation position memory (refine/inpaint): cells keep their
+   * tangential position, moving only along their own frozen normal */
+  bool reopt_on;
+  double *reopt_pos; /* [W*H*3] positions at pass start */
+  float *reopt_nrm;  /* [W*H*3] unit normals at pass start (0 = none) */
   /* worker-owned raw-CT sampler exposed to the placement pre-veto (ribbon
    * boundary test before commit instead of a generation later) */
   struct r3d_cpuvol *bnd_ct;
@@ -169,6 +190,26 @@ void r3d_tracer_set_anchors(r3d_tracer *t, const double *pts, uint32_t n);
  * polish smooths the seams. Existing cells persist; grid dims unchanged.
  * Poll snapshots as usual; done goes true when the pass ends. */
 int r3d_tracer_refine(r3d_tracer *t);
+
+/* Load a saved trace (x/y/z.tif + optional winding/generations.tif) back
+ * into a fresh tracer so it can be rewound, refined, or grown. pred_root
+ * is the prediction tree growth would sample. Returns 0 on success. */
+int r3d_tracer_load(r3d_tracer *t, const char *dir, const char *pred_root);
+
+/* Drop every cell placed after `gen` (vc3d --rewind-gen): the standard
+ * fix for a trace that went wrong at generation N of M — rewind past the
+ * jump, drop an anchor, regrow. Stopped tracer only; follow with
+ * r3d_tracer_grow to regrow. */
+int r3d_tracer_rewind(r3d_tracer *t, uint32_t gen);
+
+/* Reopen and regrow the region around world point p (vc3d discard-and-
+ * regrow): flood the suspect neighbourhood (low conf / high werr) of the
+ * nearest cell out to `radius`, empty it against a frozen boundary ring,
+ * and restart growth restricted to that region. Where a patch jumped a
+ * wrap, the correct geometry is not a perturbation of the wrong one —
+ * this is the clean fix. Aborts (-1) if the region reaches the grid
+ * border (that is a rewind, not a reopt). Stopped tracer only. */
+int r3d_tracer_reopt(r3d_tracer *t, const double p[3], int radius);
 /* Enlarge a finished (stopped) trace and resume growth for `extra` more
  * generations (vc3d resume path: existing cells persist and anchor the
  * solve). Grid buffers reallocate — callers must refetch W/H. */
