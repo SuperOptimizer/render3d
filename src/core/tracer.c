@@ -890,6 +890,17 @@ typedef struct tr_env { /* one per solving thread */
 /* 0 = unset (1.0); negative = literal zero (a schedule pass with the
  * term fully off) */
 static inline double tr_ws(double v) { return v == 0.0 ? 1.0 : (v < 0.0 ? 0.0 : v); }
+static inline int tr_geom_terms(void) { /* R3D_GEOM_TERMS=0: A/B the
+    * anti-fold + planarity residuals */
+  static _Atomic int on = -1;
+  int v = atomic_load_explicit(&on, memory_order_relaxed);
+  if (v < 0) {
+    const char *ev = getenv("R3D_GEOM_TERMS");
+    v = ev ? atoi(ev) : 0; /* planarity term default off (see call site) */
+    atomic_store(&on, v);
+  }
+  return v;
+}
 
 /* segment neighborhood lookup/build; center quantized to 16 px so the
  * full-path scan amortizes across residual evals and LM iterations */
@@ -3463,7 +3474,8 @@ static void tr_eval(tr_ctx *c, const double x[3], tr_nlsq *acc) {
         tr_res_straight(acc, tr_at(c, ai, aj, x), tr_at(c, bi, bj, x),
                         tr_at(c, ci, cj, x), -w0,
                         TR_W_STRAIGHT * tr_ws(e->ws_straight));
-        if (a < 2) /* main axes: the sheet must not double back on itself */
+        if (a < 2) /* anti-double-back hinge: inert on healthy geometry
+                    * (activates only past 90 degrees) */
           tr_res_fold(acc, tr_at(c, ai, aj, x), tr_at(c, bi, bj, x),
                       tr_at(c, ci, cj, x), -w0, TR_W_FOLD);
       }
@@ -3483,7 +3495,11 @@ static void tr_eval(tr_ctx *c, const double x[3], tr_nlsq *acc) {
         if (ci2 == i && cj2 == j) continue;
         o3[no3++] = tr_at(c, ci2, cj2, x);
       }
-      if (no3 == 3)
+      if (no3 == 3 && tr_geom_terms()) /* DEFAULT OFF: rendered A/B at 60
+          * gens showed this blanket quad stiffness (every quad, every
+          * eval) holds cells ~8 vox off the prediction sheet - conf
+          * collapses below the save cutoff and the surface fragments.
+          * R3D_GEOM_TERMS=1 re-enables for experiments. */
         tr_res_planar(acc, x, o3[0], o3[1], o3[2],
                       TR_W_PLANAR * tr_ws(e->ws_straight));
     }

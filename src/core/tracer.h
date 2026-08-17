@@ -211,6 +211,18 @@ int r3d_tracer_load(r3d_tracer *t, const char *dir, const char *pred_root);
  * r3d_tracer_grow to regrow. */
 int r3d_tracer_rewind(r3d_tracer *t, uint32_t gen);
 
+/* Unified-tracer stage 1 (vc3d gen_neighbor): derive the ADJACENT WRAP
+ * of a finished (stopped/loaded) trace by casting every trusted cell
+ * along its local normal by the local sheet gap — the ray must first
+ * exit the current sheet, then the first prediction-DT minimum is the
+ * neighbor crossing. Misses are filled by interpolating neighbor
+ * offsets. dir = +1 (outward normal) or -1. Writes a tifxyz (x/y/z +
+ * winding shifted by dir + meta) to out_dir, immediately usable as a
+ * fusion donor for growing the neighbor wrap. Returns the number of
+ * direct hits, or -1. */
+int r3d_tracer_derive(r3d_tracer *t, const char *pred_root, int dir,
+                      const char *out_dir);
+
 /* Reopen and regrow the region around world point p (vc3d discard-and-
  * regrow): flood the suspect neighbourhood (low conf / high werr) of the
  * nearest cell out to `radius`, empty it against a frozen boundary ring,

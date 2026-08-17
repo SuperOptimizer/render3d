@@ -1909,3 +1909,19 @@ stays on; the final-QC fold clamp keeps the "no doubled-back geometry
 in saves" guarantee. Lesson recorded: bench QC medians improved while
 the real surface got worse - the metrics were partly measuring their
 own exclusions. Rendered-image review is now part of the checklist.
+
+## Regression part 2: the planarity residual was the conf collapse
+
+Rendered same-seed 60-gen A/B matrix (default cutoff 0.35):
+- geom terms ON  + new gradient: fragmented (conf 0.05-0.35 band huge)
+- geom terms ON  + legacy gradient: fragmented -> gradient not the cause
+- geom terms OFF + new gradient: full surface, pre-plan-like
+- fold hinge ON only, planarity OFF: full surface (twist rms rises
+  0.98 -> 4.3 - the planarity term did its narrow job, but its blanket
+  per-quad stiffness held cells ~8 vox off the prediction sheet, which
+  is what collapsed conf below the save cutoff everywhere).
+Verdict: planarity term DEFAULT OFF (R3D_GEOM_TERMS=1 re-enables), the
+anti-fold hinge stays (inert until 90 degrees), fold placement gate
+stays off, candidate ordering stays on. Net vs pre-plan baseline at
+default settings: comparable coverage, plus all the P0-P6 machinery
+(QC, winding field, corrections, rewind, fusion uv, honest saves).
