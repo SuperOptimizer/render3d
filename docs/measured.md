@@ -1839,3 +1839,30 @@ recorded before any behavior change.
 - Bench: no regression (medians within noise of P2).
 - NG_QMAX bind counter: 251 binds on a 28-gen run — the truncation cap
   IS hit on real slices; distance-ranked cut queued as follow-up.
+
+## Tracer improvement plan, phase 5 (fusion)
+
+| fused-seed metric (3 reps) | baseline | after P5 |
+|---|---|---|
+| folds | 10-14 | 0 / 0 / 0 |
+| kinks | ~200 | 6 / 6 / 9 |
+| twist rms | 0.95-1.08 | ~0.68 |
+| slant p95 | 0.77-1.51 | ~0.16 |
+| donor mean (vox) | 1.5-2.9 | ~1.2 |
+| fill / holes | 0.94 / 0.04 | 0.97 / 0.02 |
+
+- G6: fused candidates with zero donor support AND placement cost above
+  inl_th are deferred to EMPTY (retryable) with the solved disc
+  restored; inl_th (init 20) anneals -2 with a full boundary fringe
+  reseed whenever the fringe starves.
+- G12a: donor uv membership per cell (nearest donor id + donor-grid uv,
+  refreshed each generation); a uv-discontinuity pass marks fold-suspect
+  cells (-2) where nearest-point matching jumped a fold — those cells
+  are excluded from the donor pull (the winding gate cannot catch a
+  same-patch fold); fused placement starts from an AFFINE UV
+  EXTRAPOLATION bilerped on the donor surface instead of parent+jitter.
+  This pair is the biggest single quality jump in the plan.
+- Donor tiering: a `defective` marker file in a donor dir excludes it.
+- G12b (hr resample through donor parameterisation) NOT ported: our
+  fused traces run at the donors' own step (20), so there is no
+  resolution to recover; revisit if coarse-step fused tracing lands.

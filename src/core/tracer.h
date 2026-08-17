@@ -119,12 +119,21 @@ typedef struct r3d_tracer {
   void *don;      /* donor segments + spatial index (fusion), owned */
   uint32_t ndon;
   uint8_t *dsup;  /* [W*H] donor-support count per cell (0 = raw-traced) */
+  /* donor uv membership (G12): nearest-donor id per cell (-1 none,
+   * -2 = fold-suspect: the uv map is discontinuous there and the donor
+   * pull/adoption must not fire) + donor-grid uv of the closest point */
+  int8_t *dcell_id;
+  float *dcell_uv; /* [W*H*2] */
   uint16_t *gen_of; /* [W*H] generation each cell was placed (seed = 1);
                      * saved as generations.tif — the rewind substrate */
   uint8_t *grow_mask; /* optional: candidates allowed only where nonzero
                        * (region regrow); owned, freed on tracer_free */
   bool mask_once;     /* grow_mask set by reopt: cleared at worker finish */
   uint16_t cur_gen;   /* generation being grown (worker-internal) */
+  /* fusion consensus gate (G6): candidates in fused mode must be donor-
+   * supported or solve below inl_th; rejects go back to EMPTY
+   * (retryable) and inl_th anneals down when the fringe starves */
+  double inl_th;
   pthread_t th;
   pthread_mutex_t mu;
   bool running, quit, done;

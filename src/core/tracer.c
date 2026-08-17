@@ -2018,7 +2018,7 @@ static double tr_tri_close(const double p[3], const double a[3], const double b[
  * -1; fills q (closest point) and wnd (interpolated donor winding in the
  * GLOBAL frame; < -1e29 when the donor has no registered winding) */
 static int tr_don_closest(const tr_dons *dn, const double p[3], double rad, double q[3],
-                          double *wnd) {
+                          double *wnd, double uv[2]) {
   if (!dn || !dn->ix.nent) return -1;
   const tr_didx *ix = &dn->ix;
   long c0[3], c1[3];
@@ -2053,6 +2053,15 @@ static int tr_don_closest(const tr_dons *dn, const double p[3], double rad, doub
             bd2 = d2;
             bdon = (int)di;
             memcpy(q, qq, sizeof qq);
+            if (uv) { /* donor-grid uv of the closest point (G12) */
+              if (tri == 0) {
+                uv[0] = (double)i + ub;
+                uv[1] = (double)j + vc2;
+              } else {
+                uv[0] = (double)i + 1.0 - ub;
+                uv[1] = (double)j + 1.0 - vc2;
+              }
+            }
             if (wnd) {
               *wnd = -1e30;
               if (d->dwind && d->woff_ok) {
@@ -2194,6 +2203,17 @@ static tr_dons *tr_dons_load(const char *const *dirs, uint32_t n, double step) {
   uint64_t nquad = 0;
   for (uint32_t i = 0; i < n; i++) {
     tr_donor *d = &dn->d[dn->n];
+    { /* donor tiering: a `defective` marker file excludes the segment
+       * from fusion without deleting it (vc3d approved/defective tiers) */
+      char mp[1200];
+      snprintf(mp, sizeof mp, "%s/defective", dirs[i]);
+      FILE *f = fopen(mp, "r");
+      if (f) {
+        fclose(f);
+        printf("tracer: donor %s marked defective (skipping)\n", dirs[i]);
+        continue;
+      }
+    }
     if (r3d_tifxyz_load(&d->s, dirs[i]) != 0) {
       printf("tracer: donor %s failed to load (skipping)\n", dirs[i]);
       continue;
@@ -2290,6 +2310,77 @@ static void tr_don_register(r3d_tracer *t) {
     d->woff_ok = true;
     printf("tracer: donor %u registered at winding offset %+.2f\n", di, d->woff);
   }
+}
+
+/* bilinear donor-surface sample at fractional donor-grid uv; false when
+ * any corner is invalid or uv leaves the grid */
+static bool tr_don_bilerp(const tr_dons *dn, int di, const double uv[2],
+                          double out[3]) {
+  if (!dn || di < 0 || di >= (int)dn->n) return false;
+  const tr_donor *d = &dn->d[di];
+  if (uv[0] < 0.0 || uv[1] < 0.0 || uv[0] > (double)d->s.w - 1.001 ||
+      uv[1] > (double)d->s.h - 1.001)
+    return false;
+  uint32_t i = (uint32_t)uv[0], j = (uint32_t)uv[1];
+  double fu = uv[0] - i, fv = uv[1] - j;
+  const float *p00 = r3d_tifxyz_at(&d->s, i, j);
+  const float *p10 = r3d_tifxyz_at(&d->s, i + 1, j);
+  const float *p01 = r3d_tifxyz_at(&d->s, i, j + 1);
+  const float *p11 = r3d_tifxyz_at(&d->s, i + 1, j + 1);
+  if (!r3d_tifxyz_valid(p00) || !r3d_tifxyz_valid(p10) || !r3d_tifxyz_valid(p01) ||
+      !r3d_tifxyz_valid(p11))
+    return false;
+  for (int a = 0; a < 3; a++)
+    out[a] = ((double)p00[a] * (1 - fu) + (double)p10[a] * fu) * (1 - fv) +
+             ((double)p01[a] * (1 - fu) + (double)p11[a] * fu) * fv;
+  return true;
+}
+
+/* donor uv membership refresh (G12, generation boundary): nearest donor
+ * id + uv per SET cell, then a discontinuity pass — where a patch folds
+ * back or two of its wraps pass close, nearest-point matching flips fold
+ * mid-neighbourhood and the uv map jumps; those cells are marked -2 and
+ * the donor pull/adoption skip them (the winding gate cannot catch a
+ * same-patch fold: both folds carry similar winding). */
+static void tr_don_members(r3d_tracer *t) {
+  if (!t->don || !t->dcell_id || !t->dcell_uv) return;
+  int W = (int)t->W, H = (int)t->H;
+  for (int j = 0; j < H; j++)
+    for (int i = 0; i < W; i++) {
+      size_t k = (size_t)j * (size_t)W + (size_t)i;
+      t->dcell_id[k] = -1;
+      if (t->state[k] != R3D_TR_SET) continue;
+      double q[3], dwnd, uv[2];
+      int di = tr_don_closest(t->don, t->pos + k * 3, TR_FUS_PULL, q, &dwnd, uv);
+      if (di < 0 || di > 63) continue;
+      t->dcell_id[k] = (int8_t)di;
+      t->dcell_uv[k * 2] = (float)uv[0];
+      t->dcell_uv[k * 2 + 1] = (float)uv[1];
+    }
+  uint32_t nfold = 0;
+  for (int j = 0; j < H; j++)
+    for (int i = 0; i < W; i++) {
+      size_t k = (size_t)j * (size_t)W + (size_t)i;
+      if (t->dcell_id[k] < 0) continue;
+      static const int o4[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+      for (int o = 0; o < 4; o++) {
+        int ii = i + o4[o][0], jj = j + o4[o][1];
+        if (ii < 0 || jj < 0 || ii >= W || jj >= H) continue;
+        size_t k2 = (size_t)jj * (size_t)W + (size_t)ii;
+        if (t->dcell_id[k2] != t->dcell_id[k] || t->dcell_id[k2] < 0) continue;
+        float du = t->dcell_uv[k * 2] - t->dcell_uv[k2 * 2];
+        float dv = t->dcell_uv[k * 2 + 1] - t->dcell_uv[k2 * 2 + 1];
+        if (du * du + dv * dv > 16.0f) { /* > 4 donor cells per step: the
+                                          * membership jumped a fold */
+          t->dcell_id[k] = -2;
+          nfold++;
+          break;
+        }
+      }
+    }
+  if (nfold)
+    printf("tracer: donor membership: %u fold-suspect cell%s vetoed\n", nfold,
+           nfold == 1 ? "" : "s");
 }
 
 static int tr_dcmp(const void *a, const void *b) {
@@ -3456,7 +3547,8 @@ static void tr_eval(tr_ctx *c, const double x[3], tr_nlsq *acc) {
      * different registered winding never attract */
     double q[3], dwnd;
     size_t kc = (size_t)j * t->W + (size_t)i;
-    int di = tr_don_closest(t->don, x, TR_FUS_PULL, q, &dwnd);
+    if (t->dcell_id && t->dcell_id[kc] == -2) goto skip_donor; /* fold */
+    int di = tr_don_closest(t->don, x, TR_FUS_PULL, q, &dwnd, NULL);
     if (di >= 0 &&
         !(t->uc && dwnd > -1e29 &&
           fabs(dwnd - (double)t->wind[kc]) > TR_FUS_WIND_TH)) {
@@ -3466,6 +3558,7 @@ static void tr_eval(tr_ctx *c, const double x[3], tr_nlsq *acc) {
         nq_add(acc, TR_W_SURF * (x[a] - q[a]), J);
       }
     }
+  skip_donor:;
   }
   if (t->nanc) {
     /* user anchor owned by this cell (G10b, vc3d PointsCorrectionLoss):
@@ -3815,8 +3908,32 @@ static bool tr_place_cand(r3d_tracer *t, tr_env *e, uint32_t cell, unsigned *rng
       dsnap_k[dsnap_n++] = (uint32_t)k2;
     }
   const double *bp = t->pos + ((size_t)bj * W + (size_t)bi) * 3;
+  /* fused initial guess (G12, vc3d affine uv extrapolation): when the
+   * parent and the cell behind it both sit on the same donor, extrapolate
+   * the donor-grid uv linearly and start AT the donor surface — nearest-
+   * point matching from parent+jitter is order-0 and direction-blind at
+   * folds, where the nearest point can be behind the front. */
+  double guess[3];
+  bool have_guess = false;
+  if (t->dcell_id && t->dcell_uv) {
+    int hi2 = 2 * bi - i, hj2 = 2 * bj - j;
+    size_t kp = (size_t)bj * W + (size_t)bi;
+    if (hi2 >= 0 && hj2 >= 0 && hi2 < (int)W && hj2 < (int)t->H &&
+        t->state[(size_t)hj2 * W + (size_t)hi2] == R3D_TR_SET) {
+      size_t kb = (size_t)hj2 * W + (size_t)hi2;
+      if (t->dcell_id[kp] >= 0 && t->dcell_id[kp] == t->dcell_id[kb]) {
+        double uv[2] = {2.0 * (double)t->dcell_uv[kp * 2] -
+                            (double)t->dcell_uv[kb * 2],
+                        2.0 * (double)t->dcell_uv[kp * 2 + 1] -
+                            (double)t->dcell_uv[kb * 2 + 1]};
+        have_guess = tr_don_bilerp(t->don, t->dcell_id[kp], uv, guess);
+      }
+    }
+  }
   pthread_mutex_lock(&t->mu);
-  for (int a = 0; a < 3; a++) t->pos[k * 3 + (size_t)a] = bp[a] + tr_urand(rng);
+  for (int a = 0; a < 3; a++)
+    t->pos[k * 3 + (size_t)a] =
+        (have_guess ? guess[a] : bp[a]) + tr_urand(rng);
   t->state[k] = R3D_TR_SET; /* committed before the solve (vc3d) */
   if (t->gen_of) t->gen_of[k] = t->cur_gen ? t->cur_gen : 1;
   t->nset++;
@@ -3825,13 +3942,14 @@ static bool tr_place_cand(r3d_tracer *t, tr_env *e, uint32_t cell, unsigned *rng
                                * placement solve read it */
   /* placement: geometric + data terms, then radius-1 and radius-3 */
   double tt0 = tr_now();
-  tr_solve_cell(t, e, i, j, TRF_DIST | TRF_STRAIGHT | TRF_SPACE | TRF_SURF, 50);
+  double pcost =
+      tr_solve_cell(t, e, i, j, TRF_DIST | TRF_STRAIGHT | TRF_SPACE | TRF_SURF, 50);
   if (t->don) { /* adoption (vc3d commit semantics): a candidate that
                  * lands within same_surface_th of a same-winding donor
                  * takes the donor's exact geometry before refinement */
     double q[3], dwnd;
     double *P = t->pos + k * 3;
-    int di = tr_don_closest(t->don, P, TR_FUS_TH, q, &dwnd);
+    int di = tr_don_closest(t->don, P, TR_FUS_TH, q, &dwnd, NULL);
     if (di >= 0 &&
         !(t->uc && dwnd > -1e29 &&
           fabs(dwnd - (double)t->wind[k]) > TR_FUS_WIND_TH)) {
@@ -3850,6 +3968,22 @@ static bool tr_place_cand(r3d_tracer *t, tr_env *e, uint32_t cell, unsigned *rng
                             * the winding frame) */
     int sup = tr_don_support(t->don, fp, (double)t->wind[k], t->uc != NULL);
     t->dsup[k] = (uint8_t)(sup > 255 ? 255 : sup);
+    /* consensus gate (G6, vc3d GrowSurface commit path): fused growth
+     * exists to inherit the donors; a cell no donor vouches for AND whose
+     * solve stayed expensive is deferred — back to EMPTY (retryable, and
+     * re-offered when its neighbourhood improves or inl_th anneals down),
+     * never permanent geometry that seeds the next generation. */
+    if (sup == 0 && pcost > t->inl_th) {
+      pthread_mutex_lock(&t->mu);
+      t->state[k] = R3D_TR_EMPTY;
+      if (t->gen_of) t->gen_of[k] = 0;
+      if (t->nset) t->nset--;
+      for (uint32_t s2 = 0; s2 < dsnap_n; s2++)
+        memcpy(t->pos + (size_t)dsnap_k[s2] * 3, dsnap + (size_t)s2 * 3,
+               3 * sizeof(double));
+      pthread_mutex_unlock(&t->mu);
+      return false;
+    }
   }
   bool zclamp = t->cfg.z_max > t->cfg.z_min &&
                 (fp[2] < t->cfg.z_min || fp[2] > t->cfg.z_max);
@@ -4305,7 +4439,7 @@ static void tr_qc_donor(r3d_tracer *t) {
     if (!tr_qc_ok(t, (int)(k % t->W), (int)(k / t->W))) continue;
     tried++;
     double q[3], dwnd;
-    if (tr_don_closest(t->don, t->pos + k * 3, rad, q, &dwnd) < 0) continue;
+    if (tr_don_closest(t->don, t->pos + k * 3, rad, q, &dwnd, NULL) < 0) continue;
     double s = 0;
     for (int a = 0; a < 3; a++) {
       double dd = t->pos[k * 3 + (size_t)a] - q[a];
@@ -4933,6 +5067,7 @@ static void *tr_worker(void *ud) {
                        * winding prior joins the big solves */
     tr_spiral_flag(t);
     tr_don_register(t);
+    tr_don_members(t); /* refresh donor uv membership + fold veto */
     tr_sfx_build(t); /* refresh the self-overlap index (pool is idle) */
     tr_wind_relax(t, 30); /* winding follows the moved cells; werr = the
                            * wrong-wrap detector (clamps conf when on) */
@@ -4979,6 +5114,25 @@ static void *tr_worker(void *ud) {
         for (uint32_t f = 0; f < nsub && !t->quit; f++)
           tr_local_opt(t, &cenv, (int)(cands[f] % W), (int)(cands[f] / W), 8, 3, true);
       }
+    }
+    if (t->don && nnew == 0 && t->inl_th > 2.0 && gens_run < budget && !t->quit) {
+      /* fringe starved under the consensus gate: anneal the threshold and
+       * reseed the fringe from every boundary SET cell (vc3d curr_best_
+       * inl_th schedule) instead of terminating */
+      t->inl_th = t->inl_th > 12.0 ? t->inl_th - 2.0 : (t->inl_th > 4.0 ? t->inl_th - 2.0 : 2.0);
+      nnew = 0;
+      for (uint32_t jr = 1; jr + 1 < H; jr++)
+        for (uint32_t ir = 1; ir + 1 < W; ir++) {
+          size_t kr = (size_t)jr * W + ir;
+          if (t->state[kr] != R3D_TR_SET) continue;
+          bool edge2 = false;
+          for (int o = 0; o < 8 && !edge2; o++)
+            if (t->state[(size_t)((int)jr + n8[o][1]) * W + (size_t)((int)ir + n8[o][0])] == R3D_TR_EMPTY)
+              edge2 = true;
+          if (edge2) nfringe[nnew++] = (uint32_t)kr;
+        }
+      printf("tracer: fusion gate annealed to %.0f, fringe reseeded (%u cells)\n",
+             t->inl_th, nnew);
     }
     memcpy(fringe, nfringe, (size_t)nnew * sizeof *fringe);
     nf = nnew;
@@ -5195,6 +5349,7 @@ int r3d_tracer_start_fused(r3d_tracer *t, const char *pred_root,
                            const char *const *donor_dirs, uint32_t ndonors) {
   memset(t, 0, sizeof *t);
   for (uint32_t a = 0; a < R3D_TR_MAX_ANCHORS; a++) t->anc_cell[a] = -1;
+  t->inl_th = 20.0; /* fusion consensus gate, annealed on fringe starve */
   t->cfg = *cfg;
   if (t->cfg.max_ring < 4) t->cfg.max_ring = 4;
   if (t->cfg.max_ring > (t->cfg.rib_rows ? 40000u : 400u)) 
@@ -5230,10 +5385,13 @@ int r3d_tracer_start_fused(r3d_tracer *t, const char *pred_root,
     if (t->don) {
       t->ndon = ((tr_dons *)t->don)->n;
       t->dsup = calloc((size_t)t->W * t->H, 1);
-      if (!t->dsup) {
+      t->dcell_id = malloc((size_t)t->W * t->H);
+      t->dcell_uv = calloc((size_t)t->W * t->H * 2, sizeof *t->dcell_uv);
+      if (!t->dsup || !t->dcell_id || !t->dcell_uv) {
         r3d_tracer_free(t);
         return -1;
       }
+      memset(t->dcell_id, 0xff, (size_t)t->W * t->H); /* -1 = none */
     }
   }
   pthread_mutex_init(&t->mu, NULL);
@@ -5513,6 +5671,13 @@ int r3d_tracer_grow(r3d_tracer *t, uint32_t extra) {
   free(t->werr);
   t->werr = calloc((size_t)NW * NW, sizeof *t->werr);
   t->dsup = nd;
+  if (t->dcell_id) {
+    free(t->dcell_id);
+    free(t->dcell_uv);
+    t->dcell_id = malloc((size_t)NW * NW);
+    t->dcell_uv = calloc((size_t)NW * NW * 2, sizeof *t->dcell_uv);
+    if (t->dcell_id) memset(t->dcell_id, 0xff, (size_t)NW * NW);
+  }
   free(t->gen_of);
   t->gen_of = ng2;
   t->W = t->H = NW;
@@ -5564,6 +5729,8 @@ void r3d_tracer_free(r3d_tracer *t) {
   free(t->reopt_nrm);
   free(t->gen_of);
   free(t->grow_mask);
+  free(t->dcell_id);
+  free(t->dcell_uv);
   free(t->dsup);
   free(t->uc);
   tr_sfx_free(t->sfx);
@@ -5949,14 +6116,14 @@ int r3d_tracer_fusion_selftest(void) {
   {
     double q[3], wnd;
     double p[3] = {35.0, 42.0, 53.0};
-    int di = tr_don_closest(dn, p, TR_FUS_PULL, q, &wnd);
+    int di = tr_don_closest(dn, p, TR_FUS_PULL, q, &wnd, NULL);
     if (di != 0 || fabs(q[0] - 35.0) > 1e-6 || fabs(q[1] - 42.0) > 1e-6 ||
         fabs(q[2] - 50.0) > 1e-6)
       goto out;
     if (wnd > -1e29) goto out; /* not registered yet: no winding */
     dn->d[0].woff = 2.0;
     dn->d[0].woff_ok = true;
-    di = tr_don_closest(dn, p, TR_FUS_PULL, q, &wnd);
+    di = tr_don_closest(dn, p, TR_FUS_PULL, q, &wnd, NULL);
     if (di != 0 || fabs(wnd - (35.0 / 20.0 * 0.05 + 2.0)) > 1e-4) goto out;
     /* support: on-surface within threshold, winding-gated */
     double ps[3] = {35.0, 42.0, 51.0};
