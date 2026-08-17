@@ -1866,3 +1866,28 @@ recorded before any behavior change.
 - G12b (hr resample through donor parameterisation) NOT ported: our
   fused traces run at the donors' own step (20), so there is no
   resolution to recover; revisit if coarse-step fused tracing lands.
+
+## Tracer improvement plan, phase 6 (save/inpaint/pipeline)
+
+- G8: enclosed holes are re-solved at trace finish with the real loss
+  stack — membrane as initial guess only, then a staged data-term ramp
+  (geometry -> snap 0.1 -> full), conf recomputed so evidence-free fill
+  stays under the save cutoff. Save-time fill now (a) never re-seats
+  tear-cut cells (it used to undo the wrong-wrap safety check applied
+  lines above), and (b) fills only ENCLOSED holes — rim low-conf cells
+  stay honest holes instead of membrane extrapolations into the unknown.
+- G15: saves refuse patches with < 64 trusted cells (a noise-seeded run
+  must not leave a plausible tifxyz that later loads as a donor); planes
+  crop to the kept bbox + 2 with grid_offset recorded in meta (a 12-gen
+  74x74 grid now saves as 30x30); anchor count in meta.
+- G14: normal-grid store metadata — `sparse-volume` parsed and every
+  slice query/prefetch snapped to the published stride (against an N=4
+  store, 3 of 4 queries used to hit nonexistent files cached as "known
+  missing", leaving those cells with NO data term); multiscale format
+  detected (level-0 path, warning) instead of dying silently.
+- Bench: fused rows hold at folds 0-2 / kinks 11-20 / slant 0.15;
+  raw medians improved again (kinks median ~22 across 9 raw rows, two
+  thread-scheduling outliers remain).
+- G16 items landed earlier or deferred: seed-exit requirement already in
+  the crossing scan; rollback/lateral-registration/dv-drift measured as
+  follow-ups once a p343 umbilicus exists.

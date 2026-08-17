@@ -457,6 +457,8 @@ typedef struct ng_vol {
   char root[1200];  /* local cache dir (<pred_root>/ngrids) */
   char url[1400];   /* remote base; empty = local only */
   double spiral_step;
+  int sparse;       /* slice stride of the store (1 = dense) */
+  char lvldir[8];   /* multiscale: "0/" level directory, else "" */
   bool active;
   void *curl;
   uint64_t net_cool;
@@ -484,6 +486,11 @@ typedef struct ng_vol {
 } ng_vol;
 
 static const char *ng_plane_dir[3] = {"xy", "xz", "yz"};
+
+/* G14: sparse stores publish every Nth slice; querying the in-between
+ * slices hits nonexistent files that get cached as "known missing" and
+ * the data term dies silently. Snap every requested slice to the grid. */
+static inline int ng_snap(const struct ng_vol *v, int slice);
 
 static size_t ng_curl_write(const void *data, size_t sz, size_t nm, void *ud) {
   FILE *f = ud;
@@ -556,6 +563,17 @@ static void ng_open(ng_vol *v, const char *pred_root) {
     (void)mn;
     const char *ss = strstr(mj, "\"spiral-step\"");
     v->spiral_step = ss ? strtod(ss + 14, NULL) : 20.0;
+    const char *sv2 = strstr(mj, "\"sparse-volume\"");
+    v->sparse = sv2 ? atoi(sv2 + 16) : 1;
+    if (v->sparse < 1) v->sparse = 1;
+    if (strstr(mj, "\"normal-grid-multiscale\"")) {
+      /* multiscale store: use the native level (0); its per-level
+       * metadata may rescale coordinates, which we do not support yet */
+      snprintf(v->lvldir, sizeof v->lvldir, "0/");
+      printf("tracer: multiscale normal-grid store: using level 0\n");
+    }
+    if (v->sparse > 1)
+      printf("tracer: sparse normal-grid store (every %d slices)\n", v->sparse);
     v->active = true;
     printf("tracer: normal grids active (%s, spiral-step %.1f)\n",
            v->url[0] ? v->url : v->root, v->spiral_step);
@@ -567,6 +585,11 @@ static void ng_open(ng_vol *v, const char *pred_root) {
           v->nfth++;
     }
   }
+}
+
+static inline int ng_snap(const ng_vol *v, int slice) {
+  if (v->sparse <= 1) return slice;
+  return (int)((long)(slice + v->sparse / 2) / v->sparse * v->sparse);
 }
 
 static uint32_t ng_ih(int plane, int slice) {
@@ -637,7 +660,7 @@ static void ng_close(ng_vol *v) {
  * .missing sentinel) now exists. */
 static int ng_fetch_file(ng_vol *v, CURL *c, int plane, int slice, bool sync) {
   char dir[1300], path[1500], miss[1520];
-  snprintf(dir, sizeof dir, "%s/%s", v->root, ng_plane_dir[plane]);
+  snprintf(dir, sizeof dir, "%s/%s%s", v->root, v->lvldir, ng_plane_dir[plane]);
   snprintf(path, sizeof path, "%s/%06d.grid", dir, slice);
   snprintf(miss, sizeof miss, "%s.missing", path);
   struct stat st;
@@ -650,7 +673,7 @@ static int ng_fetch_file(ng_vol *v, CURL *c, int plane, int slice, bool sync) {
   char tmp[1600], url[1600];
   snprintf(tmp, sizeof tmp, "%s.tmp.%ld.%lx", path, (long)getpid(),
            (unsigned long)(uintptr_t)c);
-  snprintf(url, sizeof url, "%s/%s/%06d.grid", v->url, ng_plane_dir[plane], slice);
+  snprintf(url, sizeof url, "%s/%s%s/%06d.grid", v->url, v->lvldir, ng_plane_dir[plane], slice);
   FILE *tf = fopen(tmp, "wb");
   if (!tf) return -1;
   curl_easy_setopt(c, CURLOPT_URL, url);
@@ -715,6 +738,7 @@ static void ng_prefetch_reset(ng_vol *v) { /* let a new generation re-ask */
 
 static void ng_prefetch(ng_vol *v, int plane, int slice) {
   if (!v->nfth || plane < 0 || slice < 0) return;
+  slice = ng_snap(v, slice);
   uint64_t key = 1u + (((uint64_t)(unsigned)plane << 32) | (unsigned)slice);
   uint32_t h = (uint32_t)(key * 0x9E3779B97F4A7C15ull >> 40) & 8191u;
   pthread_mutex_lock(&v->fmu);
@@ -752,7 +776,7 @@ static ng_grid *ng_get(ng_vol *v, int plane, int slice, int *slot_out) {
   }
   pthread_mutex_unlock(&v->gmu);
   char path[1500];
-  snprintf(path, sizeof path, "%s/%s/%06d.grid", v->root, ng_plane_dir[plane], slice);
+  snprintf(path, sizeof path, "%s/%s%s/%06d.grid", v->root, v->lvldir, ng_plane_dir[plane], slice);
   double tt0 = tr_now();
   ng_grid *g = ng_grid_load(path);
   if (!g) { /* sync fetch the one we need; prefetch its neighborhood */
@@ -1003,6 +1027,7 @@ static ng_hood *ng_hood_get(tr_env *e, ng_grid *g, int plane, int slice, double 
 
 /* env-level grid handle cache: refs released by tr_env_flush */
 static ng_grid *ng_eget(tr_env *e, int plane, int slice, int *slot_out) {
+  slice = ng_snap(e->ngv, slice); /* sparse store: snap to published */
   for (uint32_t i = 0; i < e->gcn; i++)
     if (e->gc[i].plane == plane && e->gc[i].slice == slice) {
       *slot_out = e->gc[i].slot;
@@ -4563,6 +4588,89 @@ static void tr_wind_relax(r3d_tracer *t, int iters) {
   free(w1);
 }
 
+/* G8 (vc3d inpaint): enclosed holes (FAIL cells the growth left inside
+ * the patch) are re-solved with the REAL loss stack instead of being
+ * membrane-filled blind at save time. Membrane = initial guess only
+ * (vc3d's masked_blur role); then the data term ramps in over three
+ * staged passes so the fill finds the sheet instead of cutting through a
+ * neighbouring wrap; conf is recomputed afterwards so a hole that found
+ * no evidence stays below the save cutoff. Coordinator-only. */
+static void tr_inpaint(r3d_tracer *t, tr_env *e) {
+  size_t n = (size_t)t->W * t->H;
+  uint8_t *blocked = malloc(n), *ext = malloc(n);
+  uint32_t *holes = malloc(n * sizeof *holes);
+  uint32_t nh = 0;
+  if (!blocked || !ext || !holes) goto out;
+  for (size_t k = 0; k < n; k++) blocked[k] = t->state[k] == R3D_TR_SET;
+  tr_flood_exterior(t->W, t->H, blocked, ext);
+  for (size_t k = 0; k < n; k++)
+    if (!blocked[k] && !ext[k]) holes[nh++] = (uint32_t)k;
+  if (!nh || nh > t->nset / 5) goto out; /* none, or something is wrong */
+  /* membrane seed over the hole set (anchored on SET neighbours) */
+  pthread_mutex_lock(&t->mu);
+  for (uint32_t h = 0; h < nh; h++) { /* first guess: neighbour average */
+    uint32_t k = holes[h];
+    int i = (int)(k % t->W), j = (int)(k / t->W);
+    double avg[3] = {0, 0, 0};
+    int na = 0;
+    for (int dj = -1; dj <= 1; dj++)
+      for (int di = -1; di <= 1; di++) {
+        if (!tr_valid(t, i + di, j + dj)) continue;
+        const double *q = t->pos + ((size_t)(j + dj) * t->W + (size_t)(i + di)) * 3;
+        for (int a = 0; a < 3; a++) avg[a] += q[a];
+        na++;
+      }
+    if (na)
+      for (int a = 0; a < 3; a++) t->pos[(size_t)k * 3 + (size_t)a] = avg[a] / na;
+  }
+  for (uint32_t h = 0; h < nh; h++) {
+    uint32_t k = holes[h];
+    t->state[k] = R3D_TR_SET;
+    if (t->gen_of) t->gen_of[k] = t->cur_gen ? t->cur_gen : 1;
+    t->nset++;
+  }
+  pthread_mutex_unlock(&t->mu);
+  for (int it = 0; it < 32; it++) { /* relax the membrane */
+    for (uint32_t h = 0; h < nh; h++) {
+      uint32_t k = holes[h];
+      int i = (int)(k % t->W), j = (int)(k / t->W);
+      double avg[3] = {0, 0, 0};
+      int na = 0;
+      static const int o4[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+      for (int o = 0; o < 4; o++) {
+        if (!tr_valid(t, i + o4[o][0], j + o4[o][1])) continue;
+        const double *q =
+            t->pos + ((size_t)(j + o4[o][1]) * t->W + (size_t)(i + o4[o][0])) * 3;
+        for (int a = 0; a < 3; a++) avg[a] += q[a];
+        na++;
+      }
+      if (na >= 2)
+        for (int a = 0; a < 3; a++) t->pos[(size_t)k * 3 + (size_t)a] = avg[a] / na;
+    }
+  }
+  { /* staged data-term ramp: geometry only -> weak snap -> full */
+    static const double sched[3][3] = {{0.3, 0.1, -1.0}, {0.3, 0.1, 0.1}, {1, 1, 1}};
+    for (int pass = 0; pass < 3 && !t->quit; pass++) {
+      e->ws_dist = sched[pass][0];
+      e->ws_straight = sched[pass][1];
+      e->ws_snap = sched[pass][2];
+      for (int sweep = 0; sweep < 3; sweep++)
+        for (uint32_t h = 0; h < nh && !t->quit; h++)
+          tr_solve_cell(t, e, (int)(holes[h] % t->W), (int)(holes[h] / t->W),
+                        TRF_ALL, 4);
+    }
+    e->ws_dist = e->ws_straight = e->ws_snap = 0.0;
+  }
+  for (uint32_t h = 0; h < nh; h++) /* honest confidence for the fills */
+    tr_update_conf(t, e, (int)(holes[h] % t->W), (int)(holes[h] / t->W));
+  printf("tracer: inpainted %u enclosed hole cell%s (data-term ramp)\n", nh,
+         nh == 1 ? "" : "s");
+out:
+  free(blocked);
+  free(ext);
+  free(holes);
+}
+
 /* Generation boundary (pool idle): adopt a staged anchor set and assign
  * each anchor to the nearest SET cell within the capture radius. Distant
  * anchors stay unassigned and are retried every generation, so an anchor
@@ -5237,6 +5345,8 @@ static void *tr_worker(void *ud) {
   }
   /* final polish: one bounded pass so late cells see settled neighbors */
   if (!t->quit) tr_local_opt(t, &cenv, x0, y0, (int)W + (int)H, 4, true);
+  if (!t->quit) tr_inpaint(t, &cenv); /* re-solve enclosed holes with the
+                                       * real losses (G8) */
   tr_wind_relax(t, 30);
   tr_qc(t); /* final QC state for the panel + log */
   printf("tracer: QC %u folds, %u kinks, twist %.2f | area %.3g vx2, "
@@ -5786,6 +5896,7 @@ int r3d_tracer_save(r3d_tracer *t, const char *dir, float cutoff, bool fill) {
    * is mis-seated (usually a wrong-wrap capture in ambiguous data) — an
    * honest hole beats a committed discontinuity */
   uint8_t *keep = malloc(n);
+  uint8_t *torn = calloc(n, 1);
   if (keep) {
     double lim = 1.75 * t->cfg.step;
     for (uint64_t k = 0; k < n; k++) {
@@ -5803,7 +5914,10 @@ int r3d_tracer_save(r3d_tracer *t, const char *dir, float cutoff, bool fill) {
           double dd = t->pos[k * 3 + (size_t)a] - t->pos[k2 * 3 + (size_t)a];
           d2 += dd * dd;
         }
-        if (d2 > lim * lim) keep[k] = 0;
+        if (d2 > lim * lim) {
+          keep[k] = 0;
+          if (torn) torn[k] = 1; /* wrong-wrap capture: never re-seated */
+        }
       }
     }
     /* infill: an isolated low-conf cell whose neighbors are trusted and
@@ -5835,9 +5949,22 @@ int r3d_tracer_save(r3d_tracer *t, const char *dir, float cutoff, bool fill) {
                                            * further infill) */
     }
     if (fill) {
-      /* no holes: every grown cell gets a point. Unkept cells (low conf
-       * or tear-cut) are re-seated by membrane interpolation anchored on
-       * kept neighbors — smooth continuation instead of a skip. */
+      /* no holes: every ENCLOSED grown cell gets a point (G8 gate). Rim
+       * low-conf cells stay honest holes (a membrane there extrapolates
+       * into the unknown), and tear-cut cells are never re-seated: the
+       * tear mask deliberately removed them as wrong-wrap captures and a
+       * data-blind membrane would sew the wrap back in. */
+      uint8_t *ext = malloc(n);
+      if (ext) {
+        uint8_t *blocked = malloc(n);
+        if (blocked) {
+          for (uint64_t k = 0; k < n; k++) blocked[k] = keep[k] != 0;
+          tr_flood_exterior(t->W, t->H, blocked, ext);
+          free(blocked);
+        } else {
+          memset(ext, 0, n);
+        }
+      }
       double *fp = malloc(n * 3 * sizeof *fp);
       if (fp) {
         memcpy(fp, t->pos, n * 3 * sizeof *fp);
@@ -5868,44 +5995,88 @@ int r3d_tracer_save(r3d_tracer *t, const char *dir, float cutoff, bool fill) {
           if (moved < 0.01 * (double)n) break;
         }
         for (uint64_t k = 0; k < n; k++)
-          if (!keep[k] && t->state[k] == R3D_TR_SET) {
+          if (!keep[k] && t->state[k] == R3D_TR_SET && !(torn && torn[k]) &&
+              !(ext && ext[k])) {
             memcpy(t->pos + k * 3, fp + k * 3, 3 * sizeof(double));
-            keep[k] = 3; /* filled */
+            keep[k] = 3; /* filled (enclosed, untorn) */
           }
         free(fp);
       }
+      free(ext);
     }
   }
+  /* min-size gate + bbox crop (G15, vc3d min_area/vc_tifxyz_trim): a
+   * seed that landed in noise must not leave a plausible tifxyz behind
+   * that later gets loaded as a donor, and the grid is 2*max_ring+50
+   * wide so an early-stopped run otherwise ships a large all-invalid
+   * margin. Crop to the kept bbox + 2 and record grid_offset. */
+  uint64_t nkept = 0;
+  uint32_t cb[4] = {t->W, t->H, 0, 0};
+  for (uint64_t k = 0; k < n; k++) {
+    bool kp = keep ? keep[k] != 0
+                   : t->state[k] == R3D_TR_SET && t->conf[k] >= cutoff;
+    if (!kp) continue;
+    nkept++;
+    uint32_t i = (uint32_t)(k % t->W), j = (uint32_t)(k / t->W);
+    if (i < cb[0]) cb[0] = i;
+    if (j < cb[1]) cb[1] = j;
+    if (i > cb[2]) cb[2] = i;
+    if (j > cb[3]) cb[3] = j;
+  }
+  if (nkept < 64) {
+    pthread_mutex_unlock(&t->mu);
+    free(keep);
+    free(torn);
+    free(pl);
+    printf("tracer: refusing to save %llu-point patch (< 64 trusted cells)\n",
+           (unsigned long long)nkept);
+    return -2;
+  }
+  uint32_t ci0 = cb[0] > 2 ? cb[0] - 2 : 0, cj0 = cb[1] > 2 ? cb[1] - 2 : 0;
+  uint32_t ci1 = cb[2] + 2 < t->W ? cb[2] + 2 : t->W - 1;
+  uint32_t cj1 = cb[3] + 2 < t->H ? cb[3] + 2 : t->H - 1;
+  uint32_t cw = ci1 - ci0 + 1, ch = cj1 - cj0 + 1;
   for (int a = 0; a < 3 && rc == 0; a++) {
-    for (uint64_t k = 0; k < n; k++)
-      pl[k] = (keep ? keep[k]
-                    : t->state[k] == R3D_TR_SET && t->conf[k] >= cutoff)
-                  ? (float)t->pos[k * 3 + (size_t)a]
-                  : -1.0f;
+    for (uint32_t j = 0; j < ch; j++)
+      for (uint32_t i = 0; i < cw; i++) {
+        size_t k = (size_t)(cj0 + j) * t->W + (size_t)(ci0 + i);
+        pl[(size_t)j * cw + i] =
+            (keep ? keep[k] : t->state[k] == R3D_TR_SET && t->conf[k] >= cutoff)
+                ? (float)t->pos[k * 3 + (size_t)a]
+                : -1.0f;
+      }
     char path[1200];
     snprintf(path, sizeof path, "%s/%s", dir, nm[a]);
-    rc = tr_write_plane(path, pl, t->W, t->H);
+    rc = tr_write_plane(path, pl, cw, ch);
   }
   if (rc == 0 && t->uc && t->wind) { /* winding channel (vc3d ecosystem:
                                       * float winding per cell, NAN off) */
-    for (uint64_t k = 0; k < n; k++)
-      pl[k] = (keep ? keep[k] != 0
-                    : t->state[k] == R3D_TR_SET && t->conf[k] >= cutoff)
-                  ? t->wind[k]
-                  : -1e30f; /* invalid marker (validity lives in x.tif;
-                             * NAN is unusable under -ffast-math) */
+    for (uint32_t j = 0; j < ch; j++)
+      for (uint32_t i = 0; i < cw; i++) {
+        size_t k = (size_t)(cj0 + j) * t->W + (size_t)(ci0 + i);
+        pl[(size_t)j * cw + i] =
+            (keep ? keep[k] != 0
+                  : t->state[k] == R3D_TR_SET && t->conf[k] >= cutoff)
+                ? t->wind[k]
+                : -1e30f; /* invalid marker (validity lives in x.tif;
+                           * NAN is unusable under -ffast-math) */
+      }
     char path[1200];
     snprintf(path, sizeof path, "%s/winding.tif", dir);
-    rc = tr_write_plane(path, pl, t->W, t->H);
+    rc = tr_write_plane(path, pl, cw, ch);
   }
   if (rc == 0 && t->gen_of) { /* generation stamps: the rewind substrate */
-    for (uint64_t k = 0; k < n; k++) pl[k] = (float)t->gen_of[k];
+    for (uint32_t j = 0; j < ch; j++)
+      for (uint32_t i = 0; i < cw; i++)
+        pl[(size_t)j * cw + i] =
+            (float)t->gen_of[(size_t)(cj0 + j) * t->W + (size_t)(ci0 + i)];
     char path[1200];
     snprintf(path, sizeof path, "%s/generations.tif", dir);
-    rc = tr_write_plane(path, pl, t->W, t->H);
+    rc = tr_write_plane(path, pl, cw, ch);
   }
   pthread_mutex_unlock(&t->mu);
   free(keep);
+  free(torn);
   free(pl);
   if (rc != 0) return -1;
   char mp[1200];
@@ -5923,13 +6094,14 @@ int r3d_tracer_save(r3d_tracer *t, const char *dir, float cutoff, bool fill) {
           "\"slant_p95\": %.4f, \"wrap_frac\": %.4f, \"werr_p95\": %.4f},\n"
           "  \"donor_qc\": {\"mean\": %.2f, \"rms\": %.2f, \"p95\": %.2f, "
           "\"coverage\": %.3f},\n"
+          "  \"grid_offset\": [%u, %u],\n  \"anchors\": %u,\n"
           "  \"max_gen\": %u\n}\n",
           sc, sc, t->ndon, t->qc_area_vx2, t->qc_bbox[0], t->qc_bbox[1],
           t->qc_bbox[2], t->qc_bbox[3], (double)t->qc_fill, (double)t->qc_hole,
           t->qc_folds, t->qc_kinks, (double)t->qc_twist, (double)t->qc_slant_p95,
           (double)t->qc_wrap_frac, (double)t->qc_werr_p95,
           (double)t->qc_don_mean, (double)t->qc_don_rms, (double)t->qc_don_p95,
-          (double)t->qc_don_cov, t->gens_done);
+          (double)t->qc_don_cov, ci0, cj0, t->nanc, t->gens_done);
   fclose(mf);
   if (t->sp_valid) { /* spiral model, for fusion / winding registration */
     snprintf(mp, sizeof mp, "%s/spiral.json", dir);
