@@ -385,6 +385,16 @@ float vol_sample(float3 p, float lod) {
 
 bool is_ortho() { return (pc.view_flags & 1u) != 0u; }
 
+void store_px(uint2 opix, uint2 lp, bool half, float4 c) {
+  out_image[opix] = c;
+  if (half) {
+    bool xin = lp.x + 1u < pc.viewport.x, yin = lp.y + 1u < pc.viewport.y;
+    if (xin) out_image[opix + uint2(1, 0)] = c;
+    if (yin) out_image[opix + uint2(0, 1)] = c;
+    if (xin && yin) out_image[opix + uint2(1, 1)] = c;
+  }
+}
+
 float2 pix_ndc(uint2 pix) {
   float2 uv = (float2(pix) + 0.5) / float2(pc.viewport);
   return float2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
@@ -416,13 +426,18 @@ float2 box_hit(float3 o, float3 d, float3 lo, float3 hi) {
 // Workgroup size: 16x8 = one Adreno wave (subgroup 128). An 8x8 variant is
 // built alongside for the occupancy sweep (R3D_WG env; docs/measured.md).
 #ifndef WG_X
+#define R3D_VIEW_HALF 32u
 #define WG_X 16
 #define WG_Y 8
 #endif
 
 [shader("compute")]
 [numthreads(WG_X, WG_Y, 1)]
-void main(uint3 tid: SV_DispatchThreadID) {
+void main(uint3 tid_in: SV_DispatchThreadID) {
+  /* half-res interaction mode: each thread owns a 2x2 pixel block, traces
+   * the ray through its centre and stores to all four pixels */
+  bool half = (pc.view_flags & 32u) != 0u; /* R3D_VIEW_HALF */
+  uint3 tid = half ? uint3(tid_in.xy * 2u, 0) : tid_in;
   if (tid.x >= pc.viewport.x || tid.y >= pc.viewport.y) return;
   uint2 opix = tid.xy + uint2(pc.view_org & 0xffffu, pc.view_org >> 16);
 
@@ -440,7 +455,7 @@ void main(uint3 tid: SV_DispatchThreadID) {
     float4 bg = float4(0.02, 0.02, 0.03, 1);
     float2 txy = (fu - float2(pc.slab_x0, pc.slab_y0)) / pc.slab_px; /* texel coords */
     if (txy.x < 0.0 || txy.y < 0.0 || txy.x >= pc.slab_nx || txy.y >= pc.slab_ny) {
-      out_image[opix] = bg;
+      store_px(opix, tid.xy, half, bg);
       return;
     }
     float L = float(pc.slab_wz);
@@ -451,7 +466,7 @@ void main(uint3 tid: SV_DispatchThreadID) {
     float lo = clamp(center - halfd, 0.0, L);
     float hi = clamp(center + halfd, 0.0, L);
     if (lo >= hi) {
-      out_image[opix] = bg;
+      store_px(opix, tid.xy, half, bg);
       return;
     }
     if ((pc.view_flags & 8u) != 0u) {
@@ -468,7 +483,7 @@ void main(uint3 tid: SV_DispatchThreadID) {
       float4 cv0 = surf_coords.Load(int3(gi - int2(0, 1), 0));
       float4 cv1 = surf_coords.Load(int3(gi + int2(0, 1), 0));
       if (min(min(cu0.w, cu1.w), min(cv0.w, cv1.w)) < 0.5) {
-        out_image[opix] = bg;
+        store_px(opix, tid.xy, half, bg);
         return;
       }
       float su = length(cu1.xyz - cu0.xyz) * 0.5 * pc.vol_tx;
@@ -483,7 +498,7 @@ void main(uint3 tid: SV_DispatchThreadID) {
                                           float3(1.0 / pc.slab_nx, 1.0 / pc.slab_ny,
                                                  1.0 / L),
                                       0).r;
-      out_image[opix] = float4(col * (0.5 + 0.5 * ct), 1);
+      store_px(opix, tid.xy, half, float4(col * (0.5 + 0.5 * ct), 1));
       return;
     }
     float dt = max(pc.step_voxels, 0.25); /* layers per step (1 layer = 1 texel) */
@@ -530,14 +545,14 @@ void main(uint3 tid: SV_DispatchThreadID) {
                              : float3(mip_max * pc.density);
     if (!composite && overlay_on())
       color = lerp(color, overlay_color(), saturate(ink_max * pc.overlay_gain));
-    out_image[opix] = float4(color, 1);
+    store_px(opix, tid.xy, half, float4(color, 1));
     return;
   }
 
   float3 dir = ray_dir(tid.xy);
 
   if (pc.mode == MODE_RAYDIR) {
-    out_image[opix] = float4(dir * 0.5 + 0.5, 1);
+    store_px(opix, tid.xy, half, float4(dir * 0.5 + 0.5, 1));
     return;
   }
 
@@ -612,7 +627,7 @@ void main(uint3 tid: SV_DispatchThreadID) {
   float2 hit = box_hit(ro, dir, box_lo, box_hi);
   float tn = max(hit.x, t_lo), tf_ = min(hit.y, t_hi);
   if (tn >= tf_) {
-    out_image[opix] = float4(0.02, 0.02, 0.03, 1); // background
+    store_px(opix, tid.xy, half, float4(0.02, 0.02, 0.03, 1)); // background
     return;
   }
 
@@ -886,5 +901,5 @@ void main(uint3 tid: SV_DispatchThreadID) {
     color = float3(mip_max * pc.density);
     if (overlay_on()) color = lerp(color, overlay_color(), saturate(ink_max * pc.overlay_gain));
   }
-  out_image[opix] = float4(color, 1);
+  store_px(opix, tid.xy, half, float4(color, 1));
 }

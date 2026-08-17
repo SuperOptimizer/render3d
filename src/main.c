@@ -1101,6 +1101,7 @@ int main(int argc, char **argv) {
   float cam0[5] = {0.5f, 0.5f, -1.5f, 0.0f, 0.0f}; /* pos, yaw, pitch */
   bool no_vsync = false;
   bool headless = false; /* --headless: no window/swapchain, offscreen only */
+  bool mv_exercise_moving = false; /* R3D_MV_EXERCISE drives views without input events */
   double run_seconds = 0.0; /* --seconds S: exit after S s of wall time (with --frames: whichever first) */
   float lowcut0 = 0.0f;
   const char *bench = NULL; /* scripted camera path: orbit | zoom | fly */
@@ -1940,6 +1941,7 @@ int main(int argc, char **argv) {
         mv[i].ph = lay[i].ph;
       }
       if (getenv("R3D_MV_EXERCISE")) {
+        mv_exercise_moving = true; /* counts as interaction (adaptive res) */
         /* automated GUI interaction for profiling: scrub slices, wiggle
          * zoom and pan — drives overlay recompute, surfvol re-bakes and
          * streaming exactly like a user session, reproducibly */
@@ -2458,13 +2460,41 @@ int main(int argc, char **argv) {
     /* adaptive resolution: drop to half res while interacting (4x fewer
      * rays), snap back to full once the camera settles */
     bool moving = in.dragging || in.captured || in.wheel != 0.0f || in.zdelta || in.zpage ||
-                  z_navigated || auto_scroll ||
+                  z_navigated || auto_scroll || mv_exercise_moving ||
                   in.move[0] != 0.0f || in.move[1] != 0.0f || in.move[2] != 0.0f;
     settle = moving ? 15 : (settle > 0 ? settle - 1 : 0);
     bool half_res = adaptive_res && settle > 0 && !multiview_path;
+    /* multiview: panes render one ray per 2x2 block while interacting and
+     * snap back to full when the view settles (the pane cache keys on the
+     * flag, so the settle frame redraws at full resolution) */
+    /* Only worth it when the GPU is actually loaded: at light loads (1080p,
+     * ~1 ms frames) the GPU is clock-gated and 4x fewer rays measured no
+     * faster, while 4K interaction gained 30-70%. Gate on the smoothed GPU
+     * frame time (R3D_MV_HALF_MS overrides the 5 ms budget). */
+    static double mv_half_ms = -1.0;
+    if (mv_half_ms < 0.0) {
+      const char *hm = getenv("R3D_MV_HALF_MS");
+      mv_half_ms = hm ? atof(hm) : 4.0;
+    }
+    static bool mv_half_latch = false; /* hysteresis: half frames measure cheaper */
+    {
+      double gms = (double)prof.gpu_ns * 1e-6;
+      if (!mv_half_latch && gms > mv_half_ms) {
+        mv_half_latch = true;
+        if (getenv("R3D_MV_HALF_LOG")) fprintf(stderr, "mv: half-res on (gpu %.2f ms)\n", gms);
+      } else if (mv_half_latch && gms < mv_half_ms / 3.0) { /* half frames cost ~1/2-1/3 */
+        mv_half_latch = false;
+        if (getenv("R3D_MV_HALF_LOG")) fprintf(stderr, "mv: half-res off (gpu %.2f ms)\n", gms);
+      }
+    }
+    bool mv_half = adaptive_res && settle > 0 && multiview_path && !getenv("R3D_MV_NO_HALF") &&
+                   mv_half_latch;
+    if (multiview_path && getenv("R3D_MV_FORCE_HALF")) mv_half = true; /* A/B */
     if (getenv("R3D_FORCE_HALF")) half_res = true; /* testing/benching the path */
-    else if (in.screenshot || (total_frames && shot_path && frame_index + 1 >= total_frames))
+    else if (in.screenshot || (total_frames && shot_path && frame_index + 1 >= total_frames)) {
       half_res = false; /* captures always full res */
+      mv_half = false;
+    }
     uint32_t rvw = half_res ? (uint32_t)w / 2 : (uint32_t)w;
     uint32_t rvh = half_res ? (uint32_t)h / 2 : (uint32_t)h;
 
@@ -4078,6 +4108,8 @@ int main(int argc, char **argv) {
         q.slab_depth = (uint32_t)mv_thick;
         vp4[nvp++] = q;
       }
+      if (mv_half)
+        for (uint32_t k = 0; k < nvp; k++) vp4[k].view_flags |= R3D_VIEW_HALF;
       frc = r3d_frame_views(renderer, vp4, nvp, &st);
     } else {
       frc = r3d_frame(renderer, &p, &st);

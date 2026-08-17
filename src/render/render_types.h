@@ -99,6 +99,8 @@ static_assert(sizeof(r3d_frame_params) == 248, "must mirror shader FrameParams")
 #define R3D_VIEW_STRETCH 8u /* surf view: flattening-distortion heatmap */
 #define R3D_VIEW_CROP 16u   /* bricks: clip to the cube at slab_x0/y0/z0,
                              * edge slab_depth voxels (3D pane zoom-crop) */
+#define R3D_VIEW_HALF 32u   /* interaction: one ray per 2x2 block, written to
+                             * all four pixels (dispatch at half size) */
 #define R3D_VIEW_AXIS(a) ((uint32_t)(a) << 8) /* 0=z 1=x 2=y */
 #define R3D_MAX_VIEWS 4u
 

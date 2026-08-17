@@ -6163,6 +6163,10 @@ int r3d_frame_views(r3d_renderer *r, const r3d_frame_params *views, uint32_t nvi
     uint32_t ubo_offset = (uint32_t)((slot * R3D_MAX_VIEWS + v) * r->frame_ubo_stride);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r->pipe_layout, 0, 1, &r->dset,
                             1, &ubo_offset);
+    if (vp->view_flags & R3D_VIEW_HALF) { /* one thread per 2x2 block */
+      vw = (vw + 1) / 2;
+      vh = (vh + 1) / 2;
+    }
     vkCmdDispatch(cmd, (vw + wgx - 1) / wgx, (vh + wgy - 1) / wgy, 1);
   }
   if (st) st->panes_drawn = panes_drawn;
