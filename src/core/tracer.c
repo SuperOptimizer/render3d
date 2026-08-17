@@ -5057,25 +5057,16 @@ static void *tr_worker(void *ud) {
         if (t->cfg.grow_dirs && !(t->cfg.grow_dirs & (1u << o))) continue;
         if (t->grow_mask && !t->grow_mask[k]) continue;
         if (generation > 30) {
-          /* L-shape rule (vc3d GrowSurface): a candidate that closes no
-           * 2x2 block with SET cells is a 1-cell spur the anti-fold term
-           * would otherwise have to fight; left EMPTY it is re-offered
-           * naturally once its neighbourhood fills in */
-          bool closes = false;
-          static const int qo[4][2] = {{0, 0}, {-1, 0}, {0, -1}, {-1, -1}};
-          for (int q = 0; q < 4 && !closes; q++) {
-            int qi = ii + qo[q][0], qj = jj + qo[q][1];
-            closes = true;
-            for (int c = 0; c < 4; c++) {
-              int ci2 = qi + (c & 1), cj2 = qj + (c >> 1);
-              if (ci2 == ii && cj2 == jj) continue;
-              if (!tr_valid(t, ci2, cj2)) {
-                closes = false;
-                break;
-              }
-            }
-          }
-          if (!closes) continue;
+          /* spur rule (vc3d L-shape, adapted): a candidate with a single
+           * SET neighbour is a 1-cell spur the anti-fold term would
+           * otherwise fight; left EMPTY it is re-offered once its
+           * neighbourhood fills in. (The literal close-a-2x2 test blocks
+           * every fresh front column in grow-from-seed mode — a new
+           * column's candidates never have 3 placed quad-mates.) */
+          int nbr2 = 0;
+          for (int o2 = 0; o2 < 8 && nbr2 < 2; o2++)
+            if (tr_valid(t, ii + n8[o2][0], jj + n8[o2][1])) nbr2++;
+          if (nbr2 < 2) continue;
         }
         t->state[k] = R3D_TR_PROC; /* offered once, ever (vc3d) */
         cands[nc++] = (uint32_t)k;
