@@ -64,6 +64,10 @@ typedef struct r3d_cpuvol {
 } r3d_cpuvol;
 
 int r3d_cpuvol_open(r3d_cpuvol *v, const char *root, uint32_t cache_bricks);
+/* allow_predict=false opens a predict tree as plain files only (no
+ * predictor, no recursion) — used by the predictor to read its own output */
+int r3d_cpuvol_open_ex(r3d_cpuvol *v, const char *root, uint32_t cache_bricks,
+                       bool allow_predict);
 void r3d_cpuvol_close(r3d_cpuvol *v);
 
 /* Nearest-neighbor value at base-resolution voxel coords, sampled from

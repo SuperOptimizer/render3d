@@ -1763,3 +1763,13 @@ trace grew on live predictions and the flattened pane received live ink
 predictions at 280x200 .. 800x600 as rings were added. Open: prefetch cells
 ahead of the tracer frontier in parallel with the frontier's own requests;
 coarse LODs (>= L2) of predict trees stay empty.
+
+Resolution follow-up: the bucket pairs m7-L0 with the 8.6/9.4 um ESRF scans
+and m7-L2 with 2.4 um volumes; those m7-L2 trees have the CT's L2 shape as
+their base level (not CT geometry), which render3d cannot load as an overlay.
+Predict trees keep CT geometry with a pred_level (inferred from the CT
+source url's um tag): predict at P from level-P CT, write P and P+1, serve
+finer levels by nearest upsampling of the cell (loaded from the tree's own
+files when already predicted). PHercParis4 2.4 um at P=2: 50 predictions,
+tracer at L2 grew 196 pts in 6 gens (527 s: L2 CT chunk fetches dominate);
+plane views show the sheets via upsampled L1 bricks.

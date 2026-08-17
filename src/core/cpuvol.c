@@ -35,6 +35,11 @@ static int cv_u64_triplet(const char *p, uint64_t out[3]) {
 }
 
 int r3d_cpuvol_open(r3d_cpuvol *v, const char *root, uint32_t cache_bricks) {
+  return r3d_cpuvol_open_ex(v, root, cache_bricks, true);
+}
+
+int r3d_cpuvol_open_ex(r3d_cpuvol *v, const char *root, uint32_t cache_bricks,
+                       bool allow_predict) {
   memset(v, 0, sizeof *v);
   pthread_mutex_init(&v->mu, NULL);
   pthread_mutex_init(&v->io_mu, NULL);
@@ -130,7 +135,9 @@ int r3d_cpuvol_open(r3d_cpuvol *v, const char *root, uint32_t cache_bricks) {
         }
         lp += 9;
       }
-      if (v->url[0] && r3d_surfpred_url(v->url)) {
+      if (v->url[0] && r3d_surfpred_url(v->url) && !allow_predict) {
+        v->url[0] = 0; /* plain file reads of a predict tree */
+      } else if (v->url[0] && r3d_surfpred_url(v->url)) {
         v->sp = malloc(sizeof *v->sp);
         if (!v->sp || r3d_surfpred_open(v->sp, root) != 0) {
           fprintf(stderr, "cpuvol: predict source in %s unusable\n", root);

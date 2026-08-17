@@ -198,8 +198,12 @@ server (`predict://127.0.0.1:9744` + `ct_root`). Use it anywhere a prediction
 tree goes — `--overlay <out>` for the tint, `tracecli <out>` / the GUI tracer
 for growing segments: bricks are predicted on demand from CT blocks (with a
 32-voxel context margin), thresholded like the bucket (p >= 0.2), and cached
-under `<out>/bricks/L0` (+ the L1 parent). Levels >= 2 are not produced, so
-the overlay tint appears once the view is zoomed to L0/L1. Together with
+under `<out>/bricks`. The model's pitch is ~8-9 um, so `mkpredtree` picks the
+CT level to feed it (`pred_level` 0 for the ESRF 8.6/9.4 um scans, 2 for
+2.4 um volumes — the same choice as the bucket's m7-L0 / m7-L2 trees; the
+tracer should run at that level). Finer levels are served by upsampling the
+predicted cell (so the plane-view tint works at any zoom); levels above
+`pred_level`+1 are not produced. Together with
 `--inklive`, a fresh volume goes: empty 2x2 -> trace on live surface
 predictions -> live 2.5D ink on the growing trace.
 
