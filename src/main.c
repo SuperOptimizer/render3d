@@ -51,6 +51,51 @@ static const char PHERC1218_SHARDS[] =
     "20250521120456-8.640um-1.2m-116keV-masked.zarr/0/c";
 enum { PHERC1218_NX = 8192, PHERC1218_NY = 8192, PHERC1218_NZ = 23552 };
 
+/* Full-surface ink map cache: for a SAVED segment the surface is frozen,
+ * so 2.5D ink is deterministic — computed once (tiled, native resolution)
+ * and cached beside the segment store as <store>/<name>.inkmap. Live
+ * per-view inference remains only for changing (tracer) grids. */
+static int inkmap_save(const char *path, const float *m, uint32_t w, uint32_t h,
+                       uint32_t up) {
+  char tmp[1240];
+  snprintf(tmp, sizeof tmp, "%s.tmp", path);
+  FILE *f = fopen(tmp, "wb");
+  if (!f) return -1;
+  uint32_t hdr[4] = {0x494B4E31u /* '1NKI' */, w, h, up};
+  int ok = fwrite(hdr, sizeof hdr, 1, f) == 1 &&
+           fwrite(m, sizeof *m, (size_t)w * h, f) == (size_t)w * h;
+  fclose(f);
+  if (!ok) {
+    remove(tmp);
+    return -1;
+  }
+  remove(path);
+  return rename(tmp, path);
+}
+
+static float *inkmap_load(const char *path, uint32_t *w, uint32_t *h, uint32_t *up) {
+  FILE *f = fopen(path, "rb");
+  if (!f) return NULL;
+  uint32_t hdr[4];
+  float *m = NULL;
+  if (fread(hdr, sizeof hdr, 1, f) == 1 && hdr[0] == 0x494B4E31u && hdr[1] &&
+      hdr[2] && hdr[1] < 32768 && hdr[2] < 32768) {
+    m = malloc((size_t)hdr[1] * hdr[2] * sizeof *m);
+    if (m && fread(m, sizeof *m, (size_t)hdr[1] * hdr[2], f) !=
+                 (size_t)hdr[1] * hdr[2]) {
+      free(m);
+      m = NULL;
+    }
+    if (m) {
+      *w = hdr[1];
+      *h = hdr[2];
+      *up = hdr[3] ? hdr[3] : 1;
+    }
+  }
+  fclose(f);
+  return m;
+}
+
 static int annotation_z0(int z, uint32_t nz, uint32_t depth) {
   int64_t z0 = (int64_t)z - (int64_t)depth / 2;
   int64_t max = (int64_t)nz - depth;
@@ -1130,6 +1175,13 @@ int main(int argc, char **argv) {
   bool inklive_up = false, inklive_have = false;
   bool inklive_show = true; /* GUI toggle: display the ink overlay on the
                              * flattened pane (worker keeps predicting) */
+  /* full-surface ink map state (see inkmap_save/load) */
+  float *inkmap = NULL;
+  uint32_t inkmap_w = 0, inkmap_h = 0, inkmap_up = 1;
+  bool inkmap_have = false, inkmap_uploaded = false, inkmap_job = false;
+  uint32_t im_tx = 0, im_ty = 0, im_ntx = 0, im_nty = 0, im_ts = 0;
+  bool im_req_out = false;
+  char inkmap_path[1200] = "";
   int64_t il_rect[4] = {-1, -1, -1, -1}; /* last requested grid rect */
   int64_t il_view[4] = {-2, -2, -2, -2}; /* rect currently under the view */
   uint32_t il_stable = 0;
@@ -1533,6 +1585,10 @@ int main(int argc, char **argv) {
       r3d_inklive_stop(&inklive);
       inklive_up = false;
       inklive_have = false;
+      free(inkmap);
+      inkmap = NULL;
+      inkmap_have = inkmap_uploaded = inkmap_job = false;
+      im_req_out = false;
     }
     if (inklive_port) { /* live 2.5D ink worker (CT sampled via cpuvol on the
                          * same cache tree; predictions from inkserver.py) */
@@ -1952,6 +2008,25 @@ int main(int argc, char **argv) {
             mv[i].slice = fs;
           }
           inklive_have = false; /* prediction of the previous segment is stale */
+          free(inkmap); /* new surface: drop the old map, try its cache */
+          inkmap = NULL;
+          inkmap_have = inkmap_uploaded = inkmap_job = false;
+          im_req_out = false;
+          inkmap_path[0] = 0;
+          if (seg_store_path && sgc_active[0]) {
+            snprintf(inkmap_path, sizeof inkmap_path, "%s/%s.inkmap", seg_store_path,
+                     sgc_active);
+            uint32_t lw, lh, lup;
+            float *lm = inkmap_load(inkmap_path, &lw, &lh, &lup);
+            if (lm) {
+              inkmap = lm;
+              inkmap_w = lw;
+              inkmap_h = lh;
+              inkmap_up = lup;
+              inkmap_have = true; /* upload happens in the frame loop */
+              printf("inklive: cached ink map found (%ux%u)\n", lw, lh);
+            }
+          }
           if (r3d_tifxyz_valid(mc2) &&
               (mc2[0] >= (float)brick_shape[0] || mc2[1] >= (float)brick_shape[1] ||
                mc2[2] >= (float)brick_shape[2]))
@@ -2322,9 +2397,121 @@ int main(int argc, char **argv) {
          * page-table publication (the only moment the new bricks are actually
          * visible to the bake kernel); the old decode-counter poll here fired
          * a frame early, missed publications, and cost two stats locks/frame */
-        if (inklive_up) { /* live 2.5D ink over the visible grid rect: request
-             * when the view has been stable for ~1s and the rect (or the
-             * traced grid) changed since the last request */
+        if (inklive_up && !inkmap_job && !inkmap_have && getenv("R3D_INKMAP_TEST") &&
+            mv_seg.w > 2 && mv_seg.nvalid > 16) {
+          /* headless test: start the full-map pass as soon as a segment
+           * is up (the GUI button lives in a collapsed panel) */
+          uint32_t iup = (uint32_t)lround(1.0 / (double)mv_seg.sx);
+          if (iup < 1) iup = 1;
+          uint32_t its = R3D_INKLIVE_MAX_PX / iup;
+          its = its > 8 ? its - 8 : 8;
+          inkmap_up = iup;
+          inkmap_w = (mv_seg.w - 1) * iup;
+          inkmap_h = (mv_seg.h - 1) * iup;
+          free(inkmap);
+          inkmap = calloc((size_t)inkmap_w * inkmap_h, sizeof *inkmap);
+          if (inkmap) {
+            im_ts = its;
+            im_ntx = (mv_seg.w - 2) / its + 1;
+            im_nty = (mv_seg.h - 2) / its + 1;
+            im_tx = im_ty = 0;
+            im_req_out = false;
+            inkmap_job = true;
+            printf("inklive: computing full ink map, %ux%u px in %u tiles\n",
+                   inkmap_w, inkmap_h, im_ntx * im_nty);
+          }
+        }
+        if (inklive_up && inkmap_have) {
+          /* a cached full-surface map exists: no live inference at all */
+          if (!inkmap_uploaded &&
+              r3d_surfvol_inkpred(renderer, inkmap, inkmap_w, inkmap_h, 0.0f, 0.0f,
+                                  (float)inkmap_up) == 0) {
+            inkmap_uploaded = true;
+            inklive_have = true;
+            printf("inklive: full ink map displayed (%ux%u)\n", inkmap_w, inkmap_h);
+          }
+          const float *pred; /* drain any stale in-flight prediction */
+          uint32_t d0, d1, d2, d3, d4;
+          if (r3d_inklive_poll(&inklive, &pred, &d0, &d1, &d2, &d3, &d4) &&
+              inkmap_uploaded)
+            r3d_surfvol_inkpred(renderer, inkmap, inkmap_w, inkmap_h, 0.0f, 0.0f,
+                                (float)inkmap_up);
+        } else if (inklive_up && inkmap_job) {
+          /* full-map tile pass: one outstanding request at a time; each
+           * finished tile stitches into the map (margins cropped) and the
+           * partial map re-uploads so progress is visible */
+          uint32_t up = inkmap_up;
+          const uint32_t m = 2; /* context margin, grid cells */
+          if (!im_req_out) {
+            uint32_t c0x = im_tx * im_ts, c0y = im_ty * im_ts;
+            uint32_t c1x = c0x + im_ts, c1y = c0y + im_ts;
+            if (c1x > mv_seg.w - 1) c1x = mv_seg.w - 1;
+            if (c1y > mv_seg.h - 1) c1y = mv_seg.h - 1;
+            uint32_t r0x = c0x > m ? c0x - m : 0, r0y = c0y > m ? c0y - m : 0;
+            uint32_t r1x = c1x + m < mv_seg.w - 1 ? c1x + m : mv_seg.w - 1;
+            uint32_t r1y = c1y + m < mv_seg.h - 1 ? c1y + m : mv_seg.h - 1;
+            uint32_t rw = r1x - r0x, rh = r1y - r0y;
+            float *xyz = malloc((size_t)(rw + 1) * (rh + 1) * 3 * sizeof *xyz);
+            if (xyz && rw && rh) {
+              for (uint32_t cj = 0; cj <= rh; cj++)
+                for (uint32_t ci = 0; ci <= rw; ci++) {
+                  const float *sp = r3d_tifxyz_at(&mv_seg, r0x + ci, r0y + cj);
+                  float *dst = xyz + ((size_t)cj * (rw + 1) + ci) * 3;
+                  if (r3d_tifxyz_valid(sp)) {
+                    dst[0] = sp[0];
+                    dst[1] = sp[1];
+                    dst[2] = sp[2];
+                  } else {
+                    dst[0] = dst[1] = dst[2] = -1.0f;
+                  }
+                }
+              r3d_inklive_request(&inklive, xyz, r0x, r0y, rw, rh, up);
+              im_req_out = true;
+            } else {
+              free(xyz);
+              inkmap_job = false; /* degenerate tile: abort the pass */
+            }
+          }
+          const float *pred;
+          uint32_t pw2, ph2, pi0, pj0, pup;
+          if (im_req_out &&
+              r3d_inklive_poll(&inklive, &pred, &pw2, &ph2, &pi0, &pj0, &pup)) {
+            im_req_out = false;
+            uint32_t c0x = im_tx * im_ts, c0y = im_ty * im_ts;
+            uint32_t c1x = c0x + im_ts, c1y = c0y + im_ts;
+            if (c1x > mv_seg.w - 1) c1x = mv_seg.w - 1;
+            if (c1y > mv_seg.h - 1) c1y = mv_seg.h - 1;
+            for (uint32_t py = c0y * pup; py < c1y * pup && py < inkmap_h; py++) {
+              uint32_t sy = py - pj0 * pup;
+              if (sy >= ph2) continue;
+              for (uint32_t px = c0x * pup; px < c1x * pup && px < inkmap_w; px++) {
+                uint32_t sx2 = px - pi0 * pup;
+                if (sx2 >= pw2) continue;
+                inkmap[(size_t)py * inkmap_w + px] = pred[(size_t)sy * pw2 + sx2];
+              }
+            }
+            r3d_surfvol_inkpred(renderer, inkmap, inkmap_w, inkmap_h, 0.0f, 0.0f,
+                                (float)pup);
+            inklive_have = true;
+            if (++im_tx >= im_ntx) {
+              im_tx = 0;
+              im_ty++;
+            }
+            if (im_ty >= im_nty) { /* done: cache + switch to map mode */
+              inkmap_job = false;
+              inkmap_have = true;
+              inkmap_uploaded = true;
+              if (inkmap_path[0] &&
+                  inkmap_save(inkmap_path, inkmap, inkmap_w, inkmap_h, inkmap_up) == 0)
+                printf("inklive: full ink map saved -> %s\n", inkmap_path);
+            } else {
+              printf("inklive: ink map tile %u/%u\n", im_ty * im_ntx + im_tx,
+                     im_ntx * im_nty);
+            }
+          }
+        } else if (inklive_up) { /* live 2.5D ink over the visible grid rect:
+             * request when the view has been stable for ~1s and the rect
+             * (or the traced grid) changed since the last request */
           uint32_t up = (uint32_t)lround(1.0 / (double)mv_seg.sx);
           if (up < 1) up = 1;
           uint32_t max_cells = R3D_INKLIVE_MAX_PX / up;
@@ -3284,6 +3471,46 @@ int main(int argc, char **argv) {
       }
     if (inklive_up && igCollapsingHeader_TreeNodeFlags("live ink", 0)) {
       igCheckbox("show ink on flattened view", &inklive_show);
+      if (inkmap_have) {
+        igTextDisabled("full ink map: %ux%u (cached, one-time)", inkmap_w, inkmap_h);
+        igSameLine(0, 8);
+        if (igSmallButton("recompute##ink")) {
+          inkmap_have = inkmap_uploaded = false;
+          if (inkmap_path[0]) remove(inkmap_path);
+        }
+      } else if (inkmap_job) {
+        igText("computing full ink map: tile %u/%u", im_ty * im_ntx + im_tx + 1,
+               im_ntx * im_nty);
+      } else if (mv_seg.w > 2 && mv_seg.nvalid > 16) {
+        static bool inkmap_test_fired = false;
+        bool auto_fire = getenv("R3D_INKMAP_TEST") && !inkmap_test_fired;
+        if (auto_fire) inkmap_test_fired = true;
+        if (igButton("compute full ink map (once)", (ImVec2){0, 0}) || auto_fire) {
+          /* whole surface at native resolution, tiled; result cached on
+           * disk so this only ever runs once per saved segment */
+          uint32_t iup = (uint32_t)lround(1.0 / (double)mv_seg.sx);
+          if (iup < 1) iup = 1;
+          uint32_t its = R3D_INKLIVE_MAX_PX / iup;
+          its = its > 8 ? its - 8 : 8; /* room for the context margin */
+          inkmap_up = iup;
+          inkmap_w = (mv_seg.w - 1) * iup;
+          inkmap_h = (mv_seg.h - 1) * iup;
+          free(inkmap);
+          inkmap = calloc((size_t)inkmap_w * inkmap_h, sizeof *inkmap);
+          if (inkmap) {
+            im_ts = its;
+            im_ntx = (mv_seg.w - 2) / its + 1;
+            im_nty = (mv_seg.h - 2) / its + 1;
+            im_tx = im_ty = 0;
+            im_req_out = false;
+            inkmap_job = true;
+            printf("inklive: computing full ink map, %ux%u px in %u tiles\n",
+                   inkmap_w, inkmap_h, im_ntx * im_nty);
+          }
+        }
+        if (sgc_active[0] == 0)
+          igTextDisabled("(unsaved trace: map won't be cached to disk)");
+      }
       igTextDisabled("server 127.0.0.1:%d", inklive_port);
       igTextDisabled("%s", inklive.status);
       if (il_rect[0] >= 0)
@@ -3489,6 +3716,14 @@ int main(int argc, char **argv) {
            * active surf machinery (tiny grids — the upload is trivial; the
            * surfvol rebakes progressively) */
           mv_tr_live_ns = now2;
+          if (inkmap_have || inkmap_job) { /* growing grid: any cached or
+                                            * in-progress map is stale */
+            free(inkmap);
+            inkmap = NULL;
+            inkmap_have = inkmap_uploaded = inkmap_job = false;
+            im_req_out = false;
+            inkmap_path[0] = 0;
+          }
           r3d_tifxyz ts = {.w = mv_tr.W, .h = mv_tr.H};
           ts.sx = ts.sy = (float)(1.0 / mv_tr.cfg.step);
           ts.xyz = malloc((size_t)ts.w * ts.h * 3 * sizeof *ts.xyz);
@@ -4431,6 +4666,7 @@ int main(int argc, char **argv) {
     save_umbilicus(&umbilicus, umbilicus_path, annotation_status);
   r3d_umbilicus_free(&umbilicus);
   if (inklive_up) r3d_inklive_stop(&inklive);
+  free(inkmap);
   if (multiview_path) {
     r3d_tifxyz_free(&mv_seg);
     r3d_segrows_free(&mv_rows);
