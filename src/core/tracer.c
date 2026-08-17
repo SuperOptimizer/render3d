@@ -896,7 +896,7 @@ static inline int tr_geom_terms(void) { /* R3D_GEOM_TERMS=0: A/B the
   int v = atomic_load_explicit(&on, memory_order_relaxed);
   if (v < 0) {
     const char *ev = getenv("R3D_GEOM_TERMS");
-    v = ev ? atoi(ev) : 0; /* planarity term default off (see call site) */
+    v = ev ? atoi(ev) : 1; /* adaptive planarity on (sparse regions only) */
     atomic_store(&on, v);
   }
   return v;
@@ -2678,7 +2678,18 @@ static void tr_res_self(tr_nlsq *acc, const r3d_tracer *t, const double x[3],
         for (uint32_t e = sx->head[tr_sfx_h(sx, cx, cy, cz)]; e; e = sx->next[e - 1]) {
           uint32_t k = sx->cell[e - 1];
           if (k == self_k || t->state[k] != R3D_TR_SET) continue;
-          if (fabs((double)t->wind[k] - wself) < TR_SELF_DW) continue;
+          { /* grid-distance gate (was winding-gated, which silently
+             * DISABLED this hinge in every umbilicus-less session — all
+             * windings read 0 and nothing ever counted as another wrap).
+             * Grid-close cells are the same local sheet patch; anything
+             * grid-far that comes this close in 3D is an overlap — a
+             * neighbouring wrap OR the sheet doubling back on itself,
+             * which the winding gate could never see. */
+            int di2 = abs((int)(k % t->W) - (int)(self_k % t->W));
+            int dj2 = abs((int)(k / t->W) - (int)(self_k / t->W));
+            if (di2 <= 8 && dj2 <= 8) continue;
+          }
+          (void)wself;
           const double *Q = t->pos + (size_t)k * 3;
           double d2 = 0;
           for (int a = 0; a < 3; a++) {
@@ -3460,6 +3471,27 @@ static void tr_eval(tr_ctx *c, const double x[3], tr_nlsq *acc) {
       double D = unit * sqrt((double)(n8[o][0] * n8[o][0] + n8[o][1] * n8[o][1]));
       tr_res_dist(acc, x, tr_at(c, ii, jj, x), D, TR_W_DIST * tr_ws(e->ws_dist));
     }
+  /* sheetness is confidence-adaptive (sparse predictions are where the
+   * front doubles back): where the data term anchors the sheet the
+   * geometry stays supple (a stiff prior held cells ~8 vox off-sheet and
+   * collapsed conf — the measured planarity regression), but where the
+   * predictions run out the sheet's own inertia must take over. Local
+   * evidence = the best confidence in the 4-neighbourhood (the cell's own
+   * conf is 0 during its placement solve). */
+  double stiff = 1.0, sparse = 0.0;
+  {
+    float bc = t->conf[(size_t)j * t->W + (size_t)i];
+    static const int o4s[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+    for (int o = 0; o < 4; o++) {
+      int ii = i + o4s[o][0], jj = j + o4s[o][1];
+      if (!tr_valid(t, ii, jj)) continue;
+      float cn = t->conf[(size_t)jj * t->W + (size_t)ii];
+      if (cn > bc) bc = cn;
+    }
+    sparse = 1.0 - (bc > 1.0f ? 1.0 : (double)bc);
+    if (sparse < 0.0) sparse = 0.0;
+    stiff = 1.0 + 2.0 * sparse; /* up to 3x straightness with no evidence */
+  }
   if (c->flags & TRF_STRAIGHT) {
     static const int ax[4][2] = {{1, 0}, {0, 1}, {1, 1}, {1, -1}};
     for (int a = 0; a < 4; a++)
@@ -3471,7 +3503,7 @@ static void tr_eval(tr_ctx *c, const double x[3], tr_nlsq *acc) {
           continue;
         tr_res_straight(acc, tr_at(c, ai, aj, x), tr_at(c, bi, bj, x),
                         tr_at(c, ci, cj, x), -w0,
-                        TR_W_STRAIGHT * tr_ws(e->ws_straight));
+                        TR_W_STRAIGHT * stiff * tr_ws(e->ws_straight));
         if (a < 2) /* anti-double-back hinge: inert on healthy geometry
                     * (activates only past 90 degrees) */
           tr_res_fold(acc, tr_at(c, ai, aj, x), tr_at(c, bi, bj, x),
@@ -3493,13 +3525,13 @@ static void tr_eval(tr_ctx *c, const double x[3], tr_nlsq *acc) {
         if (ci2 == i && cj2 == j) continue;
         o3[no3++] = tr_at(c, ci2, cj2, x);
       }
-      if (no3 == 3 && tr_geom_terms()) /* DEFAULT OFF: rendered A/B at 60
-          * gens showed this blanket quad stiffness (every quad, every
-          * eval) holds cells ~8 vox off the prediction sheet - conf
-          * collapses below the save cutoff and the surface fragments.
-          * R3D_GEOM_TERMS=1 re-enables for experiments. */
+      if (no3 == 3 && sparse > 0.05 && tr_geom_terms())
+        /* planarity ONLY where evidence is missing: the blanket version
+         * held cells off the sheet everywhere (measured regression); the
+         * adaptive version supplies 2D sheet inertia exactly where the
+         * data term is silent and the front used to curl. */
         tr_res_planar(acc, x, o3[0], o3[1], o3[2],
-                      TR_W_PLANAR * tr_ws(e->ws_straight));
+                      TR_W_PLANAR * 2.0 * sparse * tr_ws(e->ws_straight));
     }
   }
   if (c->flags & TRF_SDIR) {

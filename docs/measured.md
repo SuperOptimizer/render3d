@@ -1925,3 +1925,23 @@ anti-fold hinge stays (inert until 90 degrees), fold placement gate
 stays off, candidate ordering stays on. Net vs pre-plan baseline at
 default settings: comparable coverage, plus all the P0-P6 machinery
 (QC, winding field, corrections, rewind, fusion uv, honest saves).
+
+## Doubling-back fix: winding-free overlap hinge + adaptive sheetness
+
+User report: the front doubles back where surface predictions go
+sparse. Two root causes found:
+1. The self-overlap hinge was winding-gated - in every session without
+   an umbilicus all windings read 0 and the hinge NEVER fired. The
+   anti-double-back defense was silently dead. Now gated by GRID
+   distance: grid-far cells that come 3D-close are an overlap (another
+   wrap OR the sheet folding back), no winding frame needed.
+2. In sparse regions the (correctly) zero data term left growth fully
+   unguided. Geometric stiffness is now confidence-adaptive: straight
+   weight scales up to 3x and the planarity term (previously default
+   off after the off-sheet regression) re-enters at weight
+   TR_W_PLANAR*2*sparse - zero where data anchors the sheet, strong
+   where evidence runs out and inertia must carry the front.
+Bench: 16-gen fill 0.86 -> 0.90 median, holes ~halved, folds mostly 0;
+60-gen folds 46 -> 10 with equal coverage. Twist metric reads higher
+because sparse-region cells now SURVIVE as trusted instead of
+scattering below the cutoff.
