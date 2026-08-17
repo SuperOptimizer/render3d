@@ -173,6 +173,10 @@ void r3d_surfvol_mark(r3d_renderer *r);
  * The bake writes max(overlay, pred) into the window's G channel. */
 int r3d_surfvol_inkpred(r3d_renderer *r, const float *pred, uint32_t w, uint32_t h,
                         float g0u, float g0v, float px_per_grid);
+/* Drop the live prediction: the bake stops sampling it and the window
+ * repaints (surface discarded / replaced — stale ink must not tint the
+ * new surface). The texture itself is reused by the next upload. */
+void r3d_surfvol_inkpred_clear(r3d_renderer *r);
 void r3d_surfvol_params(const r3d_renderer *r, r3d_frame_params *p);
 
 /* Device limit for 3D image dimensions (e.g. the surfvol window's W/H/L). */

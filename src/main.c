@@ -56,12 +56,16 @@ enum { PHERC1218_NX = 8192, PHERC1218_NY = 8192, PHERC1218_NZ = 23552 };
  * and cached beside the segment store as <store>/<name>.inkmap. Live
  * per-view inference remains only for changing (tracer) grids. */
 static int inkmap_save(const char *path, const float *m, uint32_t w, uint32_t h,
-                       uint32_t up) {
+                       uint32_t up, uint32_t gw, uint32_t gh, uint64_t nvalid) {
   char tmp[1240];
   snprintf(tmp, sizeof tmp, "%s.tmp", path);
   FILE *f = fopen(tmp, "wb");
   if (!f) return -1;
-  uint32_t hdr[4] = {0x494B4E31u /* '1NKI' */, w, h, up};
+  /* v2 header carries the source grid's dims + valid-point count so a
+   * map is rejected when the segment under the same name was replaced
+   * (discard + retrace): stale ink must never dress a new surface */
+  uint32_t hdr[8] = {0x494B4E32u /* '2NKI' */, w, h, up, gw, gh,
+                     (uint32_t)(nvalid & 0xffffffffu), (uint32_t)(nvalid >> 32)};
   int ok = fwrite(hdr, sizeof hdr, 1, f) == 1 &&
            fwrite(m, sizeof *m, (size_t)w * h, f) == (size_t)w * h;
   fclose(f);
@@ -73,13 +77,25 @@ static int inkmap_save(const char *path, const float *m, uint32_t w, uint32_t h,
   return rename(tmp, path);
 }
 
-static float *inkmap_load(const char *path, uint32_t *w, uint32_t *h, uint32_t *up) {
+static float *inkmap_load(const char *path, uint32_t *w, uint32_t *h, uint32_t *up,
+                          uint32_t gw, uint32_t gh, uint64_t nvalid) {
   FILE *f = fopen(path, "rb");
   if (!f) return NULL;
-  uint32_t hdr[4];
+  uint32_t hdr[8];
   float *m = NULL;
-  if (fread(hdr, sizeof hdr, 1, f) == 1 && hdr[0] == 0x494B4E31u && hdr[1] &&
+  if (fread(hdr, sizeof hdr, 1, f) == 1 && hdr[0] == 0x494B4E32u && hdr[1] &&
       hdr[2] && hdr[1] < 32768 && hdr[2] < 32768) {
+    uint64_t nv = (uint64_t)hdr[6] | ((uint64_t)hdr[7] << 32);
+    if (hdr[4] != gw || hdr[5] != gh || nv != nvalid) {
+      /* same name, different surface: the segment was replaced */
+      fclose(f);
+      printf("inklive: cached ink map is for a different surface "
+             "(grid %ux%u/%llu vs %ux%u/%llu) - discarding it\n",
+             hdr[4], hdr[5], (unsigned long long)nv, gw, gh,
+             (unsigned long long)nvalid);
+      remove(path);
+      return NULL;
+    }
     m = malloc((size_t)hdr[1] * hdr[2] * sizeof *m);
     if (m && fread(m, sizeof *m, (size_t)hdr[1] * hdr[2], f) !=
                  (size_t)hdr[1] * hdr[2]) {
@@ -2008,6 +2024,8 @@ int main(int argc, char **argv) {
             mv[i].slice = fs;
           }
           inklive_have = false; /* prediction of the previous segment is stale */
+          r3d_surfvol_inkpred_clear(renderer); /* and its texture must not
+                                                * tint the new surface */
           free(inkmap); /* new surface: drop the old map, try its cache */
           inkmap = NULL;
           inkmap_have = inkmap_uploaded = inkmap_job = false;
@@ -2017,7 +2035,8 @@ int main(int argc, char **argv) {
             snprintf(inkmap_path, sizeof inkmap_path, "%s/%s.inkmap", seg_store_path,
                      sgc_active);
             uint32_t lw, lh, lup;
-            float *lm = inkmap_load(inkmap_path, &lw, &lh, &lup);
+            float *lm = inkmap_load(inkmap_path, &lw, &lh, &lup, mv_seg.w,
+                                    mv_seg.h, mv_seg.nvalid);
             if (lm) {
               inkmap = lm;
               inkmap_w = lw;
@@ -2508,7 +2527,8 @@ int main(int argc, char **argv) {
               inkmap_have = true;
               inkmap_uploaded = true;
               if (inkmap_path[0] &&
-                  inkmap_save(inkmap_path, inkmap, inkmap_w, inkmap_h, inkmap_up) == 0)
+                  inkmap_save(inkmap_path, inkmap, inkmap_w, inkmap_h, inkmap_up,
+                              mv_seg.w, mv_seg.h, mv_seg.nvalid) == 0)
                 printf("inklive: full ink map saved -> %s\n", inkmap_path);
             } else {
               printf("inklive: ink map tile %u/%u\n", im_ty * im_ntx + im_tx,
@@ -3673,13 +3693,16 @@ int main(int argc, char **argv) {
            * active surf machinery (tiny grids — the upload is trivial; the
            * surfvol rebakes progressively) */
           mv_tr_live_ns = now2;
-          if (inkmap_have || inkmap_job) { /* growing grid: any cached or
-                                            * in-progress map is stale */
+          if (inkmap_have || inkmap_job || inklive_have) {
+            /* discarded/replaced surface: the old segment's ink (map, job,
+             * and the GPU texture) must all die with it */
             free(inkmap);
             inkmap = NULL;
             inkmap_have = inkmap_uploaded = inkmap_job = false;
             im_req_out = false;
             inkmap_path[0] = 0;
+            inklive_have = false;
+            r3d_surfvol_inkpred_clear(renderer);
           }
           r3d_tifxyz ts = {.w = mv_tr.W, .h = mv_tr.H};
           ts.sx = ts.sy = (float)(1.0 / mv_tr.cfg.step);

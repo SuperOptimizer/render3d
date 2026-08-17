@@ -1834,6 +1834,13 @@ int r3d_surfvol_inkpred(r3d_renderer *r, const float *pred, uint32_t w, uint32_t
   return 0;
 }
 
+void r3d_surfvol_inkpred_clear(r3d_renderer *r) {
+  if (!r->sv.pred_on) return;
+  r->sv.pred_on = false;
+  r3d_surfvol_mark(r); /* re-bake without the prediction channel */
+  r->scene_gen++;
+}
+
 void r3d_surfvol_mark(r3d_renderer *r) {
   /* Residency arrival with an unchanged window mapping: rewriting any texel
    * subset in place is exactly correct, so re-bake progressively (a row band
