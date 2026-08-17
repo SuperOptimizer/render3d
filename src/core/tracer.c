@@ -3988,6 +3988,43 @@ static bool tr_place_cand(r3d_tracer *t, tr_env *e, uint32_t cell, unsigned *rng
   tr_local_opt(t, e, i, j, 3, 3, false);
   const double *fp = t->pos + k * 3; /* the ONLY legitimate hole: the
                                       * point left the scroll volume */
+  { /* fold gate: a placement that STILL leaves a >90-degree turn through
+     * this cell after its radius-1/radius-3 solves is measurably wrong
+     * right now — defer it (EMPTY = retried when the neighbourhood
+     * improves) instead of letting the next generation build on top of a
+     * fold and hold it in place. Growth-never-rejects predates the retry
+     * machinery; with retries, committing a known fold buys nothing. */
+    bool folded = false;
+    static const int ax2[2][2] = {{1, 0}, {0, 1}};
+    for (int a2 = 0; a2 < 2 && !folded; a2++) {
+      int ai = i - ax2[a2][0], aj = j - ax2[a2][1];
+      int ci2 = i + ax2[a2][0], cj2 = j + ax2[a2][1];
+      if (!tr_valid(t, ai, aj) || !tr_valid(t, ci2, cj2)) continue;
+      const double *pa = t->pos + ((size_t)aj * W + (size_t)ai) * 3;
+      const double *pc = t->pos + ((size_t)cj2 * W + (size_t)ci2) * 3;
+      const double *pb = t->pos + k * 3;
+      double d1[3], d2v[3], l1 = 0, l2 = 0, dot = 0;
+      for (int c2 = 0; c2 < 3; c2++) {
+        d1[c2] = pb[c2] - pa[c2];
+        d2v[c2] = pc[c2] - pb[c2];
+        l1 += d1[c2] * d1[c2];
+        l2 += d2v[c2] * d2v[c2];
+        dot += d1[c2] * d2v[c2];
+      }
+      if (l1 > 1e-12 && l2 > 1e-12 && dot / sqrt(l1 * l2) < 0.0) folded = true;
+    }
+    if (folded) {
+      pthread_mutex_lock(&t->mu);
+      t->state[k] = R3D_TR_EMPTY; /* retryable, not FAIL */
+      if (t->gen_of) t->gen_of[k] = 0;
+      if (t->nset) t->nset--;
+      for (uint32_t s2 = 0; s2 < dsnap_n; s2++)
+        memcpy(t->pos + (size_t)dsnap_k[s2] * 3, dsnap + (size_t)s2 * 3,
+               3 * sizeof(double));
+      pthread_mutex_unlock(&t->mu);
+      return false;
+    }
+  }
   tr_wind_assign(t, k, i, j); /* final: settled position */
   if (t->don && t->dsup) { /* consensus count (vc3d inlier vote, gated by
                             * the winding frame) */
@@ -4345,7 +4382,7 @@ static int tr_u64cmp(const void *a, const void *b) {
  * cells to their nearest donor point. The donors are free ground truth —
  * a trace drifting a wrap away from them shows up here first. */
 static void tr_qc_donor(r3d_tracer *t);
-static void tr_qc(r3d_tracer *t) {
+static void tr_qc2(r3d_tracer *t, bool clamp_folds) {
   uint32_t folds = 0, kinks = 0;
   double tw2 = 0.0, area = 0.0;
   size_t ntw = 0, ntrust = 0;
@@ -4379,8 +4416,13 @@ static void tr_qc(r3d_tracer *t) {
         }
         if (l1 < 1e-12 || l2 < 1e-12) continue;
         dot /= sqrt(l1 * l2);
-        if (dot < 0.0) folds++;
-        else if (dot < TR_KINK_COS) kinks++;
+        if (dot < 0.0) {
+          folds++;
+          if (clamp_folds && t->conf[(size_t)j * t->W + (size_t)i] > 0.25f)
+            t->conf[(size_t)j * t->W + (size_t)i] = 0.25f;
+        } else if (dot < TR_KINK_COS) {
+          kinks++;
+        }
       }
       if (tr_qc_ok(t, i + 1, j) && tr_qc_ok(t, i, j + 1) && tr_qc_ok(t, i + 1, j + 1)) {
         const double *p10 = t->pos + ((size_t)j * t->W + (size_t)i + 1) * 3;
@@ -5170,7 +5212,7 @@ static void *tr_worker(void *ud) {
     tr_sfx_build(t); /* refresh the self-overlap index (pool is idle) */
     tr_wind_relax(t, 30); /* winding follows the moved cells; werr = the
                            * wrong-wrap detector (clamps conf when on) */
-    tr_qc(t);        /* refresh the mesh QC counters for the panel */
+    tr_qc2(t, false); /* refresh the mesh QC counters for the panel */
     tr_anc_assign(t); /* adopt/assign user anchors, then re-seat their
                        * neighborhoods so a correction shows immediately
                        * instead of waiting for the every-8th global solve */
@@ -5339,7 +5381,10 @@ static void *tr_worker(void *ud) {
   if (!t->quit) tr_inpaint(t, &cenv); /* re-solve enclosed holes with the
                                        * real losses (G8) */
   tr_wind_relax(t, 30);
-  tr_qc(t); /* final QC state for the panel + log */
+  /* final QC: a >90-degree fold is never legitimate papyrus � surviving
+   * folds are marked untrusted so the save writes an honest hole there
+   * instead of doubled-back geometry */
+  tr_qc2(t, true);
   printf("tracer: QC %u folds, %u kinks, twist %.2f | area %.3g vx2, "
          "bbox %ux%u, fill %.2f, holes %.3f, slant p95 %.3f\n",
          t->qc_folds, t->qc_kinks, (double)t->qc_twist, t->qc_area_vx2,
