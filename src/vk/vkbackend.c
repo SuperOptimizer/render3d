@@ -1622,6 +1622,7 @@ typedef struct sv_push {
   uint32_t x0, y0, z0;
   uint32_t use_pred;
   float pg0u, pg0v, pppg;
+  uint32_t nl; /* layers per column this dispatch */
 } sv_push;
 
 int r3d_surfvol_begin(r3d_renderer *r, uint32_t w, uint32_t h, uint32_t layers,
@@ -5995,8 +5996,10 @@ int r3d_frame_views(r3d_renderer *r, const r3d_frame_params *views, uint32_t nvi
       push.x0 = bands[b].x0;
       push.y0 = bands[b].y0;
       push.z0 = bands[b].z0;
+      push.nl = bands[b].l;
+      /* column kernel: one thread per (x,y), layers looped inside */
       r3d_vkcomp_dispatch(cmd, &r->sv.comp, &push, sizeof push, (bands[b].w + 7) / 8,
-                          (bands[b].h + 7) / 8, (bands[b].l + 3) / 4);
+                          (bands[b].h + 7) / 8, 1);
     }
     sv_baked_now = nband > 0 || shifted;
     r3d_vk_image_barrier(cmd, r->sv.vol.img, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,

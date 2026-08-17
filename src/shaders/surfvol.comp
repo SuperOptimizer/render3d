@@ -8,7 +8,7 @@
  * volume at the view's LOD, rendered afterwards by the surf raycast path. */
 #version 450
 
-layout(local_size_x = 8, local_size_y = 8, local_size_z = 4) in;
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 layout(binding = 0, rg8) uniform writeonly image3D out_vol; /* R=CT G=overlay */
 layout(binding = 1) uniform sampler2D coords;  /* rgba32f: xyz + valid */
@@ -28,17 +28,40 @@ layout(push_constant) uniform Push {
   uint x0, y0, z0;           /* window origin of the band this dispatch covers */
   uint use_pred;             /* live prediction is bound and mapped */
   float pg0u, pg0v, pppg;    /* pred origin (grid coords), pred pixels per grid unit */
+  uint nl;                   /* layers this dispatch bakes per column (from z0) */
 } pc;
 
 const float BR_SLOT = 128.0;
 const uint BR_PAGE_HEADER = 64u;
 
-vec2 bricks_sample(vec3 wp, vec3 shape, float md) {
+/* Per-column brick cache: consecutive layers of one (u,v) column step one
+ * voxel along the normal, so they almost always stay inside the brick the
+ * previous layer resolved. Reuse it (level, brick coord, slot origin) and
+ * only re-walk the page table on a brick change. */
+struct BCache {
+  bool valid;
+  uint scale;
+  uvec3 bc;
+  vec3 so;
+};
+
+vec2 bricks_sample_c(vec3 wp, vec3 shape, inout BCache c) {
   uint nlev = page[0];
   vec3 base_v = clamp(wp, vec3(0.0), max(shape - 0.001, vec3(0.0)));
+  float inv = 1.0 / (float(pc.abpa) * BR_SLOT);
+  if (c.valid) {
+    vec3 lv = base_v / float(c.scale);
+    uvec3 bc = uvec3(lv) >> 7u;
+    if (all(equal(bc, c.bc))) {
+      vec3 bl = clamp(lv - vec3(bc << 7u), vec3(0.5), vec3(127.5));
+      vec3 uvw = (c.so + bl) * inv;
+      float ct = textureLod(atlas, uvw, 0.0).r;
+      float ov = pc.use_ink != 0u ? textureLod(ink, uvw, 0.0).r : 0.0;
+      return vec2(ct, ov);
+    }
+  }
   int desired = int(min(pc.lod, nlev - 1u));
   int last = int(nlev) - 1;
-  float inv = 1.0 / (float(pc.abpa) * BR_SLOT);
   for (uint stp = 0u; stp < 4u; stp++) {
     int li = stp < 3u ? desired + int(stp) : last;
     if (li < 0 || li > last || (stp == 3u && li <= desired + 2)) continue;
@@ -52,23 +75,34 @@ vec2 bricks_sample(vec3 wp, vec3 shape, float md) {
     uint slot = e & 0xFFFFFFu;
     vec3 so = vec3(uvec3(slot % pc.abpa, (slot / pc.abpa) % pc.abpa,
                          slot / (pc.abpa * pc.abpa))) * BR_SLOT;
+    c.valid = true;
+    c.scale = scale;
+    c.bc = bc;
+    c.so = so;
     vec3 bl = clamp(lv - vec3(bc << 7u), vec3(0.5), vec3(127.5));
     vec3 uvw = (so + bl) * inv;
     float ct = textureLod(atlas, uvw, 0.0).r;
     float ov = pc.use_ink != 0u ? textureLod(ink, uvw, 0.0).r : 0.0;
     return vec2(ct, ov);
   }
+  c.valid = false;
   return vec2(0.0);
 }
 
 void main() {
-  uvec3 t = gl_GlobalInvocationID.xyz + uvec3(pc.x0, pc.y0, pc.z0);
-  if (t.x >= pc.W || t.y >= pc.H || t.z >= pc.L) return;
+  /* one thread per (u,v) column: the coords/normal bilerp + normalize is
+   * done once, then the band's layers are walked with a brick cache (the
+   * previous kernel redid the 8 RGBA32F fetches and a 4-level page walk for
+   * every one of up to 128 layers of the same column) */
+  uvec2 t = gl_GlobalInvocationID.xy + uvec2(pc.x0, pc.y0);
+  if (t.x >= pc.W || t.y >= pc.H) return;
+  uint z1 = min(pc.z0 + pc.nl, pc.L);
   float fu = pc.u0 + (float(t.x) + 0.5) * pc.step;
   float fv = pc.v0 + (float(t.y) + 0.5) * pc.step;
   vec2 g = vec2(fu * pc.sx, fv * pc.sy); /* grid coords */
   ivec2 dim = textureSize(coords, 0);
-  vec2 v = vec2(0.0);
+  bool ok = false;
+  vec3 wp0 = vec3(0.0), nrm = vec3(0.0);
   if (g.x >= 0.0 && g.y >= 0.0 && g.x <= float(dim.x - 1) && g.y <= float(dim.y - 1)) {
     ivec2 i0 = min(ivec2(g), dim - 2);
     vec2 fr = g - vec2(i0);
@@ -77,31 +111,43 @@ void main() {
     vec4 c01 = texelFetch(coords, i0 + ivec2(0, 1), 0);
     vec4 c11 = texelFetch(coords, i0 + ivec2(1, 1), 0);
     if (min(min(c00.w, c10.w), min(c01.w, c11.w)) >= 0.5) {
-      vec3 wp = mix(mix(c00.xyz, c10.xyz, fr.x), mix(c01.xyz, c11.xyz, fr.x), fr.y);
+      wp0 = mix(mix(c00.xyz, c10.xyz, fr.x), mix(c01.xyz, c11.xyz, fr.x), fr.y);
       vec3 n00 = texelFetch(normals, i0, 0).xyz;
       vec3 n10 = texelFetch(normals, i0 + ivec2(1, 0), 0).xyz;
       vec3 n01 = texelFetch(normals, i0 + ivec2(0, 1), 0).xyz;
       vec3 n11 = texelFetch(normals, i0 + ivec2(1, 1), 0).xyz;
-      vec3 nrm = mix(mix(n00, n10, fr.x), mix(n01, n11, fr.x), fr.y);
+      nrm = mix(mix(n00, n10, fr.x), mix(n01, n11, fr.x), fr.y);
       float nl = length(nrm);
       if (nl > 1e-4) {
-        wp += nrm / nl * (pc.zoff0 + (float(t.z) - float(pc.nback)) * pc.lstep);
-        vec3 shape = vec3(page[1], page[2], page[3]);
-        float md = max(shape.x, max(shape.y, shape.z));
-        if (all(greaterThanEqual(wp, vec3(0.0))) && all(lessThan(wp, shape)))
-          v = bricks_sample(wp, shape, md);
+        nrm /= nl;
+        ok = true;
       }
     }
   }
+  /* live 2.5D ink: one probability per column, painted across every layer
+   * so it survives normal-offset scrubbing (replaces the 3D overlay tint
+   * inside the predicted rect) */
+  float pred = -1.0;
   if (pc.use_pred != 0u) {
-    /* live 2.5D ink: one probability per (u,v) column, painted across all
-     * layers so it survives normal-offset scrubbing */
     vec2 pp = (g - vec2(pc.pg0u, pc.pg0v)) * pc.pppg;
     vec2 psz = vec2(textureSize(inkpred, 0));
     if (pp.x >= 0.0 && pp.y >= 0.0 && pp.x < psz.x && pp.y < psz.y)
-      v.y = textureLod(inkpred, (pp + 0.5) / psz, 0.0).r; /* live ink replaces
-        the 3D overlay inside the predicted rect (a surface-prediction tree
-        would otherwise wash out the readable signal) */
+      pred = textureLod(inkpred, (pp + 0.5) / psz, 0.0).r;
   }
-  imageStore(out_vol, ivec3(t), vec4(v, 0.0, 0.0));
+  vec3 shape = vec3(page[1], page[2], page[3]);
+  BCache bc;
+  bc.valid = false;
+  bc.scale = 1u;
+  bc.bc = uvec3(0u);
+  bc.so = vec3(0.0);
+  for (uint z = pc.z0; z < z1; z++) {
+    vec2 v = vec2(0.0);
+    if (ok) {
+      vec3 wp = wp0 + nrm * (pc.zoff0 + (float(z) - float(pc.nback)) * pc.lstep);
+      if (all(greaterThanEqual(wp, vec3(0.0))) && all(lessThan(wp, shape)))
+        v = bricks_sample_c(wp, shape, bc);
+    }
+    if (pred >= 0.0) v.y = pred;
+    imageStore(out_vol, ivec3(t.x, t.y, z), vec4(v, 0.0, 0.0));
+  }
 }

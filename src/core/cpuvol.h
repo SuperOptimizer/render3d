@@ -73,4 +73,11 @@ uint8_t r3d_cpuvol_at(r3d_cpuvol *v, uint32_t li, double x, double y, double z);
  * this the way vc3d gets interpolator derivatives from autodiff). */
 double r3d_cpuvol_tri(r3d_cpuvol *v, uint32_t li, const double p[3], double grad[3]);
 
+/* Demand-fetch (in parallel, `threads` connections) the cells owning the
+ * listed level-li bricks (x,y,z triples) that are neither cached nor on
+ * disk. Fetched bricks land in the decode cache directly. Returns the
+ * number of cells fetched, or -1. */
+int r3d_cpuvol_prefetch(r3d_cpuvol *v, uint32_t li, const uint32_t *bxyz, uint32_t n,
+                        uint32_t threads);
+
 #endif /* R3D_CPUVOL_H */

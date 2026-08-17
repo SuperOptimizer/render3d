@@ -144,6 +144,80 @@ static uint8_t *il_sample(r3d_inklive *il, const float *xyz, uint32_t rw, uint32
   return img;
 }
 
+/* Cold regions: the sampler used to demand-fetch one cell at a time under
+ * cpuvol's IO lock, stalling every sampler thread. Enumerate the level-0
+ * bricks the surface can touch (corner points, +-11 voxels for the layer
+ * span, so a point near a brick face also pulls its neighbour) and fetch
+ * the missing cells in parallel first. */
+static void il_prefetch(r3d_inklive *il, const float *xyz, uint32_t rw, uint32_t rh) {
+  if (!il->vol.url[0]) return;
+  uint32_t cw = rw + 1, ch = rh + 1;
+  size_t cap = (size_t)cw * ch * 8u;
+  if (cap > 4000000u) cap = 4000000u;
+  uint32_t *list = malloc(cap * 3u * sizeof *list);
+  if (!list) return;
+  uint32_t n = 0;
+  const double span = 11.0; /* (21-1)/2 layers, 1 voxel each */
+  for (uint32_t j = 0; j < ch; j++)
+    for (uint32_t i = 0; i < cw; i++) {
+      const float *p = xyz + ((size_t)j * cw + i) * 3;
+      if (p[0] < 0) continue;
+      /* local normal from grid neighbours (one-sided at the rect edge) so
+       * only bricks along the 21-layer line are pulled, not a whole cube */
+      const float *pu0 = i > 0 ? p - 3 : p, *pu1 = i + 1 < cw ? p + 3 : p;
+      const float *pv0 = j > 0 ? p - (size_t)cw * 3 : p, *pv1 = j + 1 < ch ? p + (size_t)cw * 3 : p;
+      double nrm[3] = {0, 0, 0};
+      if (pu0[0] >= 0 && pu1[0] >= 0 && pv0[0] >= 0 && pv1[0] >= 0) {
+        double du[3], dv[3];
+        for (int a = 0; a < 3; a++) {
+          du[a] = (double)pu1[a] - (double)pu0[a];
+          dv[a] = (double)pv1[a] - (double)pv0[a];
+        }
+        nrm[0] = du[1] * dv[2] - du[2] * dv[1];
+        nrm[1] = du[2] * dv[0] - du[0] * dv[2];
+        nrm[2] = du[0] * dv[1] - du[1] * dv[0];
+        double l = sqrt(nrm[0] * nrm[0] + nrm[1] * nrm[1] + nrm[2] * nrm[2]);
+        if (l > 1e-9)
+          for (int a = 0; a < 3; a++) nrm[a] /= l;
+        else
+          nrm[0] = nrm[1] = nrm[2] = 0;
+      }
+      bool have_n = nrm[0] != 0 || nrm[1] != 0 || nrm[2] != 0;
+      int64_t lo[3], hi[3];
+      for (int a = 0; a < 3; a++) {
+        /* with a normal: the segment p +- span*n; without: a full cube */
+        double e = have_n ? span * fabs(nrm[a]) + 0.5 : span;
+        double v0 = (double)p[a] - e, v1 = (double)p[a] + e;
+        lo[a] = v0 < 0 ? 0 : (int64_t)(v0 / 128.0);
+        hi[a] = v1 < 0 ? 0 : (int64_t)(v1 / 128.0);
+      }
+      for (int64_t bz = lo[2]; bz <= hi[2]; bz++)
+        for (int64_t by = lo[1]; by <= hi[1]; by++)
+          for (int64_t bx = lo[0]; bx <= hi[0]; bx++) {
+            bool dup = false; /* neighbours repeat: check the recent tail
+                               * (the prefetch dedupes by cell anyway) */
+            for (uint32_t k = n > 64 ? n - 64 : 0; k < n; k++)
+              if (list[k * 3] == (uint32_t)bx && list[k * 3 + 1] == (uint32_t)by &&
+                  list[k * 3 + 2] == (uint32_t)bz) {
+                dup = true;
+                break;
+              }
+            if (dup || n >= cap) continue;
+            list[n * 3] = (uint32_t)bx;
+            list[n * 3 + 1] = (uint32_t)by;
+            list[n * 3 + 2] = (uint32_t)bz;
+            n++;
+          }
+    }
+  if (n) {
+    pthread_mutex_lock(&il->mu);
+    snprintf(il->status, sizeof il->status, "prefetching %u bricks...", n);
+    pthread_mutex_unlock(&il->mu);
+    r3d_cpuvol_prefetch(&il->vol, 0, list, n, 12);
+  }
+  free(list);
+}
+
 static void *il_worker(void *ud) {
   r3d_inklive *il = ud;
   uint32_t done_gen = 0;
@@ -163,8 +237,10 @@ static void *il_worker(void *ud) {
     pthread_mutex_unlock(&il->mu);
 
     double t0 = il_now_ms();
+    if (xyz) il_prefetch(il, xyz, rw, rh);
     uint32_t W = 0, H = 0;
     uint8_t *stack = xyz ? il_sample(il, xyz, rw, rh, up, gen, &W, &H) : NULL;
+    double t_sampled = il_now_ms() - t0;
     free(xyz);
     float *pred = NULL;
     if (stack) {
@@ -217,6 +293,8 @@ static void *il_worker(void *ud) {
       il->res_fresh = true;
       il->res_ms = il_now_ms() - t0;
       snprintf(il->status, sizeof il->status, "%ux%u in %.1fs", W, H, il->res_ms / 1e3);
+      printf("inklive: %ux%u prediction in %.1f s (sample %.1f s + infer)\n", W, H,
+             il->res_ms / 1e3, t_sampled / 1e3);
     } else {
       snprintf(il->status, sizeof il->status,
                il->fd < 0 ? "server unreachable (port %d)" : "request failed (port %d)",

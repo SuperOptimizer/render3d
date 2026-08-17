@@ -4,6 +4,7 @@
 #include <curl/curl.h>
 #include <math.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -195,20 +196,87 @@ static int cv_write_file(const char *path, const void *data, size_t n) {
 
 /* Fetch the cell owning brick (bx,by,bz) at level li and write every brick
  * of the cell to <root>/bricks/L<li> (.c5b; empty file = absent/air). */
-static void cv_net_fetch(r3d_cpuvol *v, uint32_t li, uint32_t bx, uint32_t by,
-                         uint32_t bz) {
-  if (!v->url[0] || li >= v->nlev || !v->chsz[li]) return;
+static inline uint32_t cv_hash(uint64_t key) {
+  key ^= key >> 33;
+  key *= 0xff51afd7ed558ccdull;
+  key ^= key >> 33;
+  return (uint32_t)key;
+}
+
+/* hash index maintenance (open addressing, linear probing, backward-shift
+ * deletion so tombstones never accumulate) */
+static int cv_hfind(const r3d_cpuvol *v, uint64_t key) {
+  uint32_t i = cv_hash(key) & v->hmask;
+  for (;;) {
+    uint32_t e = v->hidx[i];
+    if (!e) return -1;
+    if (v->keys[e - 1] == key) return (int)(e - 1);
+    i = (i + 1) & v->hmask;
+  }
+}
+static void cv_hinsert(r3d_cpuvol *v, uint32_t slot) {
+  uint32_t i = cv_hash(v->keys[slot]) & v->hmask;
+  while (v->hidx[i]) i = (i + 1) & v->hmask;
+  v->hidx[i] = slot + 1;
+}
+static void cv_hremove(r3d_cpuvol *v, uint32_t slot) {
+  uint32_t i = cv_hash(v->keys[slot]) & v->hmask;
+  while (v->hidx[i] != slot + 1) {
+    if (!v->hidx[i]) return;
+    i = (i + 1) & v->hmask;
+  }
+  for (;;) { /* backward shift */
+    uint32_t j = (i + 1) & v->hmask;
+    v->hidx[i] = 0;
+    for (;;) {
+      uint32_t e = v->hidx[j];
+      if (!e) return;
+      uint32_t home = cv_hash(v->keys[e - 1]) & v->hmask;
+      /* entry at j may move to i if its home is not in (i, j] cyclically */
+      bool movable = (i <= j) ? (home <= i || home > j) : (home <= i && home > j);
+      if (movable) {
+        v->hidx[i] = e;
+        i = j;
+        break;
+      }
+      j = (j + 1) & v->hmask;
+    }
+  }
+}
+
+static bool cv_neg_hit(const r3d_cpuvol *v, uint64_t key, uint64_t now_s) {
+  uint32_t i = cv_hash(key ^ 0x9e3779b97f4a7c15ull) & (v->nneg - 1u);
+  return v->neg_key[i] == key && v->neg_exp[i] > now_s;
+}
+static void cv_neg_put(r3d_cpuvol *v, uint64_t key, uint64_t exp_s) {
+  uint32_t i = cv_hash(key ^ 0x9e3779b97f4a7c15ull) & (v->nneg - 1u);
+  v->neg_key[i] = key;
+  v->neg_exp[i] = exp_s;
+}
+
+#define CV_NEG_TTL_S 30u /* retry a failed fetch/decode after this long */
+
+static void cv_cache_insert(r3d_cpuvol *v, uint64_t key, const uint8_t *raw);
+
+static CURL *cv_curl_new(void) {
+  CURL *c = curl_easy_init();
+  if (!c) return NULL;
+  curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, cv_curl_write);
+  curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
+  curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 30L);
+  curl_easy_setopt(c, CURLOPT_LOW_SPEED_LIMIT, 1024L);
+  curl_easy_setopt(c, CURLOPT_LOW_SPEED_TIME, 60L);
+  return c;
+}
+
+/* fetch the cell owning brick (bx,by,bz) with a caller-owned CURL handle;
+ * bricks land in the decode cache directly (no encode->decode round trip
+ * for the first use) and in the .c5b disk cache for later sessions */
+static void cv_net_fetch_h(r3d_cpuvol *v, CURL *curl, uint32_t li, uint32_t bx, uint32_t by,
+                           uint32_t bz) {
+  if (!v->url[0] || li >= v->nlev || !v->chsz[li] || !curl) return;
   uint64_t now = (uint64_t)time(NULL);
   if (v->net_cool > now) return;
-  if (!v->curl) {
-    v->curl = curl_easy_init();
-    if (!v->curl) return;
-    curl_easy_setopt(v->curl, CURLOPT_WRITEFUNCTION, cv_curl_write);
-    curl_easy_setopt(v->curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(v->curl, CURLOPT_CONNECTTIMEOUT, 30L);
-    curl_easy_setopt(v->curl, CURLOPT_LOW_SPEED_LIMIT, 1024L);
-    curl_easy_setopt(v->curl, CURLOPT_LOW_SPEED_TIME, 60L);
-  }
   uint32_t chsz = v->chsz[li], cell = cv_cell_dim(chsz), cb = cell / CV_BRICK,
            cc = cell / chsz;
   uint32_t cz = bz / cb, cy = by / cb, cx = bx / cb;
@@ -230,10 +298,10 @@ static void cv_net_fetch(r3d_cpuvol *v, uint32_t li, uint32_t bx, uint32_t by,
         CURLcode crc = CURLE_OK;
         for (int attempt = 0; attempt < 3; attempt++) {
           buf.n = 0;
-          curl_easy_setopt(v->curl, CURLOPT_URL, url);
-          curl_easy_setopt(v->curl, CURLOPT_WRITEDATA, &buf);
-          crc = curl_easy_perform(v->curl);
-          curl_easy_getinfo(v->curl, CURLINFO_RESPONSE_CODE, &code);
+          curl_easy_setopt(curl, CURLOPT_URL, url);
+          curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buf);
+          crc = curl_easy_perform(curl);
+          curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
           if (crc == CURLE_OK && (code == 200 || code == 404)) break;
           sleep((unsigned)(1u << attempt));
         }
@@ -302,6 +370,9 @@ static void cv_net_fetch(r3d_cpuvol *v, uint32_t li, uint32_t bx, uint32_t by,
             cv_write_file(path, NULL, 0);
             continue;
           }
+          cv_cache_insert(v, ((uint64_t)li << 60) | ((uint64_t)obz << 40) |
+                                 ((uint64_t)oby << 20) | obx,
+                          raw);
           c5d_brick_params bp = c5d_brick_defaults(1.0f);
           bp.q = q;
           uint8_t *enc = NULL;
@@ -319,65 +390,102 @@ done:
   free(buf.p);
 }
 
-static inline uint32_t cv_hash(uint64_t key) {
-  key ^= key >> 33;
-  key *= 0xff51afd7ed558ccdull;
-  key ^= key >> 33;
-  return (uint32_t)key;
+static void cv_net_fetch(r3d_cpuvol *v, uint32_t li, uint32_t bx, uint32_t by, uint32_t bz) {
+  if (!v->curl) v->curl = cv_curl_new();
+  cv_net_fetch_h(v, v->curl, li, bx, by, bz);
 }
 
-/* hash index maintenance (open addressing, linear probing, backward-shift
- * deletion so tombstones never accumulate) */
-static int cv_hfind(const r3d_cpuvol *v, uint64_t key) {
-  uint32_t i = cv_hash(key) & v->hmask;
-  for (;;) {
-    uint32_t e = v->hidx[i];
-    if (!e) return -1;
-    if (v->keys[e - 1] == key) return (int)(e - 1);
-    i = (i + 1) & v->hmask;
-  }
-}
-static void cv_hinsert(r3d_cpuvol *v, uint32_t slot) {
-  uint32_t i = cv_hash(v->keys[slot]) & v->hmask;
-  while (v->hidx[i]) i = (i + 1) & v->hmask;
-  v->hidx[i] = slot + 1;
-}
-static void cv_hremove(r3d_cpuvol *v, uint32_t slot) {
-  uint32_t i = cv_hash(v->keys[slot]) & v->hmask;
-  while (v->hidx[i] != slot + 1) {
-    if (!v->hidx[i]) return;
-    i = (i + 1) & v->hmask;
-  }
-  for (;;) { /* backward shift */
-    uint32_t j = (i + 1) & v->hmask;
-    v->hidx[i] = 0;
-    for (;;) {
-      uint32_t e = v->hidx[j];
-      if (!e) return;
-      uint32_t home = cv_hash(v->keys[e - 1]) & v->hmask;
-      /* entry at j may move to i if its home is not in (i, j] cyclically */
-      bool movable = (i <= j) ? (home <= i || home > j) : (home <= i && home > j);
-      if (movable) {
-        v->hidx[i] = e;
-        i = j;
-        break;
+/* insert a decoded/raw brick into the LRU (thread-safe); no-op if present */
+static void cv_cache_insert(r3d_cpuvol *v, uint64_t key, const uint8_t *raw) {
+  pthread_mutex_lock(&v->mu);
+  if (cv_hfind(v, key) < 0) {
+    uint32_t victim = 0;
+    uint64_t oldest = UINT64_MAX;
+    for (uint32_t s2 = 0; s2 < v->nslots; s2++)
+      if (v->use[s2] < oldest) {
+        oldest = v->use[s2];
+        victim = s2;
       }
-      j = (j + 1) & v->hmask;
-    }
+    if (v->keys[victim] != UINT64_MAX) cv_hremove(v, victim);
+    v->keys[victim] = key;
+    memcpy(v->slabs + (size_t)victim * CV_RAW, raw, CV_RAW);
+    cv_hinsert(v, victim);
+    v->use[victim] = ++v->tick;
+    /* a positive result overrides any negative entry for this key */
+    uint32_t ni = cv_hash(key ^ 0x9e3779b97f4a7c15ull) & (v->nneg - 1u);
+    if (v->neg_key[ni] == key) v->neg_key[ni] = UINT64_MAX;
   }
+  pthread_mutex_unlock(&v->mu);
 }
 
-static bool cv_neg_hit(const r3d_cpuvol *v, uint64_t key, uint64_t now_s) {
-  uint32_t i = cv_hash(key ^ 0x9e3779b97f4a7c15ull) & (v->nneg - 1u);
-  return v->neg_key[i] == key && v->neg_exp[i] > now_s;
-}
-static void cv_neg_put(r3d_cpuvol *v, uint64_t key, uint64_t exp_s) {
-  uint32_t i = cv_hash(key ^ 0x9e3779b97f4a7c15ull) & (v->nneg - 1u);
-  v->neg_key[i] = key;
-  v->neg_exp[i] = exp_s;
+/* ---- parallel prefetch of an explicit brick list ---- */
+struct cv_pf {
+  r3d_cpuvol *v;
+  uint32_t li;
+  const uint64_t *cells; /* cz<<40 | cy<<20 | cx */
+  uint32_t n;
+  _Atomic uint32_t next;
+  uint32_t cb;
+};
+static void *cv_pf_thread(void *ud) {
+  struct cv_pf *j = ud;
+  CURL *curl = cv_curl_new();
+  for (;;) {
+    uint32_t i = atomic_fetch_add(&j->next, 1);
+    if (i >= j->n) break;
+    uint64_t c = j->cells[i];
+    uint32_t cx = (uint32_t)(c & 0xfffffu), cy = (uint32_t)((c >> 20) & 0xfffffu),
+             cz = (uint32_t)(c >> 40);
+    cv_net_fetch_h(j->v, curl, j->li, cx * j->cb, cy * j->cb, cz * j->cb);
+  }
+  if (curl) curl_easy_cleanup(curl);
+  return NULL;
 }
 
-#define CV_NEG_TTL_S 30u /* retry a failed fetch/decode after this long */
+int r3d_cpuvol_prefetch(r3d_cpuvol *v, uint32_t li, const uint32_t *bxyz, uint32_t n,
+                        uint32_t threads) {
+  if (!v->url[0] || li >= v->nlev || !v->chsz[li] || !n) return 0;
+  uint32_t chsz = v->chsz[li], cell = cv_cell_dim(chsz), cb = cell / CV_BRICK;
+  if (!cb) return 0;
+  uint64_t *cells = malloc((size_t)n * sizeof *cells);
+  if (!cells) return -1;
+  uint32_t nc = 0;
+  uint64_t now_s = (uint64_t)time(NULL);
+  for (uint32_t i = 0; i < n; i++) {
+    uint32_t bx = bxyz[i * 3], by = bxyz[i * 3 + 1], bz = bxyz[i * 3 + 2];
+    uint64_t key = ((uint64_t)li << 60) | ((uint64_t)bz << 40) | ((uint64_t)by << 20) | bx;
+    pthread_mutex_lock(&v->mu);
+    bool have = cv_hfind(v, key) >= 0 || cv_neg_hit(v, key, now_s);
+    pthread_mutex_unlock(&v->mu);
+    if (have) continue;
+    char path[1400];
+    snprintf(path, sizeof path, "%s/bricks/L%u/%u_%u_%u.c5b", v->root, li, bz, by, bx);
+    struct stat st;
+    if (stat(path, &st) == 0) continue; /* on disk: the sampler decodes it */
+    uint64_t c = ((uint64_t)(bz / cb) << 40) | ((uint64_t)(by / cb) << 20) | (bx / cb);
+    bool dup = false;
+    for (uint32_t k = 0; k < nc && !dup; k++) dup = cells[k] == c;
+    if (!dup) cells[nc++] = c;
+  }
+  if (!nc) {
+    free(cells);
+    return 0;
+  }
+  struct cv_pf job = {.v = v, .li = li, .cells = cells, .n = nc, .cb = cb};
+  atomic_store(&job.next, 0);
+  if (threads < 1) threads = 1;
+  if (threads > 16) threads = 16;
+  if (threads > nc) threads = nc;
+  pthread_t th[16];
+  uint32_t spawned = 0;
+  for (uint32_t t = 0; t + 1 < threads; t++)
+    if (pthread_create(&th[spawned], NULL, cv_pf_thread, &job) == 0) spawned++;
+  cv_pf_thread(&job);
+  for (uint32_t t = 0; t < spawned; t++) pthread_join(th[t], NULL);
+  free(cells);
+  return (int)nc;
+}
+
 
 /* Thread-safe brick lookup. Hits: hash probe under v->mu (tens of ns). Misses:
  * blob IO under v->io_mu (shard readers and the net fetch are not reentrant),
