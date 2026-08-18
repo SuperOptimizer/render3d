@@ -9,6 +9,7 @@
 
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -110,6 +111,24 @@ static float *inkmap_load(const char *path, uint32_t *w, uint32_t *h, uint32_t *
   }
   fclose(f);
   return m;
+}
+
+/* Trace segment name at FINISH time: yyyymmddhhmmss (sorts
+ * chronologically = alphabetically), suffixed -2, -3... when several
+ * traces finish within one second. */
+static void trace_dir_now(char *out, size_t n) {
+  time_t t = time(NULL);
+  struct tm tmv;
+  localtime_r(&t, &tmv);
+  char base[64];
+  strftime(base, sizeof base, "%Y%m%d%H%M%S", &tmv);
+  snprintf(out, n, "cache/traced/%s", base);
+  struct stat st;
+  for (int k = 2; stat(out, &st) == 0 && k < 100; k++) {
+    char tmp[96];
+    snprintf(tmp, sizeof tmp, "cache/traced/%s-%d", base, k);
+    snprintf(out, n, "%s", tmp);
+  }
 }
 
 static int annotation_z0(int z, uint32_t nz, uint32_t depth) {
@@ -3519,8 +3538,8 @@ int main(int argc, char **argv) {
         if (GT->nset > 8 && igButton("save + activate", (ImVec2){0, 0})) {
           r3d_tracer_stop(&GT->tr);
           char td[256];
-          snprintf(td, sizeof td, "cache/traced/trace-%d-%u", ++mv_tr_nsaved,
-                   (unsigned)GT->nset);
+          ++mv_tr_nsaved;
+          trace_dir_now(td, sizeof td);
           char mk[300];
           snprintf(mk, sizeof mk, "mkdir -p '%s'", td);
           if (system(mk) == 0 &&
@@ -3616,8 +3635,30 @@ int main(int argc, char **argv) {
                 pthread_cond_signal(&sgc.cv);
               }
             }
-            if (igCollapsingHeader_TreeNodeFlags("all surfaces", 0))
-              for (uint32_t si = 0; si < sgc.st.n; si++) {
+            if (igCollapsingHeader_TreeNodeFlags("all surfaces", 0)) {
+              /* alphabetical view (timestamp names sort chronologically);
+               * the order array rebuilds when the store size changes */
+              static uint32_t *surf_ord = NULL;
+              static uint32_t surf_ord_n = 0;
+              if (surf_ord_n != sgc.st.n) {
+                free(surf_ord);
+                surf_ord = malloc(sgc.st.n * sizeof *surf_ord);
+                surf_ord_n = surf_ord ? sgc.st.n : 0;
+                if (surf_ord) {
+                  for (uint32_t si = 0; si < sgc.st.n; si++) surf_ord[si] = si;
+                  for (uint32_t a = 1; a < sgc.st.n; a++) { /* insertion sort */
+                    uint32_t v = surf_ord[a], b = a;
+                    while (b > 0 && strcmp(sgc.st.segs[surf_ord[b - 1]].name,
+                                           sgc.st.segs[v].name) > 0) {
+                      surf_ord[b] = surf_ord[b - 1];
+                      b--;
+                    }
+                    surf_ord[b] = v;
+                  }
+                }
+              }
+              for (uint32_t oi3 = 0; oi3 < sgc.st.n; oi3++) {
+                uint32_t si = surf_ord ? surf_ord[oi3] : oi3;
                 bool cur = strcmp(sgc.st.segs[si].name, sgc_active) == 0;
                 char lbl[96];
                 snprintf(lbl, sizeof lbl, "%.64s##s%u", sgc.st.segs[si].name, si);
@@ -3627,6 +3668,7 @@ int main(int argc, char **argv) {
                   pthread_cond_signal(&sgc.cv);
                 }
               }
+            }
             pthread_mutex_unlock(&sgc.mu);
           }
     }
@@ -3910,8 +3952,8 @@ int main(int argc, char **argv) {
         if (!g->active || !g->done || !g->harvest) continue;
         r3d_tracer_stop(&g->tr);
         if (g->nset > 64) {
-          snprintf(saved_names[nharv], sizeof saved_names[0],
-                   "cache/traced/trace-%d-%u", ++mv_tr_nsaved, (unsigned)g->nset);
+          ++mv_tr_nsaved;
+          trace_dir_now(saved_names[nharv], sizeof saved_names[0]);
           char mk[300];
           snprintf(mk, sizeof mk, "mkdir -p '%s'", saved_names[nharv]);
           if (system(mk) == 0 &&
