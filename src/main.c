@@ -1654,7 +1654,7 @@ int main(int argc, char **argv) {
    * sharing cores); exactly ONE (gt_sel) is displayed in the seg pane
    * and receives anchors/refine/rewind/save. The rest grow in the
    * background and are switched to from the panel list. */
-  #define GT_MAX 6
+  #define GT_MAX 8
   struct gtrace {
     r3d_tracer tr;
     bool active, done, live_first;
@@ -1668,10 +1668,14 @@ int main(int argc, char **argv) {
   memset(gts, 0, sizeof gts);
   int gt_sel = 0;
   #define GT (&gts[gt_sel])
-  /* queued seed points ('G' over a plane view), traced together */
-  double mv_seeds[GT_MAX * 3];
+  /* queued seed points ('G' over a plane view). The queue is larger than
+   * the concurrency: up to GT_MAX tracers run at once and the rest of
+   * the queue drains automatically as slots free (discard or
+   * save+activate a finished trace to free its slot). */
+  #define SEEDS_MAX 100
+  double mv_seeds[SEEDS_MAX * 3];
   uint32_t mv_seeds_n = 0;
-  bool mv_seeds_go = false;
+  bool mv_seeds_go = false; /* draining: keep starting as slots free */
   float mv_tr_step = 20.0f, mv_tr_thresh = 0.35f;
   int mv_tr_rings = 60, mv_tr_nsaved = 0;
   bool mv_tr_spiral = true;
@@ -2317,7 +2321,7 @@ int main(int argc, char **argv) {
         /* G over a plane pane = queue a trace seed at the voxel under the
          * cursor; "trace all seeds" grows them concurrently */
         int av = r3d_mv_hit(mv, in.mouse_xy[0], in.mouse_xy[1]);
-        if (av > 0 && !MV_IS3D(av) && av != R3D_MV_SEG && mv_seeds_n < GT_MAX) {
+        if (av > 0 && !MV_IS3D(av) && av != R3D_MV_SEG && mv_seeds_n < SEEDS_MAX) {
           double u, vq, A[3];
           r3d_mv_unproject(&mv[av], in.mouse_xy[0], in.mouse_xy[1], &u, &vq);
           r3d_mv_b2w(mv_pb[av], mv_po[av], u, vq, mv[av].slice, A);
@@ -3282,9 +3286,13 @@ int main(int argc, char **argv) {
           if (gts[ti].active) nact++;
         igTextDisabled("G over a plane view: queue a trace seed");
         if (mv_seeds_n) {
-          igText("%u seed%s queued", mv_seeds_n, mv_seeds_n == 1 ? "" : "s");
+          igText("%u seed%s queued%s", mv_seeds_n, mv_seeds_n == 1 ? "" : "s",
+                 mv_seeds_go ? " (draining as slots free)" : "");
           igSameLine(0, 8);
-          if (igSmallButton("clear##seeds")) mv_seeds_n = 0;
+          if (igSmallButton("clear##seeds")) {
+            mv_seeds_n = 0;
+            mv_seeds_go = false;
+          }
           igSameLine(0, 8);
           if (igButton("trace all seeds", (ImVec2){0, 0})) mv_seeds_go = true;
           (void)nact;
@@ -3806,7 +3814,7 @@ int main(int argc, char **argv) {
     if (getenv("R3D_SEEDS_TEST") && frame_index == 300 && !mv_seeds_n) {
       /* headless: seeds as "x,y,z;x,y,z;..." then trace-all */
       const char *sp2 = getenv("R3D_SEEDS_TEST");
-      while (sp2 && *sp2 && mv_seeds_n < GT_MAX) {
+      while (sp2 && *sp2 && mv_seeds_n < SEEDS_MAX) {
         double *A = mv_seeds + (size_t)mv_seeds_n * 3;
         if (sscanf(sp2, "%lf,%lf,%lf", &A[0], &A[1], &A[2]) == 3) mv_seeds_n++;
         sp2 = strchr(sp2, ';');
@@ -3815,7 +3823,9 @@ int main(int argc, char **argv) {
       if (mv_seeds_n) mv_seeds_go = true;
     }
     if (mv_seeds_go && mv_seeds_n && multiview_path && n_overlays) {
-      mv_seeds_go = false;
+      /* draining queue: start into whatever slots are free this frame and
+       * stay armed until the queue empties (slots free when a finished
+       * trace is discarded or saved) */
       const char *pr = overlay_paths[overlay_sel];
       uint32_t nact = 0;
       for (int ti = 0; ti < GT_MAX; ti++)
@@ -3857,10 +3867,16 @@ int main(int argc, char **argv) {
                 GT->active = GT->pos && GT->st && GT->cf;
               }
             }
-            mv_seeds_n = 0;
-            printf("tracer: growing %u concurrent trace(s)\n", nrun);
+            if (nrun) { /* drop the started seeds; keep the rest queued */
+              memmove(mv_seeds, mv_seeds + (size_t)nrun * 3,
+                      (size_t)(mv_seeds_n - nrun) * 3 * sizeof *mv_seeds);
+              mv_seeds_n -= nrun;
+              printf("tracer: growing %u concurrent trace(s), %u seed%s queued\n",
+                     nrun, mv_seeds_n, mv_seeds_n == 1 ? "" : "s");
+            }
+            if (!mv_seeds_n) mv_seeds_go = false; /* queue drained */
       }
-    } else {
+    } else if (!mv_seeds_n) {
       mv_seeds_go = false;
     }
     for (int ti = 0; ti < GT_MAX; ti++) /* background traces: light poll
