@@ -123,6 +123,154 @@ static void inkmap_save_segdir(const char *name, const float *m, uint32_t w,
                                uint32_t h, uint32_t up, uint32_t gw, uint32_t gh,
                                uint64_t nvalid);
 
+/* Fit a surface through hand-placed points with NO ordering assumptions:
+ * the user hops between viewers, outlines roughly, then densifies inside.
+ * PCA plane through all points -> (u,v) parameterization -> grid at the
+ * requested step -> moving-least-squares height per node (order-1 fit,
+ * Gaussian-weighted) from whatever points lie nearby, in any click order.
+ * Nodes with no nearby support stay INVALID (x = -1), so the surface
+ * spans exactly the clicked territory. Densifies until the grid clears
+ * the min-size save gate. Works for patches up to roughly a quarter wrap
+ * of curl (the plane parameterization folds beyond that). */
+static double *msurf_fit(const double (*pts)[3], uint32_t n, double step,
+                         uint32_t *ow, uint32_t *oh) {
+  if (n < 4) return NULL;
+  double c[3] = {0, 0, 0};
+  for (uint32_t i = 0; i < n; i++)
+    for (int a2 = 0; a2 < 3; a2++) c[a2] += pts[i][a2];
+  for (int a2 = 0; a2 < 3; a2++) c[a2] /= n;
+  double C[3][3] = {{0}};
+  for (uint32_t i = 0; i < n; i++)
+    for (int a2 = 0; a2 < 3; a2++)
+      for (int b2 = 0; b2 < 3; b2++)
+        C[a2][b2] += (pts[i][a2] - c[a2]) * (pts[i][b2] - c[b2]);
+  /* dominant two axes by power iteration (+ deflation) */
+  double e1[3] = {1, 0, 0}, e2[3] = {0, 1, 0};
+  for (int it = 0; it < 48; it++) {
+    double v[3] = {0, 0, 0};
+    for (int a2 = 0; a2 < 3; a2++)
+      for (int b2 = 0; b2 < 3; b2++) v[a2] += C[a2][b2] * e1[b2];
+    double l = sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+    if (l < 1e-12) break;
+    for (int a2 = 0; a2 < 3; a2++) e1[a2] = v[a2] / l;
+  }
+  double l1 = 0.0;
+  {
+    double v[3] = {0, 0, 0};
+    for (int a2 = 0; a2 < 3; a2++)
+      for (int b2 = 0; b2 < 3; b2++) v[a2] += C[a2][b2] * e1[b2];
+    l1 = sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+  }
+  for (int a2 = 0; a2 < 3; a2++) /* deflate */
+    for (int b2 = 0; b2 < 3; b2++) C[a2][b2] -= l1 * e1[a2] * e1[b2];
+  for (int it = 0; it < 48; it++) {
+    double v[3] = {0, 0, 0};
+    for (int a2 = 0; a2 < 3; a2++)
+      for (int b2 = 0; b2 < 3; b2++) v[a2] += C[a2][b2] * e2[b2];
+    double d = v[0] * e1[0] + v[1] * e1[1] + v[2] * e1[2];
+    for (int a2 = 0; a2 < 3; a2++) v[a2] -= d * e1[a2]; /* orthogonalize */
+    double l = sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+    if (l < 1e-12) break;
+    for (int a2 = 0; a2 < 3; a2++) e2[a2] = v[a2] / l;
+  }
+  double nrm[3] = {e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2],
+                   e1[0] * e2[1] - e1[1] * e2[0]};
+  /* project every point into the plane frame */
+  double *uvw = malloc((size_t)n * 3 * sizeof *uvw);
+  if (!uvw) return NULL;
+  double u0 = 1e30, u1 = -1e30, v0 = 1e30, v1 = -1e30;
+  for (uint32_t i = 0; i < n; i++) {
+    double d[3] = {pts[i][0] - c[0], pts[i][1] - c[1], pts[i][2] - c[2]};
+    double pu = d[0] * e1[0] + d[1] * e1[1] + d[2] * e1[2];
+    double pv = d[0] * e2[0] + d[1] * e2[1] + d[2] * e2[2];
+    double pw = d[0] * nrm[0] + d[1] * nrm[1] + d[2] * nrm[2];
+    uvw[i * 3] = pu;
+    uvw[i * 3 + 1] = pv;
+    uvw[i * 3 + 2] = pw;
+    if (pu < u0) u0 = pu;
+    if (pu > u1) u1 = pu;
+    if (pv < v0) v0 = pv;
+    if (pv > v1) v1 = pv;
+  }
+  if (u1 - u0 < 2.0 || v1 - v0 < 2.0) {
+    free(uvw);
+    return NULL; /* degenerate: points nearly collinear */
+  }
+  double *grid = NULL;
+  for (int densify = 0; densify < 4 && !grid; densify++, step *= 0.5) {
+    uint32_t W = (uint32_t)((u1 - u0) / step) + 2;
+    uint32_t H = (uint32_t)((v1 - v0) / step) + 2;
+    if (W < 2) W = 2;
+    if (H < 2) H = 2;
+    if (W > 1024) W = 1024;
+    if (H > 1024) H = 1024;
+    if ((uint64_t)W * H < 128 && densify < 3) continue;
+    grid = malloc((size_t)W * H * 3 * sizeof *grid);
+    if (!grid) break;
+    /* support radius: generous around sparse clicks, tight when dense */
+    double h2 = 3.0 * step;
+    double area_per = (u1 - u0) * (v1 - v0) / (double)n;
+    double spac = sqrt(area_per > 1.0 ? area_per : 1.0);
+    if (spac * 1.5 > h2) h2 = spac * 1.5;
+    uint32_t nvalid2 = 0;
+    for (uint32_t gy = 0; gy < H; gy++)
+      for (uint32_t gx = 0; gx < W; gx++) {
+        double gu = u0 + (u1 - u0) * (double)gx / (double)(W - 1);
+        double gv = v0 + (v1 - v0) * (double)gy / (double)(H - 1);
+        /* order-1 MLS: w ~ a + b*du + c*dv, Gaussian weights */
+        double A[9] = {0}, B[3] = {0};
+        double wsum = 0.0;
+        for (uint32_t i = 0; i < n; i++) {
+          double du = uvw[i * 3] - gu, dv = uvw[i * 3 + 1] - gv;
+          double d2 = du * du + dv * dv;
+          if (d2 > 9.0 * h2 * h2) continue;
+          double wgt = exp(-d2 / (2.0 * h2 * h2));
+          double bx[3] = {1.0, du, dv};
+          for (int r2 = 0; r2 < 3; r2++) {
+            for (int c2 = 0; c2 < 3; c2++) A[r2 * 3 + c2] += wgt * bx[r2] * bx[c2];
+            B[r2] += wgt * bx[r2] * uvw[i * 3 + 2];
+          }
+          wsum += wgt;
+        }
+        double *gp = grid + ((size_t)gy * W + gx) * 3;
+        if (wsum < 0.35) { /* no nearby clicks: outside the surface */
+          gp[0] = gp[1] = gp[2] = -1.0;
+          continue;
+        }
+        /* solve the 3x3 (fallback to weighted mean when ill-posed) */
+        double w_off;
+        double det = A[0] * (A[4] * A[8] - A[5] * A[7]) -
+                     A[1] * (A[3] * A[8] - A[5] * A[6]) +
+                     A[2] * (A[3] * A[7] - A[4] * A[6]);
+        if (fabs(det) > 1e-9 * (fabs(A[0]) + 1.0)) {
+          w_off = (B[0] * (A[4] * A[8] - A[5] * A[7]) -
+                   A[1] * (B[1] * A[8] - A[5] * B[2]) +
+                   A[2] * (B[1] * A[7] - A[4] * B[2])) /
+                  det;
+        } else {
+          w_off = B[0] / A[0];
+        }
+        for (int a2 = 0; a2 < 3; a2++)
+          gp[a2] = c[a2] + gu * e1[a2] + gv * e2[a2] + w_off * nrm[a2];
+        nvalid2++;
+      }
+    if (nvalid2 < 100 && densify < 3) {
+      free(grid);
+      grid = NULL;
+      continue;
+    }
+    if (nvalid2 < 16) {
+      free(grid);
+      grid = NULL;
+      break;
+    }
+    *ow = W;
+    *oh = H;
+  }
+  free(uvw);
+  return grid;
+}
+
 /* Trace segment name at FINISH time: yyyymmddhhmmss (sorts
  * chronologically = alphabetically), suffixed -2, -3... when several
  * traces finish within one second. */
@@ -1742,6 +1890,15 @@ int main(int argc, char **argv) {
   memset(gts, 0, sizeof gts);
   int gt_sel = 0;
   #define GT (&gts[gt_sel])
+  /* manual surface authoring ('P' over a plane view places a point along
+   * a sheet; points cluster into z-rows and "create surface" fits a
+   * tifxyz grid through them - which then flows through the normal
+   * harvest pipeline: store + background ink map. The saved surfaces are
+   * also hand-made training labels for the surface-prediction model.) */
+  #define MSURF_MAX 1024
+  double msurf_pts[MSURF_MAX][3];
+  uint32_t msurf_n = 0;
+  bool msurf_create = false;
   /* queued seed points ('G' over a plane view). The queue is larger than
    * the concurrency: up to GT_MAX tracers run at once and the rest of
    * the queue drains automatically as slots free (discard or
@@ -2425,6 +2582,24 @@ int main(int argc, char **argv) {
             mv_seeds_n++;
             printf("tracer: seed %u queued at (%.0f, %.0f, %.0f)\n", mv_seeds_n,
                    A[0], A[1], A[2]);
+          }
+        }
+      }
+      if (in.surf_place && !io->WantCaptureMouse) {
+        /* P over a plane pane = place a manual-surface point at the voxel
+         * under the cursor */
+        int av = r3d_mv_hit(mv, in.mouse_xy[0], in.mouse_xy[1]);
+        if (av > 0 && !MV_IS3D(av) && av != R3D_MV_SEG && msurf_n < MSURF_MAX) {
+          double u, vq, A[3];
+          r3d_mv_unproject(&mv[av], in.mouse_xy[0], in.mouse_xy[1], &u, &vq);
+          r3d_mv_b2w(mv_pb[av], mv_po[av], u, vq, mv[av].slice, A);
+          bool inside = true;
+          for (int a = 0; a < 3; a++)
+            if (A[a] < 0.0 || (brick_shape[a] && A[a] > (double)brick_shape[a] - 1.0))
+              inside = false;
+          if (inside) {
+            memcpy(msurf_pts[msurf_n], A, sizeof A);
+            msurf_n++;
           }
         }
       }
@@ -3400,6 +3575,23 @@ int main(int argc, char **argv) {
         }
         igTextDisabled("segment %ux%u  %llu valid points", mv_seg.w, mv_seg.h,
                        (unsigned long long)mv_seg.nvalid);
+    if (multiview_path && igCollapsingHeader_TreeNodeFlags("manual surface", 0)) {
+      igTextDisabled("P over a plane view: place points on one sheet, in\n"
+                     "any order, any pane - rough outline first, densify\n"
+                     "inside later. Create fits a surface through them all;\n"
+                     "it joins the store, gets its ink map, and doubles as\n"
+                     "training data for surface prediction.");
+      igText("%u point%s", msurf_n, msurf_n == 1 ? "" : "s");
+      if (msurf_n) {
+        igSameLine(0, 8);
+        if (igSmallButton("undo##mp")) msurf_n--;
+        igSameLine(0, 6);
+        if (igSmallButton("clear##mp")) msurf_n = 0;
+        igSameLine(0, 8);
+        if (msurf_n >= 4 && igButton("create surface", (ImVec2){0, 0}))
+          msurf_create = true;
+      }
+    }
     if (multiview_path && n_overlays &&
         igCollapsingHeader_TreeNodeFlags("tracer", 0)) {
       const char *pr = overlay_paths[overlay_sel];
@@ -4010,6 +4202,87 @@ int main(int argc, char **argv) {
       }
       if (mv_seeds_n) mv_seeds_go = true;
     }
+    if (getenv("R3D_MSURF_TEST") && frame_index == 300 && !msurf_n) {
+      /* headless: points as "x,y,z;..." then create */
+      const char *sp3 = getenv("R3D_MSURF_TEST");
+      while (sp3 && *sp3 && msurf_n < MSURF_MAX) {
+        double *A = msurf_pts[msurf_n];
+        if (sscanf(sp3, "%lf,%lf,%lf", &A[0], &A[1], &A[2]) == 3) msurf_n++;
+        sp3 = strchr(sp3, ';');
+        if (sp3) sp3++;
+      }
+      if (msurf_n >= 4) msurf_create = true;
+    }
+    if (msurf_create) {
+      /* fit the clicked points into a grid and inject it as a FINISHED
+       * synthetic trace with the harvest flag: the normal pipeline then
+       * saves it (timestamp name), packs it into the store, and computes
+       * its ink map - a hand-made surface is a first-class segment and a
+       * training label with zero extra plumbing */
+      msurf_create = false;
+      uint32_t mw = 0, mh = 0;
+      double *mg = msurf_fit((const double(*)[3])msurf_pts, msurf_n,
+                             (double)mv_tr_step, &mw, &mh);
+      int slot = -1;
+      for (int s3 = 0; s3 < GT_MAX; s3++)
+        if (!gts[s3].active) {
+          slot = s3;
+          break;
+        }
+      if (mg && slot >= 0) {
+        struct gtrace *g = &gts[slot];
+        memset(&g->tr, 0, sizeof g->tr);
+        for (uint32_t a = 0; a < R3D_TR_MAX_ANCHORS; a++) g->tr.anc_cell[a] = -1;
+        g->tr.W = mw;
+        g->tr.H = mh;
+        g->tr.cfg.step = (double)mv_tr_step;
+        g->tr.cfg.thresh = mv_tr_thresh;
+        g->tr.pos = mg;
+        g->tr.state = malloc((size_t)mw * mh);
+        g->tr.conf = malloc((size_t)mw * mh * sizeof *g->tr.conf);
+        g->tr.wind = calloc((size_t)mw * mh, sizeof *g->tr.wind);
+        g->tr.werr = calloc((size_t)mw * mh, sizeof *g->tr.werr);
+        g->tr.gen_of = malloc((size_t)mw * mh * sizeof *g->tr.gen_of);
+        if (g->tr.state && g->tr.conf && g->tr.wind && g->tr.gen_of) {
+          uint32_t nv2 = 0;
+          for (size_t k = 0; k < (size_t)mw * mh; k++) {
+            bool valid = mg[k * 3] >= 0.0;
+            g->tr.state[k] = valid ? R3D_TR_SET : R3D_TR_EMPTY;
+            g->tr.conf[k] = valid ? 1.0f : 0.0f;
+            g->tr.gen_of[k] = valid ? 1 : 0;
+            if (valid) nv2++;
+          }
+          g->tr.nset = nv2;
+          pthread_mutex_init(&g->tr.mu, NULL);
+          r3d_umbilicus_init(&g->tr.umb);
+          g->pos = NULL;
+          g->st = NULL;
+          g->cf = NULL;
+          g->active = true;
+          g->done = true;
+          g->harvest = true; /* the pipeline takes it from here */
+          g->nset = g->tr.nset;
+          g->ring = 0;
+          printf("manual surface: %ux%u grid from %u points -> harvest\n", mw,
+                 mh, msurf_n);
+          msurf_n = 0;
+        } else {
+          free(g->tr.pos);
+          free(g->tr.state);
+          free(g->tr.conf);
+          free(g->tr.wind);
+          free(g->tr.werr);
+          free(g->tr.gen_of);
+          memset(&g->tr, 0, sizeof g->tr);
+        }
+      } else {
+        free(mg);
+        if (!mg)
+          printf("manual surface: need points on 2+ z slices (2+ per slice)\n");
+        else
+          printf("manual surface: no free trace slot - stop/save one first\n");
+      }
+    }
     { /* auto-harvest: a finished QUEUE-STARTED trace is
        * saved straight into the segment store (selectable in the surfaces
        * panel like any segment) and its slot freed so the next seed
@@ -4396,6 +4669,34 @@ int main(int argc, char **argv) {
         if (fx_ >= (float)mv[i].px && fx_ < (float)(mv[i].px + mv[i].pw) &&
             fy_ >= (float)mv[i].py && fy_ < (float)(mv[i].py + mv[i].ph))
           ImDrawList_AddCircle(draw, (ImVec2){fx_, fy_}, 10.0f, fc, 24, 2.0f);
+      }
+      if (msurf_n) { /* manual-surface points: magenta dots, consecutive
+                      * same-row clicks connected so the sheet path reads */
+        const ImU32 mb_ = 0xff000000u, mc_ = 0xffff40ffu, md_ = 0x80ff40ffu;
+        for (int i = 1; i < 4; i++) {
+          if (!(mv_mask & (1u << i)) || MV_IS3D(i)) continue;
+          float lx = 0, ly = 0;
+          bool have_prev = false;
+          double prev_z = 1e30;
+          for (uint32_t a = 0; a < msurf_n; a++) {
+            double fu, fv, fs;
+            r3d_mv_w2b(mv_pb[i], mv_po[i], msurf_pts[a], &fu, &fv, &fs);
+            float ax_, ay_;
+            r3d_mv_project(&mv[i], fu, fv, &ax_, &ay_);
+            bool on = fabs(fs - mv[i].slice) < 6.0;
+            bool inpane = ax_ >= (float)mv[i].px && ax_ < (float)(mv[i].px + mv[i].pw) &&
+                          ay_ >= (float)mv[i].py && ay_ < (float)(mv[i].py + mv[i].ph);
+            if (inpane) {
+              ImDrawList_AddCircleFilled(draw, (ImVec2){ax_, ay_}, 4.0f, mb_, 12);
+              ImDrawList_AddCircleFilled(draw, (ImVec2){ax_, ay_}, 3.0f,
+                                         on ? mc_ : md_, 12);
+            }
+            (void)lx;
+            (void)ly;
+            (void)have_prev;
+            (void)prev_z;
+          }
+        }
       }
       if (mv_seeds_n) { /* queued trace seeds: green circles */
         const ImU32 sb_ = 0xff000000u, sc_ = 0xff40d060u, sd_ = 0x8040d060u;

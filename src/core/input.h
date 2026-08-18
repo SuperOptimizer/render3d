@@ -29,6 +29,7 @@ typedef struct r3d_input {
   bool umb_place;    /* U pressed (umbilicus edit: place point at cursor) */
   bool anchor_place; /* X pressed (tracer: drop an anchor at the cursor) */
   bool seed_place;   /* G pressed (tracer: queue a seed at the cursor) */
+  bool surf_place;   /* P pressed (manual surface: place a point) */
   bool undo;         /* Ctrl+Z pressed */
   bool redo;         /* Ctrl+Shift+Z pressed */
   bool annotate_click; /* uncaptured LMB press in annotation mode */
