@@ -1899,6 +1899,8 @@ int main(int argc, char **argv) {
   double msurf_pts[MSURF_MAX][3];
   uint32_t msurf_n = 0;
   bool msurf_create = false;
+  bool msurf_dirty = false; /* re-fit + preview in the flattened view */
+  bool msurf_first = true;  /* fit-to-view on the first preview */
   /* queued seed points ('G' over a plane view). The queue is larger than
    * the concurrency: up to GT_MAX tracers run at once and the rest of
    * the queue drains automatically as slots free (discard or
@@ -2600,6 +2602,8 @@ int main(int argc, char **argv) {
           if (inside) {
             memcpy(msurf_pts[msurf_n], A, sizeof A);
             msurf_n++;
+            msurf_dirty = true; /* live preview follows every point */
+            mv_tr_view = false;
           }
         }
       }
@@ -3584,9 +3588,15 @@ int main(int argc, char **argv) {
       igText("%u point%s", msurf_n, msurf_n == 1 ? "" : "s");
       if (msurf_n) {
         igSameLine(0, 8);
-        if (igSmallButton("undo##mp")) msurf_n--;
+        if (igSmallButton("undo##mp")) {
+          msurf_n--;
+          msurf_dirty = true;
+        }
         igSameLine(0, 6);
-        if (igSmallButton("clear##mp")) msurf_n = 0;
+        if (igSmallButton("clear##mp")) {
+          msurf_n = 0;
+          msurf_first = true;
+        }
         igSameLine(0, 8);
         if (msurf_n >= 4 && igButton("create surface", (ImVec2){0, 0}))
           msurf_create = true;
@@ -4213,6 +4223,81 @@ int main(int argc, char **argv) {
       }
       if (msurf_n >= 4) msurf_create = true;
     }
+    if (msurf_dirty && !msurf_create && msurf_n >= 4 && multiview_path) {
+      /* live preview: re-fit on every placed point and swap the surface
+       * into the flattened pane immediately */
+      msurf_dirty = false;
+      uint32_t pw3 = 0, ph3 = 0;
+      double *pg3 = msurf_fit((const double(*)[3])msurf_pts, msurf_n,
+                              (double)mv_tr_step, &pw3, &ph3);
+      if (pg3) {
+        r3d_tifxyz ts = {.w = pw3, .h = ph3};
+        ts.sx = ts.sy = (float)(1.0 / (double)mv_tr_step);
+        ts.xyz = malloc((size_t)pw3 * ph3 * 3 * sizeof *ts.xyz);
+        if (ts.xyz) {
+          float bb[2][3] = {{1e30f, 1e30f, 1e30f}, {-1e30f, -1e30f, -1e30f}};
+          uint64_t nv = 0;
+          uint32_t gi0 = pw3, gi1 = 0, gj0 = ph3, gj1 = 0;
+          for (size_t k = 0; k < (size_t)pw3 * ph3; k++) {
+            bool ok3 = pg3[k * 3] >= 0.0;
+            for (int a = 0; a < 3; a++)
+              ts.xyz[k * 3 + (size_t)a] = ok3 ? (float)pg3[k * 3 + (size_t)a] : -1.0f;
+            if (ok3) {
+              nv++;
+              for (int a = 0; a < 3; a++) {
+                float vv3 = ts.xyz[k * 3 + (size_t)a];
+                if (vv3 < bb[0][a]) bb[0][a] = vv3;
+                if (vv3 > bb[1][a]) bb[1][a] = vv3;
+              }
+              uint32_t gi = (uint32_t)(k % pw3), gj = (uint32_t)(k / pw3);
+              if (gi < gi0) gi0 = gi;
+              if (gi > gi1) gi1 = gi;
+              if (gj < gj0) gj0 = gj;
+              if (gj > gj1) gj1 = gj;
+            }
+          }
+          memcpy(ts.bbox, bb, sizeof bb);
+          ts.nvalid = nv;
+          float *tco = NULL, *tno = NULL;
+          r3d_segrows trr = {0};
+          if (nv > 4 && r3d_segrows_build(&ts, &trr) == 0 &&
+              mv_build_grids(&ts, &tco, &tno) == 0 &&
+              r3d_surf_swap(renderer, ts.w, ts.h, tco, tno, ts.sx, ts.sy) == 0) {
+            r3d_tifxyz_free(&mv_seg);
+            r3d_segrows_free(&mv_rows);
+            free(mv_normals);
+            mv_seg = ts;
+            mv_rows = trr;
+            mv_normals = tno;
+            snprintf(sgc_active, sizeof sgc_active, "(manual)");
+            for (int oi2 = 0; oi2 < 4; oi2++) {
+              mv_ol[oi2].n = 0;
+              mv_ol_off[oi2].n = 0;
+              mv_ol_slice[oi2] = 1e30;
+            }
+            mv_ol_zoff = 1e30;
+            if (msurf_first) {
+              msurf_first = false;
+              mv[R3D_MV_SEG].cu = ((double)gi0 + gi1) * 0.5;
+              mv[R3D_MV_SEG].cv = ((double)gj0 + gj1) * 0.5;
+              double bw = (double)(gi1 - gi0) + 6.0, bh = (double)(gj1 - gj0) + 6.0;
+              double zx = (double)mv[R3D_MV_SEG].pw / bw;
+              double zy = (double)mv[R3D_MV_SEG].ph / bh;
+              double zf = zx < zy ? zx : zy;
+              double zmax3 = 10.0 / (double)mv_seg.sx;
+              if (zf > zmax3) zf = zmax3;
+              if (zf > 0.05) mv[R3D_MV_SEG].zoom = zf;
+            }
+          } else {
+            r3d_tifxyz_free(&ts);
+            r3d_segrows_free(&trr);
+            free(tno);
+          }
+          free(tco);
+        }
+        free(pg3);
+      }
+    }
     if (msurf_create) {
       /* fit the clicked points into a grid and inject it as a FINISHED
        * synthetic trace with the harvest flag: the normal pipeline then
@@ -4683,7 +4768,11 @@ int main(int argc, char **argv) {
             r3d_mv_w2b(mv_pb[i], mv_po[i], msurf_pts[a], &fu, &fv, &fs);
             float ax_, ay_;
             r3d_mv_project(&mv[i], fu, fv, &ax_, &ay_);
-            bool on = fabs(fs - mv[i].slice) < 6.0;
+            double zd = fabs(fs - mv[i].slice);
+            if (zd >= 3.0) continue; /* points live in a 3x3x3: on this
+                                      * pane only within ~1.5 slices,
+                                      * faint out to 3, gone beyond */
+            bool on = zd < 1.5;
             bool inpane = ax_ >= (float)mv[i].px && ax_ < (float)(mv[i].px + mv[i].pw) &&
                           ay_ >= (float)mv[i].py && ay_ < (float)(mv[i].py + mv[i].ph);
             if (inpane) {
