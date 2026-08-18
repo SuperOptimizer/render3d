@@ -177,6 +177,10 @@ int r3d_surfvol_inkpred(r3d_renderer *r, const float *pred, uint32_t w, uint32_t
  * repaints (surface discarded / replaced — stale ink must not tint the
  * new surface). The texture itself is reused by the next upload. */
 void r3d_surfvol_inkpred_clear(r3d_renderer *r);
+/* Whether the flattened bake samples the 3D overlay atlas: true for ink
+ * overlay trees, false for surface-prediction trees (which must never
+ * dress the flattened segment). */
+void r3d_surfvol_overlay_enable(r3d_renderer *r, bool enable);
 void r3d_surfvol_params(const r3d_renderer *r, r3d_frame_params *p);
 
 /* Device limit for 3D image dimensions (e.g. the surfvol window's W/H/L). */

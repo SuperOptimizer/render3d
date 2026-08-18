@@ -169,6 +169,10 @@ struct r3d_renderer {
   r3d_brlod_reader *ink_readers;
   r3d_vkimage ink_atlas;
   bool ink_active;
+  bool sv_use_overlay; /* include the 3D overlay atlas in the flattened
+                        * bake (true for ink trees; false for surface-
+                        * prediction trees, which must never dress the
+                        * flattened segment) */
   /* net ingest: on a brick miss, fetch the owning RAW zarr chunk from
    * source.json's URL, transcode its bricks to c5d and cache them under
    * <root>/bricks/L<l>/<z>_<y>_<x>.c5b (empty file = absent upstream) —
@@ -1832,6 +1836,13 @@ int r3d_surfvol_inkpred(r3d_renderer *r, const float *pred, uint32_t w, uint32_t
   r3d_surfvol_mark(r); /* repaint the window with the new probabilities */
   r->scene_gen++;
   return 0;
+}
+
+void r3d_surfvol_overlay_enable(r3d_renderer *r, bool enable) {
+  if (r->sv_use_overlay == enable) return;
+  r->sv_use_overlay = enable;
+  r3d_surfvol_mark(r); /* re-bake with/without the overlay channel */
+  r->scene_gen++;
 }
 
 void r3d_surfvol_inkpred_clear(r3d_renderer *r) {
@@ -6072,7 +6083,7 @@ int r3d_frame_views(r3d_renderer *r, const r3d_frame_params *views, uint32_t nvi
                     .abpa = r->bricks_abpa,
                     .lod = lodq,
                     .lstep = 1.0f, /* depth stays native-res regardless of xy zoom */
-                    .use_ink = r->ink_active ? 1u : 0u,
+                    .use_ink = r->ink_active && r->sv_use_overlay ? 1u : 0u,
                     .use_pred = r->sv.pred_on ? 1u : 0u,
                     .pg0u = r->sv.pred_g0u,
                     .pg0v = r->sv.pred_g0v,

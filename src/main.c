@@ -4895,19 +4895,32 @@ int main(int argc, char **argv) {
         if (brick_shape[a] > mdim) mdim = brick_shape[a];
       r3d_frame_params vp4[4];
       uint32_t nvp = 0;
+      /* the flattened bake samples the 3D overlay atlas only for ink
+       * trees; surface predictions never dress the flattened segment */
+      r3d_surfvol_overlay_enable(renderer,
+                                 overlay_path && strstr(overlay_path, "ink"));
       for (int i = 0; i < 4; i++) {
         if (!(mv_mask & (1u << i))) continue; /* collapsed: no dispatch at all */
         r3d_frame_params q = p;
         q.viewport[0] = (uint32_t)mv[i].pw;
         q.viewport[1] = (uint32_t)mv[i].ph;
         q.view_org = (uint32_t)mv[i].px | ((uint32_t)mv[i].py << 16);
-        if (!(mv_ov_mask & (1u << i)) &&
-            !(i == R3D_MV_SEG && inklive_have &&
-              inklive_show)) /* live ink on the flat pane
-                                                 * outlives the pane's overlay
-                                                 * checkbox: unchecking it must
-                                                 * not silently hide the ink */
-          q.overlay_flags &= ~1u;
+        { /* strict per-source routing: SURFACE PREDICTIONS (overlay panel)
+           * show only on the plane views; 2.5D INK only on the flattened
+           * segment; 3D INK overlay trees may show on both. */
+          bool tree_ink = overlay_path && strstr(overlay_path, "ink");
+          q.overlay_flags &= ~(1u | 2u);
+          if (i == R3D_MV_SEG) {
+            bool ink25 = inklive_have && inklive_show;
+            bool ink3d = tree_ink && overlay_show && (mv_ov_mask & (1u << i));
+            if (ink25 || ink3d) q.overlay_flags |= 1u;
+            if (ink25) q.overlay_flags |= 2u; /* ink-green palette */
+          } else {
+            if (overlay_path && overlay_show && (mv_ov_mask & (1u << i)))
+              q.overlay_flags |= 1u; /* tree overlay (surface preds or 3D
+                                      * ink), palette by tree type */
+          }
+        }
         if (i == R3D_MV_SEG) {
           /* flattened segment: raycast the surface-volume window. Camera in
            * FLATTENED VOXELS (grid / scale); window mapping from the backend. */
