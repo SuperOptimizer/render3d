@@ -20,6 +20,7 @@ void r3d_input_poll(r3d_input *in, SDL_Window *win,
   in->view_toggle = false;
   in->umb_place = false;
   in->anchor_place = false;
+  in->seed_place = false;
   in->undo = false;
   in->redo = false;
   in->annotate_click = false;
@@ -111,6 +112,7 @@ void r3d_input_poll(r3d_input *in, SDL_Window *win,
       case SDLK_SPACE: in->view_toggle = true; break;
       case SDLK_U: in->umb_place = true; break;
       case SDLK_X: in->anchor_place = true; break;
+      case SDLK_G: in->seed_place = true; break;
       case SDLK_Z:
         if (SDL_GetModState() & SDL_KMOD_CTRL) {
           if (SDL_GetModState() & SDL_KMOD_SHIFT) in->redo = true;

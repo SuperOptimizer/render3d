@@ -108,6 +108,14 @@ background worker decodes decimated grids into a RAM-budgeted LRU cache,
 and the panel lists cache state, per-plane hit counts, and the surfaces
 nearest the focus.
 
+**Concurrent traces**: press **G** over a plane view to queue a trace seed
+(green circles), then *trace all seeds* grows one tracer per seed at the
+same time (each self-contained with its own solve pool, thread-capped to
+share cores; up to 6). Exactly one trace is displayed in the flattened
+pane; the panel lists the rest with live ring/point counts and *show* /
+*stop* per trace - saved traces enter the segment store/browser as usual.
+Headless: `R3D_SEEDS_TEST="x,y,z;x,y,z"`.
+
 **Tracer anchors**: when the live tracer wanders onto the wrong sheet, hover
 the sheet the trace *should* pass through in any plane view and press **X**
 to drop an anchor at the cursor (orange diamonds; dimmed when off the pane's

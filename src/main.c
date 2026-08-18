@@ -1649,24 +1649,38 @@ int main(int argc, char **argv) {
   double sgc_key_slice[4] = {1e30, 1e30, 1e30, 1e30};
   uint32_t sgc_key_gen[4] = {UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX};
   char sgc_active[R3D_SEGSTORE_NAME] = {0};
-  /* live surface tracer (grow-from-seed over the selected overlay tree) */
-  r3d_tracer mv_tr;
-  memset(&mv_tr, 0, sizeof mv_tr);
-  bool mv_tr_active = false, mv_tr_done = false;
-  double *mv_tr_pos = NULL;
-  uint8_t *mv_tr_st = NULL;
-  float *mv_tr_cf = NULL;
-  uint64_t mv_tr_gen = 0;
-  uint32_t mv_tr_ring = 0, mv_tr_nset = 0;
+  /* live surface tracers: several can grow CONCURRENTLY (each r3d_tracer
+   * is self-contained - own worker + solve pool, thread-capped when
+   * sharing cores); exactly ONE (gt_sel) is displayed in the seg pane
+   * and receives anchors/refine/rewind/save. The rest grow in the
+   * background and are switched to from the panel list. */
+  #define GT_MAX 6
+  struct gtrace {
+    r3d_tracer tr;
+    bool active, done, live_first;
+    double *pos;
+    uint8_t *st;
+    float *cf;
+    uint64_t gen;
+    uint32_t ring, nset;
+  };
+  static struct gtrace gts[GT_MAX]; /* static: r3d_tracer is large */
+  memset(gts, 0, sizeof gts);
+  int gt_sel = 0;
+  #define GT (&gts[gt_sel])
+  /* queued seed points ('G' over a plane view), traced together */
+  double mv_seeds[GT_MAX * 3];
+  uint32_t mv_seeds_n = 0;
+  bool mv_seeds_go = false;
   float mv_tr_step = 20.0f, mv_tr_thresh = 0.35f;
   int mv_tr_rings = 60, mv_tr_nsaved = 0;
+  bool mv_tr_spiral = true;
   bool mv_tr_live = true;      /* render the growing grid in the seg pane */
   /* tracer anchors: world points the sheet must pass through (placed by
    * Ctrl+click in anchor mode; pushed to the tracer live) */
   double mv_anchor[R3D_TR_MAX_ANCHORS * 3];
   uint32_t mv_anchor_n = 0;
   uint64_t mv_tr_live_ns = 0;  /* last live swap (throttle) */
-  bool mv_tr_live_first = true;
   double sgc_near_focus[3] = {1e30, 1e30, 1e30};
   uint32_t sgc_near[6];
   uint32_t sgc_nnear = 0;
@@ -2293,8 +2307,28 @@ int main(int argc, char **argv) {
           if (inside) {
             memcpy(mv_anchor + (size_t)mv_anchor_n * 3, A, sizeof A);
             mv_anchor_n++;
-            if (mv_tr_active) r3d_tracer_set_anchors(&mv_tr, mv_anchor, mv_anchor_n);
+            if (GT->active) r3d_tracer_set_anchors(&GT->tr, mv_anchor, mv_anchor_n);
             printf("tracer: anchor %u placed at (%.0f, %.0f, %.0f)\n", mv_anchor_n,
+                   A[0], A[1], A[2]);
+          }
+        }
+      }
+      if (in.seed_place && !io->WantCaptureMouse) {
+        /* G over a plane pane = queue a trace seed at the voxel under the
+         * cursor; "trace all seeds" grows them concurrently */
+        int av = r3d_mv_hit(mv, in.mouse_xy[0], in.mouse_xy[1]);
+        if (av > 0 && !MV_IS3D(av) && av != R3D_MV_SEG && mv_seeds_n < GT_MAX) {
+          double u, vq, A[3];
+          r3d_mv_unproject(&mv[av], in.mouse_xy[0], in.mouse_xy[1], &u, &vq);
+          r3d_mv_b2w(mv_pb[av], mv_po[av], u, vq, mv[av].slice, A);
+          bool inside = true;
+          for (int a = 0; a < 3; a++)
+            if (A[a] < 0.0 || (brick_shape[a] && A[a] > (double)brick_shape[a] - 1.0))
+              inside = false;
+          if (inside) {
+            memcpy(mv_seeds + (size_t)mv_seeds_n * 3, A, sizeof A);
+            mv_seeds_n++;
+            printf("tracer: seed %u queued at (%.0f, %.0f, %.0f)\n", mv_seeds_n,
                    A[0], A[1], A[2]);
           }
         }
@@ -3222,26 +3256,82 @@ int main(int argc, char **argv) {
         igSameLine(0, 10);
         if (igSmallButton("undo##anc")) {
           mv_anchor_n--;
-          if (mv_tr_active) r3d_tracer_set_anchors(&mv_tr, mv_anchor, mv_anchor_n);
+          if (GT->active) r3d_tracer_set_anchors(&GT->tr, mv_anchor, mv_anchor_n);
         }
         igSameLine(0, 6);
         if (igSmallButton("clear##anc")) {
           mv_anchor_n = 0;
-          if (mv_tr_active) r3d_tracer_set_anchors(&mv_tr, mv_anchor, 0);
+          if (GT->active) r3d_tracer_set_anchors(&GT->tr, mv_anchor, 0);
         }
       }
-      static bool mv_tr_spiral = true;
       if (umbilicus.count >= 2) {
         igCheckbox("spiral prior", &mv_tr_spiral);
-        if (mv_tr_active && mv_tr.sp_valid) {
+        if (GT->active && GT->tr.sp_valid) {
           igSameLine(0, 10);
-          igTextDisabled("omega %.1f rms %.1f", mv_tr.sp_omega, mv_tr.sp_rms);
+          igTextDisabled("omega %.1f rms %.1f", GT->tr.sp_omega, GT->tr.sp_rms);
         }
       } else {
         igTextDisabled("spiral prior needs an umbilicus (U to annotate)");
       }
-      if (!mv_tr_active) {
-        if (igButton("seed at focus", (ImVec2){0, 0})) {
+      /* concurrent traces: the seeds queue ('G' over a plane view) grows
+       * one tracer per seed, all at once; the list below switches which
+       * one the flattened pane displays */
+      {
+        uint32_t nact = 0;
+        for (int ti = 0; ti < GT_MAX; ti++)
+          if (gts[ti].active) nact++;
+        igTextDisabled("G over a plane view: queue a trace seed");
+        if (mv_seeds_n) {
+          igText("%u seed%s queued", mv_seeds_n, mv_seeds_n == 1 ? "" : "s");
+          igSameLine(0, 8);
+          if (igSmallButton("clear##seeds")) mv_seeds_n = 0;
+          igSameLine(0, 8);
+          if (igButton("trace all seeds", (ImVec2){0, 0})) mv_seeds_go = true;
+          (void)nact;
+        }
+        for (int ti = 0; ti < GT_MAX; ti++) { /* the live trace list */
+          struct gtrace *g = &gts[ti];
+          if (!g->active) continue;
+          igPushID_Int(ti);
+          igText("%s trace %d: %u/%u, %u pts%s", ti == gt_sel ? ">" : " ", ti,
+                 g->ring, g->tr.cfg.max_ring, g->nset, g->done ? " (done)" : "");
+          if (ti != gt_sel) {
+            igSameLine(0, 8);
+            if (igSmallButton("show")) {
+              gt_sel = ti;
+              GT->gen = 0; /* force a fresh snapshot + live swap */
+              GT->live_first = true;
+            }
+          }
+          igSameLine(0, 6);
+          if (igSmallButton(g->done ? "x" : "stop")) {
+            r3d_tracer_stop(&g->tr);
+            if (!g->done) {
+              g->done = true; /* keep on screen; x again to discard */
+            } else {
+              r3d_tracer_free(&g->tr);
+              free(g->pos);
+              free(g->st);
+              free(g->cf);
+              g->pos = NULL;
+              g->st = NULL;
+              g->cf = NULL;
+              g->active = false;
+            }
+          }
+          igPopID();
+        }
+      }
+      if (!GT->active) {
+        bool have_free = false;
+        for (int s3 = 0; s3 < GT_MAX && !have_free; s3++)
+          if (!gts[s3].active) have_free = true;
+        if (have_free && igButton("seed at focus", (ImVec2){0, 0})) {
+          for (int s3 = 0; s3 < GT_MAX; s3++)
+            if (!gts[s3].active) {
+              gt_sel = s3;
+              break;
+            }
           r3d_tracer_cfg tc = {.seed = {mv_focus[0], mv_focus[1], mv_focus[2]},
                                .step = (double)mv_tr_step,
                                .thresh = mv_tr_thresh,
@@ -3249,112 +3339,112 @@ int main(int argc, char **argv) {
                                .level = 1,
                                .wind_weight =
                                    mv_tr_spiral && umbilicus.count >= 2 ? 0.5 : 0.0};
-          if (r3d_tracer_start(&mv_tr, pr, &tc, &umbilicus) == 0) {
-            if (mv_anchor_n) r3d_tracer_set_anchors(&mv_tr, mv_anchor, mv_anchor_n);
-            free(mv_tr_pos);
-            free(mv_tr_st);
-            free(mv_tr_cf);
-            mv_tr_pos = malloc((size_t)mv_tr.W * mv_tr.H * 3 * sizeof *mv_tr_pos);
-            mv_tr_st = calloc((size_t)mv_tr.W * mv_tr.H, 1);
-            mv_tr_cf = calloc((size_t)mv_tr.W * mv_tr.H, sizeof *mv_tr_cf);
-            mv_tr_gen = 0;
-            mv_tr_live_first = true;
-            mv_tr_active = mv_tr_pos && mv_tr_st && mv_tr_cf;
+          if (r3d_tracer_start(&GT->tr, pr, &tc, &umbilicus) == 0) {
+            if (mv_anchor_n) r3d_tracer_set_anchors(&GT->tr, mv_anchor, mv_anchor_n);
+            free(GT->pos);
+            free(GT->st);
+            free(GT->cf);
+            GT->pos = malloc((size_t)GT->tr.W * GT->tr.H * 3 * sizeof *GT->pos);
+            GT->st = calloc((size_t)GT->tr.W * GT->tr.H, 1);
+            GT->cf = calloc((size_t)GT->tr.W * GT->tr.H, sizeof *GT->cf);
+            GT->gen = 0;
+            GT->live_first = true;
+            GT->active = GT->pos && GT->st && GT->cf;
           }
         }
         igSameLine(0, 8);
         igTextDisabled("(uses the SELECTED overlay as predictions)");
       } else {
-        igText("ring %u/%u  %u point%s%s", mv_tr_ring, mv_tr.cfg.max_ring, mv_tr_nset,
-               mv_tr_nset == 1 ? "" : "s",
-               mv_tr_done ? "  done"
-                          : (mv_tr_ring >= mv_tr.cfg.max_ring ? "  optimizing..."
+        igText("ring %u/%u  %u point%s%s", GT->ring, GT->tr.cfg.max_ring, GT->nset,
+               GT->nset == 1 ? "" : "s",
+               GT->done ? "  done"
+                          : (GT->ring >= GT->tr.cfg.max_ring ? "  optimizing..."
                                                               : "  growing..."));
-        if (mv_tr.qc_folds || mv_tr.qc_kinks)
+        if (GT->tr.qc_folds || GT->tr.qc_kinks)
           igTextColored((ImVec4){1.0f, 0.55f, 0.3f, 1.0f},
-                        "QC: %u fold%s, %u kink%s, twist %.2f vox", mv_tr.qc_folds,
-                        mv_tr.qc_folds == 1 ? "" : "s", mv_tr.qc_kinks,
-                        mv_tr.qc_kinks == 1 ? "" : "s", (double)mv_tr.qc_twist);
-        else if (mv_tr_nset > 8)
+                        "QC: %u fold%s, %u kink%s, twist %.2f vox", GT->tr.qc_folds,
+                        GT->tr.qc_folds == 1 ? "" : "s", GT->tr.qc_kinks,
+                        GT->tr.qc_kinks == 1 ? "" : "s", (double)GT->tr.qc_twist);
+        else if (GT->nset > 8)
           igTextDisabled("QC clean: no folds/kinks, twist %.2f vox",
-                         (double)mv_tr.qc_twist);
-        if (igButton(mv_tr_done ? "discard" : "stop", (ImVec2){0, 0})) {
-          r3d_tracer_stop(&mv_tr);
-          if (!mv_tr_done) { /* stopped mid-grow: keep result on screen */
-            mv_tr_done = true;
+                         (double)GT->tr.qc_twist);
+        if (igButton(GT->done ? "discard" : "stop", (ImVec2){0, 0})) {
+          r3d_tracer_stop(&GT->tr);
+          if (!GT->done) { /* stopped mid-grow: keep result on screen */
+            GT->done = true;
           } else {
-            r3d_tracer_free(&mv_tr);
-            free(mv_tr_pos);
-            free(mv_tr_st);
-            free(mv_tr_cf);
-            mv_tr_pos = NULL;
-            mv_tr_st = NULL;
-            mv_tr_cf = NULL;
-            mv_tr_active = false;
+            r3d_tracer_free(&GT->tr);
+            free(GT->pos);
+            free(GT->st);
+            free(GT->cf);
+            GT->pos = NULL;
+            GT->st = NULL;
+            GT->cf = NULL;
+            GT->active = false;
           }
         }
-        if (mv_tr_done && mv_tr_nset > 0 && mv_tr.gen_of && mv_tr.gens_done > 4) {
+        if (GT->done && GT->nset > 0 && GT->tr.gen_of && GT->tr.gens_done > 4) {
           static int mv_tr_rewind_to = 0;
-          if (mv_tr_rewind_to <= 0 || mv_tr_rewind_to >= (int)mv_tr.gens_done)
-            mv_tr_rewind_to = (int)mv_tr.gens_done / 2;
+          if (mv_tr_rewind_to <= 0 || mv_tr_rewind_to >= (int)GT->tr.gens_done)
+            mv_tr_rewind_to = (int)GT->tr.gens_done / 2;
           igSetNextItemWidth(140);
-          igSliderInt("##rewind", &mv_tr_rewind_to, 1, (int)mv_tr.gens_done - 1,
+          igSliderInt("##rewind", &mv_tr_rewind_to, 1, (int)GT->tr.gens_done - 1,
                       "rewind to gen %d", 0);
           igSameLine(0, 6);
           if (igButton("rewind##tr", (ImVec2){0, 0})) {
             /* drop everything placed after the chosen generation; grow
              * then regrows it (drop an anchor first to steer) */
-            r3d_tracer_stop(&mv_tr);
-            r3d_tracer_rewind(&mv_tr, (uint32_t)mv_tr_rewind_to);
-            mv_tr_gen = 0; /* refresh the live view */
+            r3d_tracer_stop(&GT->tr);
+            r3d_tracer_rewind(&GT->tr, (uint32_t)mv_tr_rewind_to);
+            GT->gen = 0; /* refresh the live view */
           }
         }
-        if (mv_tr_done && mv_tr_nset > 0 && mv_anchor_n) {
+        if (GT->done && GT->nset > 0 && mv_anchor_n) {
           igSameLine(0, 8);
           if (igButton("re-solve", (ImVec2){0, 0})) {
             /* fix the segment in place: no growth, anneal the grid through
              * the placed anchors (grid dims unchanged, buffers stay) */
-            r3d_tracer_stop(&mv_tr);
-            r3d_tracer_set_anchors(&mv_tr, mv_anchor, mv_anchor_n);
-            if (r3d_tracer_refine(&mv_tr) == 0) {
-              mv_tr_done = false;
-              mv_tr_gen = 0; /* force a fresh snapshot/live swap */
+            r3d_tracer_stop(&GT->tr);
+            r3d_tracer_set_anchors(&GT->tr, mv_anchor, mv_anchor_n);
+            if (r3d_tracer_refine(&GT->tr) == 0) {
+              GT->done = false;
+              GT->gen = 0; /* force a fresh snapshot/live swap */
             }
           }
           if (igIsItemHovered(0))
             igSetTooltip("re-run the solve through the %u anchor%s without growing",
                          mv_anchor_n, mv_anchor_n == 1 ? "" : "s");
         }
-        if (mv_tr_done && mv_tr_nset > 0) {
+        if (GT->done && GT->nset > 0) {
           igSameLine(0, 8);
           if (igButton("grow", (ImVec2){0, 0})) { /* extend by half again;
              * failed cells retry (more predictions may be local now) */
-            r3d_tracer_stop(&mv_tr);
-            if (r3d_tracer_grow(&mv_tr, mv_tr.cfg.max_ring / 2 + 10) == 0) {
-              free(mv_tr_pos);
-              free(mv_tr_st);
-              free(mv_tr_cf);
-              mv_tr_pos = malloc((size_t)mv_tr.W * mv_tr.H * 3 * sizeof *mv_tr_pos);
-              mv_tr_st = calloc((size_t)mv_tr.W * mv_tr.H, 1);
-              mv_tr_cf = calloc((size_t)mv_tr.W * mv_tr.H, sizeof *mv_tr_cf);
-              mv_tr_gen = 0;
-              mv_tr_done = false;
-              if (!mv_tr_pos || !mv_tr_st || !mv_tr_cf) mv_tr_active = false;
+            r3d_tracer_stop(&GT->tr);
+            if (r3d_tracer_grow(&GT->tr, GT->tr.cfg.max_ring / 2 + 10) == 0) {
+              free(GT->pos);
+              free(GT->st);
+              free(GT->cf);
+              GT->pos = malloc((size_t)GT->tr.W * GT->tr.H * 3 * sizeof *GT->pos);
+              GT->st = calloc((size_t)GT->tr.W * GT->tr.H, 1);
+              GT->cf = calloc((size_t)GT->tr.W * GT->tr.H, sizeof *GT->cf);
+              GT->gen = 0;
+              GT->done = false;
+              if (!GT->pos || !GT->st || !GT->cf) GT->active = false;
             }
           }
         }
         igSameLine(0, 8);
-        if (mv_tr_nset > 8 && igButton("save + activate", (ImVec2){0, 0})) {
-          r3d_tracer_stop(&mv_tr);
+        if (GT->nset > 8 && igButton("save + activate", (ImVec2){0, 0})) {
+          r3d_tracer_stop(&GT->tr);
           char td[256];
           snprintf(td, sizeof td, "cache/traced/trace-%d-%u", ++mv_tr_nsaved,
-                   (unsigned)mv_tr_nset);
+                   (unsigned)GT->nset);
           char mk[300];
           snprintf(mk, sizeof mk, "mkdir -p '%s'", td);
           if (system(mk) == 0 &&
-              r3d_tracer_save(&mv_tr, td, mv_tr_thresh, mv_tr_fill) == 0) {
-            printf("tracer: saved %s (%ux%u, %u pts)\n", td, mv_tr.W, mv_tr.H,
-                   mv_tr_nset);
+              r3d_tracer_save(&GT->tr, td, mv_tr_thresh, mv_tr_fill) == 0) {
+            printf("tracer: saved %s (%ux%u, %u pts)\n", td, GT->tr.W, GT->tr.H,
+                   GT->nset);
             if (sgc.open) { /* pack + reopen the corpus so it shows at once */
               const char *dirs1[1] = {td};
               if (r3d_segstore_build(seg_store_path, dirs1, 1, 2, false) > 0) {
@@ -3390,14 +3480,14 @@ int main(int argc, char **argv) {
                     }
                   pthread_mutex_unlock(&sgc.mu);
                   /* the orange preview served its purpose */
-                  r3d_tracer_free(&mv_tr);
-                  free(mv_tr_pos);
-                  free(mv_tr_st);
-                  free(mv_tr_cf);
-                  mv_tr_pos = NULL;
-                  mv_tr_st = NULL;
-                  mv_tr_cf = NULL;
-                  mv_tr_active = false;
+                  r3d_tracer_free(&GT->tr);
+                  free(GT->pos);
+                  free(GT->st);
+                  free(GT->cf);
+                  GT->pos = NULL;
+                  GT->st = NULL;
+                  GT->cf = NULL;
+                  GT->active = false;
                 }
               }
             }
@@ -3673,7 +3763,7 @@ int main(int argc, char **argv) {
       }
     }
 
-    if (getenv("R3D_TRACE_TEST") && multiview_path && n_overlays && !mv_tr_active &&
+    if (getenv("R3D_TRACE_TEST") && multiview_path && n_overlays && !GT->active &&
         frame_index == 120) { /* headless: seed a trace at the focus */
       if (getenv("R3D_TRACE_RINGS"))
         mv_tr_rings = atoi(getenv("R3D_TRACE_RINGS"));
@@ -3683,12 +3773,12 @@ int main(int argc, char **argv) {
                            .max_ring = (uint32_t)mv_tr_rings,
                            .level = 1,
                            .wind_weight = umbilicus.count >= 2 ? 0.5 : 0.0};
-      if (r3d_tracer_start(&mv_tr, overlay_paths[overlay_sel], &tc, &umbilicus) == 0) {
-        mv_tr_pos = malloc((size_t)mv_tr.W * mv_tr.H * 3 * sizeof *mv_tr_pos);
-        mv_tr_st = calloc((size_t)mv_tr.W * mv_tr.H, 1);
-        mv_tr_cf = calloc((size_t)mv_tr.W * mv_tr.H, sizeof *mv_tr_cf);
-        mv_tr_active = mv_tr_pos && mv_tr_st && mv_tr_cf;
-        if (mv_tr_active && getenv("R3D_ANCHOR_TEST")) {
+      if (r3d_tracer_start(&GT->tr, overlay_paths[overlay_sel], &tc, &umbilicus) == 0) {
+        GT->pos = malloc((size_t)GT->tr.W * GT->tr.H * 3 * sizeof *GT->pos);
+        GT->st = calloc((size_t)GT->tr.W * GT->tr.H, 1);
+        GT->cf = calloc((size_t)GT->tr.W * GT->tr.H, sizeof *GT->cf);
+        GT->active = GT->pos && GT->st && GT->cf;
+        if (GT->active && getenv("R3D_ANCHOR_TEST")) {
           /* headless: anchors as "x,y,z;x,y,z;..." (world voxels) */
           const char *s = getenv("R3D_ANCHOR_TEST");
           while (s && *s && mv_anchor_n < R3D_TR_MAX_ANCHORS) {
@@ -3697,31 +3787,96 @@ int main(int argc, char **argv) {
             s = strchr(s, ';');
             if (s) s++;
           }
-          if (mv_anchor_n) r3d_tracer_set_anchors(&mv_tr, mv_anchor, mv_anchor_n);
+          if (mv_anchor_n) r3d_tracer_set_anchors(&GT->tr, mv_anchor, mv_anchor_n);
         }
       }
     }
     static bool refine_test_done = false;
-    if (mv_tr_active && mv_tr_done && mv_anchor_n && getenv("R3D_REFINE_TEST") &&
+    if (GT->active && GT->done && mv_anchor_n && getenv("R3D_REFINE_TEST") &&
         !refine_test_done) { /* headless: one solve-only pass after finish */
       refine_test_done = true;
-      r3d_tracer_stop(&mv_tr);
-      r3d_tracer_set_anchors(&mv_tr, mv_anchor, mv_anchor_n);
-      if (r3d_tracer_refine(&mv_tr) == 0) {
-        mv_tr_done = false;
-        mv_tr_gen = 0;
+      r3d_tracer_stop(&GT->tr);
+      r3d_tracer_set_anchors(&GT->tr, mv_anchor, mv_anchor_n);
+      if (r3d_tracer_refine(&GT->tr) == 0) {
+        GT->done = false;
+        GT->gen = 0;
         printf("tracer: refine test started\n");
       }
     }
-    if (mv_tr_active) { /* live tracer snapshot when it grew */
-      uint64_t g = r3d_tracer_snapshot(&mv_tr, NULL, NULL, NULL, &mv_tr_ring,
-                                       &mv_tr_nset, &mv_tr_done);
-      if (g != mv_tr_gen && mv_tr_pos) {
-        r3d_tracer_snapshot(&mv_tr, mv_tr_pos, mv_tr_st, mv_tr_cf, NULL, NULL, NULL);
-        mv_tr_gen = g;
+    if (getenv("R3D_SEEDS_TEST") && frame_index == 300 && !mv_seeds_n) {
+      /* headless: seeds as "x,y,z;x,y,z;..." then trace-all */
+      const char *sp2 = getenv("R3D_SEEDS_TEST");
+      while (sp2 && *sp2 && mv_seeds_n < GT_MAX) {
+        double *A = mv_seeds + (size_t)mv_seeds_n * 3;
+        if (sscanf(sp2, "%lf,%lf,%lf", &A[0], &A[1], &A[2]) == 3) mv_seeds_n++;
+        sp2 = strchr(sp2, ';');
+        if (sp2) sp2++;
+      }
+      if (mv_seeds_n) mv_seeds_go = true;
+    }
+    if (mv_seeds_go && mv_seeds_n && multiview_path && n_overlays) {
+      mv_seeds_go = false;
+      const char *pr = overlay_paths[overlay_sel];
+      uint32_t nact = 0;
+      for (int ti = 0; ti < GT_MAX; ti++)
+        if (gts[ti].active) nact++;
+      {
+            uint32_t nrun = mv_seeds_n < GT_MAX - nact ? mv_seeds_n : GT_MAX - nact;
+            uint32_t cap = 20u / (nact + (nrun ? nrun : 1));
+            if (cap < 2) cap = 2;
+            for (uint32_t si2 = 0; si2 < nrun; si2++) {
+              int slot = -1;
+              for (int s3 = 0; s3 < GT_MAX; s3++)
+                if (!gts[s3].active) {
+                  slot = s3;
+                  break;
+                }
+              if (slot < 0) break;
+              gt_sel = slot;
+              r3d_tracer_cfg tc = {.seed = {mv_seeds[si2 * 3], mv_seeds[si2 * 3 + 1],
+                                            mv_seeds[si2 * 3 + 2]},
+                                   .step = (double)mv_tr_step,
+                                   .thresh = mv_tr_thresh,
+                                   .max_ring = (uint32_t)mv_tr_rings,
+                                   .level = 1,
+                                   .max_threads = cap,
+                                   .wind_weight = mv_tr_spiral && umbilicus.count >= 2
+                                                      ? 0.5
+                                                      : 0.0};
+              if (r3d_tracer_start(&GT->tr, pr, &tc, &umbilicus) == 0) {
+                if (mv_anchor_n)
+                  r3d_tracer_set_anchors(&GT->tr, mv_anchor, mv_anchor_n);
+                free(GT->pos);
+                free(GT->st);
+                free(GT->cf);
+                GT->pos = malloc((size_t)GT->tr.W * GT->tr.H * 3 * sizeof *GT->pos);
+                GT->st = calloc((size_t)GT->tr.W * GT->tr.H, 1);
+                GT->cf = calloc((size_t)GT->tr.W * GT->tr.H, sizeof *GT->cf);
+                GT->gen = 0;
+                GT->live_first = true;
+                GT->active = GT->pos && GT->st && GT->cf;
+              }
+            }
+            mv_seeds_n = 0;
+            printf("tracer: growing %u concurrent trace(s)\n", nrun);
+      }
+    } else {
+      mv_seeds_go = false;
+    }
+    for (int ti = 0; ti < GT_MAX; ti++) /* background traces: light poll
+        (ring/points/done for the panel; no buffer copy, no live swap) */
+      if (ti != gt_sel && gts[ti].active)
+        r3d_tracer_snapshot(&gts[ti].tr, NULL, NULL, NULL, &gts[ti].ring,
+                            &gts[ti].nset, &gts[ti].done);
+    if (GT->active) { /* live tracer snapshot when it grew */
+      uint64_t g = r3d_tracer_snapshot(&GT->tr, NULL, NULL, NULL, &GT->ring,
+                                       &GT->nset, &GT->done);
+      if (g != GT->gen && GT->pos) {
+        r3d_tracer_snapshot(&GT->tr, GT->pos, GT->st, GT->cf, NULL, NULL, NULL);
+        GT->gen = g;
         uint64_t now2 = r3d_now_ns();
-        if (mv_tr_live && mv_tr_nset > 8 &&
-            (now2 - mv_tr_live_ns > 400000000ull || mv_tr_done)) {
+        if (mv_tr_live && GT->nset > 8 &&
+            (now2 - mv_tr_live_ns > 400000000ull || GT->done)) {
           /* live growth in the segment pane: swap the trace grid into the
            * active surf machinery (tiny grids — the upload is trivial; the
            * surfvol rebakes progressively) */
@@ -3737,18 +3892,18 @@ int main(int argc, char **argv) {
             inklive_have = false;
             r3d_surfvol_inkpred_clear(renderer);
           }
-          r3d_tifxyz ts = {.w = mv_tr.W, .h = mv_tr.H};
-          ts.sx = ts.sy = (float)(1.0 / mv_tr.cfg.step);
+          r3d_tifxyz ts = {.w = GT->tr.W, .h = GT->tr.H};
+          ts.sx = ts.sy = (float)(1.0 / GT->tr.cfg.step);
           ts.xyz = malloc((size_t)ts.w * ts.h * 3 * sizeof *ts.xyz);
           if (ts.xyz) {
             float bb[2][3] = {{1e30f, 1e30f, 1e30f}, {-1e30f, -1e30f, -1e30f}};
             uint64_t nv = 0;
             uint32_t gi0 = ts.w, gi1 = 0, gj0 = ts.h, gj1 = 0; /* grid bbox */
             for (size_t k = 0; k < (size_t)ts.w * ts.h; k++) {
-              bool ok2 = mv_tr_st[k] == R3D_TR_SET; /* growth never skips a
+              bool ok2 = GT->st[k] == R3D_TR_SET; /* growth never skips a
                   * cell; the cutoff is a SAVE decision, not a display one */
               for (int a = 0; a < 3; a++) {
-                float vv2 = ok2 ? (float)mv_tr_pos[k * 3 + (size_t)a] : -1.0f;
+                float vv2 = ok2 ? (float)GT->pos[k * 3 + (size_t)a] : -1.0f;
                 ts.xyz[k * 3 + (size_t)a] = vv2;
                 if (ok2) {
                   if (vv2 < bb[0][a]) bb[0][a] = vv2;
@@ -3784,10 +3939,10 @@ int main(int argc, char **argv) {
                 mv_ol_slice[oi2] = 1e30;
               }
               mv_ol_zoff = 1e30;
-              if (mv_tr_live_first || !mv_tr_done) {
+              if (GT->live_first || !GT->done) {
                 /* keep the pane fitted to the growing patch; once growth
                  * finishes the view is yours */
-                mv_tr_live_first = false;
+                GT->live_first = false;
                 double bw = (double)(gi1 - gi0) + 6.0, bh = (double)(gj1 - gj0) + 6.0;
                 mv[R3D_MV_SEG].cu = ((double)gi0 + gi1) * 0.5;
                 mv[R3D_MV_SEG].cv = ((double)gj0 + gj1) * 0.5;
@@ -3964,6 +4119,24 @@ int main(int argc, char **argv) {
             fy_ >= (float)mv[i].py && fy_ < (float)(mv[i].py + mv[i].ph))
           ImDrawList_AddCircle(draw, (ImVec2){fx_, fy_}, 10.0f, fc, 24, 2.0f);
       }
+      if (mv_seeds_n) { /* queued trace seeds: green circles */
+        const ImU32 sb_ = 0xff000000u, sc_ = 0xff40d060u, sd_ = 0x8040d060u;
+        for (int i = 1; i < 4; i++) {
+          if (!(mv_mask & (1u << i)) || MV_IS3D(i)) continue;
+          for (uint32_t a = 0; a < mv_seeds_n; a++) {
+            double fu, fv, fs;
+            r3d_mv_w2b(mv_pb[i], mv_po[i], mv_seeds + (size_t)a * 3, &fu, &fv, &fs);
+            float ax_, ay_;
+            r3d_mv_project(&mv[i], fu, fv, &ax_, &ay_);
+            if (ax_ < (float)mv[i].px || ax_ >= (float)(mv[i].px + mv[i].pw) ||
+                ay_ < (float)mv[i].py || ay_ >= (float)(mv[i].py + mv[i].ph))
+              continue;
+            ImU32 col = fabs(fs - mv[i].slice) < 6.0 ? sc_ : sd_;
+            ImDrawList_AddCircle(draw, (ImVec2){ax_, ay_}, 8.0f, sb_, 20, 3.5f);
+            ImDrawList_AddCircle(draw, (ImVec2){ax_, ay_}, 8.0f, col, 20, 1.8f);
+          }
+        }
+      }
       if (mv_anchor_n) { /* tracer anchors: orange diamonds in the plane
                           * panes, dimmed when off this pane's slice */
         const ImU32 ab_ = 0xff000000u, ac_ = 0xff00a5ffu, ad_ = 0x8000a5ffu;
@@ -4130,17 +4303,17 @@ int main(int argc, char **argv) {
           ImDrawList_PopClipRect(draw);
         }
       }
-      if (mv_tr_active && mv_tr_done && getenv("R3D_TRACE_SAVE") && !mv_tr_nsaved) {
+      if (GT->active && GT->done && getenv("R3D_TRACE_SAVE") && !mv_tr_nsaved) {
         /* TEMP verify: save the finished trace headlessly */
         mv_tr_nsaved = 1;
-        r3d_tracer_stop(&mv_tr);
+        r3d_tracer_stop(&GT->tr);
         if (system("mkdir -p cache/traced/trace-test") == 0 &&
-            r3d_tracer_save(&mv_tr, "cache/traced/trace-test", mv_tr_thresh, true) == 0)
+            r3d_tracer_save(&GT->tr, "cache/traced/trace-test", mv_tr_thresh, true) == 0)
           printf("tracer: saved cache/traced/trace-test\n");
       }
-      if (mv_tr_active && mv_tr_pos) { /* growing trace: orange points */
+      if (GT->active && GT->pos) { /* growing trace: orange points */
         const ImU32 tc_ = 0xff2896ffu, tb_ = 0xff000000u;
-        uint32_t TW = mv_tr.W, TH = mv_tr.H;
+        uint32_t TW = GT->tr.W, TH = GT->tr.H;
         for (int i = 1; i < 4; i++) {
           if (!(mv_mask & (1u << i))) continue;
           ImVec2 cmin = {(float)mv[i].px, (float)mv[i].py};
@@ -4168,8 +4341,8 @@ int main(int argc, char **argv) {
               for (uint32_t j = 0; j < TH; j += strd)
                 for (uint32_t ii = 0; ii < TW; ii += strd) {
                   size_t k = (size_t)j * TW + ii;
-                  if (mv_tr_st[k] != R3D_TR_SET) continue;
-                  const double *P = mv_tr_pos + k * 3;
+                  if (GT->st[k] != R3D_TR_SET) continue;
+                  const double *P = GT->pos + k * 3;
                   bool inb = true;
                   for (int a = 0; a < 3; a++)
                     if (P[a] < mv_crop_c[a] - (double)mv_crop_d[a] * 0.5 ||
@@ -4187,7 +4360,7 @@ int main(int argc, char **argv) {
                                (float)mv[i].py + (0.5f - ny * 0.5f) * (float)mv[i].ph};
                   ImDrawList_AddCircleFilled(
                       draw, sp, 2.0f,
-                      mv_tr_cf[k] < mv_tr_thresh ? 0x907070e0u : tc_, 6);
+                      GT->cf[k] < mv_tr_thresh ? 0x907070e0u : tc_, 6);
                 }
             }
           } else {
@@ -4195,14 +4368,14 @@ int main(int argc, char **argv) {
             for (uint32_t j = 0; j < TH; j++)
               for (uint32_t ii = 0; ii < TW; ii++) {
                 size_t k = (size_t)j * TW + ii;
-                if (mv_tr_st[k] != R3D_TR_SET) continue;
-                const double *P = mv_tr_pos + k * 3;
+                if (GT->st[k] != R3D_TR_SET) continue;
+                const double *P = GT->pos + k * 3;
                 double fu, fv, fs;
                 r3d_mv_w2b(mv_pb[i], mv_po[i], P, &fu, &fv, &fs);
                 if (fs < lo || fs > hi) continue;
                 float sx_, sy_;
                 r3d_mv_project(&mv[i], fu, fv, &sx_, &sy_);
-                float cf2 = mv_tr_cf[k];
+                float cf2 = GT->cf[k];
                 bool weak = cf2 < mv_tr_thresh;
                 ImU32 pc_ = weak ? 0x907070e0u /* weak: translucent red */
                                  : tc_;
@@ -4710,13 +4883,18 @@ int main(int argc, char **argv) {
       free(sgc_ln[i]);
       sgc_ln[i] = NULL;
     }
-    if (mv_tr_active || mv_tr.pos) {
-      r3d_tracer_stop(&mv_tr);
-      r3d_tracer_free(&mv_tr);
+    for (int ti = 0; ti < GT_MAX; ti++) { /* stop every background trace */
+      struct gtrace *g = &gts[ti];
+      if (g->active || g->tr.pos) {
+        r3d_tracer_stop(&g->tr);
+        r3d_tracer_free(&g->tr);
+      }
+      free(g->pos);
+      free(g->st);
+      free(g->cf);
+      memset(g, 0, sizeof *g);
     }
-    free(mv_tr_pos);
-    free(mv_tr_st);
-    free(mv_tr_cf);
+    mv_seeds_n = 0;
     sgc_close(&sgc);
     for (int i = 0; i < 4; i++) {
       free(mv_ol[i].w);

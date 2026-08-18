@@ -4366,6 +4366,8 @@ static void tr_pool_init(tr_pool *pl, r3d_tracer *t, ng_vol *ngv) {
   pthread_cond_init(&pl->cv, NULL);
   pthread_cond_init(&pl->idle_cv, NULL);
   uint32_t want = TR_NTHREADS;
+  if (t->cfg.max_threads && t->cfg.max_threads < want)
+    want = t->cfg.max_threads < 2 ? 0 : t->cfg.max_threads;
   const char *tenv = getenv("R3D_TRACE_THREADS");
   if (tenv) { /* 0/1 = serial (deterministic quality A/B runs) */
     long tv = strtol(tenv, NULL, 10);

@@ -56,6 +56,8 @@ typedef struct r3d_tracer_cfg {
                        * fitted sheet spacing so ~0.5 is a gentle prior. */
   uint8_t grow_dirs;  /* growth-direction bitmask over the 8-neighbour
                        * order {+u,+v,-u,-v,diag...}; 0 = all (G13) */
+  uint32_t max_threads; /* solve-pool cap (0 = default); set when several
+                         * tracers grow concurrently so they share cores */
 } r3d_tracer_cfg;
 
 #define R3D_TR_MAX_ANCHORS 64
