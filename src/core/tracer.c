@@ -4527,7 +4527,7 @@ static int tr_u64cmp(const void *a, const void *b) {
  * a trace drifting a wrap away from them shows up here first. */
 static void tr_qc_donor(r3d_tracer *t);
 static void tr_qc2(r3d_tracer *t, bool clamp_folds) {
-  uint32_t folds = 0, kinks = 0;
+  uint32_t folds = 0, kinks = 0, nsharp = 0;
   double tw2 = 0.0, area = 0.0;
   size_t ntw = 0, ntrust = 0;
   uint32_t bb[4] = {t->W, t->H, 0, 0}; /* i0,j0,i1,j1 */
@@ -4567,6 +4567,8 @@ static void tr_qc2(r3d_tracer *t, bool clamp_folds) {
           if (clamp_folds && t->conf[(size_t)j * t->W + (size_t)i] > 0.25f)
             t->conf[(size_t)j * t->W + (size_t)i] = 0.25f;
         } else if (dot < TR_KINK_COS) {
+          if (dot < 0.64 && nsharp < 16) /* sharper than ~50 deg */
+            t->qc_kink_cell[nsharp++] = (uint32_t)((size_t)j * t->W + (size_t)i);
           kinks++;
         }
       }
@@ -4632,6 +4634,7 @@ static void tr_qc2(r3d_tracer *t, bool clamp_folds) {
   pthread_mutex_lock(&t->mu);
   t->qc_folds = folds;
   t->qc_nfoldc = folds < 16 ? folds : 16;
+  t->qc_nkinkc = nsharp;
   t->qc_kinks = kinks;
   t->qc_twist = ntw ? (float)sqrt(tw2 / (double)ntw) : 0.0f;
   t->qc_area_vx2 = area;
@@ -5367,7 +5370,7 @@ static void *tr_worker(void *ud) {
     tr_wind_relax(t, 30); /* winding follows the moved cells; werr = the
                            * wrong-wrap detector (clamps conf when on) */
     tr_qc2(t, false); /* refresh the mesh QC counters for the panel */
-    if (t->qc_nfoldc && !t->quit) {
+    if ((t->qc_nfoldc || t->qc_nkinkc) && !t->quit) {
       /* active fold repair: a fold that survives its own generation
        * becomes the parent geometry of the next ring. Anneal each fold's
        * disc with the staged schedule - data term off first so the fold
@@ -5388,6 +5391,9 @@ static void *tr_worker(void *ud) {
         for (uint32_t f = 0; f < t->qc_nfoldc && !t->quit; f++)
           tr_local_opt(t, &cenv, (int)(t->qc_fold_cell[f] % W),
                        (int)(t->qc_fold_cell[f] / W), 4, 3, true);
+        for (uint32_t f = 0; f < t->qc_nkinkc && !t->quit; f++)
+          tr_local_opt(t, &cenv, (int)(t->qc_kink_cell[f] % W),
+                       (int)(t->qc_kink_cell[f] / W), 3, 3, true);
       }
       cenv.ws_dist = cenv.ws_straight = cenv.ws_snap = 0.0;
       for (uint32_t pe = 0; pe < pool.nth; pe++)

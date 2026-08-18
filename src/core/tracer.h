@@ -162,6 +162,10 @@ typedef struct r3d_tracer {
    * parenting the next ring */
   uint32_t qc_fold_cell[16];
   uint32_t qc_nfoldc;
+  /* sharpest kinks (turn > ~50 deg) join the same repair anneal; gentler
+   * kinks are left alone - real papyrus creases exist */
+  uint32_t qc_kink_cell[16];
+  uint32_t qc_nkinkc;
   double qc_area_vx2;  /* two-triangle quad area over all-trusted quads */
   uint32_t qc_bbox[4]; /* i0,j0,i1,j1 inclusive over trusted cells */
   float qc_fill;       /* trusted cells / bbox area */
