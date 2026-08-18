@@ -1749,6 +1749,7 @@ int main(int argc, char **argv) {
   int mv_tr_rings = 60, mv_tr_nsaved = 0;
   bool mv_tr_spiral = true;
   bool mv_tr_fill = true;
+  float mv_corpus_vis = 0.55f; /* corpus polyline alpha in the plane views */
   bool mv_tr_live = true;      /* render the growing grid in the seg pane */
   bool mv_tr_view = false; /* the flattened pane FOLLOWS the selected live
                             * trace; cleared when a store segment is
@@ -3661,6 +3662,8 @@ int main(int argc, char **argv) {
       }
     }
     if (sgc.open && igCollapsingHeader_TreeNodeFlags("surfaces", 0)) {
+          igSetNextItemWidth(160);
+          igSliderFloat("corpus lines", &mv_corpus_vis, 0.0f, 1.0f, "%.2f", 0);
           {
             pthread_mutex_lock(&sgc.mu);
             uint32_t ready = 0;
@@ -4269,7 +4272,10 @@ int main(int argc, char **argv) {
          * the active segment's curve. Queries hit only the tile index;
          * grids come from the worker's cache (missing ones get queued) and
          * at most a few re-traces run per frame to amortize slice scrubs. */
-        const ImU32 dim_col = 0x505a5a5au;
+        /* corpus line visibility: user-adjustable alpha; brighter teal
+         * default (the old 0x50 gray vanished into the CT) */
+        uint32_t ca8 = (uint32_t)(mv_corpus_vis * 255.0f + 0.5f);
+        const ImU32 dim_col = (ca8 << 24) | 0x00c8b478u;
         const ImU32 ov_hi = 0x783c8ce6u; /* heavy overlap with active: orange */
         const ImU32 ov_lo = 0x5864b4d2u; /* light overlap: sand */
         pthread_mutex_lock(&sgc.mu);
