@@ -1493,7 +1493,12 @@ int main(int argc, char **argv) {
      * multiview starts in its empty state (blank flattened pane, planes
      * centered on the volume, tracer ready) instead of dropping to the
      * single-pane slab view */
-    multiview_path = od_next_seg[0] ? od_next_seg : "(none)";
+    /* volume-only swap keeps the 2x2 layout; CLOSE (no next volume)
+     * drops to the plain empty view with the browser open instead of
+     * exiting through the multiview-needs-bricks check */
+    multiview_path =
+        od_next_seg[0] ? od_next_seg : (od_next_bricks[0] ? "(none)" : NULL);
+    if (!od_next_bricks[0]) od_window = true;
     n_overlays = 0; /* browser-opened datasets have no overlay tree yet */
     overlay_path = NULL; /* else the old tree is reopened against the new
                           * volume: shape mismatch -> silent EXIT_FAILURE */
