@@ -111,8 +111,13 @@ nearest the focus.
 **Concurrent traces**: press **G** over a plane view to queue a trace seed
 (green circles), then *trace all seeds* grows one tracer per seed at the
 same time (each self-contained with its own solve pool, thread-capped to
-share cores; 8 run in parallel, and a queue of up to 100 seeds drains
-automatically as slots free). Exactly one trace is displayed in the flattened
+share cores; 8 run in parallel from a queue of up to 100 seeds). Queue-
+started traces are fully automatic: on finish each is saved into the
+segment store (selectable in the surfaces panel), its 2.5D ink map is
+computed in the background (no TTA) and cached, and its slot immediately
+starts the next queued seed - drop 21 seeds, come back to 21 packed,
+ink-mapped segments. Manually seeded traces stay resident for
+interactive refine/rewind as before. Exactly one trace is displayed in the flattened
 pane; the panel lists the rest with live ring/point counts and *show* /
 *stop* per trace - saved traces enter the segment store/browser as usual.
 Headless: `R3D_SEEDS_TEST="x,y,z;x,y,z"`.
