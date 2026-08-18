@@ -1714,6 +1714,10 @@ int main(int argc, char **argv) {
   bool mv_tr_spiral = true;
   bool mv_tr_fill = true;
   bool mv_tr_live = true;      /* render the growing grid in the seg pane */
+  bool mv_tr_view = false; /* the flattened pane FOLLOWS the selected live
+                            * trace; cleared when a store segment is
+                            * activated so a finishing background trace
+                            * never steals the view back */
   /* tracer anchors: world points the sheet must pass through (placed by
    * Ctrl+click in anchor mode; pushed to the tracer live) */
   double mv_anchor[R3D_TR_MAX_ANCHORS * 3];
@@ -2094,6 +2098,8 @@ int main(int argc, char **argv) {
             mv[i].cv = fv;
             mv[i].slice = fs;
           }
+          mv_tr_view = false; /* the pane now shows a store segment; live
+                               * traces keep growing without stealing it */
           inklive_have = false; /* prediction of the previous segment is stale */
           r3d_surfvol_inkpred_clear(renderer); /* and its texture must not
                                                 * tint the new surface */
@@ -3401,6 +3407,7 @@ int main(int argc, char **argv) {
               gt_sel = ti;
               GT->gen = 0; /* force a fresh snapshot + live swap */
               GT->live_first = true;
+              mv_tr_view = true;
             }
           }
           igSameLine(0, 6);
@@ -3441,6 +3448,7 @@ int main(int argc, char **argv) {
                                    mv_tr_spiral && umbilicus.count >= 2 ? 0.5 : 0.0};
           if (r3d_tracer_start(&GT->tr, pr, &tc, &umbilicus) == 0) {
             GT->harvest = false; /* interactive: stays resident when done */
+            mv_tr_view = true;
             if (mv_anchor_n) r3d_tracer_set_anchors(&GT->tr, mv_anchor, mv_anchor_n);
             free(GT->pos);
             free(GT->st);
@@ -3902,6 +3910,7 @@ int main(int argc, char **argv) {
         GT->st = calloc((size_t)GT->tr.W * GT->tr.H, 1);
         GT->cf = calloc((size_t)GT->tr.W * GT->tr.H, sizeof *GT->cf);
         GT->active = GT->pos && GT->st && GT->cf;
+        mv_tr_view = true; /* headless hooks watch the trace */
         if (GT->active && getenv("R3D_ANCHOR_TEST")) {
           /* headless: anchors as "x,y,z;x,y,z;..." (world voxels) */
           const char *s = getenv("R3D_ANCHOR_TEST");
@@ -4036,6 +4045,7 @@ int main(int argc, char **argv) {
                                                       : 0.0};
               if (r3d_tracer_start(&GT->tr, pr, &tc, &umbilicus) == 0) {
                 GT->harvest = true; /* auto-save + auto-ink on finish */
+                if (sgc_active[0] == 0) mv_tr_view = true;
                 if (mv_anchor_n)
                   r3d_tracer_set_anchors(&GT->tr, mv_anchor, mv_anchor_n);
                 free(GT->pos);
@@ -4073,7 +4083,7 @@ int main(int argc, char **argv) {
         r3d_tracer_snapshot(&GT->tr, GT->pos, GT->st, GT->cf, NULL, NULL, NULL);
         GT->gen = g;
         uint64_t now2 = r3d_now_ns();
-        if (mv_tr_live && GT->nset > 8 &&
+        if (mv_tr_live && mv_tr_view && GT->nset > 8 &&
             (now2 - mv_tr_live_ns > 400000000ull || GT->done)) {
           /* live growth in the segment pane: swap the trace grid into the
            * active surf machinery (tiny grids — the upload is trivial; the
