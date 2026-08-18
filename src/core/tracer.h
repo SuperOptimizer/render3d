@@ -157,6 +157,11 @@ typedef struct r3d_tracer {
    * quad plane in voxels (planarity) */
   uint32_t qc_folds, qc_kinks;
   float qc_twist;
+  /* first fold locations this generation: fed to the active fold-repair
+   * anneal so a fold is fixed while it is one generation old instead of
+   * parenting the next ring */
+  uint32_t qc_fold_cell[16];
+  uint32_t qc_nfoldc;
   double qc_area_vx2;  /* two-triangle quad area over all-trusted quads */
   uint32_t qc_bbox[4]; /* i0,j0,i1,j1 inclusive over trusted cells */
   float qc_fill;       /* trusted cells / bbox area */

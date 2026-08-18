@@ -4561,6 +4561,8 @@ static void tr_qc2(r3d_tracer *t, bool clamp_folds) {
         if (l1 < 1e-12 || l2 < 1e-12) continue;
         dot /= sqrt(l1 * l2);
         if (dot < 0.0) {
+          if (folds < 16)
+            t->qc_fold_cell[folds] = (uint32_t)((size_t)j * t->W + (size_t)i);
           folds++;
           if (clamp_folds && t->conf[(size_t)j * t->W + (size_t)i] > 0.25f)
             t->conf[(size_t)j * t->W + (size_t)i] = 0.25f;
@@ -4629,6 +4631,7 @@ static void tr_qc2(r3d_tracer *t, bool clamp_folds) {
   }
   pthread_mutex_lock(&t->mu);
   t->qc_folds = folds;
+  t->qc_nfoldc = folds < 16 ? folds : 16;
   t->qc_kinks = kinks;
   t->qc_twist = ntw ? (float)sqrt(tw2 / (double)ntw) : 0.0f;
   t->qc_area_vx2 = area;
@@ -5364,6 +5367,32 @@ static void *tr_worker(void *ud) {
     tr_wind_relax(t, 30); /* winding follows the moved cells; werr = the
                            * wrong-wrap detector (clamps conf when on) */
     tr_qc2(t, false); /* refresh the mesh QC counters for the panel */
+    if (t->qc_nfoldc && !t->quit) {
+      /* active fold repair: a fold that survives its own generation
+       * becomes the parent geometry of the next ring. Anneal each fold's
+       * disc with the staged schedule - data term off first so the fold
+       * can cross back over the barrier holding it, then full weights.
+       * (The placement-time gate was measured worse: deferral re-placed
+       * cells from worse parents. Repair-in-place keeps the cell and
+       * fixes it.) */
+      static const double fsched[2][3] = {{0.3, 0.1, -1.0}, {1.0, 1.0, 1.0}};
+      for (int pass = 0; pass < 2 && !t->quit; pass++) {
+        cenv.ws_dist = fsched[pass][0];
+        cenv.ws_straight = fsched[pass][1];
+        cenv.ws_snap = fsched[pass][2];
+        for (uint32_t pe = 0; pe < pool.nth; pe++) {
+          pool.env[pe].ws_dist = fsched[pass][0];
+          pool.env[pe].ws_straight = fsched[pass][1];
+          pool.env[pe].ws_snap = fsched[pass][2];
+        }
+        for (uint32_t f = 0; f < t->qc_nfoldc && !t->quit; f++)
+          tr_local_opt(t, &cenv, (int)(t->qc_fold_cell[f] % W),
+                       (int)(t->qc_fold_cell[f] / W), 4, 3, true);
+      }
+      cenv.ws_dist = cenv.ws_straight = cenv.ws_snap = 0.0;
+      for (uint32_t pe = 0; pe < pool.nth; pe++)
+        pool.env[pe].ws_dist = pool.env[pe].ws_straight = pool.env[pe].ws_snap = 0.0;
+    }
     tr_anc_assign(t); /* adopt/assign user anchors, then re-seat their
                        * neighborhoods so a correction shows immediately
                        * instead of waiting for the every-8th global solve */
