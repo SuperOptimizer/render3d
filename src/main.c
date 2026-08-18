@@ -10,6 +10,8 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <time.h>
+
+#include "core/pngw.h"
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -113,6 +115,14 @@ static float *inkmap_load(const char *path, uint32_t *w, uint32_t *h, uint32_t *
   return m;
 }
 
+/* Write the ink artifacts INTO a segment's tifxyz dir so the detection
+ * travels with the surface: ink.inkmap (float, reload-exact) + ink.png
+ * (8-bit view, scrollprize-style). Skips silently when the dir does not
+ * exist (segments that came from elsewhere). */
+static void inkmap_save_segdir(const char *name, const float *m, uint32_t w,
+                               uint32_t h, uint32_t up, uint32_t gw, uint32_t gh,
+                               uint64_t nvalid);
+
 /* Trace segment name at FINISH time: yyyymmddhhmmss (sorts
  * chronologically = alphabetically), suffixed -2, -3... when several
  * traces finish within one second. */
@@ -128,6 +138,32 @@ static void trace_dir_now(char *out, size_t n) {
     char tmp[96];
     snprintf(tmp, sizeof tmp, "cache/traced/%s-%d", base, k);
     snprintf(out, n, "%s", tmp);
+  }
+}
+
+static int inkmap_save(const char *path, const float *m, uint32_t w, uint32_t h,
+                       uint32_t up, uint32_t gw, uint32_t gh, uint64_t nvalid);
+
+static void inkmap_save_segdir(const char *name, const float *m, uint32_t w,
+                               uint32_t h, uint32_t up, uint32_t gw, uint32_t gh,
+                               uint64_t nvalid) {
+  char dir[320];
+  snprintf(dir, sizeof dir, "cache/traced/%s", name);
+  struct stat st;
+  if (stat(dir, &st) != 0) return; /* not one of our traced segments */
+  char path[400];
+  snprintf(path, sizeof path, "%s/ink.inkmap", dir);
+  inkmap_save(path, m, w, h, up, gw, gh, nvalid);
+  uint8_t *px = malloc((size_t)w * h);
+  if (px) {
+    for (size_t k = 0; k < (size_t)w * h; k++) {
+      float v = m[k] * 255.0f;
+      px[k] = (uint8_t)(v < 0.0f ? 0.0f : (v > 255.0f ? 255.0f : v));
+    }
+    snprintf(path, sizeof path, "%s/ink.png", dir);
+    if (r3d_png_write_gray(path, px, w, h) == 0)
+      printf("inklive: ink image -> %s\n", path);
+    free(px);
   }
 }
 
@@ -2115,8 +2151,14 @@ int main(int argc, char **argv) {
             snprintf(inkmap_path, sizeof inkmap_path, "%s/%s.inkmap", seg_store_path,
                      sgc_active);
             uint32_t lw, lh, lup;
-            float *lm = inkmap_load(inkmap_path, &lw, &lh, &lup, mv_seg.w,
-                                    mv_seg.h, mv_seg.nvalid);
+            /* the copy living WITH the segment wins; store cache second */
+            char sdp[400];
+            snprintf(sdp, sizeof sdp, "cache/traced/%s/ink.inkmap", sgc_active);
+            float *lm = inkmap_load(sdp, &lw, &lh, &lup, mv_seg.w, mv_seg.h,
+                                    mv_seg.nvalid);
+            if (!lm)
+              lm = inkmap_load(inkmap_path, &lw, &lh, &lup, mv_seg.w,
+                               mv_seg.h, mv_seg.nvalid);
             if (lm) {
               inkmap = lm;
               inkmap_w = lw;
@@ -2678,6 +2720,15 @@ int main(int argc, char **argv) {
               if (inkmap_save(imq_path, inkmap, inkmap_w, inkmap_h, inkmap_up,
                               IMS->w, IMS->h, IMS->nvalid) == 0)
                 printf("inklive: queued ink map saved -> %s\n", imq_path);
+              { /* the detection travels with the surface */
+                const char *bn = strrchr(imq_path, '/');
+                char nm[200];
+                snprintf(nm, sizeof nm, "%s", bn ? bn + 1 : imq_path);
+                char *dot = strstr(nm, ".inkmap");
+                if (dot) *dot = 0;
+                inkmap_save_segdir(nm, inkmap, inkmap_w, inkmap_h, inkmap_up,
+                                   IMS->w, IMS->h, IMS->nvalid);
+              }
               free(inkmap);
               inkmap = NULL;
               r3d_tifxyz_free(&imq_seg);
@@ -2690,6 +2741,9 @@ int main(int argc, char **argv) {
                   inkmap_save(inkmap_path, inkmap, inkmap_w, inkmap_h, inkmap_up,
                               IMS->w, IMS->h, IMS->nvalid) == 0)
                 printf("inklive: full ink map saved -> %s\n", inkmap_path);
+              if (sgc_active[0]) /* the detection travels with the surface */
+                inkmap_save_segdir(sgc_active, inkmap, inkmap_w, inkmap_h,
+                                   inkmap_up, IMS->w, IMS->h, IMS->nvalid);
             } else {
               printf("inklive: ink map tile %u/%u\n", im_ty * im_ntx + im_tx,
                      im_ntx * im_nty);
@@ -3345,7 +3399,7 @@ int main(int argc, char **argv) {
       const char *pr = overlay_paths[overlay_sel];
       const char *prb = strrchr(pr, '/');
       igTextDisabled("predictions: %s", prb ? prb + 1 : pr);
-      igSliderFloat("grid step (vox)", &mv_tr_step, 5.0f, 40.0f, "%.0f", 0);
+      igSliderFloat("grid step (vox)", &mv_tr_step, 1.0f, 40.0f, "%.0f", 0);
       igSliderFloat("confidence cutoff", &mv_tr_thresh, 0.05f, 0.9f, "%.2f", 0);
       igTextDisabled("growth never rejects (vc3d); the cutoff masks display + save");
       igSliderInt("generations", &mv_tr_rings, 8, 200, "%d", 0);

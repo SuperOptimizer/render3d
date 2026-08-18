@@ -44,6 +44,7 @@ find_package(Vulkan REQUIRED)
 find_package(Threads REQUIRED)
 find_package(CURL REQUIRED)
 find_package(TIFF REQUIRED) # tifxyz segment surfaces (BigTIFF/LZW/predictor-3)
+find_package(ZLIB REQUIRED) # grayscale PNG writer (ink maps, rendseg)
 find_library(BLOSC_LIB blosc REQUIRED) # zarr v2 chunk decode (zarr2c5d + net ingest)
 
 # --- core (backend-agnostic: math, camera, volume, transfer, stats) ---
@@ -58,6 +59,7 @@ add_library(r3d_core STATIC
   src/core/segtrace.c
   src/core/segstore.c
   src/core/cpuvol.c
+  src/core/pngw.c
   src/core/tracer.c
   src/core/inklive.c
   src/core/surfpred.c
@@ -70,7 +72,7 @@ set_source_files_properties(src/core/tracer.c src/core/cpuvol.c
 target_include_directories(r3d_core PUBLIC src)
 target_link_libraries(r3d_core PRIVATE r3d_warnings r3d_sanitize
                                PUBLIC m Threads::Threads SDL3::SDL3 TIFF::TIFF
-                                      CURL::libcurl ${BLOSC_LIB})
+                                      CURL::libcurl ZLIB::ZLIB ${BLOSC_LIB})
 
 # --- c5d codec (pinned source dependency) ---
 # The GPU host/kernel contract is not a stable c5d public ABI.  Compiling a
