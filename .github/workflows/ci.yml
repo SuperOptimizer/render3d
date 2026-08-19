@@ -1,0 +1,45 @@
+# CI: build every preset and run the quick-label test suite (CPU-only,
+# offline, synthetic-data). GPU-labeled tests need a real device and are
+# excluded here; they skip locally too when no GPU is present.
+name: ci
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [release, dev, tsan]
+    runs-on: ubuntu-latest
+    # ubuntu-latest images predate SDL3 in apt; the 26.04 container has it
+    container: ubuntu:26.04
+    steps:
+      - name: dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            clang ccache cmake ninja-build git curl ca-certificates unzip \
+            libsdl3-dev libvulkan-dev glslc libcurl4-openssl-dev \
+            libtiff-dev zlib1g-dev libblosc-dev
+      - uses: actions/checkout@v4
+      - name: vendored toolchain (slang + 3ddct pins)
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          tools/fetch_slang.sh
+          tools/fetch_3ddct.sh
+      - name: ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-${{ matrix.preset }}-${{ github.sha }}
+          restore-keys: ccache-${{ matrix.preset }}-
+      - name: configure
+        run: cmake --preset ${{ matrix.preset }}
+      - name: build
+        run: cmake --build --preset ${{ matrix.preset }}
+      - name: quick tests
+        working-directory: build/${{ matrix.preset }}
+        run: ctest -L quick --output-on-failure
