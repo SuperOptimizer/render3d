@@ -1916,7 +1916,7 @@ static void tr_spiral_flag(r3d_tracer *t) {
     /* only clamp genuinely wrap-like errors: past half a sheet gap AND
      * past 2.5x the fit's own noise floor (a rigid model on a squashed
      * scroll cannot justify distrusting 2-sigma cells) */
-    double thr = 0.5 * fabs(t->sp_omega);
+    double thr = 0.5 * fabs(atomic_load(&t->sp_omega));
     if (2.5 * t->sp_rms > thr) thr = 2.5 * t->sp_rms;
     if (fabs(r) > thr && t->conf[k] > 0.25f && !(t->dsup && t->dsup[k] >= 2))
       t->conf[k] = 0.25f;
@@ -3470,7 +3470,7 @@ static void tr_res_space(tr_nlsq *acc, td_cache *dt, const double x[3],
 
 /* effective sheet gap: joint-fit omega when trusted, else measured */
 static double tr_om_eff(const r3d_tracer *t) {
-  if (t->sp_valid) return fabs(t->sp_omega);
+  if (t->sp_valid) return fabs(atomic_load(&t->sp_omega));
   return t->sp_om_meas >= 4.0 ? t->sp_om_meas : 0.0;
 }
 
@@ -3500,7 +3500,7 @@ static void tr_res_wind(tr_nlsq *acc, const r3d_tracer *t, const double x[3],
   if (rho < 1e-6) return;
   double r0v, r0s;
   tr_sp_r0_at(t, x[2], &r0v, &r0s);
-  double om = fabs(t->sp_omega);
+  double om = fabs(atomic_load(&t->sp_omega));
   if (om < 1e-9) return;
   double th = atan2(uy, ux);
   const double *ab = t->sp_ab;
