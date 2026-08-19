@@ -153,6 +153,19 @@ static void test_labelvol(const char *tmp) {
     else if (!b) CHECK(memcmp(a, memset(za, 0, sizeof za), sizeof za) == 0);
     else CHECK(memcmp(a, b, sizeof za) == 0);
   }
+  /* coarse-LOD fetch stride-samples the paint grid: an even-coordinate
+   * voxel painted at level 0 must appear at half coords in the level-1
+   * brick (out[o] samples world voxel o<<1) */
+  {
+    double pv[3] = {50.0, 40.0, 30.0};
+    CHECK(r3d_labelvol_paint(&lv, pv, 0.4, 7) == 1);
+    static uint8_t l1[128 * 128 * 128];
+    r3d_labelvol_fetch(&lv, 1, 0, 0, 0, l1);
+    CHECK(l1[((size_t)15 * 128 + 20) * 128 + 25] == 7);
+    CHECK(r3d_labelvol_gen(&lv, 1, 0, 0, 0) > 0);
+    CHECK(r3d_labelvol_paint(&lv, pv, 0.4, 0) == 1); /* erase it again */
+    CHECK(lv.nvox[7] == 0);
+  }
   /* truncated brick: load fails closed, the live volume is untouched */
   {
     DIR *dp = opendir(dir);
@@ -239,6 +252,39 @@ static void test_regvol(const char *root, const char *tmp, const uint8_t *ref) {
   CHECK(r3d_regvol_load_json(&rv, jp) == 0);
   r3d_regvol_pull(&rv, P1);
   for (int i = 0; i < 12; i++) CHECK(fabs(P0[i] - P1[i]) < 1e-6);
+  /* shipped Vesuvius convention: transformation_matrix is moving->fixed in
+   * XYZ; load must invert it into the pull map. f = 0.5*m + t  =>
+   * m = 2*(f - t): check the exact inverse lands. */
+  {
+    char sp2[700];
+    snprintf(sp2, sizeof sp2, "%s/shipped.json", tmp);
+    FILE *f = fopen(sp2, "w");
+    CHECK(f != NULL);
+    if (f) {
+      fprintf(f, "{\n  \"transformation_matrix\": [\n"
+                 "    [0.5, 0, 0, 10],\n    [0, 0.5, 0, 20],\n"
+                 "    [0, 0, 0.5, 30]\n  ]\n}\n");
+      fclose(f);
+      CHECK(r3d_regvol_load_json(&rv, sp2) == 0);
+      double Ps[12];
+      r3d_regvol_pull(&rv, Ps);
+      CHECK(fabs(Ps[0] - 2.0) < 1e-9 && fabs(Ps[3] + 20.0) < 1e-9);
+      CHECK(fabs(Ps[5] - 2.0) < 1e-9 && fabs(Ps[7] + 40.0) < 1e-9);
+      CHECK(fabs(Ps[10] - 2.0) < 1e-9 && fabs(Ps[11] + 60.0) < 1e-9);
+      /* malformed json: refused, and the transform is left untouched */
+      FILE *g = fopen(sp2, "w");
+      CHECK(g != NULL);
+      if (g) {
+        fprintf(g, "{ not json at all ]]");
+        fclose(g);
+        CHECK(r3d_regvol_load_json(&rv, sp2) != 0);
+        double Pk[12];
+        r3d_regvol_pull(&rv, Pk);
+        for (int i = 0; i < 12; i++) CHECK(fabs(Pk[i] - Ps[i]) < 1e-12);
+      }
+      unlink(sp2);
+    }
+  }
   /* rigid refine recovers a known misalignment (64^3 ROI at the center) */
   r3d_regvol_set_scale(&rv, 1.0);
   rv.d_tr[0] = 2.5;

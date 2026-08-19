@@ -273,6 +273,16 @@ target_link_libraries(test_ingest PRIVATE r3d_core r3d_warnings r3d_sanitize)
 add_test(NAME ingest COMMAND test_ingest)
 set_tests_properties(ingest PROPERTIES LABELS quick TIMEOUT 120)
 
+add_executable(test_odlist tests/test_odlist.c)
+target_link_libraries(test_odlist PRIVATE r3d_core r3d_warnings r3d_sanitize)
+add_test(NAME odlist COMMAND test_odlist)
+set_tests_properties(odlist PROPERTIES LABELS quick TIMEOUT 60)
+
+add_executable(test_zarr2c5d tests/test_zarr2c5d.c)
+target_link_libraries(test_zarr2c5d PRIVATE r3d_core r3d_warnings r3d_sanitize)
+add_test(NAME zarr2c5d COMMAND test_zarr2c5d $<TARGET_FILE:zarr2c5d>)
+set_tests_properties(zarr2c5d PROPERTIES LABELS quick TIMEOUT 180)
+
 add_executable(test_overlay tests/test_overlay.c)
 target_link_libraries(test_overlay PRIVATE r3d_c5d r3d_warnings r3d_sanitize m)
 add_test(NAME overlay COMMAND test_overlay $<TARGET_FILE:render3d>)
