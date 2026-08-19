@@ -26,6 +26,7 @@
 #include "core/cpuvol.h"
 #include "core/labelvol.h"
 #include "core/regvol.h"
+#include "core/segstore.h"
 #include "core/tracer.h"
 
 static int failures = 0;
@@ -258,41 +259,49 @@ static void test_regvol(const char *root, const char *tmp, const uint8_t *ref) {
 
 /* ---- tracer: save -> load round trip through the versioned sidecar ----- */
 
+/* a gently curved synthetic sheet, seed ring at the center: geometry whose
+ * 4-neighbor edges match cfg.step so the tear mask keeps it all. zoff
+ * varies the sheet so distinct "segments" differ. */
+static int make_synth_trace(r3d_tracer *t, double zoff) {
+  memset(t, 0, sizeof *t);
+  t->W = 40;
+  t->H = 30;
+  t->cfg.step = 5.0;
+  t->cfg.max_ring = 60;
+  t->cfg.thresh = 0.42f;
+  t->cfg.level = 2;
+  uint64_t n = (uint64_t)t->W * t->H;
+  t->pos = calloc(n * 3, sizeof *t->pos);
+  t->state = calloc(n, 1);
+  t->conf = calloc(n, sizeof *t->conf);
+  t->wind = calloc(n, sizeof *t->wind);
+  t->gen_of = calloc(n, sizeof *t->gen_of);
+  if (!t->pos || !t->state || !t->conf || !t->wind || !t->gen_of) return -1;
+  pthread_mutex_init(&t->mu, NULL);
+  for (uint32_t j = 0; j < t->H; j++)
+    for (uint32_t i = 0; i < t->W; i++) {
+      size_t k = (size_t)j * t->W + i;
+      t->pos[k * 3 + 0] = 100.0 + 5.0 * (double)i;
+      t->pos[k * 3 + 1] = 200.0 + 5.0 * (double)j;
+      t->pos[k * 3 + 2] = 50.0 + zoff + 3.0 * sin((double)i * 0.2);
+      t->state[k] = R3D_TR_SET;
+      t->conf[k] = 0.25f + 0.5f * (float)i / (float)t->W;
+      t->wind[k] = 0.01f * (float)i;
+      uint32_t ri = i > t->W / 2 ? i - t->W / 2 : t->W / 2 - i;
+      uint32_t rj = j > t->H / 2 ? j - t->H / 2 : t->H / 2 - j;
+      t->gen_of[k] = (uint16_t)(1u + (ri > rj ? ri : rj));
+    }
+  atomic_store(&t->gens_done, 15u);
+  return 0;
+}
+
 static void test_tracer_roundtrip(const char *tmp) {
   char dir[700];
   snprintf(dir, sizeof dir, "%s/trace", tmp);
   CHECK(mkdir(dir, 0755) == 0); /* save expects the target dir to exist */
-  r3d_tracer t = {0};
-  t.W = 40;
-  t.H = 30;
-  t.cfg.step = 5.0;
-  t.cfg.max_ring = 60;
-  t.cfg.thresh = 0.42f;
-  t.cfg.level = 2;
+  r3d_tracer t;
+  CHECK(make_synth_trace(&t, 0.0) == 0);
   uint64_t n = (uint64_t)t.W * t.H;
-  t.pos = calloc(n * 3, sizeof *t.pos);
-  t.state = calloc(n, 1);
-  t.conf = calloc(n, sizeof *t.conf);
-  t.wind = calloc(n, sizeof *t.wind);
-  t.gen_of = calloc(n, sizeof *t.gen_of);
-  CHECK(t.pos && t.state && t.conf && t.wind && t.gen_of);
-  pthread_mutex_init(&t.mu, NULL);
-  /* a gently curved synthetic sheet, seed ring at the center: geometry
-   * whose 4-neighbor edges match cfg.step so the tear mask keeps it all */
-  for (uint32_t j = 0; j < t.H; j++)
-    for (uint32_t i = 0; i < t.W; i++) {
-      size_t k = (size_t)j * t.W + i;
-      t.pos[k * 3 + 0] = 100.0 + 5.0 * (double)i;
-      t.pos[k * 3 + 1] = 200.0 + 5.0 * (double)j;
-      t.pos[k * 3 + 2] = 50.0 + 3.0 * sin((double)i * 0.2);
-      t.state[k] = R3D_TR_SET;
-      t.conf[k] = 0.25f + 0.5f * (float)i / (float)t.W;
-      t.wind[k] = 0.01f * (float)i;
-      uint32_t ri = i > t.W / 2 ? i - t.W / 2 : t.W / 2 - i;
-      uint32_t rj = j > t.H / 2 ? j - t.H / 2 : t.H / 2 - j;
-      t.gen_of[k] = (uint16_t)(1u + (ri > rj ? ri : rj));
-    }
-  atomic_store(&t.gens_done, 15u);
   t.anc[0] = 111.0;
   t.anc[1] = 222.0;
   t.anc[2] = 55.0;
@@ -335,6 +344,72 @@ static void test_tracer_roundtrip(const char *tmp) {
   rmdir(dir);
 }
 
+/* ---- segstore: fail-closed rebuild + recovery ---------------------------- */
+
+static void rmdir_all(const char *dir) {
+  DIR *dp = opendir(dir);
+  struct dirent *de;
+  while (dp && (de = readdir(dp)) != NULL)
+    if (de->d_name[0] != '.') {
+      char p[900];
+      snprintf(p, sizeof p, "%s/%s", dir, de->d_name);
+      unlink(p);
+    }
+  if (dp) closedir(dp);
+  rmdir(dir);
+}
+
+static void test_segstore(const char *tmp) {
+  char sa[700], sb[700], store[700];
+  snprintf(sa, sizeof sa, "%s/segA", tmp);
+  snprintf(sb, sizeof sb, "%s/segB", tmp);
+  snprintf(store, sizeof store, "%s/store", tmp);
+  CHECK(mkdir(sa, 0755) == 0 && mkdir(sb, 0755) == 0 && mkdir(store, 0755) == 0);
+  r3d_tracer t;
+  CHECK(make_synth_trace(&t, 0.0) == 0);
+  CHECK(r3d_tracer_save(&t, sa, 0.0f, false) == 0);
+  r3d_tracer_free(&t);
+  CHECK(make_synth_trace(&t, 40.0) == 0);
+  CHECK(r3d_tracer_save(&t, sb, 0.0f, false) == 0);
+  r3d_tracer_free(&t);
+  /* build with A, then add B: B's build carries A forward */
+  const char *da[1] = {sa}, *db[1] = {sb};
+  CHECK(r3d_segstore_build(store, da, 1, 2, false) == 1);
+  CHECK(r3d_segstore_build(store, db, 1, 2, false) == 2);
+  r3d_segstore st;
+  CHECK(r3d_segstore_open(&st, store) == 0);
+  CHECK(st.n == 2);
+  r3d_segstore_close(&st);
+  if (geteuid() != 0) {
+    /* fail-closed: an unwritable store dir must abort the rebuild and
+     * leave the previous corpus fully usable */
+    CHECK(chmod(store, 0555) == 0);
+    CHECK(r3d_segstore_build(store, da, 1, 2, true) < 0); /* force re-encode */
+    CHECK(chmod(store, 0755) == 0);
+    CHECK(r3d_segstore_open(&st, store) == 0);
+    CHECK(st.n == 2);
+    r3d_segstore_close(&st);
+  }
+  /* corrupt manifest: open refuses (no crash, no partial corpus), and a
+   * source-less rebuild regenerates it from the store's own .tfx files */
+  char mp[760];
+  snprintf(mp, sizeof mp, "%s/segments.r3ds", store);
+  CHECK(truncate(mp, 17) == 0);
+  CHECK(r3d_segstore_open(&st, store) != 0);
+  CHECK(r3d_segstore_build(store, NULL, 0, 2, false) == 2);
+  CHECK(r3d_segstore_open(&st, store) == 0);
+  CHECK(st.n == 2);
+  /* the rebuilt corpus still decodes */
+  r3d_tifxyz s0;
+  CHECK(r3d_segstore_load(&st, 0, 1, &s0) == 0);
+  CHECK(s0.nvalid > 500);
+  r3d_tifxyz_free(&s0);
+  r3d_segstore_close(&st);
+  rmdir_all(sa);
+  rmdir_all(sb);
+  rmdir_all(store);
+}
+
 int main(void) {
   char tmp[512];
   const char *base = getenv("TMPDIR");
@@ -367,6 +442,7 @@ int main(void) {
   test_labelvol(tmp);
   test_regvol(root, tmp, ref);
   test_tracer_roundtrip(tmp);
+  test_segstore(tmp);
   free(ref);
   st_rm_tree(root, 2);
   /* label/json leftovers live under tmp; remove what the tests created */
