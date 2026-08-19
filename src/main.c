@@ -249,6 +249,41 @@ static int flat_save(const char *dir, const float *xyz, uint32_t w, uint32_t h,
   return rc;
 }
 
+/* Automatic post-save flattening: the 2.5D ink model is trained on
+ * flattened segments, so every harvested trace is SLIM-flattened before
+ * it enters the store (and thus before the ink queue sees it). Loads the
+ * artifact just written by r3d_tracer_save (so fill/cutoff re-seating is
+ * included), flattens + resamples, and saves <rawdir>-flat. The raw dir
+ * keeps the tracer.json round trip for tracecli resume; only the flat
+ * segment is packed/inked. Returns 0 and fills flatdir on success; on
+ * any failure the caller falls back to the raw segment. */
+static int trace_flatten_save(const char *rawdir, char *flatdir, size_t fn) {
+  r3d_tifxyz s = {0};
+  if (r3d_tifxyz_load(&s, rawdir) != 0 || s.w < 3 || s.h < 3) {
+    r3d_tifxyz_free(&s);
+    return -1;
+  }
+  double step = s.sx > 0.0f ? 1.0 / (double)s.sx : 20.0;
+  float *uv = malloc((size_t)s.w * s.h * 2 * sizeof *uv);
+  float *rxyz = NULL;
+  uint32_t rw = 0, rh = 0;
+  r3d_flatten_stats fst = {0};
+  int rc = -1;
+  if (uv && r3d_flatten_slim(s.xyz, s.w, s.h, step, 200, uv, &fst) == 0 &&
+      r3d_flatten_resample(s.xyz, uv, s.w, s.h, step, &rxyz, &rw, &rh) == 0) {
+    snprintf(flatdir, fn, "%s-flat", rawdir);
+    rc = flat_save(flatdir, rxyz, rw, rh, step);
+    if (rc == 0)
+      printf("tracer: flattened %s -> %s (%ux%u, stretch %.4f -> %.4f, "
+             "%u iters)\n", rawdir, flatdir, rw, rh, fst.stretch0,
+             fst.stretch1, fst.iters);
+  }
+  free(rxyz);
+  free(uv);
+  r3d_tifxyz_free(&s);
+  return rc;
+}
+
 static int inkmap_save(const char *path, const float *m, uint32_t w, uint32_t h,
                        uint32_t up, uint32_t gw, uint32_t gh, uint64_t nvalid) {
   char tmp[1240];
@@ -4789,8 +4824,13 @@ int main(int argc, char **argv) {
             ++mv_tr_nsaved; /* only a durable artifact counts as saved */
             printf("tracer: saved %s (%ux%u, %u pts)\n", td, GT->tr.W, GT->tr.H,
                    GT->nset);
+            /* the STORE (and thus ink/display) gets the flattened segment;
+             * the raw dir stays on disk for tracecli round trips */
+            char fdtd[280];
+            const char *sd = trace_flatten_save(td, fdtd, sizeof fdtd) == 0
+                                 ? fdtd : td;
             if (sgc.open) { /* pack + reopen the corpus so it shows at once */
-              const char *dirs1[1] = {td};
+              const char *dirs1[1] = {sd};
               if (r3d_segstore_build(seg_store_path, dirs1, 1, 2, false) > 0) {
                 for (int oi2 = 1; oi2 < 4; oi2++) {
                   if (!sgc_ln[oi2]) continue;
@@ -4811,9 +4851,9 @@ int main(int argc, char **argv) {
                   }
                   memcpy(sgc_near_focus,
                          (double[3]){1e30, 1e30, 1e30}, sizeof sgc_near_focus);
-                  printf("tracer: %s added to the store (%u surfaces)\n", td, sgc.st.n);
-                  const char *tb = strrchr(td, '/');
-                  tb = tb ? tb + 1 : td;
+                  printf("tracer: %s added to the store (%u surfaces)\n", sd, sgc.st.n);
+                  const char *tb = strrchr(sd, '/');
+                  tb = tb ? tb + 1 : sd;
                   pthread_mutex_lock(&sgc.mu); /* make it the ACTIVE surface:
                      * the grown segment replaces the flattened view */
                   for (uint32_t si = 0; si < sgc.st.n; si++)
@@ -5922,7 +5962,13 @@ int main(int argc, char **argv) {
             continue;
           }
           ++mv_tr_nsaved;
-          snprintf(saved_names[nharv], sizeof saved_names[0], "%s", td);
+          /* flatten before the store/ink chain (the ink model expects
+           * flattened segments); raw dir kept for tracecli round trips */
+          char fdh[280];
+          if (trace_flatten_save(td, fdh, sizeof fdh) == 0)
+            snprintf(saved_names[nharv], sizeof saved_names[0], "%s", fdh);
+          else
+            snprintf(saved_names[nharv], sizeof saved_names[0], "%s", td);
           saved_dirs[nharv] = saved_names[nharv];
           const char *bn = strrchr(saved_names[nharv], '/');
           bn = bn ? bn + 1 : saved_names[nharv];
