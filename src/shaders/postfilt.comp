@@ -1,0 +1,103 @@
+#version 450
+/* Post-decode 3D display filter over one brick's atlas slot: the streamed
+ * brick is filtered ONCE on upload (not per frame), so every view — plane
+ * panes, 3D, the flattened bake — sees the filtered volume for free.
+ *   mode 1 = 3x3x3 median (27-tap partial selection)
+ *   mode 2 = 3D unsharp sharpen (3x3x3 box mean; amount = strength)
+ *   mode 3 = 5x5x5 median (two-pass 4+4 bit histogram over the u8 values)
+ *   mode 4 = 3x3x3 max pool
+ *   mode 5 = 5x5x5 max pool
+ * Neighbourhoods clamp to the slot, so the outermost voxels of a brick
+ * filter against themselves across brick seams — invisible in practice at
+ * 128^3. Reads the atlas, writes a scratch slot; the caller copies the
+ * scratch back over the atlas slot. */
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+
+layout(binding = 0) uniform sampler3D atlas;
+layout(binding = 1, r8) uniform writeonly image3D dst;
+
+layout(push_constant) uniform PC {
+  uint sx, sy, sz; /* atlas texel origin of the slot payload */
+  uint dx, dy, dz; /* scratch texel origin */
+  uint mode;       /* see table above */
+  float amount;    /* sharpen strength */
+} pc;
+
+float fetch(ivec3 base, ivec3 l, ivec3 d) {
+  return texelFetch(atlas, base + clamp(l + d, ivec3(0), ivec3(127)), 0).r;
+}
+
+void main() {
+  ivec3 l = ivec3(gl_GlobalInvocationID);
+  if (any(greaterThanEqual(l, ivec3(128)))) return;
+  ivec3 base = ivec3(int(pc.sx), int(pc.sy), int(pc.sz));
+  float outv = 0.0;
+  if (pc.mode == 1u) { /* median 27: partial selection up to rank 13 */
+    float v[27];
+    int n = 0;
+    for (int dz = -1; dz <= 1; dz++)
+      for (int dy = -1; dy <= 1; dy++)
+        for (int dx = -1; dx <= 1; dx++)
+          v[n++] = fetch(base, l, ivec3(dx, dy, dz));
+    for (int i = 0; i <= 13; i++) {
+      int mi = i;
+      for (int j = i + 1; j < 27; j++)
+        if (v[j] < v[mi]) mi = j;
+      float t = v[i];
+      v[i] = v[mi];
+      v[mi] = t;
+    }
+    outv = v[13];
+  } else if (pc.mode == 2u) { /* unsharp: center pushed off the box mean */
+    float sum = 0.0;
+    for (int dz = -1; dz <= 1; dz++)
+      for (int dy = -1; dy <= 1; dy++)
+        for (int dx = -1; dx <= 1; dx++)
+          sum += fetch(base, l, ivec3(dx, dy, dz));
+    float center = texelFetch(atlas, base + l, 0).r;
+    outv = clamp(center + pc.amount * (center - sum / 27.0), 0.0, 1.0);
+  } else if (pc.mode == 3u) { /* median 125: u8 histogram, coarse then fine */
+    int cnt[16];
+    for (int i = 0; i < 16; i++) cnt[i] = 0;
+    for (int dz = -2; dz <= 2; dz++)
+      for (int dy = -2; dy <= 2; dy++)
+        for (int dx = -2; dx <= 2; dx++) {
+          int q = int(round(fetch(base, l, ivec3(dx, dy, dz)) * 255.0));
+          cnt[q >> 4]++;
+        }
+    int rank = 62; /* 0-based median of 125 */
+    int coarse = 15, acc = 0;
+    for (int i = 0; i < 16; i++) {
+      if (acc + cnt[i] > rank) {
+        coarse = i;
+        break;
+      }
+      acc += cnt[i];
+    }
+    int rank2 = rank - acc;
+    for (int i = 0; i < 16; i++) cnt[i] = 0;
+    for (int dz = -2; dz <= 2; dz++)
+      for (int dy = -2; dy <= 2; dy++)
+        for (int dx = -2; dx <= 2; dx++) {
+          int q = int(round(fetch(base, l, ivec3(dx, dy, dz)) * 255.0));
+          if ((q >> 4) == coarse) cnt[q & 15]++;
+        }
+    int fine = 15;
+    acc = 0;
+    for (int i = 0; i < 16; i++) {
+      if (acc + cnt[i] > rank2) {
+        fine = i;
+        break;
+      }
+      acc += cnt[i];
+    }
+    outv = float(coarse * 16 + fine) / 255.0;
+  } else { /* mode 4/5: max pool, radius 1 or 2 */
+    int rr = pc.mode == 4u ? 1 : 2;
+    for (int dz = -rr; dz <= rr; dz++)
+      for (int dy = -rr; dy <= rr; dy++)
+        for (int dx = -rr; dx <= rr; dx++)
+          outv = max(outv, fetch(base, l, ivec3(dx, dy, dz)));
+  }
+  imageStore(dst, ivec3(int(pc.dx), int(pc.dy), int(pc.dz)) + l, vec4(outv));
+}

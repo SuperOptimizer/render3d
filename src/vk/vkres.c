@@ -127,15 +127,93 @@ void r3d_vkbuf_destroy(r3d_vkctx *c, r3d_vkbuf *b) {
   memset(b, 0, sizeof *b);
 }
 
+/* Legacy extent inference. Correct ONLY where depth>=2 means a 3D contract and
+ * a {N,1,1} extent means a 1D contract; see the invariant in vkres.h. New code
+ * states the type through the _typed entry points. */
+static VkImageType infer_image_type(VkExtent3D extent) {
+  return extent.depth > 1     ? VK_IMAGE_TYPE_3D
+         : extent.height > 1  ? VK_IMAGE_TYPE_2D
+                              : VK_IMAGE_TYPE_1D;
+}
+
+static uint32_t max_mips_for(VkExtent3D e) {
+  uint32_t m = e.width > e.height ? e.width : e.height;
+  if (e.depth > m) m = e.depth;
+  uint32_t n = 1;
+  while (m > 1) {
+    m >>= 1;
+    n++;
+  }
+  return n;
+}
+
+/* Fail closed before vkCreateImage: a zero extent, a type the extent cannot
+ * satisfy, an impossible mip count, or a format/type/usage combination the
+ * device does not support all produce a diagnostic instead of an object the
+ * descriptor cannot bind. */
+static bool image_params_ok(const r3d_vkctx *c, VkImageType type, VkFormat format,
+                            VkExtent3D extent, uint32_t mips, VkImageUsageFlags usage) {
+  if (!extent.width || !extent.height || !extent.depth || !mips) {
+    fprintf(stderr, "vkres: degenerate image request (%ux%ux%u m%u)\n", extent.width,
+            extent.height, extent.depth, mips);
+    return false;
+  }
+  if (type == VK_IMAGE_TYPE_1D && (extent.height != 1 || extent.depth != 1)) {
+    fprintf(stderr, "vkres: 1D image needs height=depth=1 (%ux%ux%u)\n", extent.width,
+            extent.height, extent.depth);
+    return false;
+  }
+  if (type == VK_IMAGE_TYPE_2D && extent.depth != 1) {
+    fprintf(stderr, "vkres: 2D image needs depth=1 (%ux%ux%u)\n", extent.width, extent.height,
+            extent.depth);
+    return false;
+  }
+  if (mips > max_mips_for(extent)) {
+    fprintf(stderr, "vkres: %u mips exceed the %u the extent %ux%ux%u allows\n", mips,
+            max_mips_for(extent), extent.width, extent.height, extent.depth);
+    return false;
+  }
+  /* the _2 query is the one that accepts extension usage bits (host transfer) */
+  VkPhysicalDeviceImageFormatInfo2 fi = {.sType =
+                                             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2,
+                                         .format = format,
+                                         .type = type,
+                                         .tiling = VK_IMAGE_TILING_OPTIMAL,
+                                         .usage = usage};
+  VkImageFormatProperties2 fp2 = {.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2};
+  if (vkGetPhysicalDeviceImageFormatProperties2(c->phys, &fi, &fp2) != VK_SUCCESS) {
+    fprintf(stderr, "vkres: format %d unsupported as type %d with usage 0x%x\n", (int)format,
+            (int)type, (unsigned)usage);
+    return false;
+  }
+  const VkImageFormatProperties *ifp = &fp2.imageFormatProperties;
+  if (extent.width > ifp->maxExtent.width || extent.height > ifp->maxExtent.height ||
+      extent.depth > ifp->maxExtent.depth || mips > ifp->maxMipLevels) {
+    fprintf(stderr, "vkres: %ux%ux%u m%u exceeds device limit %ux%ux%u m%u\n", extent.width,
+            extent.height, extent.depth, mips, ifp->maxExtent.width, ifp->maxExtent.height,
+            ifp->maxExtent.depth, ifp->maxMipLevels);
+    return false;
+  }
+  return true;
+}
+
+static VkImageViewType view_type_for(VkImageType type) {
+  return type == VK_IMAGE_TYPE_3D   ? VK_IMAGE_VIEW_TYPE_3D
+         : type == VK_IMAGE_TYPE_2D ? VK_IMAGE_VIEW_TYPE_2D
+                                    : VK_IMAGE_VIEW_TYPE_1D;
+}
+
 int r3d_vkimage_create(r3d_vkctx *c, VkFormat format, VkExtent3D extent, uint32_t mips,
                        VkImageUsageFlags usage, r3d_vkimage *im) {
+  return r3d_vkimage_create_typed(c, infer_image_type(extent), format, extent, mips, usage, im);
+}
+
+int r3d_vkimage_create_typed(r3d_vkctx *c, VkImageType type, VkFormat format,
+                             VkExtent3D extent, uint32_t mips, VkImageUsageFlags usage,
+                             r3d_vkimage *im) {
   memset(im, 0, sizeof *im);
   bool reserved = false;
-  /* dimensionality heuristic: depth>1 -> 3D, height>1 -> 2D, else 1D
-   * (callers wanting a 1-slice 3D image must pass depth>=2) */
-  VkImageType type = extent.depth > 1   ? VK_IMAGE_TYPE_3D
-                     : extent.height > 1 ? VK_IMAGE_TYPE_2D
-                                         : VK_IMAGE_TYPE_1D;
+  if (!image_params_ok(c, type, format, extent, mips, usage)) return -1;
   VkImageCreateInfo ici = {
       .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
       .imageType = type,
@@ -179,9 +257,7 @@ int r3d_vkimage_create(r3d_vkctx *c, VkFormat format, VkExtent3D extent, uint32_
   VkImageViewCreateInfo vci = {
       .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
       .image = im->img,
-      .viewType = type == VK_IMAGE_TYPE_3D   ? VK_IMAGE_VIEW_TYPE_3D
-                  : type == VK_IMAGE_TYPE_2D ? VK_IMAGE_VIEW_TYPE_2D
-                                             : VK_IMAGE_VIEW_TYPE_1D,
+      .viewType = view_type_for(type),
       .format = format,
       .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, mips, 0, 1},
   };
@@ -220,11 +296,16 @@ void r3d_vkarena_destroy(r3d_vkctx *c, r3d_vkarena *a) {
 int r3d_vkimage_create_arena(r3d_vkctx *c, r3d_vkarena *a, VkFormat format,
                              VkExtent3D extent, uint32_t mips, VkImageUsageFlags usage,
                              r3d_vkimage *im) {
-  if (!a) return r3d_vkimage_create(c, format, extent, mips, usage, im);
+  return r3d_vkimage_create_arena_typed(c, a, infer_image_type(extent), format, extent, mips,
+                                        usage, im);
+}
+
+int r3d_vkimage_create_arena_typed(r3d_vkctx *c, r3d_vkarena *a, VkImageType type,
+                                   VkFormat format, VkExtent3D extent, uint32_t mips,
+                                   VkImageUsageFlags usage, r3d_vkimage *im) {
+  if (!a) return r3d_vkimage_create_typed(c, type, format, extent, mips, usage, im);
   memset(im, 0, sizeof *im);
-  VkImageType type = extent.depth > 1   ? VK_IMAGE_TYPE_3D
-                     : extent.height > 1 ? VK_IMAGE_TYPE_2D
-                                         : VK_IMAGE_TYPE_1D;
+  if (!image_params_ok(c, type, format, extent, mips, usage)) return -1;
   VkImageCreateInfo ici = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
                            .imageType = type,
                            .format = format,
@@ -248,7 +329,7 @@ int r3d_vkimage_create_arena(r3d_vkctx *c, r3d_vkarena *a, VkFormat format,
   if (dr.requiresDedicatedAllocation) {
     vkDestroyImage(c->dev, im->img, NULL);
     memset(im, 0, sizeof *im);
-    return r3d_vkimage_create(c, format, extent, mips, usage, im);
+    return r3d_vkimage_create_typed(c, type, format, extent, mips, usage, im);
   }
   uint32_t type_idx = r3d_vk_find_mem(c, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
   if (type_idx == UINT32_MAX || mr.size > c->caps.max_alloc_bytes) goto fail;
@@ -297,9 +378,7 @@ int r3d_vkimage_create_arena(r3d_vkctx *c, r3d_vkarena *a, VkFormat format,
   VkImageViewCreateInfo vci = {
       .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
       .image = im->img,
-      .viewType = type == VK_IMAGE_TYPE_3D   ? VK_IMAGE_VIEW_TYPE_3D
-                  : type == VK_IMAGE_TYPE_2D ? VK_IMAGE_VIEW_TYPE_2D
-                                             : VK_IMAGE_VIEW_TYPE_1D,
+      .viewType = view_type_for(type),
       .format = format,
       .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, mips, 0, 1}};
   if (vkCreateImageView(c->dev, &vci, NULL, &im->view) != VK_SUCCESS) goto fail;
@@ -472,6 +551,10 @@ int r3d_vk_oneshot_end(r3d_vkctx *c, VkCommandPool pool, VkCommandBuffer cmd) {
 
 int r3d_vk_oneshot_end_async(r3d_vkctx *c, VkCommandPool pool, VkCommandBuffer cmd,
                              VkFence *fence, VkCommandBuffer *keep) {
+  /* a still-pending previous async submission would be silently clobbered
+   * (fence + command buffer leak, and the caller has already overwritten
+   * the staging it reads): consume it first */
+  if (*fence) r3d_vk_oneshot_finish(c, pool, fence, keep);
   vkEndCommandBuffer(cmd);
   VkFenceCreateInfo fci = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
   if (vkCreateFence(c->dev, &fci, NULL, fence) != VK_SUCCESS) {

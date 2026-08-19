@@ -28,8 +28,39 @@ import common;
 // overlay (ink) atlas: slot-parallel to brick_atlas — the SAME page-table
 // resolve and slot coords fetch the overlay value
 [[vk::binding(10, 0)]] Sampler3D<float> ink_atlas;
+// second overlay (3D ink) atlas: same slot-parallel scheme, always red —
+// surface predictions and 3D ink display TOGETHER
+[[vk::binding(11, 0)]] Sampler3D<float> ink2_atlas;
+// 3D labelling class-id atlas: same slot-parallel scheme; the user paints
+// class ids (1..8) and each class tints with its own palette color
+[[vk::binding(12, 0)]] Sampler3D<float> label_atlas;
+// registration atlas: a second scan of the same scroll, CPU-resampled onto
+// this volume's brick grid through the current alignment transform. Fused
+// green (fixed) / magenta (moving) so misalignment shows as color fringes.
+[[vk::binding(13, 0)]] Sampler3D<float> reg_atlas;
 
 bool overlay_on() { return (pc.overlay_flags & 1u) != 0u; }
+bool overlay2_on() { return (pc.overlay_flags & 4u) != 0u; }
+bool labels_on() { return (pc.overlay_flags & 8u) != 0u; }
+bool reg_on() { return (pc.overlay_flags & 16u) != 0u; }
+float reg_alpha() { return float((pc.overlay_flags >> 16) & 0xffu) * (1.0 / 255.0); }
+static const float3 INK3D_RED = float3(1.0, 0.30, 0.22);
+/* paint-label palette (class id 1..8; keep in sync with core/labelvol.c) */
+static const float3 LBL_PAL[8] = {
+  float3(0.82, 0.66, 0.43), // 1 papyrus
+  float3(0.95, 0.20, 0.85), // 2 ink
+  float3(0.20, 0.80, 0.80), // 3 not ink
+  float3(0.30, 0.90, 0.30), // 4 recto
+  float3(1.00, 0.55, 0.15), // 5 verso
+  float3(0.35, 0.45, 0.90), // 6 background
+  float3(0.95, 0.90, 0.20), // 7 damage
+  float3(0.90, 0.90, 0.90), // 8 other
+};
+static const float LBL_ALPHA = 0.65;
+float3 label_color(float v) {
+  uint c = clamp(uint(round(v * 255.0)), 1u, 8u);
+  return LBL_PAL[c - 1u];
+}
 /* overlay tint by palette id (overlay_flags bits 8+): 0 = ink green,
  * 1 = surface-prediction cyan — both readable on sepia CT */
 float3 overlay_color() {
@@ -37,16 +68,47 @@ float3 overlay_color() {
                                                  : float3(0.25, 1.0, 0.55);
 }
 /* the flat (segment) pane: live 2.5D ink replaces the overlay values inside
- * its rect, so the pane tints ink green while live ink is up (bit 1), the
- * tree palette otherwise */
+ * its rect, so the pane tints mint green while live ink is up (bit 1); a
+ * baked 3D-ink G channel (bit 2) tints red; the tree palette otherwise */
 float3 flat_overlay_color() {
-  return (pc.overlay_flags & 2u) != 0u ? float3(0.25, 1.0, 0.55) : overlay_color();
+  return (pc.overlay_flags & 16u) != 0u  ? float3(1.0, 0.25, 1.0) /* registration */
+         : (pc.overlay_flags & 2u) != 0u ? float3(0.25, 1.0, 0.55)
+         : (pc.overlay_flags & 4u) != 0u ? INK3D_RED
+                                         : overlay_color();
 }
 
 float bricks_fetch_ink(float3 slot_org, float3 bl_off, float lod, float inv_adim) {
   float inset = max(0.5 * exp2(lod), 0.5);
   float3 l = clamp(bl_off, float3(inset), float3(128.0 - inset));
   return ink_atlas.SampleLevel((slot_org + l) * inv_adim, lod);
+}
+
+float bricks_fetch_ink2(float3 slot_org, float3 bl_off, float lod, float inv_adim) {
+  float inset = max(0.5 * exp2(lod), 0.5);
+  float3 l = clamp(bl_off, float3(inset), float3(128.0 - inset));
+  return ink2_atlas.SampleLevel((slot_org + l) * inv_adim, lod);
+}
+
+float bricks_fetch_label(float3 slot_org, float3 bl_off, float inv_adim) {
+  /* class ids must not blend: snap to the texel center so the linear
+   * sampler degenerates to nearest */
+  float3 l = clamp(floor(bl_off) + 0.5, float3(0.5), float3(127.5));
+  return label_atlas.SampleLevel((slot_org + l) * inv_adim, 0.0);
+}
+
+float bricks_fetch_reg(float3 slot_org, float3 bl_off, float inv_adim) {
+  float3 l = clamp(bl_off, float3(0.5), float3(127.5));
+  float v = reg_atlas.SampleLevel((slot_org + l) * inv_adim, 0.0);
+  /* mirror the fixed volume's low-cut so aligned content fuses to gray
+   * instead of a global magenta cast where the CT was gated */
+  return v < pc.threshold ? 0.0 : v;
+}
+
+/* green/magenta fuse: fixed content -> green channel, moving -> red+blue.
+ * Aligned structure reads gray; misalignment reads as color fringes. */
+float3 reg_fuse(float3 col, float m) {
+  float lum = dot(col, float3(0.333, 0.334, 0.333));
+  return lerp(col, float3(m, lum, m), reg_alpha());
 }
 
 static const uint MODE_FULL = 0;
@@ -647,6 +709,9 @@ void main(uint3 tid_in: SV_DispatchThreadID) {
 
   float mip_max = 0.0;   // MODE_MIP accumulator
   float ink_max = 0.0;   // overlay MIP accumulator
+  float ink2_max = 0.0;  // 3D-ink MIP accumulator
+  float lbl_max = 0.0;   // paint-label MIP accumulator (highest class id wins)
+  float reg_max = 0.0;   // registration moving-scan MIP accumulator
   float first_hit = -1.0;
   float4 acc = float4(0); // MODE_FULL front-to-back accumulator
   uint steps = 0;
@@ -751,8 +816,8 @@ void main(uint3 tid_in: SV_DispatchThreadID) {
        * fires; a ~4 LSB skip floor loses at most ~1% accumulated alpha per
        * skipped block (invisible) and restores cube-grade skipping */
       float bgate = max(occ_gate, 4.5 / 255.0);
-      if (pc.mode == MODE_MIP && !overlay_on() && bricks_is_lod() && b_ok &&
-          b_max <= mip_max) {
+      if (pc.mode == MODE_MIP && !overlay_on() && !overlay2_on() && !labels_on() &&
+          !reg_on() && bricks_is_lod() && b_ok && b_max <= mip_max) {
         /* MIP early-out: this brick's max cannot raise the running max, so
          * the whole brick skips — exact for the CT MIP (overlay-on keeps
          * marching: ink can live where CT is dim) */
@@ -788,15 +853,45 @@ void main(uint3 tid_in: SV_DispatchThreadID) {
       float k = bricks_fetch_ink(b_slot, b_bl, blod, b_inv);
       if (k > ink_max) ink_max = k;
     }
-    if (pc.mode == MODE_MIP && mip_max >= 0.999 && !overlay_on()) break; // saturated
+    if (is_bricks() && bricks_is_lod() && overlay2_on() && b_ok && pc.mode == MODE_MIP) {
+      float k = bricks_fetch_ink2(b_slot, b_bl, blod, b_inv);
+      if (k > ink2_max) ink2_max = k;
+    }
+    if (is_bricks() && bricks_is_lod() && labels_on() && b_ok && pc.mode == MODE_MIP) {
+      float k = bricks_fetch_label(b_slot, b_bl, b_inv);
+      if (k > lbl_max) lbl_max = k;
+    }
+    if (is_bricks() && bricks_is_lod() && reg_on() && b_ok && pc.mode == MODE_MIP) {
+      float k = bricks_fetch_reg(b_slot, b_bl, b_inv);
+      if (k > reg_max) reg_max = k;
+    }
+    if (pc.mode == MODE_MIP && mip_max >= 0.999 && !overlay_on() && !overlay2_on() &&
+        !labels_on() && !reg_on())
+      break; // saturated
     if (first_hit < 0.0 && v > 0.05) first_hit = t;
 
     if (composite && !cut) {
       float4 s = tf.SampleLevel(v, 0);
+      /* registration: run the moving sample through the SAME transfer
+       * function so aligned content fuses to neutral gray, and let
+       * moving-only structure contribute opacity (it must stay visible
+       * where the fixed scan is empty) */
+      float4 reg_s = float4(0);
+      bool reg_live = is_bricks() && bricks_is_lod() && reg_on() && b_ok;
+      if (reg_live) {
+        reg_s = tf.SampleLevel(bricks_fetch_reg(b_slot, b_bl, b_inv), 0);
+        s.a = max(s.a, reg_s.a * reg_alpha());
+      }
       // opacity correction: appearance invariant under step-size changes
       float a = 1.0 - pow(1.0 - s.a, pc.density * pc.step_voxels * lod_step);
       if (a > 0.003) {
         float3 col = s.rgb;
+        if (reg_live) { /* green/magenta fuse in pure TF space, BEFORE
+                         * shading, so aligned content is exactly neutral */
+          float lm = dot(reg_s.rgb, float3(0.333, 0.334, 0.333));
+          float lf = dot(col, float3(0.333, 0.334, 0.333));
+          col = lerp(col, float3(lm, lf, lm), reg_alpha());
+        }
         if (shaded) {
           // gradient-modulated Blinn-Phong; homogeneous regions stay unshaded
           float e = voxel * lod_step;
@@ -887,6 +982,16 @@ void main(uint3 tid_in: SV_DispatchThreadID) {
           float k = bricks_fetch_ink(b_slot, b_bl, blod, b_inv) * pc.overlay_gain;
           col = lerp(col, overlay_color(), saturate(k));
         }
+        if (is_bricks() && bricks_is_lod() && overlay2_on() && b_ok) {
+          /* 3D ink on top: red wins where both overlays light up */
+          float k = bricks_fetch_ink2(b_slot, b_bl, blod, b_inv) * pc.overlay_gain;
+          col = lerp(col, INK3D_RED, saturate(k));
+        }
+        if (is_bricks() && bricks_is_lod() && labels_on() && b_ok) {
+          /* user paint labels on the very top: flat per-class tint */
+          float k = bricks_fetch_label(b_slot, b_bl, b_inv);
+          if (k > 0.0) col = lerp(col, label_color(k), LBL_ALPHA);
+        }
         acc.rgb += (1.0 - acc.a) * a * col;
         acc.a += (1.0 - acc.a) * a;
         if (acc.a >= ALPHA_CUTOFF) break;
@@ -905,7 +1010,10 @@ void main(uint3 tid_in: SV_DispatchThreadID) {
     color = acc.rgb + (1.0 - acc.a) * float3(0.02, 0.02, 0.03);
   } else { // MODE_MIP
     color = float3(mip_max * pc.density);
+    if (reg_on()) color = reg_fuse(color, reg_max * pc.density);
     if (overlay_on()) color = lerp(color, overlay_color(), saturate(ink_max * pc.overlay_gain));
+    if (overlay2_on()) color = lerp(color, INK3D_RED, saturate(ink2_max * pc.overlay_gain));
+    if (labels_on() && lbl_max > 0.0) color = lerp(color, label_color(lbl_max), LBL_ALPHA);
   }
   store_px(opix, tid.xy, half, float4(color, 1));
 }

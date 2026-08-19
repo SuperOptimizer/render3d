@@ -54,6 +54,51 @@ int r3d_bricks_begin(r3d_renderer *r, const char *c5s_path, uint32_t pool_bpa, u
  * brick lands in the same slot of a parallel atlas (absent = 0). Call after
  * r3d_bricks_begin (CPU-decode LOD mode only); pass the LOD root directory. */
 int r3d_bricks_overlay(r3d_renderer *r, const char *lod_root);
+/* Second overlay slot (3D ink, red tint): a third slot-parallel atlas so
+ * surface predictions and 3D ink display TOGETHER. Same geometry rules. */
+int r3d_bricks_ink3d(r3d_renderer *r, const char *lod_root);
+int r3d_bricks_ink3d_switch(r3d_renderer *r, const char *lod_root);
+/* Post-decode 3D display filter, applied once per brick as it streams in
+ * (all views see it). mode low byte = primary filter (0 none, 1 median
+ * 3^3, 2 median 5^3, 3 max pool 3^3, 4 max pool 5^3); bit 8 adds a 3D
+ * unsharp sharpen pass (amount = strength); 0 = off. targets picks what it
+ * applies to: bit0 raw
+ * CT, bit1 the overlay tree (surface preds), bit2 3D ink (0 defaults to
+ * CT). Applies to bricks uploaded AFTER the call; call r3d_bricks_refilter
+ * to re-stream what is already resident. Survives dataset swaps. */
+void r3d_bricks_postfilter(r3d_renderer *r, uint32_t mode, float amount,
+                           uint32_t targets);
+/* Re-stream the resident fine-level bricks through the current filter
+ * in place — viewer state (camera, panes, segment, overlays) untouched. */
+void r3d_bricks_refilter(r3d_renderer *r);
+/* 3D labelling display: a slot-parallel class-id atlas (binding 12) the
+ * shader tints per class (overlay_flags bit 3). The CPU label volume is the
+ * source of truth; gen() is polled per resident slot per frame (must be
+ * cheap) and fetch() fills a 128^3 class-id brick only when gen changed. */
+typedef struct r3d_label_src {
+  uint32_t (*gen)(void *user, uint32_t level, uint32_t bx, uint32_t by, uint32_t bz);
+  void (*fetch)(void *user, uint32_t level, uint32_t bx, uint32_t by, uint32_t bz,
+                uint8_t *out);
+  void *user;
+} r3d_label_src;
+int r3d_bricks_labels(r3d_renderer *r, const r3d_label_src *src);
+/* Per-frame: re-upload up to `budget` resident slots whose label content
+ * changed (paint strokes, loads, slot reassignment). Call from the render
+ * thread. */
+void r3d_bricks_labels_sync(r3d_renderer *r, uint32_t budget);
+/* Registration overlay: a second scan resampled per brick onto the fixed
+ * grid (core/regvol.c), displayed via a fourth slot-parallel atlas (binding
+ * 13, overlay_flags bit 4 + alpha byte in bits 16..23). Same gen/fetch
+ * contract as the labels atlas. */
+int r3d_bricks_regatlas(r3d_renderer *r, const r3d_label_src *src);
+void r3d_bricks_regatlas_sync(r3d_renderer *r, uint32_t budget);
+/* Must be called BEFORE destroying/replacing the registration source: stops
+ * the sync worker (which holds a raw source pointer and may be mid-fetch)
+ * and detaches. A later r3d_bricks_regatlas re-attaches the same atlas. */
+void r3d_bricks_regatlas_detach(r3d_renderer *r);
+/* Flattened viewer: bake the registration atlas into the surface volume's
+ * overlay channel (replaces the ink tap while on). */
+void r3d_surfvol_regtap(r3d_renderer *r, bool on);
 /* Swap the active overlay tree for another (drains the decode job, reopens
  * readers + atlas, re-seeds resident bricks). No-op if already active. */
 int r3d_bricks_overlay_switch(r3d_renderer *r, const char *lod_root);

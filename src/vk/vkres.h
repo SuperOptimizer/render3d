@@ -45,14 +45,33 @@ void r3d_vkbuf_destroy(r3d_vkctx *c, r3d_vkbuf *b);
 int r3d_vkbuf_create_device(r3d_vkctx *c, VkDeviceSize size, VkBufferUsageFlags usage,
                             r3d_vkbuf *b);
 
-/* Device-local image + view (2D if extent.depth==1, else 3D). Dedicated allocation. */
+/* Device-local image + view, dedicated allocation. The view type always
+ * matches the image type (1D/2D/3D), so the image type must match the
+ * descriptor the shader declares.
+ *
+ * INVARIANT: dimensionality is a property of the descriptor contract, not of
+ * the extent. A {N,1,1} image is 1D for a Sampler1D binding and 2D for a
+ * sampler2D binding; extent alone cannot tell them apart. Prefer the _typed
+ * entry points, which state it. The untyped forms keep the legacy inference
+ * (depth>1 -> 3D, else height>1 -> 2D, else 1D) for existing call sites: they
+ * are correct only when depth>=2 implies a 3D contract, height>=2 with depth==1
+ * implies 2D, and a degenerate {N,1,1} really is 1D. Creation validates the
+ * chosen type against the extent, the mip count, and the device's
+ * format/usage limits, and fails with a diagnostic rather than creating an
+ * object the descriptor cannot bind. */
 int r3d_vkimage_create(r3d_vkctx *c, VkFormat format, VkExtent3D extent, uint32_t mips,
                        VkImageUsageFlags usage, r3d_vkimage *im);
+int r3d_vkimage_create_typed(r3d_vkctx *c, VkImageType type, VkFormat format,
+                             VkExtent3D extent, uint32_t mips, VkImageUsageFlags usage,
+                             r3d_vkimage *im);
 void r3d_vkarena_init(r3d_vkarena *a, VkDeviceSize block_size);
 void r3d_vkarena_destroy(r3d_vkctx *c, r3d_vkarena *a);
 int r3d_vkimage_create_arena(r3d_vkctx *c, r3d_vkarena *a, VkFormat format,
                              VkExtent3D extent, uint32_t mips, VkImageUsageFlags usage,
                              r3d_vkimage *im);
+int r3d_vkimage_create_arena_typed(r3d_vkctx *c, r3d_vkarena *a, VkImageType type,
+                                   VkFormat format, VkExtent3D extent, uint32_t mips,
+                                   VkImageUsageFlags usage, r3d_vkimage *im);
 void r3d_vkimage_destroy(r3d_vkctx *c, r3d_vkimage *im);
 
 /* One-shot command buffer helpers (submit + wait idle; init/upload paths only). */
