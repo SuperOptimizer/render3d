@@ -26,6 +26,7 @@
 #include "core/cpuvol.h"
 #include "core/labelvol.h"
 #include "core/regvol.h"
+#include "core/tracer.h"
 
 static int failures = 0;
 #define CHECK(cond)                                                   \
@@ -255,6 +256,85 @@ static void test_regvol(const char *root, const char *tmp, const uint8_t *ref) {
   unlink(jp);
 }
 
+/* ---- tracer: save -> load round trip through the versioned sidecar ----- */
+
+static void test_tracer_roundtrip(const char *tmp) {
+  char dir[700];
+  snprintf(dir, sizeof dir, "%s/trace", tmp);
+  CHECK(mkdir(dir, 0755) == 0); /* save expects the target dir to exist */
+  r3d_tracer t = {0};
+  t.W = 40;
+  t.H = 30;
+  t.cfg.step = 5.0;
+  t.cfg.max_ring = 60;
+  t.cfg.thresh = 0.42f;
+  t.cfg.level = 2;
+  uint64_t n = (uint64_t)t.W * t.H;
+  t.pos = calloc(n * 3, sizeof *t.pos);
+  t.state = calloc(n, 1);
+  t.conf = calloc(n, sizeof *t.conf);
+  t.wind = calloc(n, sizeof *t.wind);
+  t.gen_of = calloc(n, sizeof *t.gen_of);
+  CHECK(t.pos && t.state && t.conf && t.wind && t.gen_of);
+  pthread_mutex_init(&t.mu, NULL);
+  /* a gently curved synthetic sheet, seed ring at the center: geometry
+   * whose 4-neighbor edges match cfg.step so the tear mask keeps it all */
+  for (uint32_t j = 0; j < t.H; j++)
+    for (uint32_t i = 0; i < t.W; i++) {
+      size_t k = (size_t)j * t.W + i;
+      t.pos[k * 3 + 0] = 100.0 + 5.0 * (double)i;
+      t.pos[k * 3 + 1] = 200.0 + 5.0 * (double)j;
+      t.pos[k * 3 + 2] = 50.0 + 3.0 * sin((double)i * 0.2);
+      t.state[k] = R3D_TR_SET;
+      t.conf[k] = 0.25f + 0.5f * (float)i / (float)t.W;
+      t.wind[k] = 0.01f * (float)i;
+      uint32_t ri = i > t.W / 2 ? i - t.W / 2 : t.W / 2 - i;
+      uint32_t rj = j > t.H / 2 ? j - t.H / 2 : t.H / 2 - j;
+      t.gen_of[k] = (uint16_t)(1u + (ri > rj ? ri : rj));
+    }
+  atomic_store(&t.gens_done, 15u);
+  t.anc[0] = 111.0;
+  t.anc[1] = 222.0;
+  t.anc[2] = 55.0;
+  t.nanc = 1;
+  CHECK(r3d_tracer_save(&t, dir, 0.0f, false) == 0);
+  r3d_tracer u = {0};
+  CHECK(r3d_tracer_load(&u, dir, NULL) == 0);
+  CHECK(u.W == t.W && u.H == t.H);
+  CHECK(fabs(u.cfg.step - t.cfg.step) < 1e-9);
+  CHECK(u.cfg.max_ring == t.cfg.max_ring);
+  CHECK(fabs((double)u.cfg.thresh - (double)t.cfg.thresh) < 1e-6);
+  CHECK(u.cfg.level == t.cfg.level);
+  CHECK(u.nanc == 1 && fabs(u.anc[0] - 111.0) < 1e-6 && fabs(u.anc[2] - 55.0) < 1e-6);
+  double mad = 0;
+  uint64_t set = 0;
+  bool gen_ok = true;
+  for (uint64_t k = 0; k < n; k++) {
+    if (u.state[k] != R3D_TR_SET || t.state[k] != R3D_TR_SET) continue;
+    set++;
+    for (uint64_t a = 0; a < 3; a++)
+      mad += fabs(u.pos[k * 3 + a] - t.pos[k * 3 + a]);
+    if (u.gen_of[k] != t.gen_of[k]) gen_ok = false;
+  }
+  CHECK(set == n); /* nothing torn/cropped away */
+  CHECK(mad / ((double)set * 3.0) < 0.01);
+  CHECK(gen_ok);
+  /* the restored budget must allow further growth (P0.2: no zero-budget
+   * resumes): max_ring restored above already proves the sidecar path */
+  r3d_tracer_free(&u);
+  r3d_tracer_free(&t);
+  DIR *dp = opendir(dir); /* cleanup: whatever artifact set save wrote */
+  struct dirent *de;
+  while (dp && (de = readdir(dp)) != NULL)
+    if (de->d_name[0] != '.') {
+      char p[900];
+      snprintf(p, sizeof p, "%s/%s", dir, de->d_name);
+      unlink(p);
+    }
+  if (dp) closedir(dp);
+  rmdir(dir);
+}
+
 int main(void) {
   char tmp[512];
   const char *base = getenv("TMPDIR");
@@ -286,6 +366,7 @@ int main(void) {
   test_cpuvol_lease(root, ref);
   test_labelvol(tmp);
   test_regvol(root, tmp, ref);
+  test_tracer_roundtrip(tmp);
   free(ref);
   st_rm_tree(root, 2);
   /* label/json leftovers live under tmp; remove what the tests created */
