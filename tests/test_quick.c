@@ -17,6 +17,7 @@
 #include "core/segtrace.h"
 #include "core/tifxyz.h"
 #include "core/tracer.h"
+#include "core/bsurf.h"
 #include "core/umbilicus.h"
 #include "core/vslab.h"
 #include "core/transfer.h"
@@ -711,6 +712,7 @@ int main(void) {
   test_umbilicus();
   CHECK(r3d_tracer_spiral_selftest() == 0);
   CHECK(r3d_tracer_fusion_selftest() == 0);
+  CHECK(r3d_bsurf_selftest() == 0);
   test_tifxyz();
   test_mview();
   if (failures) {

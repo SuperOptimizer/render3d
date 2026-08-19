@@ -63,6 +63,10 @@ typedef struct blob {
 
 static const char *g_mirror, *g_out;
 static const char *g_url = NULL; /* streaming ingest: fetch chunks, keep no mirror */
+/* Total bytes a shard's phase-1 fill workers may hold in scratch buffers at
+ * once (on top of the fixed 1024^3 assembly); worker count is derived from
+ * this, not from CPU count alone -- overridable with --mem-budget-mb. */
+static uint64_t g_mem_budget_bytes = 4ull * 1024 * 1024 * 1024;
 static _Atomic uint64_t g_fetched_bytes = 0, g_fetched_n = 0, g_absent_n = 0;
 static level_info g_lv[MAX_LEVELS];
 static uint32_t g_nlev = 0, g_full_from = 3;
@@ -317,6 +321,26 @@ typedef struct shard_job {
   _Atomic uint64_t missing; /* chunks not yet downloaded */
 } shard_job;
 
+/* Source-chunk index range (inclusive) overlapping shard (oz,oy,ox) at
+ * `level`, and the cell count over that range -- shared by fill_worker
+ * (iteration) and process_shard (worker-count budgeting), so the two never
+ * disagree on how many fill jobs a shard has. */
+static void shard_fill_range(uint32_t level, uint64_t oz, uint64_t oy, uint64_t ox,
+                             uint64_t c0[3], uint64_t c1[3]) {
+  uint32_t chsz = g_lv[level].chsz;
+  uint64_t O[3] = {oz * SHARD, oy * SHARD, ox * SHARD};
+  for (int a = 0; a < 3; a++) {
+    c0[a] = O[a] / chsz;
+    c1[a] = (O[a] + SHARD - 1) / chsz;
+  }
+}
+
+static uint64_t shard_fill_ncells(uint32_t level, uint64_t oz, uint64_t oy, uint64_t ox) {
+  uint64_t c0[3], c1[3];
+  shard_fill_range(level, oz, oy, ox, c0, c1);
+  return (c1[0] - c0[0] + 1) * (c1[1] - c0[1] + 1) * (c1[2] - c0[2] + 1);
+}
+
 /* Phase 1: decode every zarr chunk overlapping the shard into a shared
  * SHARD^3 assembly (disjoint copy regions — no locking). Handles any cubic
  * chunk size, including ones that don't divide 1024 (e.g. the 192^3
@@ -325,12 +349,9 @@ static void *fill_worker(void *arg) {
   shard_job *j = arg;
   const level_info *lv = &g_lv[j->level];
   uint32_t chsz = lv->chsz;
-  uint64_t O[3] = {j->oz * SHARD, j->oy * SHARD, j->ox * SHARD};
   uint64_t c0[3], c1[3];
-  for (int a = 0; a < 3; a++) {
-    c0[a] = O[a] / chsz;
-    c1[a] = (O[a] + SHARD - 1) / chsz;
-  }
+  shard_fill_range(j->level, j->oz, j->oy, j->ox, c0, c1);
+  uint64_t O[3] = {j->oz * SHARD, j->oy * SHARD, j->ox * SHARD};
   uint64_t nz = c1[0] - c0[0] + 1, ny = c1[1] - c0[1] + 1, nx = c1[2] - c0[2] + 1;
   size_t chunk_bytes = (size_t)chsz * chsz * chsz;
   uint8_t *chunk = malloc(chunk_bytes);
@@ -482,10 +503,28 @@ static int process_shard(uint32_t level, uint64_t oz, uint64_t oy, uint64_t ox,
   }
   pthread_t tids[32];
   uint32_t nt = threads > 32u ? 32u : threads;
+  if (nt < 1u) nt = 1u;
+  /* Phase 1 (fill) holds one chsz^3 scratch buffer per worker alongside the
+   * fixed SHARD^3 assembly; bound worker count by a global byte budget
+   * instead of trusting CPU count alone (a 512-edge chunk is 128 MiB/worker,
+   * so an unbudgeted 32-way fan-out could still approach the assembly plus
+   * several GiB of scratch). Also never start more fill workers than there
+   * are source chunks to claim. */
+  const level_info *lv0 = &g_lv[level];
+  uint64_t assem_bytes = (uint64_t)SHARD * SHARD * SHARD;
+  uint64_t worker_bytes = (uint64_t)lv0->chsz * lv0->chsz * lv0->chsz;
+  uint64_t avail = g_mem_budget_bytes > assem_bytes ? g_mem_budget_bytes - assem_bytes : 0;
+  uint32_t budget_nt = worker_bytes ? (uint32_t)(avail / worker_bytes) : nt;
+  if (budget_nt < 1u) budget_nt = 1u;
+  uint64_t fill_ncells = shard_fill_ncells(level, oz, oy, ox);
+  uint32_t fill_nt = nt < budget_nt ? nt : budget_nt;
+  if (fill_ncells < (uint64_t)fill_nt) fill_nt = (uint32_t)fill_ncells;
+  if (fill_nt < 1u) fill_nt = 1u;
   for (int phase = 0; phase < 2 && !atomic_load(&j->failed); phase++) {
     atomic_store(&j->next, 0);
+    uint32_t phase_nt = phase == 0 ? fill_nt : nt;
     uint32_t created = 0;
-    for (; created < nt; created++)
+    for (; created < phase_nt; created++)
       if (pthread_create(&tids[created], NULL, phase == 0 ? fill_worker : brick_worker,
                          j) != 0) {
         atomic_store(&j->failed, 1);
@@ -638,8 +677,12 @@ int main(int argc, char **argv) {
     fprintf(stderr,
             "usage: zarr2c5d <zarr-mirror-dir> <output-dir> [--url BASE] [--surface DIR] "
             "[--pad N] [--full-from L] [--min-level L] [--rect i0 j0 i1 j1] [--threads N] "
+            "[--mem-budget-mb N] "
             "[--c5d-quality Q] [--tau T] [--only-level L] "
             "[--list-missing FILE] [--dry-run] [--verify N] [--force]\n"
+            "  --mem-budget-mb: cap on phase-1 fill-worker scratch bytes per shard, on top "
+            "of the fixed 1024 MiB assembly (default 4096); worker count is derived from "
+            "this, not CPU count alone\n"
             "  --url: streaming ingest — chunks are fetched straight into memory and only "
             "transcoded c5d shards are written (the mirror dir holds .zarray metadata "
             "only); without it, chunks are read from a pre-fetched local mirror\n");
@@ -664,6 +707,8 @@ int main(int argc, char **argv) {
       bootstrap = true; /* full-from = coarsest level only (set after probe) */
     else if (strcmp(argv[i], "--threads") == 0 && i + 1 < argc)
       threads = (uint32_t)strtoul(argv[++i], NULL, 10);
+    else if (strcmp(argv[i], "--mem-budget-mb") == 0 && i + 1 < argc)
+      g_mem_budget_bytes = strtoull(argv[++i], NULL, 10) * 1024ull * 1024ull;
     else if (strcmp(argv[i], "--c5d-quality") == 0 && i + 1 < argc)
       g_quality = strtof(argv[++i], NULL);
     else if (strcmp(argv[i], "--tau") == 0 && i + 1 < argc)
@@ -695,6 +740,10 @@ int main(int argc, char **argv) {
     long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
     threads = ncpu > 0 ? (uint32_t)ncpu : 1u;
   }
+  if (g_mem_budget_bytes < (uint64_t)SHARD * SHARD * SHARD)
+    fprintf(stderr,
+            "zarr2c5d: --mem-budget-mb is below the fixed 1024 MiB shard assembly; "
+            "clamping every shard to 1 fill worker\n");
   if (g_url) { /* streaming ingest: bootstrap per-level .zarray metadata only */
     curl_global_init(CURL_GLOBAL_DEFAULT);
     for (uint32_t l = 0; l < MAX_LEVELS; l++) {
@@ -729,9 +778,13 @@ int main(int argc, char **argv) {
     bool raw = false;
     if (read_zarray(l, &shape, &chunks, &raw) != 0) break;
     g_lv[l].raw = raw;
+    /* edges above 512 make a single source chunk overlap most or all of a
+     * 1024^3 shard: fill_worker would need a chsz^3 scratch buffer that size
+     * per thread, so a legal-looking 1024-edge chunk can push one worker's
+     * transient allocation past 1 GiB. Reject before any buffer is sized. */
     if (chunks.z != chunks.y || chunks.y != chunks.x || chunks.z < 32 ||
-        chunks.z > 1024) {
-      fprintf(stderr, "zarr2c5d: L%u chunks must be cubic (32..1024 edge)\n", l);
+        chunks.z > 512) {
+      fprintf(stderr, "zarr2c5d: L%u chunks must be cubic (32..512 edge)\n", l);
       return 1;
     }
     uint32_t ch = (uint32_t)chunks.z;
@@ -790,8 +843,9 @@ int main(int argc, char **argv) {
              (double)wc * (double)lv->chsz * lv->chsz * lv->chsz / 1073741824.0);
     printf("\n");
   }
-  printf("zarr2c5d: %llu shards total, %u levels, threads %u\n",
-         (unsigned long long)total, g_nlev, threads);
+  printf("zarr2c5d: %llu shards total, %u levels, threads %u (fill-phase budget %llu MiB)\n",
+         (unsigned long long)total, g_nlev, threads,
+         (unsigned long long)(g_mem_budget_bytes / (1024u * 1024u)));
   if (dry) return 0;
 
   if (missing_path) {

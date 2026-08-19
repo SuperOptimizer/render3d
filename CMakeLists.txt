@@ -61,6 +61,9 @@ add_library(r3d_core STATIC
   src/core/cpuvol.c
   src/core/pngw.c
   src/core/tracer.c
+  src/core/bsurf.c
+  src/core/labelvol.c
+  src/core/regvol.c
   src/core/inklive.c
   src/core/surfpred.c
   src/core/odbrowse.c
@@ -79,7 +82,7 @@ target_link_libraries(r3d_core PRIVATE r3d_warnings r3d_sanitize
 # random sibling working tree previously produced hangs and quiet corruption,
 # so normal builds fetch one audited revision.  R3D_C5D_DIR remains available
 # for c5d development, but is revision-checked unless explicitly overridden.
-set(R3D_C5D_PIN "84274f8998d0ab614a78488c68e76312b8e50c1e")
+set(R3D_C5D_PIN "fc63df1f442b424bef9227e57ffec617b2a99d8f")
 set(R3D_C5D_DIR "" CACHE PATH "Override the pinned c5d checkout")
 option(R3D_ALLOW_UNPINNED_C5D "Allow an R3D_C5D_DIR revision other than R3D_C5D_PIN" OFF)
 if(NOT R3D_C5D_DIR)
@@ -114,6 +117,32 @@ if(NOT R3D_ALLOW_UNPINNED_C5D AND
     "use the default pinned fetch or set R3D_ALLOW_UNPINNED_C5D=ON for development")
 endif()
 message(STATUS "render3d c5d revision: ${R3D_C5D_REV}")
+
+# --- fysics registration kernels (pinned source dependency) ---
+# Volume registration (core/regvol.c): affine resampler, coarse-to-fine NCC
+# registration, sub-voxel phase correlation. Same pinning discipline as c5d.
+set(R3D_FYSICS_PIN "cf9b2c482996e904fc537876ce8d46f072e0b91f")
+set(R3D_FYSICS_DIR "" CACHE PATH "Override the pinned fysics checkout")
+if(NOT R3D_FYSICS_DIR)
+  include(FetchContent)
+  FetchContent_Declare(r3d_fysics_source
+    GIT_REPOSITORY https://github.com/SuperOptimizer/fysics.git
+    GIT_TAG ${R3D_FYSICS_PIN}
+    GIT_SHALLOW FALSE
+    SOURCE_SUBDIR __render3d_dependency_sources_only)
+  FetchContent_MakeAvailable(r3d_fysics_source)
+  set(R3D_FYSICS_DIR "${r3d_fysics_source_SOURCE_DIR}")
+endif()
+if(NOT EXISTS "${R3D_FYSICS_DIR}/fysics.h")
+  message(FATAL_ERROR "fysics not found at ${R3D_FYSICS_DIR} (set R3D_FYSICS_DIR)")
+endif()
+add_library(r3d_fysics STATIC
+  ${R3D_FYSICS_DIR}/register.c
+  ${R3D_FYSICS_DIR}/phasecorr.c
+  ${R3D_FYSICS_DIR}/fft.c)
+target_include_directories(r3d_fysics SYSTEM PUBLIC ${R3D_FYSICS_DIR})
+target_compile_options(r3d_fysics PRIVATE -ffast-math -fno-math-errno -O3)
+target_link_libraries(r3d_fysics PUBLIC m PRIVATE r3d_sanitize)
 # Sources are compiled directly (not add_subdirectory) to keep target/test
 # namespaces separate; this list mirrors the c5d library at R3D_C5D_PIN.
 add_library(r3d_c5d STATIC
@@ -126,14 +155,15 @@ add_library(r3d_c5d STATIC
   ${R3D_C5D_DIR}/src/gpu/host_entropy.c
   ${R3D_C5D_DIR}/src/shard.c
   ${R3D_C5D_DIR}/src/cache.c
-  ${R3D_C5D_DIR}/src/tifxyz.c)
+  ${R3D_C5D_DIR}/src/tifxyz.c
+  ${R3D_C5D_DIR}/src/label.c)
 target_include_directories(r3d_c5d SYSTEM PUBLIC ${R3D_C5D_DIR}/src)
 target_compile_options(r3d_c5d PRIVATE -ffast-math -fno-math-errno -O3)
 target_compile_definitions(r3d_c5d PUBLIC
   R3D_C5D_REV="${R3D_C5D_REV}"
   R3D_C5D_GPU_ABI=20260806)
 target_link_libraries(r3d_c5d PUBLIC m Threads::Threads PRIVATE r3d_sanitize)
-target_link_libraries(r3d_core PUBLIC r3d_c5d) # segstore uses the tifxyz codec
+target_link_libraries(r3d_core PUBLIC r3d_c5d r3d_fysics) # segstore: tifxyz; regvol: fysics
 
 # --- shard store: vendored dct3d codec + zarr-v3 shard reader ---
 if(NOT EXISTS "${CMAKE_SOURCE_DIR}/tools/3ddct/dct3d.c")

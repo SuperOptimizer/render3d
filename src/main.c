@@ -12,8 +12,12 @@
 #include <time.h>
 
 #include "core/pngw.h"
+#include <signal.h>
+#include <spawn.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+extern char **environ; /* argv-spawned browser jobs inherit the environment */
 
 #include "cimgui.h"
 #include "core/camera.h"
@@ -25,6 +29,10 @@
 #include "core/screenshot.h"
 #include "core/segstore.h"
 #include "core/tracer.h"
+#include "core/bsurf.h"
+#include "core/labelvol.h"
+#include "core/regvol.h"
+#include "core/cpuvol.h"
 #include "core/segtrace.h"
 #include "core/inklive.h"
 #include "core/stats.h"
@@ -122,6 +130,139 @@ static float *inkmap_load(const char *path, uint32_t *w, uint32_t *h, uint32_t *
 static void inkmap_save_segdir(const char *name, const float *m, uint32_t w,
                                uint32_t h, uint32_t up, uint32_t gw, uint32_t gh,
                                uint64_t nvalid);
+
+/* CT sampler for the boundary-surface grower: cpuvol over the bricks tree,
+ * base level (the papyrus/void edge is a voxel-scale feature) */
+static uint8_t bsurf_ct_sample(void *ctx, int64_t x, int64_t y, int64_t z) {
+  return r3d_cpuvol_at((r3d_cpuvol *)ctx, 0, (double)x, (double)y, (double)z);
+}
+
+/* 3D labelling: paint class ids (papyrus / ink / recto / ...) with the mouse
+ * in the plane panes; the renderer mirrors the CPU volume into a slot-
+ * parallel atlas (r3d_bricks_labels_sync), and C5L1 label bricks persist it
+ * losslessly. State is file-scope because the paint gesture (event loop),
+ * the panel (GUI), the per-pane routing and the dataset-loop cleanup all
+ * touch it. */
+static r3d_labelvol g_lblv;
+static bool g_lbl_init = false;
+static bool g_lbl_show = true, g_lbl_paint = false;
+static int g_lbl_class = 1;
+static float g_lbl_radius = 4.0f;
+static char g_lbl_dir[640] = "";
+/* last persistence outcome, shown in the labels panel: a failed save must be
+ * visible and retryable, never silently swallowed */
+static char g_lbl_status[200] = "";
+static bool g_lbl_stroke = false; /* a drag is in progress */
+static double g_lbl_prev[3];
+
+static uint32_t lblsrc_gen(void *u, uint32_t level, uint32_t bx, uint32_t by, uint32_t bz) {
+  return r3d_labelvol_gen((const r3d_labelvol *)u, level, bx, by, bz);
+}
+static void lblsrc_fetch(void *u, uint32_t level, uint32_t bx, uint32_t by, uint32_t bz,
+                         uint8_t *out) {
+  r3d_labelvol_fetch((const r3d_labelvol *)u, level, bx, by, bz, out);
+}
+
+/* Volume registration: a second scan of the same scroll overlaid through an
+ * affine pull map (core/regvol.c) and displayed as a green/magenta fuse in
+ * every pane. GUI mirrors hold the interactive deltas in friendly units. */
+static r3d_regvol g_reg;
+static bool g_reg_open = false;
+static bool g_reg_show = true, g_reg_flat = false;
+static float g_reg_alpha = 0.5f;
+static char g_reg_root[640] = "";
+static char g_reg_json[640] = "";
+static float g_reg_tr[3], g_reg_rot[3]; /* voxels / degrees */
+static float g_reg_scale = 1.0f;
+static float g_reg_um_fix = 0.0f, g_reg_um_mov = 0.0f; /* voxel pitch, um */
+static int g_reg_refmode = 0; /* 0 measure NCC, 1 rigid, 2 affine */
+static int g_reg_reflevel = 1;
+static bool g_reg_busy = false;
+static double g_reg_ncc0 = -2.0, g_reg_ncc1 = -2.0;
+
+static void reg_gui_reset_mirrors(void) {
+  memset(g_reg_tr, 0, sizeof g_reg_tr);
+  memset(g_reg_rot, 0, sizeof g_reg_rot);
+  g_reg_scale = 1.0f;
+}
+
+static void reg_gui_apply_mirrors(void) {
+  /* the renderer's sync worker reads the deltas through r3d_regvol_pull:
+   * write them under the same lock */
+  pthread_mutex_lock(&g_reg.mu);
+  for (int a = 0; a < 3; a++) {
+    g_reg.d_tr[a] = (double)g_reg_tr[a];
+    g_reg.d_rot[a] = (double)g_reg_rot[a] * 0.017453292519943295;
+  }
+  g_reg.d_lscale = log(g_reg_scale > 0.01f ? (double)g_reg_scale : 0.01);
+  pthread_mutex_unlock(&g_reg.mu);
+  r3d_regvol_bump(&g_reg);
+}
+
+/* open (or replace) the registration moving volume: accepts the LOD root or
+ * its manifest.json path. Scale seeding, best first: the voxel-pitch ratio
+ * when both paths carry a "...um" token (bucket names do — crops differ
+ * between scans, so this beats the shape ratio), else the shape ratio.
+ * Shared by the panel and the data browser. */
+static bool reg_open_moving(r3d_renderer *renderer, const char *root, const uint32_t fd[3],
+                            const char *fixed_path) {
+  char rr[640];
+  snprintf(rr, sizeof rr, "%s", root);
+  size_t rl = strlen(rr);
+  if (rl > 14 && strcmp(rr + rl - 14, "/manifest.json") == 0) rr[rl - 14] = 0;
+  if (g_reg_open) { /* replace the current moving volume: stop the renderer's
+                     * sync worker before its source dies under it */
+    g_reg_open = false;
+    g_reg_busy = false;
+    r3d_bricks_regatlas_detach(renderer);
+    r3d_regvol_close(&g_reg);
+  }
+  if (r3d_regvol_open(&g_reg, rr, fd) != 0) return false;
+  r3d_label_src ls = {r3d_regvol_srcgen, r3d_regvol_srcfetch, &g_reg};
+  if (r3d_bricks_regatlas(renderer, &ls) != 0) {
+    r3d_regvol_close(&g_reg); /* atlas never attached: no worker to stop */
+    return false;
+  }
+  g_reg_open = true;
+  g_reg_show = true;
+  reg_gui_reset_mirrors();
+  g_reg_ncc0 = g_reg_ncc1 = -2.0;
+  snprintf(g_reg_root, sizeof g_reg_root, "%s", rr);
+  double um_m = r3d_regvol_parse_um(rr);
+  double um_f = fixed_path ? r3d_regvol_parse_um(fixed_path) : 0.0;
+  if (um_m > 0.0) g_reg_um_mov = (float)um_m;
+  if (um_f > 0.0) g_reg_um_fix = (float)um_f;
+  if (um_m > 0.0 && um_f > 0.0) {
+    if (fabs(um_f / um_m - 1.0) > 0.001) r3d_regvol_set_scale(&g_reg, um_f / um_m);
+    printf("regvol: scale seeded from voxel pitch %.4gum / %.4gum = %.4f\n", um_f, um_m,
+           um_f / um_m);
+  } else {
+    double sr = ((double)g_reg.mv.nx / (double)fd[0] + (double)g_reg.mv.ny / (double)fd[1] +
+                 (double)g_reg.mv.nz / (double)fd[2]) /
+                3.0;
+    if (sr > 0.0 && fabs(sr - 1.0) > 0.01) r3d_regvol_set_scale(&g_reg, sr);
+  }
+  return true;
+}
+
+/* stamp spheres along the drag segment so fast strokes stay solid */
+static void lbl_stroke_to(const double A[3], double radius, uint8_t cls) {
+  if (g_lbl_stroke) {
+    double d[3] = {A[0] - g_lbl_prev[0], A[1] - g_lbl_prev[1], A[2] - g_lbl_prev[2]};
+    double dist = sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+    double step = radius * 0.5 > 0.75 ? radius * 0.5 : 0.75;
+    int nstep = (int)ceil(dist / step);
+    for (int k = 1; k <= nstep; k++) {
+      double t = (double)k / (double)nstep;
+      double q[3] = {g_lbl_prev[0] + d[0] * t, g_lbl_prev[1] + d[1] * t,
+                     g_lbl_prev[2] + d[2] * t};
+      r3d_labelvol_paint(&g_lblv, q, radius, cls);
+    }
+  } else
+    r3d_labelvol_paint(&g_lblv, A, radius, cls);
+  g_lbl_stroke = true;
+  memcpy(g_lbl_prev, A, 3 * sizeof(double));
+}
 
 /* Fit a surface through hand-placed points with NO ordering assumptions:
  * the user hops between viewers, outlines roughly, then densifies inside.
@@ -724,7 +865,16 @@ static int sgc_open(sgcache *c, const char *store_dir, size_t budget) {
   memset(c, 0, sizeof *c);
   c->act_req = c->act_ready = UINT32_MAX;
   c->ov_active = c->ov_req = UINT32_MAX;
-  if (r3d_segstore_open(&c->st, store_dir) != 0) return -1;
+  if (r3d_segstore_open(&c->st, store_dir) != 0) {
+    /* an older/incompatible manifest (the format is versioned and rejected
+     * outright when it changes): regenerate it from the store's own .tfx
+     * files, then retry — losing the store over a format bump is worse
+     * than one rebuild pass */
+    printf("segments: store manifest unreadable, rebuilding from %s\n", store_dir);
+    if (r3d_segstore_build(store_dir, NULL, 0, 2, false) <= 0 ||
+        r3d_segstore_open(&c->st, store_dir) != 0)
+      return -1;
+  }
   c->ent = calloc(c->st.n ? c->st.n : 1, sizeof *c->ent);
   c->queue = malloc((c->st.n ? c->st.n : 1) * sizeof *c->queue);
   c->ov = calloc(c->st.n ? c->st.n : 1, sizeof *c->ov);
@@ -863,10 +1013,24 @@ static float tf_min_visible(const uint8_t lut[256][4]) {
 
 static const char OD_BUCKET[] = "https://vesuvius-challenge-open-data.s3.amazonaws.com";
 
+#define OD_MAX_STEPS 6
+#define OD_MAX_ARGS 12
+#define OD_ARGBUF 8192
+
+/* one argv-spawned step of a browser job (offset into od_state.argbuf) */
+typedef struct {
+  uint32_t off, nargs;
+} od_step;
+
 typedef struct od_state {
   r3d_odlist scrolls, vols, segs, variants;
   int sel_scroll, sel_vol, sel_seg, sel_variant;
   bool scrolls_ok, vols_ok, segs_ok, variants_ok;
+  /* surface-prediction overlays (.zarr dirs under <scroll>/representations/
+   * predictions/surfaces/) and 3D ink (.../ink-3d/): independent picks */
+  r3d_odlist ovls, inks;
+  int sel_ovl, sel_ink;
+  bool ovls_ok, inks_ok;
   /* async listing worker: the GUI thread never blocks on the network or
    * touches the filesystem — it posts requests and polls results */
   pthread_t fth;
@@ -878,12 +1042,30 @@ typedef struct od_state {
   r3d_odlist fres_a, fres_b;
   bool *fcached; /* per-volume [cached] flags, computed on the worker */
   bool *vol_cached;
-  FILE *job;            /* running subprocess (popen, non-blocking reads) */
+  /* running subprocess: argv-spawned, never a shell (remote object names are
+   * arguments, never syntax); stdout+stderr merged onto a non-blocking pipe */
+  bool job_up;
+  int jobfd;
+  pid_t jobpid;
   char log[10][160];    /* rolling job output */
   int nlog;
-  int stage;            /* 0 idle, 1 volume bootstrap, 2 segment download */
-  char vol_dir[512], seg_dir[512];
-  bool with_segment, spawned_vol, spawned_seg;
+  /* one pending action at a time: bootstrap/download the pick, then either
+   * request a dataset swap (volume/segment) or a live attach (overlays) */
+  int act; /* 0 idle, 1 volume, 2 segment, 3 surface preds, 4 3D ink */
+  bool spawned;
+  char tgt_dir[512]; /* local dir the action produces */
+  /* the pending job as a sequence of argv-spawned steps, built at click time.
+   * argv strings live NUL-separated in argbuf; a step names its first arg's
+   * offset and its argument count. job_ovf latches a build overflow so the
+   * action fails closed rather than running a truncated command. */
+  od_step steps[OD_MAX_STEPS];
+  int nsteps, curstep;
+  char argbuf[OD_ARGBUF];
+  uint32_t arglen;
+  bool job_ovf;
+  /* published only after every step succeeds: a partial download must never
+   * look complete to the "does meta.json exist" probe */
+  char fin_src[600], fin_dst[600];
   char linebuf[512];
   size_t linelen;
 } od_state;
@@ -912,24 +1094,145 @@ static bool od_file_exists(const char *path) {
   return stat(path, &st) == 0;
 }
 
-/* start a shell command with merged stderr, non-blocking stdout */
-static int od_spawn(od_state *od, const char *cmd) {
-  char full[4096];
-  snprintf(full, sizeof full, "%s 2>&1", cmd);
-  od->job = popen(full, "r");
-  if (!od->job) return -1;
-  int fd = fileno(od->job);
-  fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+/* Remote object names become both path components and process arguments.
+ * Accept only a plain component: [A-Za-z0-9._-]+, no leading '-' (so it can
+ * never be read as an option), no "..", bounded length. Everything else is
+ * rejected before any path or argv is built. */
+static bool od_name_ok(const char *s) {
+  if (!s || !s[0] || s[0] == '-') return false;
+  size_t n = strlen(s);
+  if (n > 255) return false;
+  if (strstr(s, "..")) return false;
+  for (size_t i = 0; i < n; i++) {
+    char c = s[i];
+    if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+        c == '.' || c == '_' || c == '-')
+      continue;
+    return false;
+  }
+  return true;
+}
+
+/* fail-closed guard for every remote name an action interpolates */
+static bool od_names_ok(od_state *od, const char *const *names, int n) {
+  for (int i = 0; i < n; i++)
+    if (!od_name_ok(names[i])) {
+      od_log(od, "rejected: unsafe remote name");
+      fprintf(stderr, "odbrowse: rejected unsafe remote name \"%s\"\n",
+              names[i] ? names[i] : "(null)");
+      return false;
+    }
+  return true;
+}
+
+/* mkdir -p, in process: no shell, no quoting, and errors are visible */
+static bool mkdir_p(const char *path) {
+  char tmp[640];
+  if (snprintf(tmp, sizeof tmp, "%s", path) >= (int)sizeof tmp) {
+    errno = ENAMETOOLONG;
+    return false;
+  }
+  for (char *q = tmp + 1; *q; q++) {
+    if (*q != '/') continue;
+    *q = 0;
+    if (mkdir(tmp, 0755) != 0 && errno != EEXIST) return false;
+    *q = '/';
+  }
+  return mkdir(tmp, 0755) == 0 || errno == EEXIST;
+}
+
+static void od_job_reset(od_state *od) {
+  od->nsteps = od->curstep = 0;
+  od->arglen = 0;
+  od->job_ovf = false;
+  od->fin_src[0] = od->fin_dst[0] = 0;
+}
+
+/* append one argv-spawned step; on any overflow latch job_ovf so the caller
+ * refuses the action rather than running a truncated command */
+static void od_job_step(od_state *od, const char *const *args, int n) {
+  if (od->job_ovf || od->nsteps >= OD_MAX_STEPS || n <= 0 || n > OD_MAX_ARGS) {
+    od->job_ovf = true;
+    return;
+  }
+  uint32_t off = od->arglen;
+  for (int i = 0; i < n; i++) {
+    if (!args[i]) {
+      od->job_ovf = true;
+      return;
+    }
+    size_t len = strlen(args[i]) + 1;
+    if (len > sizeof od->argbuf - od->arglen) {
+      od->job_ovf = true;
+      return;
+    }
+    memcpy(od->argbuf + od->arglen, args[i], len);
+    od->arglen += (uint32_t)len;
+  }
+  od->steps[od->nsteps].off = off;
+  od->steps[od->nsteps].nargs = (uint32_t)n;
+  od->nsteps++;
+}
+
+/* spawn steps[curstep] with merged stderr on a non-blocking pipe. argv only:
+ * no /bin/sh, so names carrying quotes or metacharacters stay data. */
+static int od_spawn_step(od_state *od) {
+  if (od->job_ovf || od->curstep >= od->nsteps) return -1;
+  const od_step *st = &od->steps[od->curstep];
+  char *argv[OD_MAX_ARGS + 1];
+  char *p = od->argbuf + st->off;
+  for (uint32_t i = 0; i < st->nargs; i++) {
+    argv[i] = p;
+    p += strlen(p) + 1;
+  }
+  argv[st->nargs] = NULL;
+  int fds[2];
+  if (pipe2(fds, O_CLOEXEC) != 0) return -1; /* read end never reaches a child */
+  posix_spawn_file_actions_t fa;
+  if (posix_spawn_file_actions_init(&fa) != 0) {
+    close(fds[0]);
+    close(fds[1]);
+    return -1;
+  }
+  int rc = posix_spawn_file_actions_adddup2(&fa, fds[1], 1);
+  if (rc == 0) rc = posix_spawn_file_actions_adddup2(&fa, fds[1], 2);
+  if (rc == 0 && fds[1] > 2) rc = posix_spawn_file_actions_addclose(&fa, fds[1]);
+  pid_t pid = 0;
+  if (rc == 0) rc = posix_spawnp(&pid, argv[0], &fa, NULL, argv, environ);
+  posix_spawn_file_actions_destroy(&fa);
+  close(fds[1]);
+  if (rc != 0) {
+    close(fds[0]);
+    errno = rc;
+    return -1;
+  }
+  fcntl(fds[0], F_SETFL, fcntl(fds[0], F_GETFL) | O_NONBLOCK);
+  od->jobfd = fds[0];
+  od->jobpid = pid;
+  od->job_up = true;
   od->linelen = 0;
   return 0;
 }
 
-/* pump the job pipe; returns 1 when finished (status ok), -1 failed, 0 busy */
+/* reap the finished child: 1 exited 0, -1 anything else */
+static int od_job_reap(od_state *od) {
+  int status = 0;
+  pid_t r;
+  do {
+    r = waitpid(od->jobpid, &status, 0);
+  } while (r < 0 && errno == EINTR);
+  od->jobpid = 0;
+  if (r < 0) return -1;
+  return (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 1 : -1;
+}
+
+/* pump the job pipe; returns 1 when the whole step sequence finished ok,
+ * -1 failed, 0 busy (including "this step is done, next one started") */
 static int od_pump(od_state *od) {
-  if (!od->job) return 0;
+  if (!od->job_up) return 0;
   char buf[512];
   for (;;) {
-    ssize_t n = read(fileno(od->job), buf, sizeof buf);
+    ssize_t n = read(od->jobfd, buf, sizeof buf);
     if (n > 0) {
       for (ssize_t i = 0; i < n; i++) {
         if (buf[i] == '\n' || od->linelen + 1 >= sizeof od->linebuf) {
@@ -945,9 +1248,35 @@ static int od_pump(od_state *od) {
     if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return 0;
     break; /* EOF or error */
   }
-  int status = pclose(od->job);
-  od->job = NULL;
-  return status == 0 ? 1 : -1;
+  close(od->jobfd);
+  od->jobfd = -1;
+  od->job_up = false;
+  if (od_job_reap(od) < 0) return -1;
+  if (++od->curstep < od->nsteps) {
+    if (od_spawn_step(od) != 0) {
+      od_log(od, "spawn failed");
+      return -1;
+    }
+    return 0;
+  }
+  if (od->fin_src[0] && rename(od->fin_src, od->fin_dst) != 0) {
+    od_log(od, "publish (rename) failed");
+    fprintf(stderr, "odbrowse: rename %s -> %s failed: %s\n", od->fin_src, od->fin_dst,
+            strerror(errno));
+    return -1;
+  }
+  return 1;
+}
+
+/* zarr2c5d bootstrap: a single argv-spawned step */
+static void od_job_bootstrap(od_state *od, const char *exe, const char *url) {
+  char prog[600], meta[600];
+  snprintf(prog, sizeof prog, "%s/zarr2c5d", exe);
+  snprintf(meta, sizeof meta, "%s/meta", od->tgt_dir);
+  const char *a[] = {prog,        meta,      od->tgt_dir, "--url",
+                     url,         "--bootstrap", "--threads", "8"};
+  od_job_reset(od);
+  od_job_step(od, a, 8);
 }
 
 static void *od_fetch_worker(void *ud) {
@@ -983,6 +1312,12 @@ static void *od_fetch_worker(void *ud) {
       }
     } else if (req == 3) {
       snprintf(pfx, sizeof pfx, "%s/segments/%s/mesh/", scroll, seg);
+      r3d_odlist_fetch(OD_BUCKET, pfx, &a);
+    } else if (req == 4) {
+      snprintf(pfx, sizeof pfx, "%s/representations/predictions/surfaces/", scroll);
+      r3d_odlist_fetch(OD_BUCKET, pfx, &a);
+    } else if (req == 5) {
+      snprintf(pfx, sizeof pfx, "%s/representations/predictions/ink-3d/", scroll);
       r3d_odlist_fetch(OD_BUCKET, pfx, &a);
     }
     pthread_mutex_lock(&od->fmu);
@@ -1042,70 +1377,66 @@ static int od_poll(od_state *od, r3d_odlist *a, r3d_odlist *b, bool **cached) {
  * when everything is local it writes the chosen paths and requests a
  * dataset swap — plain mutable state, reopened in the same session. */
 static void od_browser_window(od_state *od, bool *open, char *next_bricks, size_t nb_cap,
-                              char *next_seg, size_t ns_cap, bool *swap) {
+                              char *next_seg, size_t ns_cap, char *next_ovl,
+                              size_t no_cap, char *next_ink, size_t ni_cap,
+                              char *next_reg, size_t nr_cap, bool *swap,
+                              bool *attach_ovl, bool *attach_ink, bool *attach_reg,
+                              const char *cur_bricks) {
   int prc = od_pump(od);
-  if (prc < 0 && od->stage) {
+  if (prc < 0 && od->act) {
     od_log(od, "job FAILED");
-    od->stage = 0;
+    od->act = 0;
   }
-  if (od->stage == 1 && !od->job) { /* ensure the volume is bootstrapped */
-    char mp[600];
-    snprintf(mp, sizeof mp, "%s/manifest.json", od->vol_dir);
-    if (od_file_exists(mp)) {
-      od_log(od, "volume ready");
-      od->stage = od->with_segment ? 2 : 3;
-    } else if (od->spawned_vol) {
-      od_log(od, "bootstrap produced no manifest");
-      od->stage = 0;
-    } else {
-      od->spawned_vol = true;
-      char exe[512], cmd[4096];
-      od_exe_dir(exe);
-      snprintf(cmd, sizeof cmd,
-               "'%s/zarr2c5d' '%s/meta' '%s' --url '%s/%s/volumes/%s' --bootstrap "
-               "--threads 8",
-               exe, od->vol_dir, od->vol_dir, OD_BUCKET, od->scrolls.dirs[od->sel_scroll],
-               od->vols.dirs[od->sel_vol]);
-      od_log(od, "bootstrapping volume (coarsest level + source.json)...");
-      if (od_spawn(od, cmd) != 0) od->stage = 0;
-    }
-  }
-  if (od->stage == 2 && !od->job) { /* ensure the segment tifxyz is local */
+  if (od->act && !od->job_up) { /* probe -> spawn -> finish the pending action */
     char probe[600];
-    snprintf(probe, sizeof probe, "%s/meta.json", od->seg_dir);
+    snprintf(probe, sizeof probe, "%s/%s", od->tgt_dir,
+             od->act == 2 ? "meta.json" : "manifest.json");
     if (od_file_exists(probe)) {
-      od_log(od, "segment ready");
-      od->stage = 3;
-    } else if (od->spawned_seg) {
-      od_log(od, "segment download incomplete");
-      od->stage = 0;
+      switch (od->act) {
+      case 1: /* volume: full dataset swap, dropping segment + overlays */
+        snprintf(next_bricks, nb_cap, "%s/manifest.json", od->tgt_dir);
+        next_seg[0] = 0;
+        next_ovl[0] = 0;
+        next_ink[0] = 0;
+        *swap = true;
+        od_log(od, "volume ready - opening...");
+        break;
+      case 2: /* segment: re-swap the current volume with it; browser-picked
+               * overlays (next_ovl/next_ink) survive the swap */
+        if (cur_bricks) snprintf(next_bricks, nb_cap, "%s", cur_bricks);
+        snprintf(next_seg, ns_cap, "%s", od->tgt_dir);
+        *swap = true;
+        od_log(od, "segment ready - opening...");
+        break;
+      case 3: /* surface predictions: live attach, no teardown */
+        snprintf(next_ovl, no_cap, "%s", od->tgt_dir);
+        *attach_ovl = true;
+        od_log(od, "surface predictions ready - attaching...");
+        break;
+      case 4: /* 3D ink: live attach on the second overlay slot */
+        snprintf(next_ink, ni_cap, "%s", od->tgt_dir);
+        *attach_ink = true;
+        od_log(od, "3D ink ready - attaching...");
+        break;
+      case 5: /* registration: live attach as the moving scan, no teardown */
+        snprintf(next_reg, nr_cap, "%s", od->tgt_dir);
+        *attach_reg = true;
+        od_log(od, "registration volume ready - attaching...");
+        break;
+      }
+      od->act = 0;
+    } else if (od->spawned) {
+      od_log(od, od->act == 2 ? "segment download incomplete"
+                              : "bootstrap produced no manifest");
+      od->act = 0;
     } else {
-      od->spawned_seg = true;
-      char murl[1100], cmd[4096];
-      snprintf(murl, sizeof murl, "%s/%s/segments/%s/mesh/%s", OD_BUCKET,
-               od->scrolls.dirs[od->sel_scroll], od->segs.dirs[od->sel_seg],
-               od->variants.dirs[od->sel_variant]);
-      snprintf(cmd, sizeof cmd,
-               "mkdir -p '%s' && curl -fsS -o '%s/x.tif' '%s/x.tif' && "
-               "curl -fsS -o '%s/y.tif' '%s/y.tif' && "
-               "curl -fsS -o '%s/z.tif' '%s/z.tif' && "
-               "curl -fsS -o '%s/meta.json.dl' '%s/meta.json' && "
-               "mv '%s/meta.json.dl' '%s/meta.json' && echo downloaded",
-               od->seg_dir, od->seg_dir, murl, od->seg_dir, murl, od->seg_dir, murl,
-               od->seg_dir, murl, od->seg_dir, od->seg_dir);
-      od_log(od, "downloading segment tifxyz...");
-      if (od_spawn(od, cmd) != 0) od->stage = 0;
+      od->spawned = true;
+      if (od->job_ovf || od->nsteps == 0 || od_spawn_step(od) != 0) {
+        od_log(od, "job could not be started");
+        fprintf(stderr, "odbrowse: job spawn failed: %s\n", strerror(errno));
+        od->act = 0;
+      }
     }
-  }
-  if (od->stage == 3) { /* everything local: request the dataset swap */
-    snprintf(next_bricks, nb_cap, "%s/manifest.json", od->vol_dir);
-    if (od->with_segment)
-      snprintf(next_seg, ns_cap, "%s", od->seg_dir);
-    else
-      next_seg[0] = 0;
-    *swap = true;
-    od->stage = 0;
-    od_log(od, "opening...");
   }
 
   {
@@ -1129,6 +1460,14 @@ static void od_browser_window(od_state *od, bool *open, char *next_bricks, size_
       r3d_odlist_free(&od->variants);
       od->variants = ra;
       od->variants_ok = true;
+    } else if (done == 4) {
+      r3d_odlist_free(&od->ovls);
+      od->ovls = ra;
+      od->ovls_ok = true;
+    } else if (done == 5) {
+      r3d_odlist_free(&od->inks);
+      od->inks = ra;
+      od->inks_ok = true;
     } else if (done) {
       r3d_odlist_free(&ra);
       r3d_odlist_free(&rb);
@@ -1156,8 +1495,10 @@ static void od_browser_window(od_state *od, bool *open, char *next_bricks, size_
         r3d_odlist_free(&od->vols);
         r3d_odlist_free(&od->segs);
         r3d_odlist_free(&od->variants);
-        od->vols_ok = od->segs_ok = od->variants_ok = false;
-        od->sel_vol = od->sel_seg = od->sel_variant = -1;
+        r3d_odlist_free(&od->ovls);
+        r3d_odlist_free(&od->inks);
+        od->vols_ok = od->segs_ok = od->variants_ok = od->ovls_ok = od->inks_ok = false;
+        od->sel_vol = od->sel_seg = od->sel_variant = od->sel_ovl = od->sel_ink = -1;
       }
     igEndCombo();
   }
@@ -1165,9 +1506,19 @@ static void od_browser_window(od_state *od, bool *open, char *next_bricks, size_
     od_request(od, 2);
     igTextDisabled("listing scroll...");
   }
+  bool busy = od->act != 0;
+  char volid[64] = "";
+  if (od->sel_vol >= 0) { /* volume id = dir name up to the first '-' */
+    snprintf(volid, sizeof volid, "%s", od->vols.dirs[od->sel_vol]);
+    char *dash = strchr(volid, '-');
+    if (dash) *dash = 0;
+  }
+  char exe[512];
+  od_exe_dir(exe);
+  /* ---- volume: its own list + button; opening swaps the whole dataset */
   if (od->vols_ok) {
     igText("volumes");
-    igBeginChild_Str("odvols", (ImVec2){0, 140}, ImGuiChildFlags_Borders, 0);
+    igBeginChild_Str("odvols", (ImVec2){0, 120}, ImGuiChildFlags_Borders, 0);
     for (uint32_t i = 0; i < od->vols.ndirs; i++) {
       char label[800];
       snprintf(label, sizeof label, "%s%s",
@@ -1178,10 +1529,52 @@ static void od_browser_window(od_state *od, bool *open, char *next_bricks, size_
       }
     }
     igEndChild();
+    igBeginDisabled(busy || od->sel_vol < 0);
+    if (igButton("open volume", (ImVec2){0, 0})) {
+      const char *nm[2] = {od->scrolls.dirs[od->sel_scroll], od->vols.dirs[od->sel_vol]};
+      if (od_names_ok(od, nm, 2)) {
+        char url[1200];
+        snprintf(od->tgt_dir, sizeof od->tgt_dir, "cache/od/%s/%s", nm[0], nm[1]);
+        snprintf(url, sizeof url, "%s/%s/volumes/%s", OD_BUCKET, nm[0], nm[1]);
+        od_job_bootstrap(od, exe, url);
+        if (!od->job_ovf) {
+          od->spawned = false;
+          od->act = 1;
+          od_log(od, "bootstrapping volume (coarsest level + source.json)...");
+        } else {
+          od_log(od, "rejected: job arguments too long");
+        }
+      }
+    }
+    igEndDisabled();
+    igSameLine(0, 10);
+    /* same bootstrap, but attaches live as the registration moving scan
+     * (green/magenta fuse over the open volume) instead of swapping */
+    igBeginDisabled(busy || od->sel_vol < 0 || !cur_bricks);
+    if (igButton("open as registration volume", (ImVec2){0, 0})) {
+      const char *nm[2] = {od->scrolls.dirs[od->sel_scroll], od->vols.dirs[od->sel_vol]};
+      if (od_names_ok(od, nm, 2)) {
+        char url[1200];
+        snprintf(od->tgt_dir, sizeof od->tgt_dir, "cache/od/%s/%s", nm[0], nm[1]);
+        snprintf(url, sizeof url, "%s/%s/volumes/%s", OD_BUCKET, nm[0], nm[1]);
+        od_job_bootstrap(od, exe, url);
+        if (!od->job_ovf) {
+          od->spawned = false;
+          od->act = 5;
+          od_log(od, "bootstrapping registration volume...");
+        } else {
+          od_log(od, "rejected: job arguments too long");
+        }
+      }
+    }
+    igEndDisabled();
+    if (od->sel_vol >= 0 && !cur_bricks && igIsItemHovered(0))
+      igSetTooltip("open a volume first - the registration volume overlays it");
   }
+  /* ---- segment: list + mesh variant + button; re-swaps the open volume */
   if (od->segs_ok && od->segs.ndirs) {
     igText("segments (%u)", od->segs.ndirs);
-    igBeginChild_Str("odsegs", (ImVec2){0, 150}, ImGuiChildFlags_Borders, 0);
+    igBeginChild_Str("odsegs", (ImVec2){0, 110}, ImGuiChildFlags_Borders, 0);
     for (uint32_t i = 0; i < od->segs.ndirs; i++)
       if (igSelectable_Bool(od->segs.dirs[i], (int)i == od->sel_seg, 0, (ImVec2){0, 0})) {
         od->sel_seg = (int)i;
@@ -1190,53 +1583,138 @@ static void od_browser_window(od_state *od, bool *open, char *next_bricks, size_
         od->sel_variant = -1;
       }
     igEndChild();
+    if (od->sel_seg >= 0 && !od->variants_ok) od_request(od, 3);
+    if (od->variants_ok && od->variants.ndirs) {
+      igText("segment mesh (tifxyz)");
+      igBeginChild_Str("odvar", (ImVec2){0, 70}, ImGuiChildFlags_Borders, 0);
+      char onvol[80];
+      snprintf(onvol, sizeof onvol, "-on-%s", volid);
+      for (uint32_t i = 0; i < od->variants.ndirs; i++) {
+        bool match = volid[0] && strstr(od->variants.dirs[i], onvol) != NULL;
+        char label[700];
+        snprintf(label, sizeof label, "%s%s", match ? "[matches volume] " : "",
+                 od->variants.dirs[i]);
+        if (igSelectable_Bool(label, (int)i == od->sel_variant, 0, (ImVec2){0, 0}))
+          od->sel_variant = (int)i;
+      }
+      igEndChild();
+    }
+    igBeginDisabled(busy || od->sel_variant < 0 || !cur_bricks);
+    if (igButton("open segment", (ImVec2){0, 0})) {
+      const char *nm[3] = {od->scrolls.dirs[od->sel_scroll], od->segs.dirs[od->sel_seg],
+                           od->variants.dirs[od->sel_variant]};
+      if (od_names_ok(od, nm, 3)) {
+        char murl[1100];
+        snprintf(od->tgt_dir, sizeof od->tgt_dir, "cache/od/segments/%s", nm[2]);
+        snprintf(murl, sizeof murl, "%s/%s/segments/%s/mesh/%s", OD_BUCKET, nm[0], nm[1],
+                 nm[2]);
+        /* four argv-spawned curls; meta.json lands staged and is renamed into
+         * place only after every file arrived, so the completion probe never
+         * sees a partial download */
+        od_job_reset(od);
+        static const char *const parts[4] = {"x.tif", "y.tif", "z.tif", "meta.json"};
+        for (int k = 0; k < 4; k++) {
+          char dst[700], src[1300];
+          snprintf(dst, sizeof dst, "%s/%s%s", od->tgt_dir, parts[k],
+                   k == 3 ? ".dl" : "");
+          snprintf(src, sizeof src, "%s/%s", murl, parts[k]);
+          const char *a[5] = {"curl", "-fsS", "-o", dst, src};
+          od_job_step(od, a, 5);
+        }
+        snprintf(od->fin_src, sizeof od->fin_src, "%s/meta.json.dl", od->tgt_dir);
+        snprintf(od->fin_dst, sizeof od->fin_dst, "%s/meta.json", od->tgt_dir);
+        if (od->job_ovf) {
+          od_log(od, "rejected: job arguments too long");
+        } else if (!mkdir_p(od->tgt_dir)) {
+          od_log(od, "cannot create download dir");
+          fprintf(stderr, "odbrowse: mkdir %s failed: %s\n", od->tgt_dir,
+                  strerror(errno));
+          od_job_reset(od);
+        } else {
+          od->spawned = false;
+          od->act = 2;
+          od_log(od, "downloading segment tifxyz...");
+        }
+      }
+    }
+    igEndDisabled();
+    if (od->sel_variant >= 0 && !cur_bricks && igIsItemHovered(0))
+      igSetTooltip("open a volume first");
   }
-  if (od->sel_seg >= 0 && !od->variants_ok) od_request(od, 3);
-  char volid[64] = "";
-  if (od->sel_vol >= 0) { /* volume id = dir name up to the first '-' */
-    snprintf(volid, sizeof volid, "%s", od->vols.dirs[od->sel_vol]);
-    char *dash = strchr(volid, '-');
-    if (dash) *dash = 0;
-  }
-  if (od->variants_ok && od->variants.ndirs) {
-    igText("segment mesh (tifxyz)");
-    igBeginChild_Str("odvar", (ImVec2){0, 90}, ImGuiChildFlags_Borders, 0);
-    char onvol[80];
-    snprintf(onvol, sizeof onvol, "-on-%s", volid);
-    for (uint32_t i = 0; i < od->variants.ndirs; i++) {
-      bool match = volid[0] && strstr(od->variants.dirs[i], onvol) != NULL;
+  /* ---- surface predictions: attach live as the blue overlay slot */
+  if (od->sel_scroll >= 0 && od->vols_ok && !od->ovls_ok) od_request(od, 4);
+  if (od->ovls_ok && od->ovls.ndirs) {
+    igText("surface predictions");
+    igBeginChild_Str("odovls", (ImVec2){0, 70}, ImGuiChildFlags_Borders, 0);
+    for (uint32_t i = 0; i < od->ovls.ndirs; i++) {
+      const char *nm = od->ovls.dirs[i];
+      size_t nl = strlen(nm);
+      if (nl < 5 || strcmp(nm + nl - 5, ".zarr") != 0)
+        continue; /* .normal-grids siblings ride along with the tracer */
+      bool match = volid[0] && strncmp(nm, volid, strlen(volid)) == 0;
       char label[700];
-      snprintf(label, sizeof label, "%s%s", match ? "[matches volume] " : "",
-               od->variants.dirs[i]);
-      if (igSelectable_Bool(label, (int)i == od->sel_variant, 0, (ImVec2){0, 0}))
-        od->sel_variant = (int)i;
+      snprintf(label, sizeof label, "%s%s", match ? "[matches volume] " : "", nm);
+      if (igSelectable_Bool(label, (int)i == od->sel_ovl, 0, (ImVec2){0, 0}))
+        od->sel_ovl = (int)i;
     }
     igEndChild();
+    igBeginDisabled(busy || od->sel_ovl < 0 || !cur_bricks);
+    if (igButton("open surface predictions", (ImVec2){0, 0})) {
+      const char *nm[2] = {od->scrolls.dirs[od->sel_scroll], od->ovls.dirs[od->sel_ovl]};
+      if (od_names_ok(od, nm, 2)) {
+        char url[1200];
+        snprintf(od->tgt_dir, sizeof od->tgt_dir, "cache/od/%s/overlays/%s", nm[0], nm[1]);
+        snprintf(url, sizeof url, "%s/%s/representations/predictions/surfaces/%s",
+                 OD_BUCKET, nm[0], nm[1]);
+        od_job_bootstrap(od, exe, url);
+        if (!od->job_ovf) {
+          od->spawned = false;
+          od->act = 3;
+          od_log(od, "bootstrapping surface predictions...");
+        } else {
+          od_log(od, "rejected: job arguments too long");
+        }
+      }
+    }
+    igEndDisabled();
   }
-  bool busy = od->stage != 0;
-  igTextDisabled("sel: scroll %d vol %d seg %d variant %d stage %d", od->sel_scroll,
-                 od->sel_vol, od->sel_seg, od->sel_variant, od->stage);
-  igBeginDisabled(busy || od->sel_vol < 0);
-  bool go_vol = igButton("open volume", (ImVec2){0, 0});
-  igEndDisabled();
-  igSameLine(0, 10);
-  igBeginDisabled(busy || od->sel_vol < 0 || od->sel_variant < 0);
-  bool go_seg = igButton("open volume + segment", (ImVec2){0, 0});
-  igEndDisabled();
-  if ((go_vol || go_seg) && od->sel_vol >= 0) {
-    od->with_segment = go_seg && od->sel_variant >= 0;
-    od->spawned_vol = od->spawned_seg = false;
-    snprintf(od->vol_dir, sizeof od->vol_dir, "cache/od/%s/%s",
-             od->scrolls.dirs[od->sel_scroll], od->vols.dirs[od->sel_vol]);
-    if (od->with_segment)
-      snprintf(od->seg_dir, sizeof od->seg_dir, "cache/od/segments/%s",
-               od->variants.dirs[od->sel_variant]);
-    od->stage = 1;
+  /* ---- 3D ink: attach live as the red overlay slot */
+  if (od->sel_scroll >= 0 && od->vols_ok && !od->inks_ok) od_request(od, 5);
+  if (od->inks_ok && od->inks.ndirs) {
+    igText("3D ink");
+    igBeginChild_Str("odinks", (ImVec2){0, 70}, ImGuiChildFlags_Borders, 0);
+    for (uint32_t i = 0; i < od->inks.ndirs; i++) {
+      const char *nm = od->inks.dirs[i];
+      size_t nl = strlen(nm);
+      if (nl < 5 || strcmp(nm + nl - 5, ".zarr") != 0) continue;
+      bool match = volid[0] && strncmp(nm, volid, strlen(volid)) == 0;
+      char label[700];
+      snprintf(label, sizeof label, "%s%s", match ? "[matches volume] " : "", nm);
+      if (igSelectable_Bool(label, (int)i == od->sel_ink, 0, (ImVec2){0, 0}))
+        od->sel_ink = (int)i;
+    }
+    igEndChild();
+    igBeginDisabled(busy || od->sel_ink < 0 || !cur_bricks);
+    if (igButton("open 3D ink", (ImVec2){0, 0})) {
+      const char *nm[2] = {od->scrolls.dirs[od->sel_scroll], od->inks.dirs[od->sel_ink]};
+      if (od_names_ok(od, nm, 2)) {
+        char url[1200];
+        snprintf(od->tgt_dir, sizeof od->tgt_dir, "cache/od/%s/ink3d/%s", nm[0], nm[1]);
+        snprintf(url, sizeof url, "%s/%s/representations/predictions/ink-3d/%s", OD_BUCKET,
+                 nm[0], nm[1]);
+        od_job_bootstrap(od, exe, url);
+        if (!od->job_ovf) {
+          od->spawned = false;
+          od->act = 4;
+          od_log(od, "bootstrapping 3D ink...");
+        } else {
+          od_log(od, "rejected: job arguments too long");
+        }
+      }
+    }
+    igEndDisabled();
   }
-  if (busy) {
-    igSameLine(0, 12);
-    igTextDisabled("working...");
-  }
+  if (busy) igTextDisabled("working...");
   igSeparator();
   for (int i = 0; i < od->nlog; i++) igTextDisabled("%s", od->log[i]);
   igEnd();
@@ -1417,6 +1895,9 @@ int main(int argc, char **argv) {
   const char *overlay_paths[8];      /* all --overlay trees (ink, surface preds...) */
   uint32_t n_overlays = 0;
   int overlay_sel = 0;
+  char ink3d_root[640] = ""; /* --ink3d / browser: 3D-ink overlay (red, second
+                              * atlas slot — shows WITH the surface preds) */
+  bool ink3d_ok = false, ink3d_show = true;
   bool od_browse = false;            /* start with the open-data browser window */
   int sv_w = 2048, sv_h = 2048, sv_l = 128; /* flattened surface-volume window (1 GiB RG8) */
   int annotation_prefetch = 5; /* annotation steps ahead; one slot is kept behind */
@@ -1475,6 +1956,8 @@ int main(int argc, char **argv) {
       if (i < argc - 1 && argv[i + 1][0] >= '1' && argv[i + 1][0] <= '9')
         inklive_port = atoi(argv[i + 1]);
     }
+    if (i < argc - 1 && strcmp(argv[i], "--ink3d") == 0)
+      snprintf(ink3d_root, sizeof ink3d_root, "%s", argv[i + 1]);
     if (i < argc - 1 && strcmp(argv[i], "--overlay") == 0 &&
         n_overlays < sizeof overlay_paths / sizeof *overlay_paths)
       overlay_paths[n_overlays++] = argv[i + 1];
@@ -1629,10 +2112,13 @@ int main(int argc, char **argv) {
   /* the dataset (volume + segment + overlay) is ordinary mutable state: the
    * open-data browser swaps it by tearing the bricks family down and
    * re-opening inside this loop, same window, same renderer */
-  od_state od = {.sel_scroll = -1, .sel_vol = -1, .sel_seg = -1, .sel_variant = -1};
+  od_state od = {.sel_scroll = -1, .sel_vol = -1, .sel_seg = -1, .sel_variant = -1,
+                 .sel_ovl = -1, .sel_ink = -1};
   bool od_window = od_browse;
-  char od_next_bricks[640] = "", od_next_seg[560] = "";
-  bool od_swap = false;
+  char od_next_bricks[640] = "", od_next_seg[560] = "", od_next_ovl[640] = "",
+       od_next_ink[640] = "", od_next_reg[640] = "";
+  bool od_swap = false, od_attach_ovl = false, od_attach_ink = false,
+       od_attach_reg = false;
   for (;;) {
   if (od_swap) {
     od_swap = false;
@@ -1647,9 +2133,20 @@ int main(int argc, char **argv) {
     multiview_path =
         od_next_seg[0] ? od_next_seg : (od_next_bricks[0] ? "(none)" : NULL);
     if (!od_next_bricks[0]) od_window = true;
-    n_overlays = 0; /* browser-opened datasets have no overlay tree yet */
     overlay_path = NULL; /* else the old tree is reopened against the new
                           * volume: shape mismatch -> silent EXIT_FAILURE */
+    if (od_next_ovl[0]) { /* browser-picked surface predictions */
+      overlay_paths[0] = od_next_ovl;
+      n_overlays = 1;
+      overlay_sel = 0;
+    } else {
+      n_overlays = 0;
+    }
+    if (od_next_ink[0]) /* browser-picked 3D ink survives the swap */
+      snprintf(ink3d_root, sizeof ink3d_root, "%s", od_next_ink);
+    else
+      ink3d_root[0] = 0; /* 3D ink attaches per volume (browser or --ink3d) */
+    ink3d_ok = false;
     umbilicus_path = NULL;
     vslab_mode = false;
     clip_mode = false;
@@ -1688,6 +2185,9 @@ int main(int argc, char **argv) {
   }
 
   if (bricks_path) {
+    const char *pfe = getenv("R3D_POSTFILT"); /* headless/bench: force the
+                                               * display filter (mode bits) */
+    if (pfe) r3d_bricks_postfilter(renderer, (uint32_t)strtoul(pfe, NULL, 0), 1.0f, 1u);
     if (r3d_bricks_begin(renderer, bricks_path, (uint32_t)pool_bpa, (uint32_t)warm_mb) != 0)
       return EXIT_FAILURE;
     r3d_bricks_shape(renderer, brick_shape);
@@ -1696,6 +2196,39 @@ int main(int argc, char **argv) {
     brick_is_lod = initial_bst.nlevels > 1u;
     brick_depth = depth_given ? depth0 : (brick_is_lod ? 8 : 0);
     if (brick_depth < 0) brick_depth = 0;
+    if (getenv("R3D_LBLTEST")) { /* headless/bench: enable 3D labelling and
+                                  * stamp test blobs at the volume center */
+      uint32_t ld[3] = {brick_shape[0], brick_shape[1], brick_shape[2]};
+      if (r3d_labelvol_init(&g_lblv, ld) == 0) {
+        r3d_label_src ls = {lblsrc_gen, lblsrc_fetch, &g_lblv};
+        if (r3d_bricks_labels(renderer, &ls) == 0) {
+          g_lbl_init = true;
+          double c[3] = {(double)ld[0] * 0.5, (double)ld[1] * 0.5, (double)ld[2] * 0.5};
+          for (uint8_t k = 1; k < R3D_LBL_NCLASS; k++) {
+            double q[3] = {c[0] + (double)k * 40.0 - 180.0, c[1], c[2]};
+            r3d_labelvol_paint(&g_lblv, q, 15.0, k);
+          }
+        } else
+          r3d_labelvol_free(&g_lblv);
+      }
+    }
+    const char *rte = getenv("R3D_REGTEST"); /* headless/bench: overlay a
+                                              * moving scan; <root>[:tx,ty,tz] */
+    if (rte && *rte) {
+      char rr[640];
+      snprintf(rr, sizeof rr, "%s", rte);
+      char *co = strchr(rr, ':');
+      double t3[3] = {0, 0, 0};
+      if (co) {
+        *co = 0;
+        sscanf(co + 1, "%lf,%lf,%lf", &t3[0], &t3[1], &t3[2]);
+      }
+      uint32_t fd3[3] = {brick_shape[0], brick_shape[1], brick_shape[2]};
+      if (reg_open_moving(renderer, rr, fd3, bricks_path)) {
+        memcpy(g_reg.d_tr, t3, sizeof t3);
+        r3d_regvol_bump(&g_reg);
+      }
+    }
     if (brick_depth > (int)brick_shape[2]) brick_depth = (int)brick_shape[2];
     if (brick_z < 0) brick_z = brick_depth ? ((int)brick_shape[2] - brick_depth) / 2 : 0;
     if (brick_z < 0) brick_z = 0;
@@ -1708,6 +2241,12 @@ int main(int argc, char **argv) {
               overlay_path);
       overlay_path = NULL;
       n_overlays = 0;
+    }
+    if (ink3d_root[0]) {
+      ink3d_ok = r3d_bricks_ink3d(renderer, ink3d_root) == 0;
+      if (!ink3d_ok)
+        fprintf(stderr, "3D ink %s not usable with this volume; continuing without\n",
+                ink3d_root);
     }
   }
   bool overlay_show = overlay_path != NULL;
@@ -1901,6 +2440,23 @@ int main(int argc, char **argv) {
   bool msurf_create = false;
   bool msurf_dirty = false; /* re-fit + preview in the flattened view */
   bool msurf_first = true;  /* fit-to-view on the first preview */
+  /* boundary surface ('B' over a plane view seeds an automatic grower
+   * that follows the papyrus/void edge defined by the render low cut;
+   * grows on its own thread, previews live in the flattened pane, then
+   * saves through the same harvest pipeline as a manual surface) */
+  r3d_bsurf bsurf;
+  memset(&bsurf, 0, sizeof bsurf);
+  r3d_cpuvol bsurf_ct;
+  memset(&bsurf_ct, 0, sizeof bsurf_ct);
+  bool bsurf_ct_ok = false;
+  bool bsurf_active = false; /* a grid exists (growing or finished) */
+  bool bsurf_have_seed = false;
+  double bsurf_seed[3] = {0, 0, 0};
+  int bsurf_gens = 100;
+  float bsurf_snap = 6.0f, bsurf_step = 4.0f;
+  bool bsurf_go = false, bsurf_save = false, bsurf_discard = false;
+  bool bsurf_first = true;
+  uint64_t bsurf_gen = 0, bsurf_prev_ns = 0;
   /* queued seed points ('G' over a plane view). The queue is larger than
    * the concurrency: up to GT_MAX tracers run at once and the rest of
    * the queue drains automatically as slots free (discard or
@@ -2402,7 +2958,9 @@ int main(int argc, char **argv) {
         double fy2 = (double)mv[R3D_MV_SEG].ph / (double)(mv_seg.h ? mv_seg.h : 1);
         double fx2 = (double)mv[R3D_MV_SEG].pw / (double)(mv_seg.w ? mv_seg.w : 1);
         mv[R3D_MV_SEG].zoom = fy2 < fx2 ? fy2 : fx2;
-        for (int i = 1; i < 4; i++) mv[i].zoom = (double)mv[i].ph / 2048.0;
+        double fitv = getenv("R3D_MV_FIT") ? strtod(getenv("R3D_MV_FIT"), NULL) : 0.0;
+        if (!(fitv >= 64.0)) fitv = 2048.0; /* headless: voxels shown vertically */
+        for (int i = 1; i < 4; i++) mv[i].zoom = (double)mv[i].ph / fitv;
       }
       int hover = r3d_mv_hit(mv, in.mouse_xy[0], in.mouse_xy[1]);
       if (in.dragging && mv_drag_view < 0) mv_drag_view = hover;
@@ -2606,6 +3164,47 @@ int main(int argc, char **argv) {
             mv_tr_view = false;
           }
         }
+      }
+      if (in.bnd_place && !io->WantCaptureMouse) {
+        /* B over a plane pane = seed the boundary-surface grower at the
+         * voxel under the cursor (replaces the previous seed) */
+        int av = r3d_mv_hit(mv, in.mouse_xy[0], in.mouse_xy[1]);
+        if (av > 0 && !MV_IS3D(av) && av != R3D_MV_SEG) {
+          double u, vq, A[3];
+          r3d_mv_unproject(&mv[av], in.mouse_xy[0], in.mouse_xy[1], &u, &vq);
+          r3d_mv_b2w(mv_pb[av], mv_po[av], u, vq, mv[av].slice, A);
+          bool inside = true;
+          for (int a = 0; a < 3; a++)
+            if (A[a] < 0.0 || (brick_shape[a] && A[a] > (double)brick_shape[a] - 1.0))
+              inside = false;
+          if (inside) {
+            memcpy(bsurf_seed, A, sizeof A);
+            bsurf_have_seed = true;
+            printf("boundary surface: seed at (%.0f, %.0f, %.0f)\n", A[0], A[1], A[2]);
+          }
+        }
+      }
+      { /* label painting: plain LMB drag over a plane pane while the labels
+         * panel's paint mode is on (plain LMB is otherwise idle in the
+         * multiview; Ctrl+LMB stays the focus gesture) */
+        bool painted = false;
+        if (g_lbl_init && g_lbl_paint && in.lmb_held && !in.ctrl && !io->WantCaptureMouse) {
+          int av = r3d_mv_hit(mv, in.mouse_xy[0], in.mouse_xy[1]);
+          if (av > 0 && !MV_IS3D(av) && av != R3D_MV_SEG) {
+            double u, vq, A[3];
+            r3d_mv_unproject(&mv[av], in.mouse_xy[0], in.mouse_xy[1], &u, &vq);
+            r3d_mv_b2w(mv_pb[av], mv_po[av], u, vq, mv[av].slice, A);
+            bool inside = true;
+            for (int a = 0; a < 3; a++)
+              if (A[a] < 0.0 || (brick_shape[a] && A[a] > (double)brick_shape[a] - 1.0))
+                inside = false;
+            if (inside) {
+              lbl_stroke_to(A, (double)g_lbl_radius, (uint8_t)g_lbl_class);
+              painted = true;
+            }
+          }
+        }
+        if (!painted) g_lbl_stroke = false;
       }
       if (in.annotate_click && in.click_ctrl) { /* Ctrl+click = set focus POI */
         int cv_ = r3d_mv_hit(mv, in.click_xy[0], in.click_xy[1]);
@@ -3602,6 +4201,44 @@ int main(int argc, char **argv) {
           msurf_create = true;
       }
     }
+    if (multiview_path && bricks_path &&
+        igCollapsingHeader_TreeNodeFlags("boundary surface", 0)) {
+      igTextDisabled("Set the render low cut so papyrus stands hard against\n"
+                     "air, then B over a plane view on/near that edge. Grow\n"
+                     "follows the papyrus/void interface outward from the\n"
+                     "seed: each node is the papyrus voxel touching the void\n"
+                     "along the local normal, never farther than the snap\n"
+                     "distance; the fringe stops where the face ends.");
+      igText("low cut %.0f (render panel)", (double)low_cut);
+      if (bsurf_have_seed)
+        igText("seed (%.0f, %.0f, %.0f)", bsurf_seed[0], bsurf_seed[1], bsurf_seed[2]);
+      else
+        igTextDisabled("no seed - press B over a plane view");
+      igSliderInt("generations##bs", &bsurf_gens, 1, 600, "%d", 0);
+      igSliderFloat("snap dist (vox)##bs", &bsurf_snap, 1.0f, 24.0f, "%.0f", 0);
+      igSliderFloat("grid step (vox)##bs", &bsurf_step, 2.0f, 40.0f, "%.0f", 0);
+      if (bsurf_active) {
+        bool bdone = false;
+        uint32_t bring = 0, bnset = 0;
+        r3d_bsurf_snapshot(&bsurf, NULL, &bring, &bnset, &bdone);
+        igText("%s", bsurf.status);
+        if (!bdone) {
+          if (igButton("stop##bs", (ImVec2){0, 0})) r3d_bsurf_stop(&bsurf);
+        } else {
+          if (!bsurf.failed && bnset > 64 && igButton("save surface##bs", (ImVec2){0, 0}))
+            bsurf_save = true;
+          if (!bsurf.failed && bnset > 64) igSameLine(0, 8);
+          if (igButton("discard##bs", (ImVec2){0, 0})) bsurf_discard = true;
+          igSameLine(0, 8);
+          if (bsurf_have_seed && igButton("regrow##bs", (ImVec2){0, 0})) {
+            bsurf_discard = true;
+            bsurf_go = true;
+          }
+        }
+      } else if (bsurf_have_seed && igButton("grow##bs", (ImVec2){0, 0})) {
+        bsurf_go = true;
+      }
+    }
     if (multiview_path && n_overlays &&
         igCollapsingHeader_TreeNodeFlags("tracer", 0)) {
       const char *pr = overlay_paths[overlay_sel];
@@ -3804,16 +4441,41 @@ int main(int argc, char **argv) {
             }
           }
         }
+        if (GT->done && GT->nset > 0 && bricks_path) {
+          /* prediction-traced sheet -> actual papyrus: bsurf's edge rule as
+           * a tracer refine (cells move along their normals only, capped) */
+          static float mv_tr_snapd = 8.0f;
+          igSetNextItemWidth(130);
+          igSliderFloat("##ctsnapd", &mv_tr_snapd, 2.0f, 24.0f, "reach %.0f vox",
+                        0);
+          igSameLine(0, 6);
+          if (igButton("snap to CT edge", (ImVec2){0, 0})) {
+            char croot[1024];
+            snprintf(croot, sizeof croot, "%s", bricks_path);
+            char *ms3 = strrchr(croot, '/');
+            if (ms3 && strcmp(ms3 + 1, "manifest.json") == 0) *ms3 = 0;
+            r3d_tracer_stop(&GT->tr);
+            if (r3d_tracer_ctsnap(&GT->tr, croot, (double)mv_tr_snapd,
+                                  (double)low_cut) == 0) {
+              GT->done = false;
+              GT->gen = 0; /* force a fresh snapshot/live swap */
+            }
+          }
+          if (igIsItemHovered(0))
+            igSetTooltip("pull the sheet off the predictions onto the actual\n"
+                         "papyrus/void edge (render low cut %.0f), each point\n"
+                         "moving at most %.0f voxels along its own normal",
+                         (double)low_cut, (double)mv_tr_snapd);
+        }
         igSameLine(0, 8);
         if (GT->nset > 8 && igButton("save + activate", (ImVec2){0, 0})) {
           r3d_tracer_stop(&GT->tr);
           char td[256];
-          ++mv_tr_nsaved;
           trace_dir_now(td, sizeof td);
-          char mk[300];
-          snprintf(mk, sizeof mk, "mkdir -p '%s'", td);
-          if (system(mk) == 0 &&
+          errno = 0;
+          if (mkdir_p(td) &&
               r3d_tracer_save(&GT->tr, td, mv_tr_thresh, mv_tr_fill) == 0) {
+            ++mv_tr_nsaved; /* only a durable artifact counts as saved */
             printf("tracer: saved %s (%ux%u, %u pts)\n", td, GT->tr.W, GT->tr.H,
                    GT->nset);
             if (sgc.open) { /* pack + reopen the corpus so it shows at once */
@@ -3863,7 +4525,10 @@ int main(int argc, char **argv) {
               }
             }
           } else {
-            fprintf(stderr, "tracer: save failed\n");
+            /* nothing is freed here: the trace stays resident so the button
+             * can be pressed again once the cause is cleared */
+            fprintf(stderr, "tracer: SAVE FAILED for %s (%s) - trace kept in memory\n",
+                    td, errno ? strerror(errno) : "write error");
           }
         }
       }
@@ -4013,9 +4678,259 @@ int main(int argc, char **argv) {
       igTextDisabled("server 127.0.0.1:%d", inklive_port);
       igTextDisabled("%s", inklive.status);
     }
-    if (overlay_path && igCollapsingHeader_TreeNodeFlags("overlay", 0)) {
+    if (bricks_path && igCollapsingHeader_TreeNodeFlags("post process", 0)) {
+      /* GPU post-decode display filter: runs once per streamed brick, so
+       * pane rendering stays free; applying flushes the resident bricks so
+       * they re-stream through the filter IN PLACE — no reload, and no
+       * viewer state is touched */
+      static int pf_sel = 0; /* combo index == mode low byte */
+      static bool pf_sharp = false;
+      static float pf_amt = 1.0f;
+      static bool pf_ct = true, pf_preds = false, pf_ink = false;
+      igSetNextItemWidth(170);
+      igCombo_Str("3D filter", &pf_sel,
+                  "none\0median 3x3x3\0median 5x5x5\0max pool 3x3x3\0"
+                  "max pool 5x5x5\0",
+                  5);
+      igCheckbox("sharpen 3D##pfs", &pf_sharp);
+      if (pf_sharp) {
+        igSameLine(0, 10);
+        igSetNextItemWidth(150);
+        igSliderFloat("amount##pfamt", &pf_amt, 0.25f, 4.0f, "%.2f", 0);
+      }
+      igText("apply to:");
+      igSameLine(0, 8);
+      igCheckbox("raw CT##pft", &pf_ct);
+      if (overlay_path) {
+        igSameLine(0, 8);
+        igCheckbox("surface preds##pft", &pf_preds);
+      }
+      if (ink3d_ok) {
+        igSameLine(0, 8);
+        igCheckbox("3D ink##pft", &pf_ink);
+      }
+      if (igButton("apply##pf", (ImVec2){0, 0})) {
+        uint32_t tgts = (pf_ct ? 1u : 0u) | (pf_preds && overlay_path ? 2u : 0u) |
+                        (pf_ink && ink3d_ok ? 4u : 0u);
+        uint32_t pfmode = (uint32_t)pf_sel | (pf_sharp ? 0x100u : 0u);
+        r3d_bricks_postfilter(renderer, pfmode, pf_amt, tgts);
+        r3d_bricks_refilter(renderer);
+      }
+      if (igIsItemHovered(0))
+        igSetTooltip("resident bricks re-stream through the filter in place;\n"
+                     "the view falls back to the coarse level for a moment\n"
+                     "while they refill — nothing else changes");
+    }
+    if (bricks_path && igCollapsingHeader_TreeNodeFlags("labels", 0)) {
+      if (!g_lbl_init) {
+        igTextWrapped("paint 3D class labels (papyrus, ink, recto/verso, ...) into "
+                      "the volume; saved losslessly as C5L1 label bricks");
+        if (igButton("enable 3D labelling##lblen", (ImVec2){0, 0})) {
+          uint32_t ld[3] = {brick_shape[0], brick_shape[1], brick_shape[2]};
+          if (r3d_labelvol_init(&g_lblv, ld) == 0) {
+            r3d_label_src ls = {lblsrc_gen, lblsrc_fetch, &g_lblv};
+            if (r3d_bricks_labels(renderer, &ls) == 0) {
+              g_lbl_init = true;
+              g_lbl_paint = true;
+              if (!g_lbl_dir[0]) { /* default: <lod root>/labels */
+                char croot[560];
+                snprintf(croot, sizeof croot, "%s", bricks_path);
+                char *ms = strrchr(croot, '/');
+                if (ms) *ms = 0;
+                snprintf(g_lbl_dir, sizeof g_lbl_dir, "%s/labels", croot);
+              }
+              char mp[704];
+              snprintf(mp, sizeof mp, "%s/manifest.json", g_lbl_dir);
+              FILE *mf = fopen(mp, "r");
+              if (mf) { /* labels already on disk: pick them straight up */
+                fclose(mf);
+                r3d_labelvol_load(&g_lblv, g_lbl_dir);
+              }
+            } else {
+              r3d_labelvol_free(&g_lblv);
+              printf("labels: renderer atlas unavailable (needs streamed LOD bricks)\n");
+            }
+          }
+        }
+      } else {
+        igCheckbox("show##lblshow", &g_lbl_show);
+        igSameLine(0, 12);
+        igCheckbox("paint (LMB drag in plane views)##lblpaint", &g_lbl_paint);
+        igSetNextItemWidth(170);
+        igSliderFloat("brush##lblrad", &g_lbl_radius, 0.5f, 32.0f, "%.1f vox", 0);
+        for (uint32_t c = 0; c < R3D_LBL_NCLASS; c++) {
+          if (c) {
+            const float *rgb = r3d_lbl_class_rgb[c];
+            char cid[16];
+            snprintf(cid, sizeof cid, "##lblc%u", c);
+            igColorButton(cid, (ImVec4){rgb[0], rgb[1], rgb[2], 1.0f},
+                          ImGuiColorEditFlags_NoTooltip, (ImVec2){14, 14});
+            igSameLine(0, 6);
+          }
+          char rl[64];
+          if (c && g_lblv.nvox[c])
+            snprintf(rl, sizeof rl, "%s (%llu vox)##lblr%u", r3d_lbl_class_name[c],
+                     (unsigned long long)g_lblv.nvox[c], c);
+          else
+            snprintf(rl, sizeof rl, "%s##lblr%u", r3d_lbl_class_name[c], c);
+          if (igRadioButton_Bool(rl, g_lbl_class == (int)c)) g_lbl_class = (int)c;
+        }
+        igSetNextItemWidth(280);
+        igInputText("dir##lbldir", g_lbl_dir, sizeof g_lbl_dir, 0, NULL, NULL);
+        uint32_t lbl_unsaved = r3d_labelvol_dirty(&g_lblv);
+        if (igButton("save##lblsave", (ImVec2){0, 0}) && g_lbl_dir[0]) {
+          errno = 0;
+          if (r3d_labelvol_save(&g_lblv, g_lbl_dir) == 0) {
+            snprintf(g_lbl_status, sizeof g_lbl_status, "saved to %s", g_lbl_dir);
+          } else { /* nothing is dropped: the edits stay dirty and retryable */
+            snprintf(g_lbl_status, sizeof g_lbl_status, "SAVE FAILED: %s (%s)",
+                     g_lbl_dir, errno ? strerror(errno) : "write error");
+            fprintf(stderr, "labels: %s\n", g_lbl_status);
+          }
+        }
+        igSameLine(0, 10);
+        if (igButton("load##lblload", (ImVec2){0, 0}) && g_lbl_dir[0]) {
+          errno = 0;
+          if (r3d_labelvol_load(&g_lblv, g_lbl_dir) == 0)
+            snprintf(g_lbl_status, sizeof g_lbl_status, "loaded from %s", g_lbl_dir);
+          else {
+            snprintf(g_lbl_status, sizeof g_lbl_status, "LOAD FAILED: %s (%s)",
+                     g_lbl_dir, errno ? strerror(errno) : "read error");
+            fprintf(stderr, "labels: %s\n", g_lbl_status);
+          }
+        }
+        if (lbl_unsaved) {
+          igSameLine(0, 12);
+          igTextColored((ImVec4){1.0f, 0.75f, 0.3f, 1.0f}, "%u brick(s) unsaved",
+                        lbl_unsaved);
+        }
+        if (g_lbl_status[0]) {
+          bool bad = strstr(g_lbl_status, "FAILED") != NULL;
+          igTextColored(bad ? (ImVec4){1.0f, 0.4f, 0.35f, 1.0f}
+                            : (ImVec4){0.6f, 0.8f, 0.6f, 1.0f},
+                        "%s", g_lbl_status);
+        }
+      }
+    }
+    if (bricks_path && igCollapsingHeader_TreeNodeFlags("registration", 0)) {
+      if (!g_reg_open) {
+        igTextWrapped("overlay a second scan of the same scroll and line it up "
+                      "(green = this volume, magenta = the other scan)");
+        igSetNextItemWidth(280);
+        igInputText("moving volume##regroot", g_reg_root, sizeof g_reg_root, 0, NULL, NULL);
+        if (igButton("open moving volume##regopen", (ImVec2){0, 0}) && g_reg_root[0]) {
+          uint32_t fd[3] = {brick_shape[0], brick_shape[1], brick_shape[2]};
+          reg_open_moving(renderer, g_reg_root, fd, bricks_path);
+        }
+        igSameLine(0, 10);
+        igTextDisabled("(or use the data browser)");
+      } else {
+        igText("moving: %s", g_reg.root);
+        { /* voxel-pitch matching: the correct scale between two scans of the
+           * same scroll is the pitch ratio (crops differ, shapes don't tell).
+           * Prefilled when a path carries "...um"; editable otherwise. */
+          igSetNextItemWidth(70);
+          igInputFloat("fixed um##regumf", &g_reg_um_fix, 0.0f, 0.0f, "%.4g", 0);
+          igSameLine(0, 10);
+          igSetNextItemWidth(70);
+          igInputFloat("moving um##regumm", &g_reg_um_mov, 0.0f, 0.0f, "%.4g", 0);
+          igSameLine(0, 10);
+          igBeginDisabled(!(g_reg_um_fix > 0.0f) || !(g_reg_um_mov > 0.0f));
+          if (igButton("match voxel size##regmatch", (ImVec2){0, 0})) {
+            r3d_regvol_set_scale(&g_reg, (double)g_reg_um_fix / (double)g_reg_um_mov);
+            reg_gui_reset_mirrors();
+          }
+          igEndDisabled();
+          if (igIsItemHovered(0))
+            igSetTooltip("replace the transform with the pure scale\n"
+                         "fixed um / moving um (translation/rotation reset)");
+          igText("current scale: %.4f moving vox per fixed vox",
+                 r3d_regvol_scale(&g_reg));
+        }
+        igCheckbox("show##regshow", &g_reg_show);
+        igSameLine(0, 12);
+        igCheckbox("flattened pane##regflat", &g_reg_flat);
+        igSetNextItemWidth(170);
+        igSliderFloat("opacity##rega", &g_reg_alpha, 0.0f, 1.0f, "%.2f", 0);
+        bool rch = false;
+        igSetNextItemWidth(240);
+        rch |= igDragFloat3("translate##regt", g_reg_tr, 0.25f, -1e6f, 1e6f, "%.2f", 0);
+        igSetNextItemWidth(240);
+        rch |= igDragFloat3("rotate deg##regr", g_reg_rot, 0.02f, -180.0f, 180.0f, "%.3f", 0);
+        igSetNextItemWidth(120);
+        rch |= igDragFloat("scale##regs", &g_reg_scale, 0.0005f, 0.01f, 100.0f, "%.4f", 0);
+        if (rch) reg_gui_apply_mirrors();
+        if (igButton("bake##regbake", (ImVec2){0, 0})) {
+          r3d_regvol_bake(&g_reg);
+          reg_gui_reset_mirrors();
+        }
+        if (igIsItemHovered(0))
+          igSetTooltip("fold the sliders into the base transform and zero them");
+        igSameLine(0, 10);
+        if (igButton("reset deltas##regreset", (ImVec2){0, 0})) {
+          r3d_regvol_reset_deltas(&g_reg);
+          reg_gui_reset_mirrors();
+        }
+        igSetNextItemWidth(280);
+        igInputText("transform.json##regjson", g_reg_json, sizeof g_reg_json, 0, NULL, NULL);
+        if (igButton("load transform##regjl", (ImVec2){0, 0}) && g_reg_json[0]) {
+          if (r3d_regvol_load_json(&g_reg, g_reg_json) == 0) reg_gui_reset_mirrors();
+        }
+        if (igIsItemHovered(0))
+          igSetTooltip("shipped Vesuvius transform.json (transformation_matrix,\n"
+                       "XYZ, moving->fixed) or this tool's own saves");
+        igSameLine(0, 10);
+        if (igButton("save transform##regjs", (ImVec2){0, 0}) && g_reg_json[0])
+          r3d_regvol_save_json(&g_reg, g_reg_json);
+        igSeparator();
+        igSetNextItemWidth(150);
+        igCombo_Str("##regmode", &g_reg_refmode, "measure NCC\0refine rigid\0refine affine\0",
+                    3);
+        igSameLine(0, 8);
+        igSetNextItemWidth(90);
+        igSliderInt("level##reglvl", &g_reg_reflevel, 0, 4, "L%d", 0);
+        igSameLine(0, 8);
+        if (!g_reg_busy && igButton("run##regrun", (ImVec2){0, 0})) {
+          char croot[1024];
+          snprintf(croot, sizeof croot, "%s", bricks_path);
+          char *ms = strrchr(croot, '/');
+          if (ms) *ms = 0;
+          double ctr[3] = {mv_crop_c[0], mv_crop_c[1], mv_crop_c[2]};
+          if (r3d_regvol_job_start(&g_reg, croot, g_reg_refmode, ctr, 64,
+                                   (uint32_t)g_reg_reflevel) == 0)
+            g_reg_busy = true;
+        }
+        if (igIsItemHovered(0))
+          igSetTooltip("128^3 ROI at level L around the focus point\n"
+                       "(Ctrl+click a pane to set the focus); refines\n"
+                       "the transform in the background and applies it");
+        if (g_reg_busy) {
+          igSameLine(0, 10);
+          igText("running...");
+        }
+        if (g_reg_ncc0 > -1.5)
+          igText("NCC %.4f%s", g_reg_ncc0,
+                 g_reg_ncc1 > -1.5 && g_reg_ncc1 != g_reg_ncc0 ? "" : " (at focus ROI)");
+        if (g_reg_ncc1 > -1.5 && g_reg_ncc1 != g_reg_ncc0) {
+          igSameLine(0, 6);
+          igText("-> %.4f (refined)", g_reg_ncc1);
+        }
+        if (igButton("close moving volume##regclose", (ImVec2){0, 0})) {
+          g_reg_open = false;
+          g_reg_flat = false;
+          g_reg_busy = false;
+          r3d_bricks_regatlas_detach(renderer); /* worker holds the source */
+          r3d_regvol_close(&g_reg);
+        }
+      }
+    }
+    if ((overlay_path || ink3d_ok) && igCollapsingHeader_TreeNodeFlags("overlay", 0)) {
         {
-          igCheckbox("show##ovshow", &overlay_show);
+          if (overlay_path) igCheckbox("show##ovshow", &overlay_show);
+          if (ink3d_ok) {
+            if (overlay_path) igSameLine(0, 10);
+            igCheckbox("3D ink (red)##i3dshow", &ink3d_show);
+          }
           igSameLine(0, 10);
           igSetNextItemWidth(140);
           igSliderFloat("gain", &overlay_gain, 0.25f, 8.0f, "%.2f",
@@ -4125,7 +5040,48 @@ int main(int argc, char **argv) {
     igEnd();
 
     od_browser_window(&od, &od_window, od_next_bricks, sizeof od_next_bricks, od_next_seg,
-                      sizeof od_next_seg, &od_swap);
+                      sizeof od_next_seg, od_next_ovl, sizeof od_next_ovl, od_next_ink,
+                      sizeof od_next_ink, od_next_reg, sizeof od_next_reg, &od_swap,
+                      &od_attach_ovl, &od_attach_ink, &od_attach_reg, bricks_path);
+    if (od_attach_ovl) { /* browser: attach surface predictions live (blue) */
+      od_attach_ovl = false;
+      if (bricks_path && od_next_ovl[0] &&
+          r3d_bricks_overlay_switch(renderer, od_next_ovl) == 0) {
+        overlay_paths[0] = od_next_ovl;
+        n_overlays = 1;
+        overlay_sel = 0;
+        overlay_path = od_next_ovl;
+        overlay_show = true;
+      } else if (od_next_ovl[0]) {
+        printf("odbrowse: overlay %s failed to attach\n", od_next_ovl);
+        od_next_ovl[0] = 0;
+      }
+    }
+    if (od_attach_ink) { /* browser: attach 3D ink live (red, second slot) */
+      od_attach_ink = false;
+      if (bricks_path && od_next_ink[0] &&
+          r3d_bricks_ink3d_switch(renderer, od_next_ink) == 0) {
+        snprintf(ink3d_root, sizeof ink3d_root, "%s", od_next_ink);
+        ink3d_ok = true;
+        ink3d_show = true;
+      } else if (od_next_ink[0]) {
+        printf("odbrowse: 3D ink %s failed to attach\n", od_next_ink);
+        od_next_ink[0] = 0;
+      }
+    }
+    if (od_attach_reg) { /* browser: attach a second scan as the moving
+                          * registration volume (green/magenta fuse) */
+      od_attach_reg = false;
+      if (bricks_path && od_next_reg[0]) {
+        uint32_t fd3[3] = {brick_shape[0], brick_shape[1], brick_shape[2]};
+        if (reg_open_moving(renderer, od_next_reg, fd3, bricks_path))
+          printf("odbrowse: registration volume %s attached\n", od_next_reg);
+        else {
+          printf("odbrowse: registration volume %s failed to attach\n", od_next_reg);
+          od_next_reg[0] = 0;
+        }
+      }
+    }
     if (getenv("R3D_SWAP_TEST") && frame_index == 300 && !od_swap) {
       /* headless repro of a browser dataset swap: R3D_SWAP_TEST=<manifest.json>
        * (volume-only swap; the segment store and --inklive stay) */
@@ -4212,6 +5168,37 @@ int main(int argc, char **argv) {
       }
       if (mv_seeds_n) mv_seeds_go = true;
     }
+    if (getenv("R3D_BSURF_TEST") && frame_index == 300 && !bsurf_active &&
+        !bsurf_have_seed) {
+      /* headless: "x,y,z,lowcut,gens,step,snap" -> seed + grow; the
+       * finished grid auto-saves through the harvest pipeline */
+      double bx = 0, by = 0, bz = 0, blc = 0, bst = 4, bsn = 6;
+      int bg = 60;
+      if (sscanf(getenv("R3D_BSURF_TEST"), "%lf,%lf,%lf,%lf,%d,%lf,%lf", &bx, &by, &bz,
+                 &blc, &bg, &bst, &bsn) >= 4) {
+        bsurf_seed[0] = bx;
+        bsurf_seed[1] = by;
+        bsurf_seed[2] = bz;
+        bsurf_have_seed = true;
+        low_cut = (float)blc;
+        bsurf_gens = bg;
+        bsurf_step = (float)bst;
+        bsurf_snap = (float)bsn;
+        bsurf_go = true;
+        printf("bsurf test: seed (%.0f,%.0f,%.0f) lowcut %.0f gens %d step %.0f snap %.0f\n",
+               bx, by, bz, blc, bg, bst, bsn);
+      }
+    }
+    if (getenv("R3D_BSURF_TEST") && bsurf_active && !bsurf_save) {
+      bool bdone = false;
+      uint32_t bn = 0;
+      r3d_bsurf_snapshot(&bsurf, NULL, NULL, &bn, &bdone);
+      if (bdone) {
+        printf("bsurf test: %s\n", bsurf.status);
+        if (!bsurf.failed && bn > 64) bsurf_save = true;
+        else bsurf_discard = true;
+      }
+    }
     if (getenv("R3D_MSURF_TEST") && frame_index == 300 && !msurf_n) {
       /* headless: points as "x,y,z;..." then create */
       const char *sp3 = getenv("R3D_MSURF_TEST");
@@ -4223,16 +5210,70 @@ int main(int argc, char **argv) {
       }
       if (msurf_n >= 4) msurf_create = true;
     }
+    if (bsurf_discard && bsurf_active) {
+      r3d_bsurf_free(&bsurf);
+      bsurf_active = false;
+      bsurf_discard = false;
+    }
+    if (bsurf_go && !bsurf_active && bsurf_have_seed && bricks_path) {
+      bsurf_go = false;
+      if (!bsurf_ct_ok) {
+        char croot[1024];
+        snprintf(croot, sizeof croot, "%s", bricks_path);
+        char *ms2 = strrchr(croot, '/');
+        if (ms2 && strcmp(ms2 + 1, "manifest.json") == 0) *ms2 = 0;
+        bsurf_ct_ok = r3d_cpuvol_open(&bsurf_ct, croot, 256) == 0;
+        if (!bsurf_ct_ok) printf("boundary surface: cannot open CT tree %s\n", croot);
+      }
+      if (bsurf_ct_ok) {
+        r3d_bsurf_cfg bc = {.step = (double)bsurf_step,
+                            .gens = (uint32_t)bsurf_gens,
+                            .snap = (double)bsurf_snap,
+                            .low_cut = (double)low_cut};
+        memcpy(bc.seed, bsurf_seed, sizeof bc.seed);
+        for (int a = 0; a < 3; a++) bc.vdim[a] = (double)brick_shape[a];
+        if (r3d_bsurf_start(&bsurf, &bc, bsurf_ct_sample, &bsurf_ct) == 0) {
+          bsurf_active = true;
+          bsurf_first = true;
+          bsurf_gen = 0;
+          bsurf_prev_ns = 0;
+          mv_tr_view = false;
+          printf("boundary surface: growing %u gens, step %.0f, snap %.0f, low cut %.0f\n",
+                 bc.gens, bc.step, bc.snap, bc.low_cut);
+        }
+      }
+    }
+    /* live preview of an authored surface (manual points re-fit on every
+     * click; boundary grower polled as it grows): swap the grid into the
+     * flattened pane immediately */
+    double *pg3 = NULL;
+    uint32_t pw3 = 0, ph3 = 0;
+    bool *pfirst = &msurf_first;
+    const char *plabel = "(manual)";
     if (msurf_dirty && !msurf_create && msurf_n >= 4 && multiview_path) {
-      /* live preview: re-fit on every placed point and swap the surface
-       * into the flattened pane immediately */
       msurf_dirty = false;
-      uint32_t pw3 = 0, ph3 = 0;
-      double *pg3 = msurf_fit((const double(*)[3])msurf_pts, msurf_n,
-                              (double)mv_tr_step, &pw3, &ph3);
-      if (pg3) {
+      pg3 = msurf_fit((const double(*)[3])msurf_pts, msurf_n, (double)mv_tr_step,
+                      &pw3, &ph3);
+    } else if (bsurf_active && multiview_path) {
+      bool bdone = false;
+      uint64_t bg = r3d_bsurf_snapshot(&bsurf, NULL, NULL, NULL, &bdone);
+      uint64_t bnow = r3d_now_ns();
+      if (bg != bsurf_gen && (bdone || bnow - bsurf_prev_ns > 400000000ull)) {
+        bsurf_gen = bg;
+        bsurf_prev_ns = bnow;
+        pw3 = bsurf.W;
+        ph3 = bsurf.H;
+        pg3 = malloc((size_t)pw3 * ph3 * 3 * sizeof *pg3);
+        if (pg3) r3d_bsurf_snapshot(&bsurf, pg3, NULL, NULL, NULL);
+        pfirst = &bsurf_first;
+        plabel = "(boundary)";
+      }
+    }
+    if (pg3) {
+      {
+        double pstep = pfirst == &msurf_first ? (double)mv_tr_step : bsurf.cfg.step;
         r3d_tifxyz ts = {.w = pw3, .h = ph3};
-        ts.sx = ts.sy = (float)(1.0 / (double)mv_tr_step);
+        ts.sx = ts.sy = (float)(1.0 / pstep);
         ts.xyz = malloc((size_t)pw3 * ph3 * 3 * sizeof *ts.xyz);
         if (ts.xyz) {
           float bb[2][3] = {{1e30f, 1e30f, 1e30f}, {-1e30f, -1e30f, -1e30f}};
@@ -4269,15 +5310,15 @@ int main(int argc, char **argv) {
             mv_seg = ts;
             mv_rows = trr;
             mv_normals = tno;
-            snprintf(sgc_active, sizeof sgc_active, "(manual)");
+            snprintf(sgc_active, sizeof sgc_active, "%s", plabel);
             for (int oi2 = 0; oi2 < 4; oi2++) {
               mv_ol[oi2].n = 0;
               mv_ol_off[oi2].n = 0;
               mv_ol_slice[oi2] = 1e30;
             }
             mv_ol_zoff = 1e30;
-            if (msurf_first) {
-              msurf_first = false;
+            if (*pfirst) {
+              *pfirst = false;
               mv[R3D_MV_SEG].cu = ((double)gi0 + gi1) * 0.5;
               mv[R3D_MV_SEG].cv = ((double)gj0 + gj1) * 0.5;
               double bw = (double)(gi1 - gi0) + 6.0, bh = (double)(gj1 - gj0) + 6.0;
@@ -4298,16 +5339,29 @@ int main(int argc, char **argv) {
         free(pg3);
       }
     }
-    if (msurf_create) {
-      /* fit the clicked points into a grid and inject it as a FINISHED
-       * synthetic trace with the harvest flag: the normal pipeline then
-       * saves it (timestamp name), packs it into the store, and computes
-       * its ink map - a hand-made surface is a first-class segment and a
-       * training label with zero extra plumbing */
+    if (msurf_create || (bsurf_save && bsurf_active)) {
+      /* fit the clicked points into a grid (or take the boundary grower's
+       * finished grid) and inject it as a FINISHED synthetic trace with
+       * the harvest flag: the normal pipeline then saves it (timestamp
+       * name), packs it into the store, and computes its ink map - a
+       * hand-made surface is a first-class segment and a training label
+       * with zero extra plumbing */
+      bool from_bsurf = !msurf_create;
       msurf_create = false;
+      bsurf_save = false;
       uint32_t mw = 0, mh = 0;
-      double *mg = msurf_fit((const double(*)[3])msurf_pts, msurf_n,
-                             (double)mv_tr_step, &mw, &mh);
+      double *mg = NULL;
+      double mstep = (double)mv_tr_step;
+      if (from_bsurf) {
+        r3d_bsurf_stop(&bsurf);
+        mw = bsurf.W;
+        mh = bsurf.H;
+        mstep = bsurf.cfg.step;
+        mg = malloc((size_t)mw * mh * 3 * sizeof *mg);
+        if (mg) r3d_bsurf_snapshot(&bsurf, mg, NULL, NULL, NULL);
+      } else {
+        mg = msurf_fit((const double(*)[3])msurf_pts, msurf_n, mstep, &mw, &mh);
+      }
       int slot = -1;
       for (int s3 = 0; s3 < GT_MAX; s3++)
         if (!gts[s3].active) {
@@ -4320,8 +5374,11 @@ int main(int argc, char **argv) {
         for (uint32_t a = 0; a < R3D_TR_MAX_ANCHORS; a++) g->tr.anc_cell[a] = -1;
         g->tr.W = mw;
         g->tr.H = mh;
-        g->tr.cfg.step = (double)mv_tr_step;
+        g->tr.cfg.step = mstep;
         g->tr.cfg.thresh = mv_tr_thresh;
+        if (from_bsurf) /* voxel-snapped nodes: edges carry the normal
+                         * excursion on top of the grid step */
+          g->tr.tear_lim = 1.75 * mstep + bsurf.cfg.snap;
         g->tr.pos = mg;
         g->tr.state = malloc((size_t)mw * mh);
         g->tr.conf = malloc((size_t)mw * mh * sizeof *g->tr.conf);
@@ -4334,7 +5391,7 @@ int main(int argc, char **argv) {
             bool valid = mg[k * 3] >= 0.0;
             g->tr.state[k] = valid ? R3D_TR_SET : R3D_TR_EMPTY;
             g->tr.conf[k] = valid ? 1.0f : 0.0f;
-            g->tr.gen_of[k] = valid ? 1 : 0;
+            g->tr.gen_of[k] = valid ? (from_bsurf ? bsurf.gen_of[k] : 1) : 0;
             if (valid) nv2++;
           }
           g->tr.nset = nv2;
@@ -4348,9 +5405,16 @@ int main(int argc, char **argv) {
           g->harvest = true; /* the pipeline takes it from here */
           g->nset = g->tr.nset;
           g->ring = 0;
-          printf("manual surface: %ux%u grid from %u points -> harvest\n", mw,
-                 mh, msurf_n);
-          msurf_n = 0;
+          if (from_bsurf) {
+            printf("boundary surface: %ux%u grid, %u nodes -> harvest\n", mw, mh,
+                   nv2);
+            r3d_bsurf_free(&bsurf);
+            bsurf_active = false;
+          } else {
+            printf("manual surface: %ux%u grid from %u points -> harvest\n", mw,
+                   mh, msurf_n);
+            msurf_n = 0;
+          }
         } else {
           free(g->tr.pos);
           free(g->tr.state);
@@ -4381,22 +5445,33 @@ int main(int argc, char **argv) {
         if (!g->active || !g->done || !g->harvest) continue;
         r3d_tracer_stop(&g->tr);
         if (g->nset > 64) {
-          ++mv_tr_nsaved;
-          trace_dir_now(saved_names[nharv], sizeof saved_names[0]);
-          char mk[300];
-          snprintf(mk, sizeof mk, "mkdir -p '%s'", saved_names[nharv]);
-          if (system(mk) == 0 &&
-              r3d_tracer_save(&g->tr, saved_names[nharv], mv_tr_thresh,
-                              mv_tr_fill) == 0) {
-            saved_dirs[nharv] = saved_names[nharv];
-            const char *bn = strrchr(saved_names[nharv], '/');
-            bn = bn ? bn + 1 : saved_names[nharv];
-            if (ink_qn < 24) { /* chain the 2.5D ink map (no TTA) */
-              snprintf(ink_q[ink_qn], sizeof ink_q[0], "%s", bn);
-              ink_qn++;
-            }
-            nharv++;
+          char td[256];
+          trace_dir_now(td, sizeof td);
+          errno = 0;
+          bool ok = mkdir_p(td) &&
+                    r3d_tracer_save(&g->tr, td, mv_tr_thresh, mv_tr_fill) == 0;
+          if (!ok) {
+            /* the in-memory trace is the only copy of this result: never free
+             * it because persistence failed. Drop it out of the harvest queue
+             * (so it does not retry every frame) and leave it resident and
+             * selectable so the user can retry save from the panel. */
+            fprintf(stderr,
+                    "tracer: SAVE FAILED for %s (%s) - trace kept in memory, "
+                    "retry with \"save + activate\" in the surfaces panel\n",
+                    td, errno ? strerror(errno) : "write error");
+            g->harvest = false;
+            continue;
           }
+          ++mv_tr_nsaved;
+          snprintf(saved_names[nharv], sizeof saved_names[0], "%s", td);
+          saved_dirs[nharv] = saved_names[nharv];
+          const char *bn = strrchr(saved_names[nharv], '/');
+          bn = bn ? bn + 1 : saved_names[nharv];
+          if (ink_qn < 24) { /* chain the 2.5D ink map (no TTA) */
+            snprintf(ink_q[ink_qn], sizeof ink_q[0], "%s", bn);
+            ink_qn++;
+          }
+          nharv++;
         }
         r3d_tracer_free(&g->tr);
         free(g->pos);
@@ -4408,7 +5483,12 @@ int main(int argc, char **argv) {
         g->active = g->done = false;
       }
       if (nharv && sgc.open && seg_store_path &&
-          r3d_segstore_build(seg_store_path, saved_dirs, nharv, 2, false) > 0) {
+          r3d_segstore_build(seg_store_path, saved_dirs, nharv, 2, false) <= 0)
+        fprintf(stderr,
+                "tracer: segment-store rebuild failed for %s - %u harvested trace(s) "
+                "are on disk but not in the corpus\n",
+                seg_store_path, nharv);
+      else if (nharv && sgc.open && seg_store_path) {
         for (int oi2 = 1; oi2 < 4; oi2++) { /* rebuild the polyline caches */
           if (!sgc_ln[oi2]) continue;
           for (uint32_t si = 0; si < sgc.st.n; si++) {
@@ -4430,6 +5510,9 @@ int main(int argc, char **argv) {
                  sizeof sgc_near_focus);
           printf("tracer: %u finished trace(s) harvested into the store "
                  "(%u surfaces)\n", nharv, sgc.st.n);
+        } else {
+          fprintf(stderr, "tracer: segment-store reopen failed for %s - the saved "
+                          "trace(s) remain on disk\n", seg_store_path);
         }
       }
     }
@@ -4787,6 +5870,24 @@ int main(int argc, char **argv) {
           }
         }
       }
+      if (bsurf_have_seed) { /* boundary-surface seed: cyan ring */
+        const ImU32 bb_ = 0xff000000u, bc_ = 0xffffd040u, bd_ = 0x80ffd040u;
+        for (int i = 1; i < 4; i++) {
+          if (!(mv_mask & (1u << i)) || MV_IS3D(i)) continue;
+          double fu, fv, fs;
+          r3d_mv_w2b(mv_pb[i], mv_po[i], bsurf_seed, &fu, &fv, &fs);
+          float ax_, ay_;
+          r3d_mv_project(&mv[i], fu, fv, &ax_, &ay_);
+          double zd = fabs(fs - mv[i].slice);
+          if (zd >= 6.0) continue;
+          if (ax_ < (float)mv[i].px || ax_ >= (float)(mv[i].px + mv[i].pw) ||
+              ay_ < (float)mv[i].py || ay_ >= (float)(mv[i].py + mv[i].ph))
+            continue;
+          ImDrawList_AddCircle(draw, (ImVec2){ax_, ay_}, 7.0f, bb_, 20, 4.0f);
+          ImDrawList_AddCircle(draw, (ImVec2){ax_, ay_}, 7.0f, zd < 1.5 ? bc_ : bd_, 20,
+                               2.0f);
+        }
+      }
       if (mv_seeds_n) { /* queued trace seeds: green circles */
         const ImU32 sb_ = 0xff000000u, sc_ = 0xff40d060u, sd_ = 0x8040d060u;
         for (int i = 1; i < 4; i++) {
@@ -4975,9 +6076,13 @@ int main(int argc, char **argv) {
         /* TEMP verify: save the finished trace headlessly */
         mv_tr_nsaved = 1;
         r3d_tracer_stop(&GT->tr);
-        if (system("mkdir -p cache/traced/trace-test") == 0 &&
+        errno = 0;
+        if (mkdir_p("cache/traced/trace-test") &&
             r3d_tracer_save(&GT->tr, "cache/traced/trace-test", mv_tr_thresh, true) == 0)
           printf("tracer: saved cache/traced/trace-test\n");
+        else
+          fprintf(stderr, "tracer: SAVE FAILED for cache/traced/trace-test (%s)\n",
+                  errno ? strerror(errno) : "write error");
       }
       if (GT->active && GT->pos) { /* growing trace: orange points */
         const ImU32 tc_ = 0xff2896ffu, tb_ = 0xff000000u;
@@ -5090,6 +6195,11 @@ int main(int argc, char **argv) {
                  ? 1u
                  : 0u) |
             (inklive_have && inklive_show ? 2u : 0u) |
+            (ink3d_ok && ink3d_show ? 4u : 0u) |
+            (g_lbl_init && g_lbl_show ? 8u : 0u) |
+            (g_reg_open && g_reg_show
+                 ? (16u | ((uint32_t)(g_reg_alpha * 255.0f + 0.5f) << 16))
+                 : 0u) |
             (overlay_path && !strstr(overlay_path, "ink") ? 256u : 0u),
     };
     memcpy(p.vol_r0, &vm.r0, 12);
@@ -5255,6 +6365,22 @@ int main(int argc, char **argv) {
         r3d_bricks_stream(renderer, be, bf, ht, pixel_cone, (uint32_t)brick_z,
                           (uint32_t)brick_depth, p.skip_gate, moving ? 2u : 6u);
       }
+      if (g_lbl_init) /* mirror paint edits / slot churn into the label atlas */
+        r3d_bricks_labels_sync(renderer, 8u);
+      if (g_reg_busy) { /* registration worker: collect NCC / refined map */
+        bool rok = true;
+        if (r3d_regvol_job_poll(&g_reg, &rok) == 0) {
+          g_reg_busy = false;
+          if (rok) {
+            g_reg_ncc0 = g_reg.ncc0;
+            g_reg_ncc1 = g_reg.ncc1;
+            if (g_reg.job_mode != 0) reg_gui_reset_mirrors(); /* deltas folded */
+          } else
+            printf("regvol: job failed\n");
+        }
+      }
+      r3d_surfvol_regtap(renderer, g_reg_open && g_reg_flat);
+      r3d_bricks_regatlas_sync(renderer, 16u);
       r3d_bricks_params(renderer, &p);
     }
     if (clip_mode) {
@@ -5293,27 +6419,41 @@ int main(int argc, char **argv) {
       /* the flattened bake samples the 3D overlay atlas only for ink
        * trees; surface predictions never dress the flattened segment */
       r3d_surfvol_overlay_enable(renderer,
-                                 overlay_path && strstr(overlay_path, "ink"));
+                                 (g_reg_open && g_reg_flat) || ink3d_ok ||
+                                     (overlay_path && strstr(overlay_path, "ink")));
       for (int i = 0; i < 4; i++) {
         if (!(mv_mask & (1u << i))) continue; /* collapsed: no dispatch at all */
         r3d_frame_params q = p;
         q.viewport[0] = (uint32_t)mv[i].pw;
         q.viewport[1] = (uint32_t)mv[i].ph;
         q.view_org = (uint32_t)mv[i].px | ((uint32_t)mv[i].py << 16);
-        { /* strict per-source routing: SURFACE PREDICTIONS (overlay panel)
-           * show only on the plane views; 2.5D INK only on the flattened
-           * segment; 3D INK overlay trees may show on both. */
+        { /* strict per-source routing: SURFACE PREDICTIONS (overlay panel,
+           * blue) show only on the plane views; 2.5D INK (mint) only on the
+           * flattened segment; 3D INK (red, second atlas slot) on both. */
           bool tree_ink = overlay_path && strstr(overlay_path, "ink");
-          q.overlay_flags &= ~(1u | 2u);
+          q.overlay_flags &= ~(1u | 2u | 4u | 8u | 16u);
           if (i == R3D_MV_SEG) {
             bool ink25 = inklive_have && inklive_show;
-            bool ink3d = tree_ink && overlay_show && (mv_ov_mask & (1u << i));
-            if (ink25 || ink3d) q.overlay_flags |= 1u;
-            if (ink25) q.overlay_flags |= 2u; /* ink-green palette */
+            bool baked3d = (ink3d_ok && ink3d_show && (mv_ov_mask & (1u << i))) ||
+                           (tree_ink && overlay_show && (mv_ov_mask & (1u << i)));
+            if (g_reg_open && g_reg_show && g_reg_flat) {
+              /* the bake's G channel carries the moving scan: magenta tint */
+              q.overlay_flags |= 1u | 16u;
+            } else {
+              if (ink25 || baked3d) q.overlay_flags |= 1u; /* G channel shows */
+              if (ink25) q.overlay_flags |= 2u; /* ink-mint palette */
+              else if (ink3d_ok && ink3d_show) q.overlay_flags |= 4u; /* red */
+            }
           } else {
+            if (g_reg_open && g_reg_show)
+              q.overlay_flags |= 16u; /* second scan: green/magenta fuse */
             if (overlay_path && overlay_show && (mv_ov_mask & (1u << i)))
-              q.overlay_flags |= 1u; /* tree overlay (surface preds or 3D
-                                      * ink), palette by tree type */
+              q.overlay_flags |= 1u; /* tree overlay (surface preds or legacy
+                                      * ink tree), palette by tree type */
+            if (ink3d_ok && ink3d_show && (mv_ov_mask & (1u << i)))
+              q.overlay_flags |= 4u; /* 3D ink rides on top in red */
+            if (g_lbl_init && g_lbl_show)
+              q.overlay_flags |= 8u; /* paint labels: plane + 3D panes only */
           }
         }
         if (i == R3D_MV_SEG) {
@@ -5529,8 +6669,10 @@ int main(int argc, char **argv) {
   if (bench_json)
     write_bench_json(bench_json, bench_name ? bench_name : bench, win_w, win_h, quality_arg,
                      warmup_frames, &stats, prof_samples, prof_frames, vs_pend_acc, &final_bst);
-  if (umbilicus_path && umbilicus.dirty)
-    save_umbilicus(&umbilicus, umbilicus_path, annotation_status);
+  if (umbilicus_path && umbilicus.dirty &&
+      save_umbilicus(&umbilicus, umbilicus_path, annotation_status) != 0)
+    fprintf(stderr, "umbilicus: FINAL SAVE FAILED for %s (%s) - %zu point(s) unsaved\n",
+            umbilicus_path, annotation_status, umbilicus.count);
   r3d_umbilicus_free(&umbilicus);
   if (inklive_up) r3d_inklive_stop(&inklive);
   free(inkmap);
@@ -5576,6 +6718,10 @@ int main(int argc, char **argv) {
       memset(g, 0, sizeof *g);
     }
     mv_seeds_n = 0;
+    if (bsurf_active) r3d_bsurf_free(&bsurf);
+    bsurf_active = false;
+    if (bsurf_ct_ok) r3d_cpuvol_close(&bsurf_ct);
+    bsurf_ct_ok = false;
     sgc_close(&sgc);
     for (int i = 0; i < 4; i++) {
       free(mv_ol[i].w);
@@ -5585,10 +6731,48 @@ int main(int argc, char **argv) {
     }
   }
   free(prof_samples);
+  if (g_lbl_init) { /* labels are per volume: save unsaved edits, then drop */
+    bool lbl_lost = false;
+    if (g_lbl_dir[0] && r3d_labelvol_dirty(&g_lblv)) {
+      printf("labels: auto-saving unsaved edits to %s\n", g_lbl_dir);
+      errno = 0;
+      if (r3d_labelvol_save(&g_lblv, g_lbl_dir) != 0) {
+        lbl_lost = true;
+        snprintf(g_lbl_status, sizeof g_lbl_status, "SAVE FAILED: %s (%s)", g_lbl_dir,
+                 errno ? strerror(errno) : "write error");
+        fprintf(stderr,
+                "labels: AUTOSAVE FAILED for %s (%s) - edits kept in memory; "
+                "fix the path and press save in the labels panel\n",
+                g_lbl_dir, errno ? strerror(errno) : "write error");
+      }
+    }
+    if (!lbl_lost) { /* only drop the volume once its edits are durable */
+      r3d_labelvol_free(&g_lblv);
+      g_lbl_init = false;
+      g_lbl_paint = false;
+      g_lbl_dir[0] = 0;
+    }
+  }
+  if (g_reg_open) { /* registration is per volume too */
+    g_reg_open = false;
+    g_reg_flat = false;
+    g_reg_busy = false;
+    r3d_bricks_regatlas_detach(renderer); /* worker holds the source */
+    r3d_regvol_close(&g_reg);
+  }
   if (!od_swap) break;
   r3d_bricks_end(renderer); /* dataset swap: teardown, then reopen */
   if (slab_src.voxels) r3d_volume_close(&slab_src);
   } /* dataset loop */
+  if (od.job_up) { /* own the browser's child: terminate and reap it */
+    close(od.jobfd);
+    od.jobfd = -1;
+    od.job_up = false;
+    kill(od.jobpid, SIGTERM);
+    int jst = 0;
+    while (waitpid(od.jobpid, &jst, 0) < 0 && errno == EINTR) {}
+    od.jobpid = 0;
+  }
   if (od.fth_up) { /* stop the browser's listing worker */
     pthread_mutex_lock(&od.fmu);
     od.fquit = true;
