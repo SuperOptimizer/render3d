@@ -19,7 +19,12 @@
 
 #define ST_B 128u /* brick edge */
 
+/* >= 0: every voxel takes this value instead of the textured pattern —
+ * constant volumes are the identity fixture for the display filters */
+static int st_const_value = -1;
+
 static uint8_t st_pat(uint32_t x, uint32_t y, uint32_t z) {
+  if (st_const_value >= 0) return (uint8_t)st_const_value;
   double v = 120.0 + 70.0 * sin((double)x * 0.113) * sin((double)y * 0.131) *
                          sin((double)z * 0.171);
   double bx = (double)x - 90.0, by = (double)y - 140.0, bz = (double)z - 100.0;
