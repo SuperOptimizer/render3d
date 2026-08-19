@@ -5,28 +5,175 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #include <tifxyz.h> /* c5d codec (angle include: render3d's core/tifxyz.h differs) */
 
-#define SGS_MAGIC "r3dsegs1"
+/* magic/version bumped together: a checksum and explicit version field were
+ * added to the header, so a store written by the previous format is
+ * rejected outright (r3d_segstore_open fails) rather than misread; the
+ * caller rebuilds from scratch, which is safe because rebuild is itself
+ * fail-closed (see r3d_segstore_build). */
+#define SGS_MAGIC "r3dsegs2"
+#define SGS_VERSION 2u
+
+/* sane ceilings for externally-supplied header counts, checked before any
+ * size arithmetic or allocation derived from them: comfortably above any
+ * real corpus (the format doc's own "tens of MB" whole-scroll estimate)
+ * while staying far below the magnitudes at which count*sizeof(record) can
+ * wrap a 64-bit (or narrower) size_t. */
+#define SGS_MAX_SEGS ((uint32_t)1 << 20)
+#define SGS_MAX_TILES ((uint64_t)1 << 30)
+#define SGS_MAX_DIM ((uint32_t)1 << 20)
 
 struct sgs_hdr {
   char magic[8];
-  uint32_t count, tile;
+  uint32_t version;
+  uint32_t count;
+  uint32_t tile;
+  uint32_t reserved; /* explicit padding, always written 0 */
   uint64_t ntiles;
+  uint64_t checksum; /* FNV-1a64 over the segs+tiles bytes following the header */
 };
 
-static const char *sgs_basename(const char *dir) {
+/* checked a*b -> out; false on overflow (out left unmodified) */
+static bool sgs_mul_ov(uint64_t a, uint64_t b, uint64_t *out) {
+  if (a != 0 && b > UINT64_MAX / a) return false;
+  *out = a * b;
+  return true;
+}
+
+/* checked a+b -> out; false on overflow (out left unmodified) */
+static bool sgs_add_ov(uint64_t a, uint64_t b, uint64_t *out) {
+  if (a > UINT64_MAX - b) return false;
+  *out = a + b;
+  return true;
+}
+
+static uint64_t sgs_fnv1a(const void *p, size_t n) {
+  const unsigned char *b = p;
+  uint64_t h = 1469598103934665603ull;
+  for (size_t i = 0; i < n; i++) {
+    h ^= b[i];
+    h *= 1099511628211ull;
+  }
+  return h;
+}
+
+/* name identity is the tifxyz dir's basename; truncation would silently
+ * alias two different sources onto the same store entry, so reject rather
+ * than truncate (false = doesn't fit). */
+static bool sgs_basename(const char *dir, char *out, size_t outsz) {
   size_t len = strlen(dir);
   while (len > 1 && dir[len - 1] == '/') len--; /* tolerate trailing slash */
   size_t end = len;
   while (len > 0 && dir[len - 1] != '/') len--;
-  static _Thread_local char name[R3D_SEGSTORE_NAME];
   size_t n = end - len;
-  if (n >= sizeof name) n = sizeof name - 1;
-  memcpy(name, dir + len, n);
-  name[n] = 0;
-  return name;
+  if (n == 0 || n >= outsz) return false;
+  memcpy(out, dir + len, n);
+  out[n] = 0;
+  return true;
+}
+
+/* open-addressed set of names seen so far this build: catches two source
+ * dirs (or a source dir and a leftover .tfx) resolving to the same
+ * identity, which would otherwise silently alias one .tfx file/manifest
+ * slot onto two different segments. */
+typedef struct sgs_nameent {
+  uint64_t hash;
+  char name[R3D_SEGSTORE_NAME];
+  bool used;
+} sgs_nameent;
+
+typedef struct sgs_nameset {
+  sgs_nameent *e;
+  uint32_t cap, n;
+} sgs_nameset;
+
+enum { SGS_NAME_OK = 0, SGS_NAME_DUP = 1, SGS_NAME_NOMEM = 2 };
+
+static bool sgs_nameset_init(sgs_nameset *ns, uint32_t hint) {
+  uint32_t cap = 16;
+  while (cap < hint * 2u + 16u) cap <<= 1;
+  ns->e = calloc(cap, sizeof *ns->e);
+  ns->cap = ns->e ? cap : 0;
+  ns->n = 0;
+  return ns->e != NULL;
+}
+
+static bool sgs_nameset_grow(sgs_nameset *ns) {
+  uint32_t ncap = ns->cap * 2;
+  sgs_nameent *ne = calloc(ncap, sizeof *ne);
+  if (!ne) return false;
+  for (uint32_t i = 0; i < ns->cap; i++)
+    if (ns->e[i].used) {
+      uint32_t k = (uint32_t)(ns->e[i].hash & (ncap - 1));
+      while (ne[k].used) k = (k + 1) & (ncap - 1);
+      ne[k] = ns->e[i];
+    }
+  free(ns->e);
+  ns->e = ne;
+  ns->cap = ncap;
+  return true;
+}
+
+/* SGS_NAME_DUP if name is already present; SGS_NAME_NOMEM if growth failed
+ * (treated by callers as a build-aborting allocation failure); else inserts
+ * and returns SGS_NAME_OK. */
+static int sgs_nameset_check_insert(sgs_nameset *ns, const char *name) {
+  if (ns->n * 2u >= ns->cap && !sgs_nameset_grow(ns)) return SGS_NAME_NOMEM;
+  uint64_t h = sgs_fnv1a(name, strlen(name));
+  uint32_t k = (uint32_t)(h & (ns->cap - 1));
+  while (ns->e[k].used) {
+    if (ns->e[k].hash == h && strcmp(ns->e[k].name, name) == 0) return SGS_NAME_DUP;
+    k = (k + 1) & (ns->cap - 1);
+  }
+  ns->e[k].used = true;
+  ns->e[k].hash = h;
+  snprintf(ns->e[k].name, sizeof ns->e[k].name, "%s", name);
+  ns->n++;
+  return SGS_NAME_OK;
+}
+
+static void sgs_nameset_free(sgs_nameset *ns) {
+  free(ns->e);
+  memset(ns, 0, sizeof *ns);
+}
+
+/* frees every rebuild-scoped resource and returns -1; call at any point
+ * where the rebuild must abort so the previous manifest (never touched
+ * here) stays the published corpus. */
+static int sgs_build_abort(r3d_segmeta *segs, r3d_segtile *tiles, sgs_nameset *names, DIR *dp,
+                           r3d_segstore *old, bool have_old) {
+  if (dp) closedir(dp);
+  if (have_old) r3d_segstore_close(old);
+  sgs_nameset_free(names);
+  free(tiles);
+  free(segs);
+  return -1;
+}
+
+/* newest mtime among a tifxyz dir's component files, or 0 if none are
+ * stat-able (treated by callers as "no freshness signal": an existing .tfx
+ * is then only trusted if its own content checks (size) pass). */
+static time_t sgs_source_mtime(const char *dir) {
+  static const char *comp[4] = {"x.tif", "y.tif", "z.tif", "meta.json"};
+  time_t mx = 0;
+  for (int i = 0; i < 4; i++) {
+    char p[1024];
+    snprintf(p, sizeof p, "%s/%s", dir, comp[i]);
+    struct stat st;
+    if (stat(p, &st) == 0 && st.st_mtime > mx) mx = st.st_mtime;
+  }
+  return mx;
+}
+
+/* true if path is a regular file with nonzero size and (when src_mtime > 0)
+ * is not older than the source it was packed from. */
+static bool sgs_file_fresh(const char *path, time_t src_mtime) {
+  struct stat st;
+  if (stat(path, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0) return false;
+  return src_mtime <= 0 || st.st_mtime >= src_mtime;
 }
 
 static int sgs_write_file(const char *path, const void *data, size_t n) {
@@ -97,18 +244,15 @@ static void sgs_tiles_build(const r3d_tifxyz *s, const float bbox[2][3], r3d_seg
   }
 }
 
-/* encode s decimated by stride into path (skipped if it already exists and
- * !force); the decimated grid keeps exact source points so quantization
- * error never compounds across tiers */
+/* encode s decimated by stride into path (skipped if it already exists,
+ * is nonempty, and is not older than src_mtime, unless force); the
+ * decimated grid keeps exact source points so quantization error never
+ * compounds across tiers. src_mtime <= 0 means "no source to compare
+ * against" (existence + nonzero size only). */
 static int sgs_encode_grid(const r3d_tifxyz *s, uint32_t stride, const uint8_t *meta,
-                           size_t meta_len, int log2q, const char *path, bool force) {
-  if (!force) {
-    FILE *probe = fopen(path, "rb");
-    if (probe) {
-      fclose(probe);
-      return 0;
-    }
-  }
+                           size_t meta_len, int log2q, const char *path, bool force,
+                           time_t src_mtime) {
+  if (!force && sgs_file_fresh(path, src_mtime)) return 0;
   uint32_t w = (s->w + stride - 1) / stride, h = (s->h + stride - 1) / stride;
   uint64_t np = (uint64_t)w * h;
   float *planes = malloc(np * 3 * sizeof *planes);
@@ -195,7 +339,14 @@ int r3d_segstore_build(const char *store_dir, const char *const *dirs, uint32_t 
   r3d_segtile *tiles = NULL;
   uint64_t ntiles = 0, tiles_cap = 0;
   uint32_t n = 0;
+  sgs_nameset names;
+  r3d_segstore old = {0};
+  bool have_old = false;
   if (!segs) return -1;
+  if (!sgs_nameset_init(&names, ndirs)) {
+    free(segs);
+    return -1;
+  }
   for (uint32_t d = 0; d < ndirs; d++) {
     r3d_tifxyz s;
     if (r3d_tifxyz_load(&s, dirs[d]) != 0) {
@@ -207,8 +358,26 @@ int r3d_segstore_build(const char *store_dir, const char *const *dirs, uint32_t 
       r3d_tifxyz_free(&s);
       continue;
     }
+    char name[R3D_SEGSTORE_NAME];
+    if (!sgs_basename(dirs[d], name, sizeof name)) {
+      fprintf(stderr, "segstore: skipping %s (basename doesn't fit the %u-byte identity)\n",
+              dirs[d], R3D_SEGSTORE_NAME - 1);
+      r3d_tifxyz_free(&s);
+      continue;
+    }
+    int nr = sgs_nameset_check_insert(&names, name);
+    if (nr == SGS_NAME_NOMEM) {
+      r3d_tifxyz_free(&s);
+      return sgs_build_abort(segs, tiles, &names, NULL, &old, have_old);
+    }
+    if (nr == SGS_NAME_DUP) {
+      fprintf(stderr, "segstore: skipping %s (name collides with another source this run)\n",
+              dirs[d]);
+      r3d_tifxyz_free(&s);
+      continue;
+    }
     r3d_segmeta *m = &segs[n];
-    snprintf(m->name, sizeof m->name, "%s", sgs_basename(dirs[d]));
+    snprintf(m->name, sizeof m->name, "%s", name);
     m->w = s.w;
     m->h = s.h;
     m->sx = s.sx;
@@ -223,10 +392,8 @@ int r3d_segstore_build(const char *store_dir, const char *const *dirs, uint32_t 
       tiles_cap = (ntiles + nt) * 2;
       r3d_segtile *nt2 = realloc(tiles, tiles_cap * sizeof *nt2);
       if (!nt2) {
-        free(tiles);
-        free(segs);
         r3d_tifxyz_free(&s);
-        return -1;
+        return sgs_build_abort(segs, tiles, &names, NULL, &old, have_old);
       }
       tiles = nt2;
     }
@@ -239,25 +406,26 @@ int r3d_segstore_build(const char *store_dir, const char *const *dirs, uint32_t 
     snprintf(mpath, sizeof mpath, "%s/meta.json", dirs[d]);
     size_t meta_len = 0;
     uint8_t *meta = sgs_read_file(mpath, &meta_len);
+    time_t src_mtime = sgs_source_mtime(dirs[d]);
     /* full-res + stride-4 tier (fast overview decodes); the loader already
      * normalized invalids to exact (-1,-1,-1) incl. the z<=0 rule */
-    int rc = sgs_encode_grid(&s, 1, meta, meta_len, log2q, path, force);
-    if (rc == 0) rc = sgs_encode_grid(&s, 4, meta, meta_len, log2q, p4, force);
+    int rc = sgs_encode_grid(&s, 1, meta, meta_len, log2q, path, force, src_mtime);
+    if (rc == 0) rc = sgs_encode_grid(&s, 4, meta, meta_len, log2q, p4, force, src_mtime);
     free(meta);
     r3d_tifxyz_free(&s);
     if (rc != 0) {
       fprintf(stderr, "segstore: encode failed for %s\n", dirs[d]);
-      free(tiles);
-      free(segs);
-      return -1;
+      return sgs_build_abort(segs, tiles, &names, NULL, &old, have_old);
     }
     n++;
   }
   /* store segments whose source dirs weren't given this run: keep them,
    * reusing the previous manifest entry when possible (so packed sources
-   * can be deleted), else rebuild the entry from the .tfx itself */
-  r3d_segstore old;
-  bool have_old = r3d_segstore_open(&old, store_dir) == 0;
+   * can be deleted), else rebuild the entry from the .tfx itself. Any
+   * allocation/encode failure from here on aborts the whole rebuild
+   * (sgs_build_abort) rather than publishing a manifest missing whatever
+   * hadn't been reached yet. */
+  have_old = r3d_segstore_open(&old, store_dir) == 0;
   DIR *dp = opendir(store_dir);
   struct dirent *de;
   while (dp && (de = readdir(dp)) != NULL) {
@@ -267,13 +435,13 @@ int r3d_segstore_build(const char *store_dir, const char *const *dirs, uint32_t 
     char name[R3D_SEGSTORE_NAME];
     memcpy(name, de->d_name, nl - 4);
     name[nl - 4] = 0;
-    bool seen = false;
-    for (uint32_t i = 0; i < n && !seen; i++) seen = strcmp(segs[i].name, name) == 0;
-    if (seen) continue;
+    int nr = sgs_nameset_check_insert(&names, name);
+    if (nr == SGS_NAME_NOMEM) return sgs_build_abort(segs, tiles, &names, dp, &old, have_old);
+    if (nr == SGS_NAME_DUP) continue; /* already added this run */
     if (n == segs_cap) {
       segs_cap *= 2;
       r3d_segmeta *ns = realloc(segs, (size_t)segs_cap * sizeof *ns);
-      if (!ns) break;
+      if (!ns) return sgs_build_abort(segs, tiles, &names, dp, &old, have_old);
       segs = ns;
     }
     r3d_segmeta *m = &segs[n];
@@ -281,27 +449,41 @@ int r3d_segstore_build(const char *store_dir, const char *const *dirs, uint32_t 
     if (have_old)
       for (uint32_t i = 0; i < old.n && oi == UINT32_MAX; i++)
         if (strcmp(old.segs[i].name, name) == 0) oi = i;
-    uint64_t nt = 0;
-    r3d_tifxyz s = {0};
-    char p4[600];
+    char path[600], p4[600];
+    snprintf(path, sizeof path, "%s/%s", store_dir, de->d_name);
     snprintf(p4, sizeof p4, "%s/%s.tfx4", store_dir, name);
-    FILE *pf = fopen(p4, "rb");
-    bool have4 = pf != NULL;
-    if (pf) fclose(pf);
+    /* no source dir this run to compare mtimes against: reuse is gated on
+     * existence + nonzero size only */
+    bool primary_ok = sgs_file_fresh(path, 0);
+    bool have4_ok = sgs_file_fresh(p4, 0);
+    r3d_tifxyz s = {0};
     bool decoded = false;
-    if (oi == UINT32_MAX || !have4) { /* need the grid: entry rebuild or
-                                       * tier backfill */
-      char path[600];
-      snprintf(path, sizeof path, "%s/%s", store_dir, de->d_name);
-      if (sgs_decode_tfx(path, &s) != 0 || s.nvalid == 0) {
-        fprintf(stderr, "segstore: skipping stale %s\n", de->d_name);
+    if (!(oi != UINT32_MAX && have4_ok && primary_ok)) { /* need the grid:
+                                       * entry rebuild or tier backfill */
+      bool ok = primary_ok && sgs_decode_tfx(path, &s) == 0 && s.nvalid != 0;
+      if (!ok) {
         r3d_tifxyz_free(&s);
-        continue;
+        if (oi == UINT32_MAX) {
+          fprintf(stderr, "segstore: skipping stale %s (unreadable, no previous entry)\n",
+                  de->d_name);
+          continue;
+        }
+        /* a transient read/decode failure here must not silently drop a
+         * segment that was already in the published corpus */
+        fprintf(stderr, "segstore: keeping %s from previous manifest (packed grid unreadable this run)\n",
+                name);
+      } else {
+        decoded = true;
+        if (!have4_ok) {
+          int rc4 = sgs_encode_grid(&s, 4, NULL, 0, log2q, p4, false, 0);
+          if (rc4 != 0) {
+            r3d_tifxyz_free(&s);
+            return sgs_build_abort(segs, tiles, &names, dp, &old, have_old);
+          }
+        }
       }
-      decoded = true;
-      if (!have4) sgs_encode_grid(&s, 4, NULL, 0, log2q, p4, false);
     }
-    if (oi == UINT32_MAX) {
+    if (oi == UINT32_MAX) { /* only reachable with a successful fresh decode */
       memset(m, 0, sizeof *m);
       snprintf(m->name, sizeof m->name, "%s", name);
       m->w = s.w;
@@ -315,13 +497,13 @@ int r3d_segstore_build(const char *store_dir, const char *const *dirs, uint32_t 
     } else {
       *m = old.segs[oi];
     }
-    nt = (uint64_t)m->tw * m->th;
+    uint64_t nt = (uint64_t)m->tw * m->th;
     if (ntiles + nt > tiles_cap) {
       tiles_cap = (ntiles + nt) * 2;
       r3d_segtile *nt2 = realloc(tiles, tiles_cap * sizeof *nt2);
       if (!nt2) {
         r3d_tifxyz_free(&s);
-        break;
+        return sgs_build_abort(segs, tiles, &names, dp, &old, have_old);
       }
       tiles = nt2;
     }
@@ -334,16 +516,32 @@ int r3d_segstore_build(const char *store_dir, const char *const *dirs, uint32_t 
   }
   if (dp) closedir(dp);
   if (have_old) r3d_segstore_close(&old);
-  /* manifest: header + metas + tile array, one atomic write */
-  struct sgs_hdr hdr = {.count = n, .tile = R3D_SEGSTORE_TILE, .ntiles = ntiles};
-  memcpy(hdr.magic, SGS_MAGIC, 8);
-  size_t total = sizeof hdr + (size_t)n * sizeof *segs + ntiles * sizeof *tiles;
+  sgs_nameset_free(&names);
+  /* manifest: header + metas + tile array, one atomic write. Sizes are
+   * checked-overflow throughout: a pathological n/ntiles aborts rather
+   * than wrapping into a too-small allocation or a corrupt file. */
+  uint64_t segbytes, tilebytes, payload, total64;
+  if (!sgs_mul_ov(n, sizeof *segs, &segbytes) || !sgs_mul_ov(ntiles, sizeof *tiles, &tilebytes) ||
+      !sgs_add_ov(segbytes, tilebytes, &payload) || !sgs_add_ov(sizeof(struct sgs_hdr), payload,
+                                                                 &total64) ||
+      total64 > SIZE_MAX) {
+    free(tiles);
+    free(segs);
+    return -1;
+  }
+  size_t total = (size_t)total64;
   uint8_t *blob = malloc(total ? total : 1);
   int rc = blob ? 0 : -1;
   if (blob) {
+    memcpy(blob + sizeof(struct sgs_hdr), segs, (size_t)segbytes);
+    memcpy(blob + sizeof(struct sgs_hdr) + (size_t)segbytes, tiles, (size_t)tilebytes);
+    struct sgs_hdr hdr = {.version = SGS_VERSION,
+                          .count = n,
+                          .tile = R3D_SEGSTORE_TILE,
+                          .ntiles = ntiles,
+                          .checksum = sgs_fnv1a(blob + sizeof(struct sgs_hdr), (size_t)payload)};
+    memcpy(hdr.magic, SGS_MAGIC, 8);
     memcpy(blob, &hdr, sizeof hdr);
-    memcpy(blob + sizeof hdr, segs, (size_t)n * sizeof *segs);
-    memcpy(blob + sizeof hdr + (size_t)n * sizeof *segs, tiles, ntiles * sizeof *tiles);
     char path[600];
     snprintf(path, sizeof path, "%s/segments.r3ds", store_dir);
     rc = sgs_write_file(path, blob, total);
@@ -364,24 +562,38 @@ int r3d_segstore_open(r3d_segstore *st, const char *store_dir) {
   struct sgs_hdr hdr;
   if (n < sizeof hdr) goto fail;
   memcpy(&hdr, blob, sizeof hdr);
-  if (memcmp(hdr.magic, SGS_MAGIC, 8) != 0 || hdr.tile != R3D_SEGSTORE_TILE) goto fail;
-  size_t want = sizeof hdr + (size_t)hdr.count * sizeof(r3d_segmeta) +
-                hdr.ntiles * sizeof(r3d_segtile);
+  if (memcmp(hdr.magic, SGS_MAGIC, 8) != 0 || hdr.version != SGS_VERSION ||
+      hdr.tile != R3D_SEGSTORE_TILE)
+    goto fail;
+  /* reject before any arithmetic derived from these counts: past this
+   * point count*sizeof(record) and ntiles*sizeof(record) cannot wrap a
+   * (>=32-bit) size_t */
+  if (hdr.count > SGS_MAX_SEGS || hdr.ntiles > SGS_MAX_TILES) goto fail;
+  uint64_t segbytes, tilebytes, payload, want64;
+  if (!sgs_mul_ov(hdr.count, sizeof(r3d_segmeta), &segbytes) ||
+      !sgs_mul_ov(hdr.ntiles, sizeof(r3d_segtile), &tilebytes) ||
+      !sgs_add_ov(segbytes, tilebytes, &payload) ||
+      !sgs_add_ov(sizeof hdr, payload, &want64) || want64 > SIZE_MAX)
+    goto fail;
+  size_t want = (size_t)want64;
   if (n != want) goto fail;
-  st->segs = malloc((size_t)hdr.count * sizeof *st->segs + 1);
-  st->tiles = malloc(hdr.ntiles * sizeof *st->tiles + 1);
+  if (sgs_fnv1a(blob + sizeof hdr, (size_t)payload) != hdr.checksum) goto fail;
+  st->segs = malloc(segbytes ? (size_t)segbytes : 1);
+  st->tiles = malloc(tilebytes ? (size_t)tilebytes : 1);
   if (!st->segs || !st->tiles) goto fail;
-  memcpy(st->segs, blob + sizeof hdr, (size_t)hdr.count * sizeof *st->segs);
-  memcpy(st->tiles, blob + sizeof hdr + (size_t)hdr.count * sizeof *st->segs,
-         hdr.ntiles * sizeof *st->tiles);
+  memcpy(st->segs, blob + sizeof hdr, (size_t)segbytes);
+  memcpy(st->tiles, blob + sizeof hdr + (size_t)segbytes, (size_t)tilebytes);
   st->n = hdr.count;
   st->ntiles = hdr.ntiles;
   for (uint32_t i = 0; i < st->n; i++) { /* validate before trusting offsets */
     r3d_segmeta *m = &st->segs[i];
     m->name[R3D_SEGSTORE_NAME - 1] = 0;
-    if (m->tw != (m->w + R3D_SEGSTORE_TILE - 1) / R3D_SEGSTORE_TILE ||
+    uint64_t nt, tile_end;
+    if (m->w > SGS_MAX_DIM || m->h > SGS_MAX_DIM ||
+        m->tw != (m->w + R3D_SEGSTORE_TILE - 1) / R3D_SEGSTORE_TILE ||
         m->th != (m->h + R3D_SEGSTORE_TILE - 1) / R3D_SEGSTORE_TILE ||
-        m->tile_ofs + (uint64_t)m->tw * m->th > st->ntiles)
+        !sgs_mul_ov(m->tw, m->th, &nt) || !sgs_add_ov(m->tile_ofs, nt, &tile_end) ||
+        tile_end > st->ntiles)
       goto fail;
   }
   snprintf(st->dir, sizeof st->dir, "%s", store_dir);

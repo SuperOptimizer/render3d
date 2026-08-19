@@ -1,6 +1,7 @@
 #include "core/odbrowse.h"
 
 #include <curl/curl.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -10,9 +11,16 @@ typedef struct sbuf {
   size_t n, cap;
 } sbuf;
 
+/* One ListObjectsV2 page is at most 1000 keys; real bodies are KB-scale.
+ * Cap growth defensively so a misbehaving/hostile endpoint cannot make one
+ * page consume unbounded memory -- returning a short write count fails the
+ * transfer through curl's normal error path. */
+#define OD_MAX_BODY ((size_t)64 << 20)
+
 static size_t sbuf_write(const void *data, size_t sz, size_t nm, void *ud) {
   sbuf *b = ud;
   size_t n = sz * nm;
+  if (b->n + n + 1 > OD_MAX_BODY) return 0;
   if (b->n + n + 1 > b->cap) {
     size_t nc = b->cap ? b->cap * 2 : (256u << 10);
     while (nc < b->n + n + 1) nc *= 2;
@@ -25,6 +33,25 @@ static size_t sbuf_write(const void *data, size_t sz, size_t nm, void *ud) {
   b->n += n;
   b->p[b->n] = 0;
   return n;
+}
+
+/* Defense in depth for the shell boundary further downstream (open-data
+ * names are later interpolated into command strings by the caller): reject
+ * any listing entry whose name is not built entirely from an ordinary
+ * filename alphabet, and reject "." / ".." / a leading "-" which are legal
+ * under that alphabet but dangerous as a path or CLI-argument component. */
+static bool name_is_safe(const char *s, size_t len) {
+  if (len == 0) return false;
+  if (s[0] == '-') return false;
+  if ((len == 1 && s[0] == '.') || (len == 2 && s[0] == '.' && s[1] == '.'))
+    return false;
+  for (size_t i = 0; i < len; i++) {
+    char c = s[i];
+    bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+              (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-';
+    if (!ok) return false;
+  }
+  return true;
 }
 
 static int push_str(char ***arr, uint32_t *n, const char *s, size_t len) {
@@ -88,6 +115,10 @@ int r3d_odlist_fetch(const char *bucket_url, const char *prefix, r3d_odlist *out
       if (len <= plen) continue;
       size_t l = len - plen;
       if (s[plen + l - 1] == '/') l--; /* drop trailing slash */
+      if (!name_is_safe(s + plen, l)) {
+        fprintf(stderr, "odbrowse: dropping unsafe directory name %.*s\n", (int)l, s + plen);
+        continue;
+      }
       if (push_str(&out->dirs, &out->ndirs, s + plen, l) != 0) goto done;
     }
     p = body.p;
@@ -98,7 +129,12 @@ int r3d_odlist_fetch(const char *bucket_url, const char *prefix, r3d_odlist *out
       size_t sl;
       const char *ss = xml_next(&q, "<Size>", "</Size>", &sl);
       if (ss) sz = strtoull(ss, NULL, 10);
-      if (push_str(&out->files, &out->nfiles, s + plen, len - plen) != 0) goto done;
+      size_t l = len - plen;
+      if (!name_is_safe(s + plen, l)) {
+        fprintf(stderr, "odbrowse: dropping unsafe file name %.*s\n", (int)l, s + plen);
+        continue;
+      }
+      if (push_str(&out->files, &out->nfiles, s + plen, l) != 0) goto done;
       uint64_t *nf = realloc(out->file_sizes, out->nfiles * sizeof *nf);
       if (!nf) goto done;
       out->file_sizes = nf;
@@ -107,19 +143,28 @@ int r3d_odlist_fetch(const char *bucket_url, const char *prefix, r3d_odlist *out
     const char *tp = body.p;
     const char *tok = xml_next(&tp, "<NextContinuationToken>", "</NextContinuationToken>",
                                &len);
-    if (!tok || len >= sizeof token) break;
+    if (!tok) { /* no continuation token: this really is the last page */
+      rc = 0;
+      goto done;
+    }
+    /* A token present but unusable (too long to store, or one we cannot
+     * escape) means more of the bucket exists beyond what was collected.
+     * Treat that the same as any other fetch failure -- fail closed rather
+     * than return a partial listing dressed up as a complete one. */
+    if (len >= sizeof token) goto done;
     /* token is URL-safe base64ish but may contain chars needing escaping */
     char rawtok[1024];
     memcpy(rawtok, tok, len);
     rawtok[len] = 0;
     char *te = curl_easy_escape(curl, rawtok, 0);
-    if (!te) break;
+    if (!te) goto done;
     snprintf(token, sizeof token, "%s", te);
     curl_free(te);
-    if (!token[0]) break;
+    if (!token[0]) goto done;
     continue;
   }
-  rc = 0;
+  /* page budget exhausted with a continuation token still pending: the
+   * bucket has more entries than were listed. Same fail-closed rule. */
 done:
   if (rc != 0) r3d_odlist_free(out);
   free(body.p);

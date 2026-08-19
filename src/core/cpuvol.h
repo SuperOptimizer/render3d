@@ -27,25 +27,28 @@ typedef struct r3d_cpuvol {
   r3d_cpuvol_level lev[R3D_CPUVOL_LEVELS];
   void *readers;   /* lazy shard readers */
   uint32_t nreaders;
-  /* decode cache: slots of 128^3 bricks keyed (level, bx, by, bz) */
-  uint8_t *slabs;
-  uint64_t *keys;    /* key or UINT64_MAX */
-  uint64_t *use;     /* LRU ticks */
-  uint32_t nslots;
-  uint64_t tick;
-  /* hash index over keys (open addressing, slot+1, 0 = empty) so a hit is
-   * O(1) instead of a linear scan of every slot per non-memo lookup */
-  uint32_t *hidx;
-  uint32_t hmask;
+  /* decode cache: refcounted slab pool of 128^3 bricks keyed
+   * (level, bx, by, bz), pinned per reader lease. Opaque (cv_cache) and
+   * separately refcounted so a lease outlives r3d_cpuvol_close. */
+  void *cache;
+  /* unique per successful open: a thread-local memo taken against a volume
+   * that was closed and reopened at the same address must not validate */
+  uint64_t id;
   /* negative cache: bricks known absent (empty cache file = air, permanent)
    * or unavailable right now (fetch/decode failed: expires) — trilinear
    * taps into empty space no longer cost 8 file probes per sample */
   uint64_t *neg_key;
   uint64_t *neg_exp;  /* expiry, seconds since epoch; UINT64_MAX = permanent */
   uint32_t nneg;      /* power of two */
-  /* thread safety: mu guards the index/LRU/negative cache; io_mu serializes
-   * shard reads + demand fetches. Decodes run outside both. Concurrent
-   * r3d_cpuvol_tri/at callers on one volume are supported. */
+  /* thread safety: the decode cache carries its own lock and per-slot pin
+   * counts; mu guards the negative cache and the net backoff; io_mu
+   * serializes shard reads + demand fetches. Decodes run outside all of
+   * them. Concurrent r3d_cpuvol_tri/at/read_block callers on one volume are
+   * supported and never observe a slot that eviction may rewrite: every
+   * returned brick pointer is pinned until that thread asks for another
+   * brick. The volume object itself is NOT concurrently closable — callers
+   * must join their samplers before r3d_cpuvol_close (leases outstanding at
+   * that point stay valid, but the r3d_cpuvol is gone). */
   pthread_mutex_t mu, io_mu;
   /* demand fetch (source.json): brick misses pull the owning zarr cell,
    * transcode, and land in <root>/bricks/L* — the same cache the

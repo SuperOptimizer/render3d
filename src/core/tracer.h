@@ -16,6 +16,7 @@
 #define R3D_TRACER_H
 
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -94,7 +95,9 @@ typedef struct r3d_tracer {
   uint32_t ucn;
   /* global spiral fit rho ~ r0(z) + omega*w over the grown points,
    * refit each generation (piecewise-linear r0, IRLS/Cauchy) */
-  double sp_omega, sp_rms;
+  /* _Atomic: the GUI reads the fit summary live while the worker
+   * refits it every generation (no lock on that path) */
+  _Atomic double sp_omega, sp_rms;
   /* coarse per-region sheet-gap field (G5): real cross-sections vary
    * 2-3x in gap; one global median shoves genuine wraps apart where the
    * gap is tight and lets them interpenetrate where it is wide. Filled
@@ -111,7 +114,7 @@ typedef struct r3d_tracer {
                     * umbilicus offset + cross-section ellipticity */
   double sp_z0, sp_dz;
   uint32_t sp_k;
-  bool sp_valid;
+  _Atomic bool sp_valid;
   void *wf;       /* winding-potential field r1(x,y) for the seed slab
                    * (evolutor port: geometry-agnostic winding coordinate
                    * from normal-grid polylines + one linear solve) */
@@ -138,8 +141,20 @@ typedef struct r3d_tracer {
   double inl_th;
   pthread_t th;
   pthread_mutex_t mu;
-  bool running, quit, done;
+  /* _Atomic: quit is set by the caller's thread while the worker
+   * polls it in every loop; running/done are published by the worker
+   * and polled by the caller. Plain loads/stores here were a data
+   * race (and a missable cancellation). */
+  _Atomic bool running, quit, done;
   bool refine; /* solve-only pass in flight (no growth) */
+  /* CT edge snap (solve-only, bsurf's rule as a soft term): each trusted
+   * cell looks along its frozen normal in the raw CT for the nearest
+   * papyrus->void crossing of ctsnap_cut within ctsnap_dist and is pulled
+   * onto it; cells with no edge in reach ride the smoothness terms. */
+  bool ctsnap;
+  double ctsnap_dist; /* max normal travel to the edge, voxels */
+  double ctsnap_cut;  /* voxel value >= cut is papyrus, below is void */
+  float *ctsnap_tgt;  /* [W*H] normal offset from reopt_pos (NaN = none) */
   /* re-optimisation position memory (refine/inpaint): cells keep their
    * tangential position, moving only along their own frozen normal */
   bool reopt_on;
@@ -155,8 +170,9 @@ typedef struct r3d_tracer {
    * folds = consecutive-edge pairs turned past 90 deg (doubling back),
    * kinks = pairs past 30 deg, twist = rms free-corner distance from the
    * quad plane in voxels (planarity) */
-  uint32_t qc_folds, qc_kinks;
-  float qc_twist;
+  /* _Atomic: displayed live by the GUI, rewritten per generation */
+  _Atomic uint32_t qc_folds, qc_kinks;
+  _Atomic float qc_twist;
   /* first fold locations this generation: fed to the active fold-repair
    * anneal so a fold is fixed while it is one generation old instead of
    * parenting the next ring */
@@ -180,9 +196,15 @@ typedef struct r3d_tracer {
   float qc_werr_p95, qc_wrap_frac;
   uint32_t ring, nset;   /* ring = generations grown so far */
   double vdim[3];        /* scroll volume extent (growth hard-stops there) */
-  uint32_t gens_done;    /* completed generations across resumes */
+  _Atomic uint32_t gens_done; /* completed generations across resumes;
+                              * _Atomic: read by the GUI while the
+                              * worker advances it */
   unsigned rng;          /* placement-perturbation PRNG state */
   uint64_t gen;
+  double tear_lim; /* save-time tear-mask edge limit in voxels (0 = the
+                    * default 1.75 * step). Synthetic grids whose nodes are
+                    * snapped to voxel edges set this from their own
+                    * geometry (boundary surface: step + snap excursion). */
 } r3d_tracer;
 
 /* Copies cfg + umbilicus and starts the grow thread. */
@@ -210,10 +232,23 @@ void r3d_tracer_set_anchors(r3d_tracer *t, const double *pts, uint32_t n);
  * polish smooths the seams. Existing cells persist; grid dims unchanged.
  * Poll snapshots as usual; done goes true when the pass ends. */
 int r3d_tracer_refine(r3d_tracer *t);
+/* Solve-only CT edge-snap pass: pull the traced sheet (which follows the
+ * predictions) onto the actual papyrus/void interface in the raw CT at
+ * ct_root, each cell moving only along its frozen normal and never
+ * farther than cutoff voxels. low_cut splits papyrus from void as in the
+ * boundary-surface grower. */
+int r3d_tracer_ctsnap(r3d_tracer *t, const char *ct_root, double cutoff,
+                      double low_cut);
 
-/* Load a saved trace (x/y/z.tif + optional winding/generations.tif) back
- * into a fresh tracer so it can be rewound, refined, or grown. pred_root
- * is the prediction tree growth would sample. Returns 0 on success. */
+/* Load a saved trace (x/y/z.tif + optional winding/generations/
+ * confidence.tif) back into a fresh tracer so it can be rewound,
+ * refined, or grown. pred_root is the prediction tree growth would
+ * sample. When <dir>/tracer.json (the versioned state sidecar written by
+ * r3d_tracer_save) is present the solver configuration, the uncropped
+ * grid frame, anchors, per-vertex confidence and the true generation
+ * count are restored faithfully; without it the load is a display/import
+ * surface whose configuration is ASSUMED (defaults + a resumable grow
+ * budget) and says so on stdout. Returns 0 on success. */
 int r3d_tracer_load(r3d_tracer *t, const char *dir, const char *pred_root);
 
 /* Drop every cell placed after `gen` (vc3d --rewind-gen): the standard
@@ -254,9 +289,15 @@ uint64_t r3d_tracer_snapshot(r3d_tracer *t, double *pos, uint8_t *state, float *
                              uint32_t *ring, uint32_t *nset, bool *done);
 
 /* Write the traced grid as <dir>/{x,y,z}.tif + meta.json (failed/empty
- * cells = the tifxyz invalid encoding). fill = no holes: every grown
- * cell is written; untrusted cells are re-seated by membrane
- * interpolation anchored on trusted neighbors instead of skipped. */
+ * cells = the tifxyz invalid encoding), plus winding/generations/
+ * confidence planes and <dir>/tracer.json, the versioned solver-state
+ * sidecar r3d_tracer_load needs for a faithful round trip. fill = no
+ * holes: every grown cell is written; untrusted cells are re-seated by
+ * membrane interpolation anchored on trusted neighbors instead of
+ * skipped (the re-seating never touches the live grid).
+ * Every artifact is written to a temporary name and renamed into place
+ * only once all of them are complete, so a failed export never truncates
+ * the previous one. Does not mutate solver state. */
 int r3d_tracer_save(r3d_tracer *t, const char *dir, float cutoff, bool fill);
 
 /* Synthetic self-check of the spiral winding frame + global fit (used by

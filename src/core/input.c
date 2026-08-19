@@ -22,6 +22,7 @@ void r3d_input_poll(r3d_input *in, SDL_Window *win,
   in->anchor_place = false;
   in->seed_place = false;
   in->surf_place = false;
+  in->bnd_place = false;
   in->undo = false;
   in->redo = false;
   in->annotate_click = false;
@@ -38,6 +39,7 @@ void r3d_input_poll(r3d_input *in, SDL_Window *win,
       in->resized = true;
       break;
     case SDL_EVENT_MOUSE_BUTTON_DOWN:
+      if (ev.button.button == SDL_BUTTON_LEFT) in->lmb_held = true;
       if (!allow_capture) break;
       if (multiview_mode && ev.button.button == SDL_BUTTON_RIGHT) {
         /* multiview pans with the RIGHT button. No relative-mouse (pointer
@@ -71,6 +73,7 @@ void r3d_input_poll(r3d_input *in, SDL_Window *win,
       }
       break;
     case SDL_EVENT_MOUSE_BUTTON_UP:
+      if (ev.button.button == SDL_BUTTON_LEFT) in->lmb_held = false;
       if ((ev.button.button == SDL_BUTTON_LEFT ||
            (multiview_mode && ev.button.button == SDL_BUTTON_RIGHT)) &&
           in->dragging) {
@@ -115,6 +118,7 @@ void r3d_input_poll(r3d_input *in, SDL_Window *win,
       case SDLK_X: in->anchor_place = true; break;
       case SDLK_G: in->seed_place = true; break;
       case SDLK_P: in->surf_place = true; break;
+      case SDLK_B: in->bnd_place = true; break;
       case SDLK_Z:
         if (SDL_GetModState() & SDL_KMOD_CTRL) {
           if (SDL_GetModState() & SDL_KMOD_SHIFT) in->redo = true;

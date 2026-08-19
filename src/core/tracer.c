@@ -28,6 +28,7 @@
 #define TR_W_FOLD 2.0     /* anti-double-back hinge (inactive above 90 deg) */
 #define TR_FOLD_COS 0.0   /* hinge threshold: cos(90 deg) */
 #define TR_W_PLANAR 0.25  /* quad twist: free corner vs other-3 plane */
+#define TR_W_CTSNAP 2.0   /* CT edge pull along the frozen normal (ctsnap) */
 #define TR_W_ANC 2.0      /* user-anchor pull: "must pass through" — an order
                            * stronger than the donor pull (0.1) so it beats
                            * the data term when the sheet picked wrong */
@@ -3789,6 +3790,14 @@ static void tr_eval(tr_ctx *c, const double x[3], tr_nlsq *acc) {
           J[b2] = w * ((a2 == b2 ? 1.0 : 0.0) - n0[a2] * n0[b2]);
         nq_add(acc, r, J);
       }
+      if (t->ctsnap_tgt) {
+        float s = t->ctsnap_tgt[kc];
+        if (s < 1e29f) { /* edge found: pull onto it along the frozen normal */
+          double J[3] = {TR_W_CTSNAP * n0[0], TR_W_CTSNAP * n0[1],
+                         TR_W_CTSNAP * n0[2]};
+          nq_add(acc, TR_W_CTSNAP * (dn - (double)s), J);
+        }
+      }
     }
   }
 }
@@ -4917,6 +4926,44 @@ void r3d_tracer_set_anchors(r3d_tracer *t, const double *pts, uint32_t n) {
   pthread_mutex_unlock(&t->mu);
 }
 
+/* tangential position memory (G10a): snapshot pos + per-cell grid normals
+ * so a solve pass can move cells across wraps but not along the sheet */
+static bool tr_reopt_snapshot(r3d_tracer *t) {
+  uint32_t W = t->W, H = t->H;
+  size_t n2 = (size_t)W * H;
+  free(t->reopt_pos);
+  free(t->reopt_nrm);
+  t->reopt_pos = malloc(n2 * 3 * sizeof *t->reopt_pos);
+  t->reopt_nrm = calloc(n2 * 3, sizeof *t->reopt_nrm);
+  if (!t->reopt_pos || !t->reopt_nrm) return false;
+  memcpy(t->reopt_pos, t->pos, n2 * 3 * sizeof *t->reopt_pos);
+  for (int j2 = 0; j2 < (int)H; j2++)
+    for (int i2 = 0; i2 < (int)W; i2++) {
+      if (!tr_valid(t, i2 - 1, j2) || !tr_valid(t, i2 + 1, j2) ||
+          !tr_valid(t, i2, j2 - 1) || !tr_valid(t, i2, j2 + 1))
+        continue;
+      const double *pu0 = t->pos + ((size_t)j2 * W + (size_t)i2 - 1) * 3;
+      const double *pu1 = t->pos + ((size_t)j2 * W + (size_t)i2 + 1) * 3;
+      const double *pv0 = t->pos + ((size_t)(j2 - 1) * W + (size_t)i2) * 3;
+      const double *pv1 = t->pos + ((size_t)(j2 + 1) * W + (size_t)i2) * 3;
+      double eu[3], ev[3], nr[3];
+      for (int a = 0; a < 3; a++) {
+        eu[a] = pu1[a] - pu0[a];
+        ev[a] = pv1[a] - pv0[a];
+      }
+      nr[0] = eu[1] * ev[2] - eu[2] * ev[1];
+      nr[1] = eu[2] * ev[0] - eu[0] * ev[2];
+      nr[2] = eu[0] * ev[1] - eu[1] * ev[0];
+      double l = sqrt(nr[0] * nr[0] + nr[1] * nr[1] + nr[2] * nr[2]);
+      if (l > 1e-9)
+        for (int a = 0; a < 3; a++)
+          t->reopt_nrm[((size_t)j2 * W + (size_t)i2) * 3 + (size_t)a] =
+              (float)(nr[a] / l);
+    }
+  t->reopt_on = true;
+  return true;
+}
+
 static void *tr_worker(void *ud) {
   r3d_tracer *t = ud;
   r3d_cpuvol vol;
@@ -5228,8 +5275,9 @@ static void *tr_worker(void *ud) {
   static const int n8[8][2] = {{1, 0},  {0, 1},  {-1, 0}, {0, -1},
                                {1, 1},  {1, -1}, {-1, 1}, {-1, -1}};
   uint32_t budget =
-      t->refine ? 0
-                : (t->cfg.max_ring > t->gens_done ? t->cfg.max_ring - t->gens_done : 0);
+      (t->refine || t->ctsnap)
+          ? 0
+          : (t->cfg.max_ring > t->gens_done ? t->cfg.max_ring - t->gens_done : 0);
   uint32_t gens_run = 0;
   while (nf > 0 && gens_run < budget && !t->quit) {
     gens_run++;
@@ -5478,41 +5526,9 @@ static void *tr_worker(void *ud) {
     tr_spiral_flag(t);
     tr_sfx_build(t);
     tr_anc_assign(t);
-    { /* tangential position memory (G10a): snapshot pos + normals so the
-       * anneal can move cells across wraps but not along the sheet */
-      size_t n2 = (size_t)W * H;
-      free(t->reopt_pos);
-      free(t->reopt_nrm);
-      t->reopt_pos = malloc(n2 * 3 * sizeof *t->reopt_pos);
-      t->reopt_nrm = calloc(n2 * 3, sizeof *t->reopt_nrm);
-      if (t->reopt_pos && t->reopt_nrm) {
-        memcpy(t->reopt_pos, t->pos, n2 * 3 * sizeof *t->reopt_pos);
-        for (int j2 = 0; j2 < (int)H; j2++)
-          for (int i2 = 0; i2 < (int)W; i2++) {
-            if (!tr_valid(t, i2 - 1, j2) || !tr_valid(t, i2 + 1, j2) ||
-                !tr_valid(t, i2, j2 - 1) || !tr_valid(t, i2, j2 + 1))
-              continue;
-            const double *pu0 = t->pos + ((size_t)j2 * W + (size_t)i2 - 1) * 3;
-            const double *pu1 = t->pos + ((size_t)j2 * W + (size_t)i2 + 1) * 3;
-            const double *pv0 = t->pos + ((size_t)(j2 - 1) * W + (size_t)i2) * 3;
-            const double *pv1 = t->pos + ((size_t)(j2 + 1) * W + (size_t)i2) * 3;
-            double eu[3], ev[3], nr[3];
-            for (int a = 0; a < 3; a++) {
-              eu[a] = pu1[a] - pu0[a];
-              ev[a] = pv1[a] - pv0[a];
-            }
-            nr[0] = eu[1] * ev[2] - eu[2] * ev[1];
-            nr[1] = eu[2] * ev[0] - eu[0] * ev[2];
-            nr[2] = eu[0] * ev[1] - eu[1] * ev[0];
-            double l = sqrt(nr[0] * nr[0] + nr[1] * nr[1] + nr[2] * nr[2]);
-            if (l > 1e-9)
-              for (int a = 0; a < 3; a++)
-                t->reopt_nrm[((size_t)j2 * W + (size_t)i2) * 3 + (size_t)a] =
-                    (float)(nr[a] / l);
-          }
-        t->reopt_on = true;
-      }
-    }
+    tr_reopt_snapshot(t); /* tangential position memory (G10a): snapshot
+                           * pos + normals so the anneal can move cells
+                           * across wraps but not along the sheet */
     /* staged weight relaxation (G9, vc3d correction schedule): a
      * correction asking the sheet to move a wrap over must cross a
      * barrier — the snap term holds it on its current polyline and
@@ -5562,10 +5578,83 @@ static void *tr_worker(void *ud) {
     t->reopt_nrm = NULL;
     t->refine = false;
   }
+  if (t->ctsnap && !t->quit) {
+    /* CT edge snap (solve-only): the traced sheet follows the predictions,
+     * which ride NEAR the papyrus but not on it. Pull every trusted cell
+     * onto the actual papyrus/void interface in the raw CT — bsurf's snap
+     * rule as a soft LM term: move only along the frozen normal, never
+     * farther than ctsnap_dist, onto the nearest papyrus->void crossing of
+     * ctsnap_cut (one face for the whole sheet: the normal field is
+     * consistent, so every cell lands on the same side). Cells with no
+     * edge in reach get no pull and ride the smoothness terms. Retarget
+     * between passes so edges found from settled neighbours extend the
+     * snap into cells that started out of range. */
+    if (!ctv_ok) {
+      printf("tracer: CT snap requested but no raw CT tree — skipped\n");
+    } else if (tr_reopt_snapshot(t)) {
+      size_t n2 = (size_t)W * H;
+      free(t->ctsnap_tgt);
+      t->ctsnap_tgt = malloc(n2 * sizeof *t->ctsnap_tgt);
+      const double cut = t->ctsnap_cut, reach = t->ctsnap_dist;
+      for (int pass = 0; pass < 3 && t->ctsnap_tgt && !t->quit; pass++) {
+        uint32_t hit = 0, miss = 0;
+        double moved = 0.0;
+        for (size_t k = 0; k < n2; k++) {
+          t->ctsnap_tgt[k] = 1e30f; /* sentinel: no edge (NaN is UB here) */
+          if (t->state[k] != R3D_TR_SET) continue;
+          const float *nrf = t->reopt_nrm + k * 3;
+          double n0[3] = {(double)nrf[0], (double)nrf[1], (double)nrf[2]};
+          if (n0[0] * n0[0] + n0[1] * n0[1] + n0[2] * n0[2] <= 0.25) continue;
+          const double *p0 = t->reopt_pos + k * 3;
+          const double *pc = t->pos + k * 3;
+          double dn = (pc[0] - p0[0]) * n0[0] + (pc[1] - p0[1]) * n0[1] +
+                      (pc[2] - p0[2]) * n0[2];
+          double best = 1e30, vp = -1.0;
+          for (double s = dn - reach; s <= dn + reach + 1e-9; s += 0.5) {
+            double q[3] = {p0[0] + s * n0[0], p0[1] + s * n0[1],
+                           p0[2] + s * n0[2]};
+            double v = r3d_cpuvol_tri(&ctv, 0, q, NULL);
+            if (vp >= cut && v < cut) { /* papyrus behind, void ahead */
+              double sc = s - 0.5 + 0.5 * (vp - cut) / (vp - v);
+              if (fabs(sc - dn) < fabs(best - dn)) best = sc;
+            }
+            vp = v;
+          }
+          if (best < 1e29) {
+            t->ctsnap_tgt[k] = (float)best;
+            moved += fabs(best - dn);
+            hit++;
+          } else {
+            miss++;
+          }
+        }
+        printf("tracer: CT snap pass %d — edge for %u/%u cells, mean pull "
+               "%.2f vox\n",
+               pass + 1, hit, hit + miss, hit ? moved / hit : 0.0);
+        tr_local_opt(t, &cenv, x0, y0, (int)W + (int)H, 4, true);
+        pthread_mutex_lock(&t->mu);
+        t->gen++; /* live view: show each pass */
+        pthread_mutex_unlock(&t->mu);
+      }
+    }
+    /* targets + tangential pin stay live through the final polish below:
+     * released after, or the polish's prediction data term (the sheet we
+     * just left) would drag the cells straight back off the CT edge */
+  }
   /* final polish: one bounded pass so late cells see settled neighbors */
   if (!t->quit) tr_local_opt(t, &cenv, x0, y0, (int)W + (int)H, 4, true);
   if (!t->quit) tr_inpaint(t, &cenv); /* re-solve enclosed holes with the
                                        * real losses (G8) */
+  if (t->ctsnap) {
+    free(t->ctsnap_tgt);
+    t->ctsnap_tgt = NULL;
+    t->reopt_on = false;
+    free(t->reopt_pos);
+    free(t->reopt_nrm);
+    t->reopt_pos = NULL;
+    t->reopt_nrm = NULL;
+    t->ctsnap = false;
+  }
   tr_wind_relax(t, 30);
   /* final QC: a >90-degree fold is never legitimate papyrus � surviving
    * folds are marked untrusted so the save writes an honest hole there
@@ -5704,7 +5793,7 @@ int r3d_tracer_start_fused(r3d_tracer *t, const char *pred_root,
   t->werr = calloc((size_t)t->W * t->H, sizeof *t->werr);
   t->gen_of = calloc((size_t)t->W * t->H, sizeof *t->gen_of);
   t->rng = 0x1234567u;
-  if (!t->pos || !t->state || !t->conf || !t->wind) {
+  if (!t->pos || !t->state || !t->conf || !t->wind || !t->werr || !t->gen_of) {
     r3d_tracer_free(t);
     return -1;
   }
@@ -5736,6 +5825,107 @@ int r3d_tracer_start_fused(r3d_tracer *t, const char *pred_root,
   return 0;
 }
 
+/* ==================== tracer.json state sidecar ====================
+ * tifxyz alone is a display artifact: it carries a CROPPED grid, no
+ * solver configuration, no anchors and no per-vertex confidence, so a
+ * load could only guess and the guess made resume a no-op. r3d_tracer_save
+ * writes <dir>/tracer.json beside the planes with everything needed to
+ * reconstruct the solver state; the object is deliberately FLAT with
+ * unique keys so strstr + sscanf is a correct parser (no nesting to get
+ * lost in) and a missing/short/garbage sidecar simply degrades to the
+ * legacy assumed-configuration path. */
+#define TR_STATE_FMT "r3d-tracer-state"
+#define TR_STATE_VER 1
+#define TR_STATE_MAX 262144       /* sidecar byte cap (anchors bound it) */
+#define TR_LOAD_SLACK 16u         /* generations of grow budget assumed for
+                                   * a sidecar-less load, so resume is not
+                                   * silently a no-op */
+#define TR_MAX_CELLS (1ull << 26) /* grid-frame sanity cap */
+
+/* value text after "key": , or NULL */
+static const char *tr_js_find(const char *buf, const char *key) {
+  char pat[64];
+  int k = snprintf(pat, sizeof pat, "\"%s\"", key);
+  if (k <= 0 || (size_t)k >= sizeof pat) return NULL;
+  const char *p = strstr(buf, pat);
+  if (!p) return NULL;
+  p = strchr(p + k, ':');
+  return p ? p + 1 : NULL;
+}
+
+static bool tr_js_num(const char *buf, const char *key, double *out) {
+  const char *p = tr_js_find(buf, key);
+  double v;
+  if (!p || sscanf(p, " %lf", &v) != 1) return false;
+  *out = v;
+  return true;
+}
+
+/* accepts only finite values inside [0, max] */
+static bool tr_js_u32(const char *buf, const char *key, uint32_t *out,
+                      uint32_t max) {
+  double v;
+  if (!tr_js_num(buf, key, &v) || !(v >= 0.0) || !(v <= (double)max))
+    return false;
+  *out = (uint32_t)v;
+  return true;
+}
+
+/* finite doubles only: a sentinel/garbage bound must not become a clamp */
+static bool tr_js_fin(const char *buf, const char *key, double *out) {
+  double v;
+  if (!tr_js_num(buf, key, &v) || !(v > -1e29) || !(v < 1e29)) return false;
+  *out = v;
+  return true;
+}
+
+static bool tr_js_bool(const char *buf, const char *key) {
+  const char *p = tr_js_find(buf, key);
+  while (p && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) p++;
+  return p && strncmp(p, "true", 4) == 0;
+}
+
+/* only \\ and \" are ever produced by the writer for printable text;
+ * any other escape keeps its payload character (control characters are
+ * written as \uXXXX and degrade to that literal text — paths do not
+ * contain them) */
+static bool tr_js_str(const char *buf, const char *key, char *out, size_t cap) {
+  const char *p = tr_js_find(buf, key);
+  while (p && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) p++;
+  if (!p || *p != '"' || cap == 0) return false;
+  p++;
+  size_t o = 0;
+  while (*p && *p != '"' && o + 1 < cap) {
+    if (*p == '\\' && p[1]) p++;
+    out[o++] = *p++;
+  }
+  out[o] = 0;
+  return *p == '"';
+}
+
+/* read a whole small file; NULL when absent/oversized */
+static char *tr_slurp(const char *dir, const char *name, size_t cap) {
+  char path[1200];
+  int k = snprintf(path, sizeof path, "%s/%s", dir, name);
+  if (k <= 0 || (size_t)k >= sizeof path) return NULL;
+  FILE *f = fopen(path, "rb");
+  if (!f) return NULL;
+  char *b = malloc(cap + 1);
+  if (!b) {
+    fclose(f);
+    return NULL;
+  }
+  size_t rd = fread(b, 1, cap, f);
+  bool over = fread(path, 1, 1, f) == 1; /* larger than the cap: refuse */
+  fclose(f);
+  if (over) {
+    free(b);
+    return NULL;
+  }
+  b[rd] = 0;
+  return b;
+}
+
 /* probe a plane's dimensions */
 static bool tr_plane_dims(const char *path, uint32_t *w, uint32_t *h) {
   TIFF *tf = TIFFOpen(path, "r");
@@ -5757,9 +5947,7 @@ int r3d_tracer_load(r3d_tracer *t, const char *dir, const char *pred_root) {
   if (!tr_plane_dims(path, &w, &h)) return -1;
   memset(t, 0, sizeof *t);
   for (uint32_t a = 0; a < R3D_TR_MAX_ANCHORS; a++) t->anc_cell[a] = -1;
-  t->W = w;
-  t->H = h;
-  snprintf(t->root, sizeof t->root, "%s", pred_root);
+  snprintf(t->root, sizeof t->root, "%s", pred_root ? pred_root : "");
   t->cfg.step = 20.0;
   t->cfg.level = 1;
   t->cfg.thresh = 0.35f;
@@ -5783,18 +5971,117 @@ int r3d_tracer_load(r3d_tracer *t, const char *dir, const char *pred_root) {
       }
     }
   }
-  uint64_t n = (uint64_t)w * h;
+  /* ---- versioned state sidecar: the only faithful source of the solver
+   * configuration, the uncropped grid frame, anchors and confidence ---- */
+  char *sj = tr_slurp(dir, "tracer.json", TR_STATE_MAX);
+  bool side = false;
+  uint32_t GW = w, GH = h, oi = 0, oj = 0;
+  if (sj) {
+    char fmt[64] = {0};
+    uint32_t ver = 0;
+    if (tr_js_str(sj, "format", fmt, sizeof fmt) &&
+        strcmp(fmt, TR_STATE_FMT) == 0 &&
+        tr_js_u32(sj, "version", &ver, 4096) && ver >= 1 &&
+        ver <= TR_STATE_VER) {
+      side = true;
+    } else {
+      printf("tracer: %s/tracer.json is not a supported state sidecar "
+             "(ignored)\n",
+             dir);
+      free(sj);
+      sj = NULL;
+    }
+  }
+  if (side) {
+    double d;
+    uint32_t u;
+    if (tr_js_num(sj, "step", &d) && d > 1e-6 && d < 1e6) t->cfg.step = d;
+    if (tr_js_num(sj, "thresh", &d) && d >= 0.0 && d <= 1.0)
+      t->cfg.thresh = (float)d;
+    if (tr_js_u32(sj, "max_ring", &u, 40000u) && u >= 4) t->cfg.max_ring = u;
+    if (tr_js_u32(sj, "level", &u, 16u)) t->cfg.level = u;
+    if (tr_js_u32(sj, "rib_rows", &u, 4096u)) t->cfg.rib_rows = u;
+    if (tr_js_u32(sj, "rib_wraps", &u, 256u)) t->cfg.rib_wraps = u;
+    if (tr_js_u32(sj, "grow_dirs", &u, 255u)) t->cfg.grow_dirs = (uint8_t)u;
+    if (tr_js_u32(sj, "max_threads", &u, 4096u)) t->cfg.max_threads = u;
+    if (tr_js_fin(sj, "seed_x", &d)) t->cfg.seed[0] = d;
+    if (tr_js_fin(sj, "seed_y", &d)) t->cfg.seed[1] = d;
+    if (tr_js_fin(sj, "seed_z", &d)) t->cfg.seed[2] = d;
+    if (tr_js_fin(sj, "z_min", &d)) t->cfg.z_min = d;
+    if (tr_js_fin(sj, "z_max", &d)) t->cfg.z_max = d;
+    if (tr_js_fin(sj, "x_min", &d)) t->cfg.x_min = d;
+    if (tr_js_fin(sj, "x_max", &d)) t->cfg.x_max = d;
+    if (tr_js_fin(sj, "y_min", &d)) t->cfg.y_min = d;
+    if (tr_js_fin(sj, "y_max", &d)) t->cfg.y_max = d;
+    if (tr_js_fin(sj, "ct_min", &d)) t->cfg.ct_min = d;
+    if (tr_js_fin(sj, "wind_weight", &d) && d >= 0.0) t->cfg.wind_weight = d;
+    if (tr_js_fin(sj, "tear_lim", &d) && d >= 0.0) t->tear_lim = d;
+    if (tr_js_fin(sj, "sp_om_meas", &d) && d >= 0.0) t->sp_om_meas = d;
+    if (tr_js_fin(sj, "vdim_x", &d) && d >= 0.0) t->vdim[0] = d;
+    if (tr_js_fin(sj, "vdim_y", &d) && d >= 0.0) t->vdim[1] = d;
+    if (tr_js_fin(sj, "vdim_z", &d) && d >= 0.0) t->vdim[2] = d;
+    tr_js_str(sj, "ct_root", t->cfg.ct_root, sizeof t->cfg.ct_root);
+    if (!t->root[0]) tr_js_str(sj, "pred_root", t->root, sizeof t->root);
+    { /* anchors: flat [x,y,z,...] */
+      const char *ap = tr_js_find(sj, "anchors");
+      if (ap) ap = strchr(ap, '[');
+      if (ap) {
+        ap++;
+        uint32_t na = 0;
+        while (na < R3D_TR_MAX_ANCHORS) {
+          double v[3];
+          int used = 0, got = 0;
+          const char *q = ap;
+          for (int c = 0; c < 3; c++) {
+            if (sscanf(q, " %lf%n", &v[c], &used) != 1) break;
+            q += used;
+            while (*q == ' ' || *q == ',' || *q == '\n' || *q == '\t') q++;
+            got++;
+          }
+          if (got != 3) break;
+          for (int c = 0; c < 3; c++) t->anc[na * 3 + (uint32_t)c] = v[c];
+          na++;
+          ap = q;
+        }
+        t->nanc = na;
+      }
+    }
+    { /* uncropped grid frame: restore the ORIGINAL solver lattice and
+       * drop the crop back at its offset, so max_ring and the grid stay
+       * consistent and a later grow re-centers correctly */
+      uint32_t fw = 0, fh = 0, ai = 0, aj = 0;
+      if (tr_js_u32(sj, "full_w", &fw, 1u << 22) &&
+          tr_js_u32(sj, "full_h", &fh, 1u << 22) &&
+          tr_js_u32(sj, "offset_i", &ai, 1u << 22) &&
+          tr_js_u32(sj, "offset_j", &aj, 1u << 22) && fw >= w && fh >= h &&
+          ai <= fw - w && aj <= fh - h &&
+          (uint64_t)fw * (uint64_t)fh <= TR_MAX_CELLS) {
+        GW = fw;
+        GH = fh;
+        oi = ai;
+        oj = aj;
+      } else if (fw || fh) {
+        printf("tracer: sidecar grid frame %ux%u+%u+%u is unusable; keeping "
+               "the cropped %ux%u frame\n",
+               fw, fh, ai, aj, w, h);
+      }
+    }
+  }
+  t->W = GW;
+  t->H = GH;
+  uint64_t n = (uint64_t)GW * GH;
   t->pos = calloc(n * 3, sizeof *t->pos);
   t->state = calloc(n, 1);
   t->conf = calloc(n, sizeof *t->conf);
   t->wind = calloc(n, sizeof *t->wind);
   t->werr = calloc(n, sizeof *t->werr);
   t->gen_of = calloc(n, sizeof *t->gen_of);
-  if (!t->pos || !t->state || !t->conf || !t->wind || !t->gen_of) {
+  if (!t->pos || !t->state || !t->conf || !t->wind || !t->werr || !t->gen_of) {
+    free(sj);
     r3d_tracer_free(t);
     return -1;
   }
-  float *px = NULL, *py = NULL, *pz = NULL, *pw = NULL, *pg = NULL;
+  float *px = NULL, *py = NULL, *pz = NULL, *pw = NULL, *pg = NULL, *pc = NULL;
   snprintf(path, sizeof path, "%s/x.tif", dir);
   px = tr_read_plane(path, w, h);
   snprintf(path, sizeof path, "%s/y.tif", dir);
@@ -5805,41 +6092,79 @@ int r3d_tracer_load(r3d_tracer *t, const char *dir, const char *pred_root) {
   pw = tr_read_plane(path, w, h); /* optional */
   snprintf(path, sizeof path, "%s/generations.tif", dir);
   pg = tr_read_plane(path, w, h); /* optional */
+  if (side && tr_js_bool(sj, "confidence")) {
+    snprintf(path, sizeof path, "%s/confidence.tif", dir);
+    pc = tr_read_plane(path, w, h); /* optional */
+  }
   if (!px || !py || !pz) {
     free(px);
     free(py);
     free(pz);
     free(pw);
     free(pg);
+    free(pc);
+    free(sj);
     r3d_tracer_free(t);
     return -1;
   }
   uint32_t maxgen = 1;
-  for (uint64_t k = 0; k < n; k++) {
-    if (px[k] <= 0.0f) continue; /* tifxyz invalid encoding */
-    t->pos[k * 3 + 0] = (double)px[k];
-    t->pos[k * 3 + 1] = (double)py[k];
-    t->pos[k * 3 + 2] = (double)pz[k];
-    t->state[k] = R3D_TR_SET;
-    t->conf[k] = 1.0f;
-    t->wind[k] = pw && pw[k] > -1e29f ? pw[k] : 0.0f;
-    uint16_t g = pg && pg[k] > 0.0f ? (uint16_t)pg[k] : 1;
-    t->gen_of[k] = g;
-    if (g > maxgen) maxgen = g;
-    t->nset++;
-  }
+  for (uint32_t j = 0; j < h; j++)
+    for (uint32_t i = 0; i < w; i++) {
+      size_t sk = (size_t)j * w + i;
+      if (px[sk] <= 0.0f) continue; /* tifxyz invalid encoding */
+      size_t k = (size_t)(oj + j) * GW + (oi + i);
+      t->pos[k * 3 + 0] = (double)px[sk];
+      t->pos[k * 3 + 1] = (double)py[sk];
+      t->pos[k * 3 + 2] = (double)pz[sk];
+      t->state[k] = R3D_TR_SET;
+      t->conf[k] = pc && pc[sk] >= 0.0f && pc[sk] <= 1.0f ? pc[sk] : 1.0f;
+      t->wind[k] = pw && pw[sk] > -1e29f ? pw[sk] : 0.0f;
+      uint16_t g = pg && pg[sk] > 0.0f && pg[sk] < 65535.0f ? (uint16_t)pg[sk]
+                                                            : (uint16_t)1;
+      t->gen_of[k] = g;
+      if (g > maxgen) maxgen = g;
+      t->nset++;
+    }
   free(px);
   free(py);
   free(pz);
   free(pw);
   free(pg);
+  free(pc);
   t->gens_done = maxgen;
-  t->ring = maxgen;
+  if (side) {
+    uint32_t v;
+    /* the true generation count: cropping can hide the outermost ring */
+    if (tr_js_u32(sj, "gens_done", &v, 1u << 20) && v >= maxgen)
+      t->gens_done = v;
+  } else if (t->cfg.max_ring < maxgen + TR_LOAD_SLACK) {
+    /* No sidecar: max_ring inferred from the CROPPED width is routinely
+     * below the generations already grown, which made the worker's
+     * budget (max_ring - gens_done) zero and resume a silent no-op.
+     * Assume a resumable budget and say so. */
+    uint32_t want = maxgen + TR_LOAD_SLACK;
+    if (want > 40000u) want = 40000u;
+    t->cfg.max_ring = want;
+  }
+  t->ring = t->gens_done;
   pthread_mutex_init(&t->mu, NULL);
   r3d_umbilicus_init(&t->umb);
   t->done = true; /* loaded = a finished, stopped trace */
-  printf("tracer: loaded %s (%ux%u, %u points, max gen %u)\n", dir, w, h, t->nset,
-         maxgen);
+  printf("tracer: loaded %s (%ux%u", dir, w, h);
+  if (GW != w || GH != h) printf(" in a %ux%u frame at +%u+%u", GW, GH, oi, oj);
+  printf(", %u points, gen %u/%u)\n", t->nset, t->gens_done, t->cfg.max_ring);
+  if (side)
+    printf("tracer: state sidecar restored: step %.3f level %u thresh %.2f "
+           "max_ring %u, %u anchor%s, confidence %s\n",
+           t->cfg.step, t->cfg.level, (double)t->cfg.thresh, t->cfg.max_ring,
+           t->nanc, t->nanc == 1 ? "" : "s", pc ? "restored" : "assumed 1.0");
+  else
+    printf("tracer: no tracer.json sidecar - IMPORT ONLY, configuration is "
+           "ASSUMED: step %.3f level %u thresh %.2f max_ring %u (grow budget "
+           "%u generations), confidence 1.0, no anchors\n",
+           t->cfg.step, t->cfg.level, (double)t->cfg.thresh, t->cfg.max_ring,
+           t->cfg.max_ring > t->gens_done ? t->cfg.max_ring - t->gens_done : 0);
+  free(sj);
   return 0;
 }
 
@@ -6103,8 +6428,11 @@ int r3d_tracer_grow(r3d_tracer *t, uint32_t extra) {
   if (t->running || !t->pos || !extra) return -1;
   uint32_t nr = t->cfg.max_ring + extra;
   if (nr > 400) nr = 400;
-  if (nr == t->cfg.max_ring) return -1;
+  /* <=, not ==: a loaded/ribbon trace can carry max_ring above the cap
+   * and `nr - max_ring` would wrap into a huge recenter offset */
+  if (nr <= t->cfg.max_ring) return -1;
   uint32_t NW = 2 * nr + 50, off = nr - t->cfg.max_ring;
+  if (off + t->W > NW || off + t->H > NW) return -1; /* would not fit */
   double *np = calloc((size_t)NW * NW * 3, sizeof *np);
   uint8_t *ns = calloc((size_t)NW * NW, 1);
   float *nc = calloc((size_t)NW * NW, sizeof *nc);
@@ -6184,6 +6512,27 @@ int r3d_tracer_refine(r3d_tracer *t) {
   return 0;
 }
 
+int r3d_tracer_ctsnap(r3d_tracer *t, const char *ct_root, double cutoff,
+                      double low_cut) {
+  if (t->running || !t->pos || !t->nset) return -1;
+  if (ct_root && ct_root[0])
+    snprintf(t->cfg.ct_root, sizeof t->cfg.ct_root, "%s", ct_root);
+  if (!t->cfg.ct_root[0]) return -1;
+  t->ctsnap = true;
+  t->ctsnap_dist = cutoff > 0 ? cutoff : 6.0;
+  t->ctsnap_cut = low_cut;
+  t->quit = false;
+  t->done = false;
+  t->gen++;
+  t->running = true;
+  if (pthread_create(&t->th, NULL, tr_worker, t) != 0) {
+    t->running = false;
+    t->ctsnap = false;
+    return -1;
+  }
+  return 0;
+}
+
 void r3d_tracer_stop(r3d_tracer *t) {
   if (!t->pos) return;
   t->quit = true;
@@ -6201,6 +6550,7 @@ void r3d_tracer_free(r3d_tracer *t) {
   free(t->omf);
   free(t->reopt_pos);
   free(t->reopt_nrm);
+  free(t->ctsnap_tgt);
   free(t->gen_of);
   free(t->grow_mask);
   free(t->dcell_id);
@@ -6248,21 +6598,167 @@ static int tr_write_plane(const char *path, const float *v, uint32_t w, uint32_t
   return rc;
 }
 
+/* ==================== transactional publication ====================
+ * Every artifact of one export is written to a temporary name in the
+ * destination directory and only renamed into place once ALL of them are
+ * complete. A failed, out-of-space or interrupted export therefore never
+ * truncates the artifact that is already there. Publication order is
+ * registration order and meta.json is registered LAST, so a torn rename
+ * (rare: same-directory rename) cannot leave a manifest describing
+ * planes that were never written. */
+typedef struct tr_pub {
+  const char *dir;
+  char pfx[48];
+  const char *name[12];
+  uint32_t n;
+} tr_pub;
+
+static void tr_pub_init(tr_pub *p, const char *dir) {
+  p->dir = dir;
+  p->n = 0;
+  snprintf(p->pfx, sizeof p->pfx, ".r3dtmp%ld", (long)getpid());
+}
+
+static bool tr_pub_path(const tr_pub *p, const char *name, bool tmp, char *out,
+                        size_t cap) {
+  int k = tmp ? snprintf(out, cap, "%s/%s.%s", p->dir, p->pfx, name)
+              : snprintf(out, cap, "%s/%s", p->dir, name);
+  return k > 0 && (size_t)k < cap;
+}
+
+/* register + hand back the temporary path to write; false = no room */
+static bool tr_pub_add(tr_pub *p, const char *name, char *out, size_t cap) {
+  if (p->n >= sizeof p->name / sizeof *p->name) return false;
+  if (!tr_pub_path(p, name, true, out, cap)) return false;
+  p->name[p->n++] = name;
+  return true;
+}
+
+static void tr_pub_abort(tr_pub *p) {
+  char tp[1200];
+  for (uint32_t i = 0; i < p->n; i++)
+    if (tr_pub_path(p, p->name[i], true, tp, sizeof tp)) unlink(tp);
+  p->n = 0;
+}
+
+static int tr_pub_commit(tr_pub *p) {
+  char tp[1200], fp[1200];
+  for (uint32_t i = 0; i < p->n; i++) {
+    if (!tr_pub_path(p, p->name[i], true, tp, sizeof tp) ||
+        !tr_pub_path(p, p->name[i], false, fp, sizeof fp) ||
+        rename(tp, fp) != 0) {
+      for (uint32_t j = i; j < p->n; j++) /* never publish a partial set */
+        if (tr_pub_path(p, p->name[j], true, tp, sizeof tp)) unlink(tp);
+      p->n = 0;
+      return -1;
+    }
+  }
+  p->n = 0;
+  return 0;
+}
+
+/* stdio errors are export failures, not noise */
+static int tr_fclose_checked(FILE *f) {
+  bool bad = ferror(f) != 0;
+  if (fflush(f) != 0) bad = true;
+  if (fclose(f) != 0) bad = true;
+  return bad ? -1 : 0;
+}
+
+static void tr_json_esc(const char *in, char *out, size_t cap) {
+  size_t o = 0;
+  if (!cap) return;
+  for (const unsigned char *q = (const unsigned char *)in; *q && o + 7 < cap;
+       q++) {
+    if (*q == '"' || *q == '\\') {
+      out[o++] = '\\';
+      out[o++] = (char)*q;
+    } else if (*q < 0x20) {
+      int k = snprintf(out + o, cap - o, "\\u%04x", (unsigned)*q);
+      if (k <= 0) break;
+      o += (size_t)k;
+    } else {
+      out[o++] = (char)*q;
+    }
+  }
+  out[o] = 0;
+}
+
+/* the state sidecar r3d_tracer_load needs for a faithful round trip */
+static int tr_write_state(const r3d_tracer *t, const char *path, uint32_t cw,
+                          uint32_t ch, uint32_t ci0, uint32_t cj0,
+                          float cutoff, bool fill, uint32_t maxgen,
+                          uint64_t nkept, bool have_conf) {
+  FILE *f = fopen(path, "w");
+  if (!f) return -1;
+  char ctr[6200], prr[6200];
+  tr_json_esc(t->cfg.ct_root, ctr, sizeof ctr);
+  tr_json_esc(t->root, prr, sizeof prr);
+  fprintf(f,
+          "{\n  \"format\": \"" TR_STATE_FMT "\",\n  \"version\": %d,\n"
+          "  \"grid_w\": %u,\n  \"grid_h\": %u,\n"
+          "  \"full_w\": %u,\n  \"full_h\": %u,\n"
+          "  \"offset_i\": %u,\n  \"offset_j\": %u,\n"
+          "  \"step\": %.9g,\n  \"thresh\": %.6g,\n"
+          "  \"max_ring\": %u,\n  \"level\": %u,\n"
+          "  \"rib_rows\": %u,\n  \"rib_wraps\": %u,\n"
+          "  \"grow_dirs\": %u,\n  \"max_threads\": %u,\n"
+          "  \"seed_x\": %.9g,\n  \"seed_y\": %.9g,\n  \"seed_z\": %.9g,\n"
+          "  \"x_min\": %.9g,\n  \"x_max\": %.9g,\n"
+          "  \"y_min\": %.9g,\n  \"y_max\": %.9g,\n"
+          "  \"z_min\": %.9g,\n  \"z_max\": %.9g,\n"
+          "  \"ct_min\": %.9g,\n  \"wind_weight\": %.9g,\n"
+          "  \"tear_lim\": %.9g,\n  \"sp_om_meas\": %.9g,\n"
+          "  \"vdim_x\": %.9g,\n  \"vdim_y\": %.9g,\n  \"vdim_z\": %.9g,\n"
+          "  \"gens_done\": %u,\n  \"max_gen\": %u,\n  \"ring\": %u,\n"
+          "  \"nset\": %u,\n  \"nkept\": %llu,\n"
+          "  \"save_cutoff\": %.6g,\n  \"save_fill\": %s,\n"
+          "  \"confidence\": %s,\n"
+          "  \"nanchors\": %u,\n  \"anchors\": [",
+          TR_STATE_VER, cw, ch, t->W, t->H, ci0, cj0, t->cfg.step,
+          (double)t->cfg.thresh, t->cfg.max_ring, t->cfg.level,
+          t->cfg.rib_rows, t->cfg.rib_wraps, (unsigned)t->cfg.grow_dirs,
+          t->cfg.max_threads, t->cfg.seed[0], t->cfg.seed[1], t->cfg.seed[2],
+          t->cfg.x_min, t->cfg.x_max, t->cfg.y_min, t->cfg.y_max, t->cfg.z_min,
+          t->cfg.z_max, t->cfg.ct_min, t->cfg.wind_weight, t->tear_lim,
+          t->sp_om_meas, t->vdim[0], t->vdim[1], t->vdim[2], t->gens_done,
+          maxgen, t->ring, t->nset, (unsigned long long)nkept, (double)cutoff,
+          fill ? "true" : "false", have_conf ? "true" : "false", t->nanc);
+  for (uint32_t a = 0; a < t->nanc && a < R3D_TR_MAX_ANCHORS; a++)
+    fprintf(f, "%s%.9g, %.9g, %.9g", a ? ",\n    " : "\n    ",
+            t->anc[a * 3 + 0], t->anc[a * 3 + 1], t->anc[a * 3 + 2]);
+  /* the free-text paths go LAST: a path is the only field that could
+   * contain a "key": sequence, and nothing is looked up after it */
+  fprintf(f, "%s],\n  \"ct_root\": \"%s\",\n  \"pred_root\": \"%s\"\n}\n",
+          t->nanc ? "\n  " : "", ctr, prr);
+  return tr_fclose_checked(f);
+}
+
 int r3d_tracer_save(r3d_tracer *t, const char *dir, float cutoff, bool fill) {
   if (!t->pos) return -1;
   uint64_t n = (uint64_t)t->W * t->H;
   float *pl = malloc(n * sizeof *pl);
-  if (!pl) return -1;
+  uint8_t *keep = malloc(n);
+  uint8_t *torn = calloc(n, 1);
+  double *fp = NULL; /* membrane re-seating, kept OUT of t->pos */
+  uint8_t *ext = NULL;
+  tr_pub pub;
+  tr_pub_init(&pub, dir);
+  if (!pl || !keep || !torn) { /* a missing tear/fill buffer would silently
+                                * change what "saved" means: refuse */
+    free(pl);
+    free(keep);
+    free(torn);
+    return -1;
+  }
   static const char *nm[3] = {"x.tif", "y.tif", "z.tif"};
   int rc = 0;
   pthread_mutex_lock(&t->mu);
   /* tear mask: a cell whose edge to any 4-neighbor is way off the unit
    * is mis-seated (usually a wrong-wrap capture in ambiguous data) — an
    * honest hole beats a committed discontinuity */
-  uint8_t *keep = malloc(n);
-  uint8_t *torn = calloc(n, 1);
-  if (keep) {
-    double lim = 1.75 * t->cfg.step;
+  {
+    double lim = t->tear_lim > 0.0 ? t->tear_lim : 1.75 * t->cfg.step;
     for (uint64_t k = 0; k < n; k++) {
       keep[k] = t->state[k] == R3D_TR_SET && t->conf[k] >= cutoff;
       if (!keep[k]) continue;
@@ -6280,7 +6776,7 @@ int r3d_tracer_save(r3d_tracer *t, const char *dir, float cutoff, bool fill) {
         }
         if (d2 > lim * lim) {
           keep[k] = 0;
-          if (torn) torn[k] = 1; /* wrong-wrap capture: never re-seated */
+          torn[k] = 1; /* wrong-wrap capture: never re-seated */
         }
       }
     }
@@ -6317,20 +6813,20 @@ int r3d_tracer_save(r3d_tracer *t, const char *dir, float cutoff, bool fill) {
        * low-conf cells stay honest holes (a membrane there extrapolates
        * into the unknown), and tear-cut cells are never re-seated: the
        * tear mask deliberately removed them as wrong-wrap captures and a
-       * data-blind membrane would sew the wrap back in. */
-      uint8_t *ext = malloc(n);
-      if (ext) {
-        uint8_t *blocked = malloc(n);
-        if (blocked) {
-          for (uint64_t k = 0; k < n; k++) blocked[k] = keep[k] != 0;
-          tr_flood_exterior(t->W, t->H, blocked, ext);
-          free(blocked);
-        } else {
-          memset(ext, 0, n);
-        }
-      }
-      double *fp = malloc(n * 3 * sizeof *fp);
-      if (fp) {
+       * data-blind membrane would sew the wrap back in.
+       * The re-seated positions live in `fp` and are consumed by the
+       * plane writer below — the live grid is never touched. */
+      ext = malloc(n);
+      uint8_t *blocked = ext ? malloc(n) : NULL;
+      fp = blocked ? malloc(n * 3 * sizeof *fp) : NULL;
+      if (!fp) { /* silently skipping the fill would change what the
+                  * caller asked for: fail the export instead */
+        free(blocked);
+        rc = -1;
+      } else {
+        for (uint64_t k = 0; k < n; k++) blocked[k] = keep[k] != 0;
+        tr_flood_exterior(t->W, t->H, blocked, ext);
+        free(blocked);
         memcpy(fp, t->pos, n * 3 * sizeof *fp);
         for (int it = 0; it < 64; it++) {
           double moved = 0.0;
@@ -6342,7 +6838,8 @@ int r3d_tracer_save(r3d_tracer *t, const char *dir, float cutoff, bool fill) {
             static const int o4[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
             for (int o = 0; o < 4; o++) {
               int ii = i + o4[o][0], jj = j + o4[o][1];
-              if (ii < 0 || jj < 0 || ii >= (int)t->W || jj >= (int)t->H) continue;
+              if (ii < 0 || jj < 0 || ii >= (int)t->W || jj >= (int)t->H)
+                continue;
               size_t k2 = (size_t)jj * t->W + (size_t)ii;
               if (t->state[k2] != R3D_TR_SET) continue;
               const double *src = keep[k2] ? t->pos + k2 * 3 : fp + k2 * 3;
@@ -6359,14 +6856,9 @@ int r3d_tracer_save(r3d_tracer *t, const char *dir, float cutoff, bool fill) {
           if (moved < 0.01 * (double)n) break;
         }
         for (uint64_t k = 0; k < n; k++)
-          if (!keep[k] && t->state[k] == R3D_TR_SET && !(torn && torn[k]) &&
-              !(ext && ext[k])) {
-            memcpy(t->pos + k * 3, fp + k * 3, 3 * sizeof(double));
-            keep[k] = 3; /* filled (enclosed, untorn) */
-          }
-        free(fp);
+          if (!keep[k] && t->state[k] == R3D_TR_SET && !torn[k] && !ext[k])
+            keep[k] = 3; /* filled (enclosed, untorn): read from fp */
       }
-      free(ext);
     }
   }
   /* min-size gate + bbox crop (G15, vc3d min_area/vc_tifxyz_trim): a
@@ -6375,59 +6867,63 @@ int r3d_tracer_save(r3d_tracer *t, const char *dir, float cutoff, bool fill) {
    * wide so an early-stopped run otherwise ships a large all-invalid
    * margin. Crop to the kept bbox + 2 and record grid_offset. */
   uint64_t nkept = 0;
+  uint32_t maxgen = 0;
   uint32_t cb[4] = {t->W, t->H, 0, 0};
-  for (uint64_t k = 0; k < n; k++) {
-    bool kp = keep ? keep[k] != 0
-                   : t->state[k] == R3D_TR_SET && t->conf[k] >= cutoff;
-    if (!kp) continue;
+  for (uint64_t k = 0; rc == 0 && k < n; k++) {
+    if (!keep[k]) continue;
     nkept++;
+    if (t->gen_of && t->gen_of[k] > maxgen) maxgen = t->gen_of[k];
     uint32_t i = (uint32_t)(k % t->W), j = (uint32_t)(k / t->W);
     if (i < cb[0]) cb[0] = i;
     if (j < cb[1]) cb[1] = j;
     if (i > cb[2]) cb[2] = i;
     if (j > cb[3]) cb[3] = j;
   }
-  if (nkept < 64) {
+  if (rc == 0 && nkept < 64) {
     pthread_mutex_unlock(&t->mu);
     free(keep);
     free(torn);
     free(pl);
+    free(fp);
+    free(ext);
     printf("tracer: refusing to save %llu-point patch (< 64 trusted cells)\n",
            (unsigned long long)nkept);
     return -2;
   }
-  uint32_t ci0 = cb[0] > 2 ? cb[0] - 2 : 0, cj0 = cb[1] > 2 ? cb[1] - 2 : 0;
-  uint32_t ci1 = cb[2] + 2 < t->W ? cb[2] + 2 : t->W - 1;
-  uint32_t cj1 = cb[3] + 2 < t->H ? cb[3] + 2 : t->H - 1;
-  uint32_t cw = ci1 - ci0 + 1, ch = cj1 - cj0 + 1;
+  uint32_t ci0 = 0, cj0 = 0, cw = 0, ch = 0;
+  if (rc == 0) {
+    ci0 = cb[0] > 2 ? cb[0] - 2 : 0;
+    cj0 = cb[1] > 2 ? cb[1] - 2 : 0;
+    uint32_t ci1 = cb[2] + 2 < t->W ? cb[2] + 2 : t->W - 1;
+    uint32_t cj1 = cb[3] + 2 < t->H ? cb[3] + 2 : t->H - 1;
+    cw = ci1 - ci0 + 1;
+    ch = cj1 - cj0 + 1;
+  }
   for (int a = 0; a < 3 && rc == 0; a++) {
     for (uint32_t j = 0; j < ch; j++)
       for (uint32_t i = 0; i < cw; i++) {
         size_t k = (size_t)(cj0 + j) * t->W + (size_t)(ci0 + i);
-        pl[(size_t)j * cw + i] =
-            (keep ? keep[k] : t->state[k] == R3D_TR_SET && t->conf[k] >= cutoff)
-                ? (float)t->pos[k * 3 + (size_t)a]
-                : -1.0f;
+        const double *src = keep[k] == 3 && fp ? fp + k * 3 : t->pos + k * 3;
+        pl[(size_t)j * cw + i] = keep[k] ? (float)src[(size_t)a] : -1.0f;
       }
     char path[1200];
-    snprintf(path, sizeof path, "%s/%s", dir, nm[a]);
-    rc = tr_write_plane(path, pl, cw, ch);
+    rc = tr_pub_add(&pub, nm[a], path, sizeof path) ? 0 : -1;
+    if (rc == 0) rc = tr_write_plane(path, pl, cw, ch);
   }
   if (rc == 0 && t->uc && t->wind) { /* winding channel (vc3d ecosystem:
                                       * float winding per cell, NAN off) */
     for (uint32_t j = 0; j < ch; j++)
       for (uint32_t i = 0; i < cw; i++) {
         size_t k = (size_t)(cj0 + j) * t->W + (size_t)(ci0 + i);
-        pl[(size_t)j * cw + i] =
-            (keep ? keep[k] != 0
-                  : t->state[k] == R3D_TR_SET && t->conf[k] >= cutoff)
-                ? t->wind[k]
-                : -1e30f; /* invalid marker (validity lives in x.tif;
-                           * NAN is unusable under -ffast-math) */
+        pl[(size_t)j * cw + i] = keep[k] ? t->wind[k]
+                                         : -1e30f; /* invalid marker (validity
+                                                    * lives in x.tif; NAN is
+                                                    * unusable under
+                                                    * -ffast-math) */
       }
     char path[1200];
-    snprintf(path, sizeof path, "%s/winding.tif", dir);
-    rc = tr_write_plane(path, pl, cw, ch);
+    rc = tr_pub_add(&pub, "winding.tif", path, sizeof path) ? 0 : -1;
+    if (rc == 0) rc = tr_write_plane(path, pl, cw, ch);
   }
   if (rc == 0 && t->gen_of) { /* generation stamps: the rewind substrate */
     for (uint32_t j = 0; j < ch; j++)
@@ -6435,52 +6931,98 @@ int r3d_tracer_save(r3d_tracer *t, const char *dir, float cutoff, bool fill) {
         pl[(size_t)j * cw + i] =
             (float)t->gen_of[(size_t)(cj0 + j) * t->W + (size_t)(ci0 + i)];
     char path[1200];
-    snprintf(path, sizeof path, "%s/generations.tif", dir);
-    rc = tr_write_plane(path, pl, cw, ch);
+    rc = tr_pub_add(&pub, "generations.tif", path, sizeof path) ? 0 : -1;
+    if (rc == 0) rc = tr_write_plane(path, pl, cw, ch);
+  }
+  bool have_conf = false;
+  if (rc == 0 && t->conf) { /* per-vertex confidence: without it a reload
+                             * has to invent 1.0 everywhere and the tear/
+                             * infill/fill decisions stop reproducing */
+    for (uint32_t j = 0; j < ch; j++)
+      for (uint32_t i = 0; i < cw; i++) {
+        size_t k = (size_t)(cj0 + j) * t->W + (size_t)(ci0 + i);
+        pl[(size_t)j * cw + i] = keep[k] ? t->conf[k] : -1.0f;
+      }
+    char path[1200];
+    rc = tr_pub_add(&pub, "confidence.tif", path, sizeof path) ? 0 : -1;
+    if (rc == 0) rc = tr_write_plane(path, pl, cw, ch);
+    have_conf = rc == 0;
+  }
+  /* spiral model + state sidecar, still under the lock: they describe the
+   * exact generation the planes came from */
+  if (rc == 0 && t->sp_valid) { /* fusion / winding registration */
+    char path[1200];
+    rc = tr_pub_add(&pub, "spiral.json", path, sizeof path) ? 0 : -1;
+    if (rc == 0) {
+      FILE *sf = fopen(path, "w");
+      if (!sf) {
+        rc = -1;
+      } else {
+        fprintf(sf, "{\n  \"omega\": %.6f,\n  \"omega_measured\": %.3f,\n"
+                    "  \"rms\": %.6f,\n  \"z0\": %.3f,\n"
+                    "  \"dz\": %.3f,\n  \"r0\": [",
+                t->sp_omega, t->sp_om_meas, t->sp_rms, t->sp_z0, t->sp_dz);
+        for (uint32_t kk = 0; kk < t->sp_k; kk++)
+          fprintf(sf, "%s%.3f", kk ? ", " : "", t->sp_r0[kk]);
+        fprintf(sf, "]\n}\n");
+        rc = tr_fclose_checked(sf);
+      }
+    }
+  }
+  if (rc == 0) {
+    char path[1200];
+    rc = tr_pub_add(&pub, "tracer.json", path, sizeof path) ? 0 : -1;
+    if (rc == 0)
+      rc = tr_write_state(t, path, cw, ch, ci0, cj0, cutoff, fill, maxgen,
+                          nkept, have_conf);
+  }
+  if (rc == 0) { /* meta.json LAST: it is what makes the directory a
+                  * tifxyz, so it must never precede its own planes */
+    char path[1200];
+    rc = tr_pub_add(&pub, "meta.json", path, sizeof path) ? 0 : -1;
+    if (rc == 0) {
+      FILE *mf = fopen(path, "w");
+      if (!mf) {
+        rc = -1;
+      } else {
+        double sc = 1.0 / t->cfg.step;
+        fprintf(mf,
+                "{\n  \"format\": \"tifxyz\",\n  \"type\": \"seg\",\n"
+                "  \"scale\": [\n    %.6f,\n    %.6f\n  ],\n"
+                "  \"source\": \"render3d-tracer\",\n"
+                "  \"donor_segments\": %u,\n"
+                "  \"area_vx2\": %.1f,\n  \"bbox\": [%u, %u, %u, %u],\n"
+                "  \"fill\": %.4f,\n  \"hole\": %.4f,\n"
+                "  \"qc\": {\"folds\": %u, \"kinks\": %u, \"twist\": %.3f, "
+                "\"slant_p95\": %.4f, \"wrap_frac\": %.4f, \"werr_p95\": "
+                "%.4f},\n"
+                "  \"donor_qc\": {\"mean\": %.2f, \"rms\": %.2f, \"p95\": "
+                "%.2f, \"coverage\": %.3f},\n"
+                "  \"grid_offset\": [%u, %u],\n  \"anchors\": %u,\n"
+                "  \"max_gen\": %u,\n  \"state\": \"tracer.json\"\n}\n",
+                sc, sc, t->ndon, t->qc_area_vx2, t->qc_bbox[0], t->qc_bbox[1],
+                t->qc_bbox[2], t->qc_bbox[3], (double)t->qc_fill,
+                (double)t->qc_hole, t->qc_folds, t->qc_kinks,
+                (double)t->qc_twist, (double)t->qc_slant_p95,
+                (double)t->qc_wrap_frac, (double)t->qc_werr_p95,
+                (double)t->qc_don_mean, (double)t->qc_don_rms,
+                (double)t->qc_don_p95, (double)t->qc_don_cov, ci0, cj0,
+                t->nanc, t->gens_done);
+        rc = tr_fclose_checked(mf);
+      }
+    }
   }
   pthread_mutex_unlock(&t->mu);
   free(keep);
   free(torn);
   free(pl);
-  if (rc != 0) return -1;
-  char mp[1200];
-  snprintf(mp, sizeof mp, "%s/meta.json", dir);
-  FILE *mf = fopen(mp, "w");
-  if (!mf) return -1;
-  double sc = 1.0 / t->cfg.step;
-  fprintf(mf,
-          "{\n  \"format\": \"tifxyz\",\n  \"type\": \"seg\",\n  \"scale\": [\n"
-          "    %.6f,\n    %.6f\n  ],\n  \"source\": \"render3d-tracer\",\n"
-          "  \"donor_segments\": %u,\n"
-          "  \"area_vx2\": %.1f,\n  \"bbox\": [%u, %u, %u, %u],\n"
-          "  \"fill\": %.4f,\n  \"hole\": %.4f,\n"
-          "  \"qc\": {\"folds\": %u, \"kinks\": %u, \"twist\": %.3f, "
-          "\"slant_p95\": %.4f, \"wrap_frac\": %.4f, \"werr_p95\": %.4f},\n"
-          "  \"donor_qc\": {\"mean\": %.2f, \"rms\": %.2f, \"p95\": %.2f, "
-          "\"coverage\": %.3f},\n"
-          "  \"grid_offset\": [%u, %u],\n  \"anchors\": %u,\n"
-          "  \"max_gen\": %u\n}\n",
-          sc, sc, t->ndon, t->qc_area_vx2, t->qc_bbox[0], t->qc_bbox[1],
-          t->qc_bbox[2], t->qc_bbox[3], (double)t->qc_fill, (double)t->qc_hole,
-          t->qc_folds, t->qc_kinks, (double)t->qc_twist, (double)t->qc_slant_p95,
-          (double)t->qc_wrap_frac, (double)t->qc_werr_p95,
-          (double)t->qc_don_mean, (double)t->qc_don_rms, (double)t->qc_don_p95,
-          (double)t->qc_don_cov, ci0, cj0, t->nanc, t->gens_done);
-  fclose(mf);
-  if (t->sp_valid) { /* spiral model, for fusion / winding registration */
-    snprintf(mp, sizeof mp, "%s/spiral.json", dir);
-    FILE *sf = fopen(mp, "w");
-    if (sf) {
-      fprintf(sf, "{\n  \"omega\": %.6f,\n  \"omega_measured\": %.3f,\n"
-                  "  \"rms\": %.6f,\n  \"z0\": %.3f,\n"
-                  "  \"dz\": %.3f,\n  \"r0\": [",
-              t->sp_omega, t->sp_om_meas, t->sp_rms, t->sp_z0, t->sp_dz);
-      for (uint32_t kk = 0; kk < t->sp_k; kk++)
-        fprintf(sf, "%s%.3f", kk ? ", " : "", t->sp_r0[kk]);
-      fprintf(sf, "]\n}\n");
-      fclose(sf);
-    }
+  free(fp);
+  free(ext);
+  if (rc != 0) {
+    tr_pub_abort(&pub); /* the previous export, if any, is untouched */
+    return -1;
   }
+  if (tr_pub_commit(&pub) != 0) return -1;
   return 0;
 }
 
@@ -6606,6 +7148,8 @@ out:
   free(t.state);
   free(t.conf);
   free(t.wind);
+  free(t.werr); /* allocated by the winding-relaxation block above */
+  free(t.omf);  /* allocated by tr_spiral_fit */
   free(t.uc);
   r3d_umbilicus_free(&t.umb);
   pthread_mutex_destroy(&t.mu);

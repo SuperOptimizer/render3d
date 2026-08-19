@@ -30,6 +30,7 @@ typedef struct r3d_input {
   bool anchor_place; /* X pressed (tracer: drop an anchor at the cursor) */
   bool seed_place;   /* G pressed (tracer: queue a seed at the cursor) */
   bool surf_place;   /* P pressed (manual surface: place a point) */
+  bool bnd_place;    /* B pressed (boundary surface: set the seed) */
   bool undo;         /* Ctrl+Z pressed */
   bool redo;         /* Ctrl+Shift+Z pressed */
   bool annotate_click; /* uncaptured LMB press in annotation mode */
@@ -39,6 +40,7 @@ typedef struct r3d_input {
   /* persistent */
   bool captured;     /* fly mode: pointer grabbed until Esc */
   bool dragging;     /* orbit mode: LMB held */
+  bool lmb_held;     /* raw left-button state (multiview label-paint brush) */
 } r3d_input;
 
 /* hook (may be NULL) sees every event first (e.g. GUI). allow_capture=false

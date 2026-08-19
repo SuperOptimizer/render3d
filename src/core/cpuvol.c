@@ -3,6 +3,7 @@
 
 #include <blosc.h>
 #include <curl/curl.h>
+#include <limits.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -19,6 +20,160 @@
 #define CV_BRICK 128u
 #define CV_SHARD_BPA 8u /* 1024^3 shards = 8^3 bricks */
 #define CV_RAW ((size_t)CV_BRICK * CV_BRICK * CV_BRICK)
+
+/* Demand-fetch resource caps. A legal-but-pathological source chunk edge
+ * must not be able to ask for gigabyte allocations or an unbounded HTTP
+ * body: the fetch assembles an lcm(chunk,128)^3 cell and holds one source
+ * chunk, one cell and one response at once. A 127-wide chunk would need a
+ * 16256^3 cell; a 1024-wide chunk a 1 GiB one. Levels whose cell exceeds
+ * the budget lose demand fetch, not the whole volume. */
+#define CV_MAX_CELL_EDGE 512u
+#define CV_MAX_CELL_BYTES ((size_t)256u << 20)
+#define CV_MAX_CHUNK_BYTES ((size_t)256u << 20)
+#define CV_MAX_BODY_BYTES ((size_t)512u << 20)
+#define CV_BLOSC_HDR ((size_t)BLOSC_MIN_HEADER_LENGTH)
+
+static uint32_t cv_cell_dim(uint32_t chsz) { /* lcm(chsz, brick) */
+  uint32_t a = chsz, b = CV_BRICK;
+  while (b) {
+    uint32_t t = a % b;
+    a = b;
+    b = t;
+  }
+  return a ? chsz / a * CV_BRICK : 0u;
+}
+
+/* true when the cell/chunk this edge implies fits the per-request budget */
+static bool cv_cell_ok(uint32_t chsz) {
+  uint32_t cell = cv_cell_dim(chsz);
+  if (!chsz || !cell || cell > CV_MAX_CELL_EDGE) return false;
+  size_t cellb = (size_t)cell * cell * cell, chb = (size_t)chsz * chsz * chsz;
+  return cellb <= CV_MAX_CELL_BYTES && chb <= CV_MAX_CHUNK_BYTES;
+}
+
+/* Decode cache: a refcounted pool of 128^3 slabs shared by every sampler
+ * on one volume. A reader holds a lease that pins its slot, so a pointer
+ * handed out under the pool lock stays valid and immutable until that
+ * thread leases a different brick; eviction only ever considers unpinned
+ * slots. The pool is refcounted apart from the r3d_cpuvol so a lease that
+ * outlives r3d_cpuvol_close keeps its bytes alive instead of dangling. */
+typedef struct cv_cache {
+  _Atomic uint32_t refs;
+  pthread_mutex_t m;
+  uint8_t *slabs;
+  uint64_t *keys; /* key or UINT64_MAX */
+  uint64_t *use;  /* LRU ticks */
+  uint32_t *pin;  /* live leases per slot; eviction skips nonzero */
+  uint32_t nslots;
+  uint64_t tick;
+  /* hash index over keys (open addressing, slot+1, 0 = empty) so a hit is
+   * O(1) instead of a linear scan of every slot per non-memo lookup */
+  uint32_t *hidx;
+  uint32_t hmask;
+} cv_cache;
+
+static void cvc_unref(cv_cache *c) {
+  if (!c) return;
+  if (atomic_fetch_sub_explicit(&c->refs, 1u, memory_order_acq_rel) != 1u) return;
+  pthread_mutex_destroy(&c->m);
+  free(c->slabs);
+  free(c->keys);
+  free(c->use);
+  free(c->pin);
+  free(c->hidx);
+  free(c);
+}
+
+static cv_cache *cvc_new(uint32_t nslots) {
+  if (nslots < 8u) nslots = 8u;
+  if (nslots > (1u << 20)) nslots = 1u << 20;
+  cv_cache *c = calloc(1, sizeof *c);
+  if (!c) return NULL;
+  atomic_init(&c->refs, 1u);
+  pthread_mutex_init(&c->m, NULL);
+  c->nslots = nslots;
+  c->slabs = malloc((size_t)nslots * CV_RAW);
+  c->keys = malloc((size_t)nslots * sizeof *c->keys);
+  c->use = calloc(nslots, sizeof *c->use);
+  c->pin = calloc(nslots, sizeof *c->pin);
+  uint32_t hs = 64;
+  while (hs < nslots * 4u) hs *= 2u;
+  c->hidx = calloc(hs, sizeof *c->hidx);
+  c->hmask = hs - 1u;
+  if (!c->slabs || !c->keys || !c->use || !c->pin || !c->hidx) {
+    cvc_unref(c);
+    return NULL;
+  }
+  for (uint32_t i = 0; i < nslots; i++) c->keys[i] = UINT64_MAX;
+  return c;
+}
+
+/* one lease per thread: the brick a sampler is currently reading. The lease
+ * holds a pool reference, so releasing it never touches the r3d_cpuvol and
+ * is safe after close; a freed pool address can never be mistaken for a
+ * live one because holding the lease is what keeps the pool allocated. */
+typedef struct cv_lease {
+  cv_cache *c;
+  const uint8_t *ptr;
+  uint64_t key;
+  uint32_t slot;
+} cv_lease;
+
+static _Thread_local cv_lease cv_ls = {NULL, NULL, UINT64_MAX, UINT32_MAX};
+static _Thread_local uint8_t *cv_scratch = NULL;
+static _Thread_local bool cv_tls_hooked = false;
+/* negative memo: (volume, open id, key) that resolved to air. Keyed on the
+ * open id so a memo cannot survive close/reopen at the same address. */
+static _Thread_local const r3d_cpuvol *cv_nvol = NULL;
+static _Thread_local uint64_t cv_nid = 0, cv_nkey = UINT64_MAX;
+static pthread_key_t cv_tls_key;
+static pthread_once_t cv_tls_once = PTHREAD_ONCE_INIT;
+static _Atomic uint64_t cv_next_id = 1;
+
+static void cv_lease_drop(void) {
+  cv_cache *c = cv_ls.c;
+  if (!c) return;
+  pthread_mutex_lock(&c->m);
+  if (cv_ls.slot < c->nslots && c->pin[cv_ls.slot]) c->pin[cv_ls.slot]--;
+  pthread_mutex_unlock(&c->m);
+  cv_ls.c = NULL;
+  cv_ls.ptr = NULL;
+  cv_ls.key = UINT64_MAX;
+  cv_ls.slot = UINT32_MAX;
+  cvc_unref(c);
+}
+
+/* c->m held, and any lease this thread still holds is on c */
+static void cv_lease_take(cv_cache *c, uint32_t slot, uint64_t key, const uint8_t *p) {
+  if (cv_ls.c == c) {
+    if (cv_ls.slot < c->nslots && c->pin[cv_ls.slot]) c->pin[cv_ls.slot]--;
+  } else {
+    atomic_fetch_add_explicit(&c->refs, 1u, memory_order_relaxed);
+  }
+  c->pin[slot]++;
+  cv_ls.c = c;
+  cv_ls.ptr = p;
+  cv_ls.key = key;
+  cv_ls.slot = slot;
+  cv_nvol = NULL; /* moving on: do not let an air memo outlive its probe */
+}
+
+static void cv_tls_exit(void *unused) {
+  (void)unused;
+  cv_lease_drop();
+  free(cv_scratch);
+  cv_scratch = NULL;
+  cv_tls_hooked = false;
+}
+static void cv_tls_init(void) { pthread_key_create(&cv_tls_key, cv_tls_exit); }
+/* thread exit must release the lease and the decode scratch, or a detached
+ * sampler would pin one slot of the pool forever */
+static void cv_tls_hook(void) {
+  if (cv_tls_hooked) return;
+  pthread_once(&cv_tls_once, cv_tls_init);
+  pthread_setspecific(cv_tls_key, (void *)1);
+  cv_tls_hooked = true;
+}
 
 typedef struct cv_reader {
   c5d_shard_reader sr;
@@ -87,25 +242,17 @@ int r3d_cpuvol_open_ex(r3d_cpuvol *v, const char *root, uint32_t cache_bricks,
   if (!v->nlev) return -1;
   v->nreaders = nread;
   v->readers = calloc(nread ? nread : 1, sizeof(cv_reader));
-  v->nslots = cache_bricks ? cache_bricks : 64;
-  v->slabs = malloc((size_t)v->nslots * CV_RAW);
-  v->keys = malloc((size_t)v->nslots * sizeof *v->keys);
-  v->use = calloc(v->nslots, sizeof *v->use);
-  uint32_t hs = 64;
-  while (hs < v->nslots * 4u) hs *= 2;
-  v->hidx = calloc(hs, sizeof *v->hidx);
-  v->hmask = hs - 1;
+  v->cache = cvc_new(cache_bricks ? cache_bricks : 64);
+  v->id = atomic_fetch_add_explicit(&cv_next_id, 1u, memory_order_relaxed);
   v->nneg = 8192;
   v->neg_key = malloc((size_t)v->nneg * sizeof *v->neg_key);
   v->neg_exp = calloc(v->nneg, sizeof *v->neg_exp);
   if (v->neg_key)
     for (uint32_t i = 0; i < v->nneg; i++) v->neg_key[i] = UINT64_MAX;
-  if (!v->readers || !v->slabs || !v->keys || !v->use || !v->hidx || !v->neg_key ||
-      !v->neg_exp) {
+  if (!v->readers || !v->cache || !v->neg_key || !v->neg_exp) {
     r3d_cpuvol_close(v);
     return -1;
   }
-  for (uint32_t i = 0; i < v->nslots; i++) v->keys[i] = UINT64_MAX;
   /* optional net source: chunk fetch config, same file the renderer uses */
   snprintf(mp, sizeof mp, "%s/source.json", root);
   f = fopen(mp, "rb");
@@ -132,6 +279,13 @@ int r3d_cpuvol_open_ex(r3d_cpuvol *v, const char *root, uint32_t cache_bricks,
         if (v->chsz[l] < 32 || v->chsz[l] > 1024) {
           v->url[0] = 0;
           break;
+        }
+        if (!cv_cell_ok(v->chsz[l])) {
+          fprintf(stderr,
+                  "cpuvol: %s L%u chunk edge %u needs a %u^3 assembly cell (cap %u^3) "
+                  "- demand fetch disabled for that level\n",
+                  root, l, v->chsz[l], cv_cell_dim(v->chsz[l]), CV_MAX_CELL_EDGE);
+          v->chsz[l] = 0;
         }
         lp += 9;
       }
@@ -160,10 +314,12 @@ void r3d_cpuvol_close(r3d_cpuvol *v) {
     for (uint32_t i = 0; i < v->nreaders; i++)
       if (rd[i].open) c5d_shard_close_reader(&rd[i].sr);
   free(v->readers);
-  free(v->slabs);
-  free(v->keys);
-  free(v->use);
-  free(v->hidx);
+  /* a lease this thread still holds on this pool must go before the volume
+   * does; leases held by other threads keep the pool alive on their own */
+  if (cv_ls.c && cv_ls.c == v->cache) cv_lease_drop();
+  if (cv_nvol == v) cv_nvol = NULL;
+  cvc_unref(v->cache);
+  v->cache = NULL;
   free(v->neg_key);
   free(v->neg_exp);
   if (v->sp) {
@@ -180,12 +336,39 @@ void r3d_cpuvol_close(r3d_cpuvol *v) {
 /* decode brick (li,bx,by,bz) into a cache slot; NULL when absent on disk */
 /* --- demand fetch: zarr chunks -> .c5b cache (mirrors ni_worker) --------- */
 
+/* response accumulator: growth is checked and capped at buf.max, so a
+ * proxy error page or an endless body aborts the transfer instead of
+ * eating the heap. `over` distinguishes that from a transport failure. */
+typedef struct cv_buf {
+  uint8_t *p;
+  size_t n, cap, max;
+  bool over;
+} cv_buf;
+
 static size_t cv_curl_write(const void *data, size_t sz, size_t nm, void *ud) {
-  struct cvbuf { uint8_t *p; size_t n, cap; } *b = ud;
+  cv_buf *b = ud;
+  if (sz && nm > SIZE_MAX / sz) {
+    b->over = true;
+    return 0;
+  }
   size_t n = sz * nm;
-  if (b->n + n > b->cap) {
-    size_t nc = b->cap ? b->cap * 2 : (4u << 20);
-    while (nc < b->n + n) nc *= 2;
+  if (n > b->max || b->n > b->max - n) {
+    b->over = true;
+    return 0;
+  }
+  if (n > b->cap - b->n) {
+    size_t nc = b->cap ? b->cap : (size_t)(1u << 20);
+    while (nc < b->n + n) {
+      if (nc > b->max / 2u) {
+        nc = b->max;
+        break;
+      }
+      nc *= 2u;
+    }
+    if (nc < b->n + n) {
+      b->over = true;
+      return 0;
+    }
     uint8_t *np = realloc(b->p, nc);
     if (!np) return 0;
     b->p = np;
@@ -194,16 +377,6 @@ static size_t cv_curl_write(const void *data, size_t sz, size_t nm, void *ud) {
   memcpy(b->p + b->n, data, n);
   b->n += n;
   return n;
-}
-
-static uint32_t cv_cell_dim(uint32_t chsz) { /* lcm(chsz, brick) */
-  uint32_t a = chsz, b = CV_BRICK;
-  while (b) {
-    uint32_t t = a % b;
-    a = b;
-    b = t;
-  }
-  return chsz / a * CV_BRICK;
 }
 
 static int cv_write_file(const char *path, const void *data, size_t n) {
@@ -230,43 +403,67 @@ static inline uint32_t cv_hash(uint64_t key) {
 
 /* hash index maintenance (open addressing, linear probing, backward-shift
  * deletion so tombstones never accumulate) */
-static int cv_hfind(const r3d_cpuvol *v, uint64_t key) {
-  uint32_t i = cv_hash(key) & v->hmask;
+static int cvc_find(const cv_cache *c, uint64_t key) {
+  uint32_t i = cv_hash(key) & c->hmask;
   for (;;) {
-    uint32_t e = v->hidx[i];
+    uint32_t e = c->hidx[i];
     if (!e) return -1;
-    if (v->keys[e - 1] == key) return (int)(e - 1);
-    i = (i + 1) & v->hmask;
+    if (c->keys[e - 1] == key) return (int)(e - 1);
+    i = (i + 1) & c->hmask;
   }
 }
-static void cv_hinsert(r3d_cpuvol *v, uint32_t slot) {
-  uint32_t i = cv_hash(v->keys[slot]) & v->hmask;
-  while (v->hidx[i]) i = (i + 1) & v->hmask;
-  v->hidx[i] = slot + 1;
+static void cvc_hinsert(cv_cache *c, uint32_t slot) {
+  uint32_t i = cv_hash(c->keys[slot]) & c->hmask;
+  while (c->hidx[i]) i = (i + 1) & c->hmask;
+  c->hidx[i] = slot + 1;
 }
-static void cv_hremove(r3d_cpuvol *v, uint32_t slot) {
-  uint32_t i = cv_hash(v->keys[slot]) & v->hmask;
-  while (v->hidx[i] != slot + 1) {
-    if (!v->hidx[i]) return;
-    i = (i + 1) & v->hmask;
+static void cvc_hremove(cv_cache *c, uint32_t slot) {
+  uint32_t i = cv_hash(c->keys[slot]) & c->hmask;
+  while (c->hidx[i] != slot + 1) {
+    if (!c->hidx[i]) return;
+    i = (i + 1) & c->hmask;
   }
   for (;;) { /* backward shift */
-    uint32_t j = (i + 1) & v->hmask;
-    v->hidx[i] = 0;
+    uint32_t j = (i + 1) & c->hmask;
+    c->hidx[i] = 0;
     for (;;) {
-      uint32_t e = v->hidx[j];
+      uint32_t e = c->hidx[j];
       if (!e) return;
-      uint32_t home = cv_hash(v->keys[e - 1]) & v->hmask;
+      uint32_t home = cv_hash(c->keys[e - 1]) & c->hmask;
       /* entry at j may move to i if its home is not in (i, j] cyclically */
       bool movable = (i <= j) ? (home <= i || home > j) : (home <= i && home > j);
       if (movable) {
-        v->hidx[i] = e;
+        c->hidx[i] = e;
         i = j;
         break;
       }
-      j = (j + 1) & v->hmask;
+      j = (j + 1) & c->hmask;
     }
   }
+}
+/* c->m held. Least-recently-used slot no reader is leasing, or -1 when
+ * every slot is leased - the decode then simply is not cached rather than
+ * yanking bytes out from under a sampler. */
+static int cvc_victim(const cv_cache *c) {
+  uint32_t best = UINT32_MAX;
+  uint64_t oldest = UINT64_MAX;
+  for (uint32_t s = 0; s < c->nslots; s++)
+    if (!c->pin[s] && c->use[s] < oldest) {
+      oldest = c->use[s];
+      best = s;
+    }
+  return best == UINT32_MAX ? -1 : (int)best;
+}
+/* c->m held. Publish `raw` into a free/evictable slot; -1 when none. */
+static int cvc_publish(cv_cache *c, uint64_t key, const uint8_t *raw) {
+  int victim = cvc_victim(c);
+  if (victim < 0) return -1;
+  uint32_t vs = (uint32_t)victim;
+  if (c->keys[vs] != UINT64_MAX) cvc_hremove(c, vs);
+  c->keys[vs] = key;
+  memcpy(c->slabs + (size_t)vs * CV_RAW, raw, CV_RAW);
+  cvc_hinsert(c, vs);
+  return victim;
 }
 
 static bool cv_neg_hit(const r3d_cpuvol *v, uint64_t key, uint64_t now_s) {
@@ -293,6 +490,7 @@ static CURL *cv_curl_new(void) {
   curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 30L);
   curl_easy_setopt(c, CURLOPT_LOW_SPEED_LIMIT, 1024L);
   curl_easy_setopt(c, CURLOPT_LOW_SPEED_TIME, 60L);
+  curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L); /* worker threads */
   return c;
 }
 
@@ -306,19 +504,27 @@ static void cv_net_fetch_h(r3d_cpuvol *v, CURL *curl, uint32_t li, uint32_t bx, 
     r3d_surfpred_cell(v->sp, li, bx, by, bz, NULL, v);
     return;
   }
-  if (!v->url[0] || li >= v->nlev || !v->chsz[li] || !curl) return;
+  if (!v->url[0] || li >= v->nlev || !curl) return;
+  if (!cv_cell_ok(v->chsz[li])) return; /* pathological edge: no fetch */
   uint64_t now = (uint64_t)time(NULL);
-  if (v->net_cool > now) return;
+  pthread_mutex_lock(&v->mu);
+  bool cooling = v->net_cool > now;
+  pthread_mutex_unlock(&v->mu);
+  if (cooling) return;
   uint32_t chsz = v->chsz[li], cell = cv_cell_dim(chsz), cb = cell / CV_BRICK,
            cc = cell / chsz;
   uint32_t cz = bz / cb, cy = by / cb, cx = bx / cb;
   size_t chunk_bytes = (size_t)chsz * chsz * chsz;
   size_t cell_bytes = (size_t)cell * cell * cell;
+  /* one compressed chunk can only exceed its raw size by the blosc header */
+  size_t body_cap = chunk_bytes + (chunk_bytes >> 3) + 4096u;
+  if (body_cap > CV_MAX_BODY_BYTES) body_cap = CV_MAX_BODY_BYTES;
   uint8_t *cellbuf = calloc(1, cell_bytes);
   uint8_t *chunk = malloc(chunk_bytes);
   uint8_t *raw = malloc(CV_RAW);
-  struct { uint8_t *p; size_t n, cap; } buf = {0};
+  cv_buf buf = {NULL, 0, 0, body_cap, false};
   if (!cellbuf || !chunk || !raw) goto done;
+  curl_easy_setopt(curl, CURLOPT_MAXFILESIZE_LARGE, (curl_off_t)body_cap);
   bool any = false;
   for (uint32_t icz = 0; icz < cc; icz++)
     for (uint32_t icy = 0; icy < cc; icy++)
@@ -330,29 +536,51 @@ static void cv_net_fetch_h(r3d_cpuvol *v, CURL *curl, uint32_t li, uint32_t bx, 
         CURLcode crc = CURLE_OK;
         for (int attempt = 0; attempt < 3; attempt++) {
           buf.n = 0;
+          buf.over = false;
           curl_easy_setopt(curl, CURLOPT_URL, url);
           curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buf);
           crc = curl_easy_perform(curl);
           curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+          if (crc == CURLE_FILESIZE_EXCEEDED) buf.over = true;
+          if (buf.over) break; /* over the cap: retrying cannot help */
           if (crc == CURLE_OK && (code == 200 || code == 404)) break;
           sleep((unsigned)(1u << attempt));
         }
-        if (!(crc == CURLE_OK && (code == 200 || code == 404))) {
-          v->net_cool = now + 30; /* network trouble: back off, stay air */
+        if (buf.over) { /* no cache artifact: a sane server must be able to heal it */
+          fprintf(stderr, "cpuvol: %s exceeds the %zu-byte response cap - cell abandoned\n",
+                  url, body_cap);
           goto done;
         }
-        if (code == 404) continue;
+        if (!(crc == CURLE_OK && (code == 200 || code == 404))) {
+          pthread_mutex_lock(&v->mu);
+          v->net_cool = now + 30; /* network trouble: back off, stay air */
+          pthread_mutex_unlock(&v->mu);
+          goto done;
+        }
+        if (code == 404) continue; /* zarr: absent chunk is fill value */
+        /* Validate before decode: prove a complete blosc header exists, that
+         * its declared sizes agree with the body and with the exact voxel
+         * count this chunk must hold, and that the decode produced all of
+         * it. An HTML proxy page, a truncated frame or a bit-flipped size
+         * field must fail the cell, not become durable false air. */
         bool ok;
         if (v->raw[li]) {
           ok = buf.n == chunk_bytes;
           if (ok) memcpy(chunk, buf.p, chunk_bytes);
         } else {
-          size_t nb = 0, cby = 0, bs = 0;
-          blosc_cbuffer_sizes(buf.p, &nb, &cby, &bs);
-          ok = nb == chunk_bytes && cby <= buf.n &&
+          size_t nb = 0;
+          ok = buf.p && buf.n >= CV_BLOSC_HDR && buf.n <= (size_t)INT_MAX &&
+               blosc_cbuffer_validate(buf.p, buf.n, &nb) == 0 && nb == chunk_bytes &&
                blosc_decompress_ctx(buf.p, chunk, chunk_bytes, 1) == (int)chunk_bytes;
         }
-        if (!ok) continue; /* bad payload reads as air */
+        if (!ok) { /* fail the whole cell: write no .c5b, no empty marker */
+          fprintf(stderr, "cpuvol: %s: malformed chunk payload (%zu bytes) - cell abandoned\n",
+                  url, buf.n);
+          pthread_mutex_lock(&v->mu);
+          if (v->net_cool < now + 5) v->net_cool = now + 5;
+          pthread_mutex_unlock(&v->mu);
+          goto done;
+        }
         for (uint32_t zz = 0; zz < chsz; zz++)
           for (uint32_t yy = 0; yy < chsz; yy++)
             memcpy(cellbuf + (((size_t)icz * chsz + zz) * cell +
@@ -429,24 +657,18 @@ static void cv_net_fetch(r3d_cpuvol *v, uint32_t li, uint32_t bx, uint32_t by, u
 
 /* insert a decoded/raw brick into the LRU (thread-safe); no-op if present */
 static void cv_cache_insert(r3d_cpuvol *v, uint64_t key, const uint8_t *raw) {
-  pthread_mutex_lock(&v->mu);
-  if (cv_hfind(v, key) < 0) {
-    uint32_t victim = 0;
-    uint64_t oldest = UINT64_MAX;
-    for (uint32_t s2 = 0; s2 < v->nslots; s2++)
-      if (v->use[s2] < oldest) {
-        oldest = v->use[s2];
-        victim = s2;
-      }
-    if (v->keys[victim] != UINT64_MAX) cv_hremove(v, victim);
-    v->keys[victim] = key;
-    memcpy(v->slabs + (size_t)victim * CV_RAW, raw, CV_RAW);
-    cv_hinsert(v, victim);
-    v->use[victim] = ++v->tick;
-    /* a positive result overrides any negative entry for this key */
-    uint32_t ni = cv_hash(key ^ 0x9e3779b97f4a7c15ull) & (v->nneg - 1u);
-    if (v->neg_key[ni] == key) v->neg_key[ni] = UINT64_MAX;
+  cv_cache *c = v->cache;
+  if (!c) return;
+  pthread_mutex_lock(&c->m);
+  if (cvc_find(c, key) < 0) {
+    int slot = cvc_publish(c, key, raw); /* -1: every slot leased, skip */
+    if (slot >= 0) c->use[slot] = ++c->tick;
   }
+  pthread_mutex_unlock(&c->m);
+  /* a positive result overrides any negative entry for this key */
+  pthread_mutex_lock(&v->mu);
+  uint32_t ni = cv_hash(key ^ 0x9e3779b97f4a7c15ull) & (v->nneg - 1u);
+  if (v->neg_key[ni] == key) v->neg_key[ni] = UINT64_MAX;
   pthread_mutex_unlock(&v->mu);
 }
 
@@ -518,7 +740,8 @@ static void *cv_pf_thread(void *ud) {
 
 int r3d_cpuvol_prefetch(r3d_cpuvol *v, uint32_t li, const uint32_t *bxyz, uint32_t n,
                         uint32_t threads) {
-  if (!v->url[0] || li >= v->nlev || !v->chsz[li] || !n) return 0;
+  if (!v->url[0] || li >= v->nlev || !n || !v->cache) return 0;
+  if (!cv_cell_ok(v->chsz[li])) return 0;
   uint32_t chsz = v->chsz[li], cell = cv_cell_dim(chsz), cb = cell / CV_BRICK;
   if (!cb) return 0;
   uint64_t *cells = malloc((size_t)n * sizeof *cells);
@@ -528,9 +751,15 @@ int r3d_cpuvol_prefetch(r3d_cpuvol *v, uint32_t li, const uint32_t *bxyz, uint32
   for (uint32_t i = 0; i < n; i++) {
     uint32_t bx = bxyz[i * 3], by = bxyz[i * 3 + 1], bz = bxyz[i * 3 + 2];
     uint64_t key = ((uint64_t)li << 60) | ((uint64_t)bz << 40) | ((uint64_t)by << 20) | bx;
-    pthread_mutex_lock(&v->mu);
-    bool have = cv_hfind(v, key) >= 0 || cv_neg_hit(v, key, now_s);
-    pthread_mutex_unlock(&v->mu);
+    cv_cache *cch = v->cache;
+    pthread_mutex_lock(&cch->m);
+    bool have = cvc_find(cch, key) >= 0;
+    pthread_mutex_unlock(&cch->m);
+    if (!have) {
+      pthread_mutex_lock(&v->mu);
+      have = cv_neg_hit(v, key, now_s);
+      pthread_mutex_unlock(&v->mu);
+    }
     if (have) continue;
     char path[1400];
     snprintf(path, sizeof path, "%s/bricks/L%u/%u_%u_%u.c5b", v->root, li, bz, by, bx);
@@ -561,44 +790,52 @@ int r3d_cpuvol_prefetch(r3d_cpuvol *v, uint32_t li, const uint32_t *bxyz, uint32
 }
 
 
-/* Thread-safe brick lookup. Hits: hash probe under v->mu (tens of ns). Misses:
- * blob IO under v->io_mu (shard readers and the net fetch are not reentrant),
- * decode OUTSIDE both locks into thread-local scratch, then insert under
- * v->mu (re-checking: another thread may have landed the same brick). The
- * per-thread memo short-circuits repeated taps into one brick (trilinear x
- * layers) and re-validates its slot key so a concurrent eviction is caught. */
+/* Thread-safe brick lookup returning a pinned, immutable brick. Hits: the
+ * thread's own lease (no lock at all), else a hash probe under the pool
+ * lock that leases the slot. Misses: blob IO under v->io_mu (shard readers
+ * and the net fetch are not reentrant), decode OUTSIDE every lock into
+ * thread-local scratch, then publish under the pool lock (re-checking:
+ * another thread may have landed the same brick).
+ *
+ * The returned pointer stays valid and unmodified until this thread asks
+ * for a different brick: the lease pins the slot and eviction only takes
+ * unpinned slots. Consumers must therefore finish with one brick before
+ * requesting the next, which every consumer here does. */
+static void cv_memo_null(const r3d_cpuvol *v, uint64_t key) {
+  cv_nvol = v;
+  cv_nid = v->id;
+  cv_nkey = key;
+}
+
 static const uint8_t *cv_brick(r3d_cpuvol *v, uint32_t li, uint32_t bx, uint32_t by,
                                uint32_t bz) {
   uint64_t key = ((uint64_t)li << 60) | ((uint64_t)bz << 40) | ((uint64_t)by << 20) | bx;
-  static _Thread_local uint64_t memo_key = UINT64_MAX;
-  static _Thread_local const uint8_t *memo_ptr = NULL;
-  static _Thread_local const r3d_cpuvol *memo_vol = NULL;
-  static _Thread_local uint32_t memo_slot = UINT32_MAX;
-  static _Thread_local uint8_t *scratch = NULL;
-  if (key == memo_key && v == memo_vol &&
-      (memo_slot == UINT32_MAX || v->keys[memo_slot] == key))
-    return memo_ptr; /* hot path */
-  pthread_mutex_lock(&v->mu);
-  int hs = cv_hfind(v, key);
+  cv_cache *c = v->cache;
+  if (!c) return NULL;
+  if (cv_ls.c == c && cv_ls.key == key) return cv_ls.ptr; /* hot path: pinned */
+  if (cv_nvol == v && cv_nid == v->id && cv_nkey == key) return NULL;
+  if (cv_ls.c && cv_ls.c != c) cv_lease_drop(); /* lease only ever spans one pool */
+  cv_tls_hook();
+
+  pthread_mutex_lock(&c->m);
+  int hs = cvc_find(c, key);
   if (hs >= 0) {
-    v->use[hs] = ++v->tick;
-    memo_key = key;
-    memo_ptr = v->slabs + (size_t)hs * CV_RAW;
-    memo_vol = v;
-    memo_slot = (uint32_t)hs;
-    pthread_mutex_unlock(&v->mu);
-    return memo_ptr;
+    c->use[hs] = ++c->tick;
+    const uint8_t *hit = c->slabs + (size_t)hs * CV_RAW;
+    cv_lease_take(c, (uint32_t)hs, key, hit);
+    pthread_mutex_unlock(&c->m);
+    return hit;
   }
+  pthread_mutex_unlock(&c->m);
+
   uint64_t now_s = (uint64_t)time(NULL);
-  if (cv_neg_hit(v, key, now_s)) { /* known absent: air */
-    pthread_mutex_unlock(&v->mu);
-    memo_key = key;
-    memo_ptr = NULL;
-    memo_vol = v;
-    memo_slot = UINT32_MAX;
+  pthread_mutex_lock(&v->mu);
+  bool absent = cv_neg_hit(v, key, now_s);
+  pthread_mutex_unlock(&v->mu);
+  if (absent) { /* known absent: air */
+    cv_memo_null(v, key);
     return NULL;
   }
-  pthread_mutex_unlock(&v->mu);
 
   /* ---- miss: source the blob (serialized IO) ---- */
   const r3d_cpuvol_level *l = &v->lev[li];
@@ -665,46 +902,34 @@ static const uint8_t *cv_brick(r3d_cpuvol *v, uint32_t li, uint32_t bx, uint32_t
     pthread_mutex_lock(&v->mu);
     cv_neg_put(v, key, empty_file ? UINT64_MAX : now_s + CV_NEG_TTL_S);
     pthread_mutex_unlock(&v->mu);
-    memo_key = key;
-    memo_ptr = NULL;
-    memo_vol = v;
-    memo_slot = UINT32_MAX;
+    cv_memo_null(v, key);
     return NULL;
   }
 
   /* ---- decode outside the locks ---- */
-  if (!scratch) scratch = malloc(CV_RAW);
-  bool ok = scratch && c5d_brick_decode(blob, bn, scratch, CV_BRICK) == 0;
+  if (!cv_scratch) cv_scratch = malloc(CV_RAW);
+  bool ok = cv_scratch && c5d_brick_decode(blob, bn, cv_scratch, CV_BRICK) == 0;
   free(owned);
-  pthread_mutex_lock(&v->mu);
-  if (!ok) { /* remember the failure briefly */
+  if (!ok) { /* remember the failure briefly; retry when the TTL lapses */
+    pthread_mutex_lock(&v->mu);
     cv_neg_put(v, key, now_s + CV_NEG_TTL_S);
     pthread_mutex_unlock(&v->mu);
     return NULL;
   }
-  hs = cv_hfind(v, key); /* raced with another thread's insert? */
+  pthread_mutex_lock(&c->m);
+  hs = cvc_find(c, key); /* raced with another thread's insert? */
   if (hs < 0) {
-    uint32_t victim = 0;
-    uint64_t oldest = UINT64_MAX;
-    for (uint32_t s = 0; s < v->nslots; s++) { /* miss path only: decode dominates */
-      if (v->use[s] < oldest) {
-        oldest = v->use[s];
-        victim = s;
-      }
+    hs = cvc_publish(c, key, cv_scratch);
+    if (hs < 0) { /* every slot leased: serve this decode uncached */
+      pthread_mutex_unlock(&c->m);
+      return cv_scratch;
     }
-    if (v->keys[victim] != UINT64_MAX) cv_hremove(v, victim);
-    v->keys[victim] = key;
-    memcpy(v->slabs + (size_t)victim * CV_RAW, scratch, CV_RAW);
-    cv_hinsert(v, victim);
-    hs = (int)victim;
   }
-  v->use[hs] = ++v->tick;
-  memo_key = key;
-  memo_ptr = v->slabs + (size_t)hs * CV_RAW;
-  memo_vol = v;
-  memo_slot = (uint32_t)hs;
-  pthread_mutex_unlock(&v->mu);
-  return memo_ptr;
+  c->use[hs] = ++c->tick;
+  const uint8_t *got = c->slabs + (size_t)hs * CV_RAW;
+  cv_lease_take(c, (uint32_t)hs, key, got);
+  pthread_mutex_unlock(&c->m);
+  return got;
 }
 
 static double cv_vox(r3d_cpuvol *v, uint32_t li, int64_t lx, int64_t ly, int64_t lz) {

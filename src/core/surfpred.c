@@ -1,6 +1,7 @@
 #include "core/surfpred.h"
 
 #include <arpa/inet.h>
+#include <errno.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <stdio.h>
@@ -43,7 +44,9 @@ static int sp_connect(int port) {
 static int sp_io(int fd, void *buf, size_t n, bool wr) {
   uint8_t *p = buf;
   while (n) {
-    ssize_t k = wr ? write(fd, p, n) : read(fd, p, n);
+    /* MSG_NOSIGNAL: a peer that closed mid-write must not raise SIGPIPE and
+     * kill the process; the short write below is reported as -1 instead */
+    ssize_t k = wr ? send(fd, p, n, MSG_NOSIGNAL) : read(fd, p, n);
     if (k <= 0) return -1;
     p += k;
     n -= (size_t)k;
@@ -157,31 +160,46 @@ static uint8_t *sp_ring_slot(r3d_surfpred *sp, uint64_t key) {
   return sp->ring.data + (size_t)i * SP_CELL_RAW;
 }
 
-static void sp_write_brick(r3d_surfpred *sp, const c5d_brick_params *bp, uint32_t li,
+/* true unless the directory creation itself failed for a reason other than
+ * "already exists" */
+static bool sp_mkdir(const char *dir) {
+  return mkdir(dir, 0755) == 0 || errno == EEXIST;
+}
+
+/* Writes one brick's artifact if not already on disk. Returns false on any
+ * directory/encode/write failure; a false return leaves no file at `path`
+ * (sp_write_file only publishes via rename on full success), so a later
+ * request that re-checks disk state will retry this brick rather than treat
+ * it as complete. */
+static bool sp_write_brick(r3d_surfpred *sp, const c5d_brick_params *bp, uint32_t li,
                            uint32_t bx, uint32_t by, uint32_t bz, const uint8_t *raw,
                            r3d_cpuvol *cache) {
   char dir[1300], path[1500];
   snprintf(dir, sizeof dir, "%s/bricks", sp->root);
-  mkdir(dir, 0755);
+  bool dir_ok = sp_mkdir(dir);
   snprintf(dir, sizeof dir, "%s/bricks/L%u", sp->root, li);
-  mkdir(dir, 0755);
+  dir_ok = sp_mkdir(dir) && dir_ok;
   snprintf(path, sizeof path, "%s/bricks/L%u/%u_%u_%u.c5b", sp->root, li, bz, by, bx);
   bool zero = true;
   for (size_t i = 0; i < SP_RAW && zero; i++) zero = raw[i] == 0;
+  bool ok = true;
   struct stat st;
   if (stat(path, &st) != 0) {
-    if (zero) {
-      sp_write_file(path, NULL, 0);
+    if (!dir_ok) {
+      ok = false;
+    } else if (zero) {
+      ok = sp_write_file(path, NULL, 0) == 0;
     } else {
       uint8_t *enc = NULL;
       size_t en = 0;
-      if (c5d_brick_encode(bp, raw, SP_BRICK, &enc, &en) == 0) {
-        sp_write_file(path, enc, en);
-        free(enc);
-      }
+      ok = c5d_brick_encode(bp, raw, SP_BRICK, &enc, &en) == 0 &&
+           sp_write_file(path, enc, en) == 0;
+      free(enc);
     }
+    if (!ok) fprintf(stderr, "surfpred: failed to persist %s\n", path);
   }
   if (cache && !zero) r3d_cpuvol_cache_put(cache, li, bx, by, bz, raw);
+  return ok;
 }
 
 void r3d_surfpred_close(r3d_surfpred *sp) {
@@ -263,8 +281,15 @@ int r3d_surfpred_cell(r3d_surfpred *sp, uint32_t li, uint32_t bx, uint32_t by, u
       int64_t x0 = (int64_t)cx * SP_CELL - m, y0 = (int64_t)cy * SP_CELL - m,
               z0 = (int64_t)cz * SP_CELL - m;
       r3d_cpuvol_read_block(&sp->ct, P, x0, y0, z0, n, n, n, ct);
+      /* complete scan: a sparse sample can miss the only nonzero voxels in
+       * the block and cache a false-empty (all-zero) prediction forever, so
+       * every byte must be checked. malloc guarantees alignment sufficient
+       * for uint64_t, so the bulk of the scan can go 8 bytes at a time. */
       bool any = false;
-      for (size_t i = 0; i < nn && !any; i += 4096) any = ct[i] != 0;
+      size_t nw = nn / sizeof(uint64_t);
+      const uint64_t *ctw = (const uint64_t *)(const void *)ct;
+      for (size_t i = 0; i < nw && !any; i++) any = ctw[i] != 0;
+      for (size_t i = nw * sizeof(uint64_t); i < nn && !any; i++) any = ct[i] != 0;
       if (!any) {
         memset(pr, 0, nn);
         rc = 0;
@@ -285,6 +310,7 @@ int r3d_surfpred_cell(r3d_surfpred *sp, uint32_t li, uint32_t bx, uint32_t by, u
           /* emit the eight level-P bricks + the P+1 brick */
           uint8_t *raw = malloc(SP_RAW), *l1 = calloc(SP_RAW, 1);
           if (raw && l1) {
+            bool persisted = true;
             for (uint32_t sz = 0; sz < 2; sz++)
               for (uint32_t sy = 0; sy < 2; sy++)
                 for (uint32_t sx = 0; sx < 2; sx++) {
@@ -309,15 +335,27 @@ int r3d_surfpred_cell(r3d_surfpred *sp, uint32_t li, uint32_t bx, uint32_t by, u
                         l1[((size_t)(sz * 64 + z) * SP_BRICK + sy * 64 + y) * SP_BRICK + sx * 64 +
                            x] = (uint8_t)((s2 + 4) / 8);
                       }
-                  sp_write_brick(sp, &bp, P, obx, oby, obz, raw, cache);
+                  if (!sp_write_brick(sp, &bp, P, obx, oby, obz, raw, cache)) persisted = false;
                 }
             if (P + 1 < sp->ct.nlev) {
               const r3d_cpuvol_level *l1v = &sp->ct.lev[P + 1];
               if (cx < l1v->bx && cy < l1v->by && cz < l1v->bz)
-                sp_write_brick(sp, &bp, P + 1, cx, cy, cz, l1, cache);
+                if (!sp_write_brick(sp, &bp, P + 1, cx, cy, cz, l1, cache)) persisted = false;
               if (out && li == P + 1) memcpy(out, l1, SP_RAW);
             }
-            sp->predicted_cells++;
+            if (persisted) {
+              sp->predicted_cells++;
+            } else {
+              /* one or more artifacts failed to reach disk: don't let this
+               * cell sit in the ring as if it were done. Evicting it here
+               * forces the next request for this cell to redo the disk
+               * check (and any still-missing writes) instead of silently
+               * reusing an under-persisted result forever. */
+              sp->failed_cells++;
+              rc = -1;
+              for (uint32_t i = 0; i < SP_RING; i++)
+                if (sp->ring.key[i] == ckey) sp->ring.key[i] = UINT64_MAX;
+            }
           } else {
             rc = -1;
           }
@@ -367,7 +405,10 @@ int r3d_surfpred_cell(r3d_surfpred *sp, uint32_t li, uint32_t bx, uint32_t by, u
             for (uint32_t x = 0; x < SP_BRICK; x++)
               raw[((size_t)z * SP_BRICK + y) * SP_BRICK + x] =
                   cellv[((size_t)(cz0 + z / f) * SP_CELL + (cy0 + y / f)) * SP_CELL + cx0 + x / f];
-        sp_write_brick(sp, &bp, li, bx, by, bz, raw, cache);
+        /* the value is correct either way (computed from cellv, not from
+         * disk); only the persistence outcome can fail, so still hand the
+         * caller `out` but report failure to signal the file needs a retry */
+        if (!sp_write_brick(sp, &bp, li, bx, by, bz, raw, cache)) rc = -1;
         if (out) memcpy(out, raw, SP_RAW);
         free(raw);
       } else {
