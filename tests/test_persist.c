@@ -301,6 +301,12 @@ static void test_regvol(const char *root, const char *tmp, const uint8_t *ref) {
   CHECK(fabs(P[3]) < 0.5 && fabs(P[7]) < 0.5 && fabs(P[11]) < 0.5);
   r3d_regvol_close(&rv);
   unlink(jp);
+  /* closing with a job still running must join it, not crash or hang
+   * (the GUI can close/replace the moving volume at any time) */
+  CHECK(r3d_regvol_open(&rv, root, fd) == 0);
+  CHECK(r3d_regvol_job_start(&rv, root, 2, ctr, 32, 0) == 0);
+  r3d_regvol_close(&rv); /* affine refine mid-flight */
+  r3d_regvol_close(&rv); /* double close is a no-op */
 }
 
 /* ---- tracer: save -> load round trip through the versioned sidecar ----- */
