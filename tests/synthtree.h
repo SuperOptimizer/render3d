@@ -23,7 +23,7 @@
  * constant volumes are the identity fixture for the display filters */
 static int st_const_value = -1;
 
-static uint8_t st_pat(uint32_t x, uint32_t y, uint32_t z) {
+static inline uint8_t st_pat(uint32_t x, uint32_t y, uint32_t z) {
   if (st_const_value >= 0) return (uint8_t)st_const_value;
   double v = 120.0 + 70.0 * sin((double)x * 0.113) * sin((double)y * 0.131) *
                          sin((double)z * 0.171);
@@ -39,7 +39,7 @@ static uint8_t st_pat(uint32_t x, uint32_t y, uint32_t z) {
 }
 
 /* level-L voxel = mean of its (2^L)^3 base voxels (L in 0..1 supported) */
-static uint8_t st_pat_lvl(uint32_t level, uint32_t x, uint32_t y, uint32_t z) {
+static inline uint8_t st_pat_lvl(uint32_t level, uint32_t x, uint32_t y, uint32_t z) {
   if (level == 0) return st_pat(x, y, z);
   uint32_t s = 0;
   for (uint32_t k = 0; k < 8; k++)
@@ -49,7 +49,7 @@ static uint8_t st_pat_lvl(uint32_t level, uint32_t x, uint32_t y, uint32_t z) {
 
 /* one 1024^3 shard covers up to 8^3 bricks: grids beyond that need more
  * shards, which the tests don't — keep nb* <= 8 */
-static int st_write_level(const char *root, uint32_t level, const uint32_t nb[3],
+static inline int st_write_level(const char *root, uint32_t level, const uint32_t nb[3],
                           bool content) {
   char dir[640], path[720], up[640];
   snprintf(up, sizeof up, "%s/c5d", root);
@@ -92,7 +92,7 @@ static int st_write_level(const char *root, uint32_t level, const uint32_t nb[3]
  * axis; nlev 1 or 2 (level 1 halves the dims, rounding up per c5d-lod).
  * Levels below content_min are written all-zero — cheap trees whose only
  * real payload is the pinned coarsest level. */
-static int st_make_tree(const char *root, const uint32_t dim[3], uint32_t nlev,
+static inline int st_make_tree(const char *root, const uint32_t dim[3], uint32_t nlev,
                         uint32_t content_min) {
   if (mkdir(root, 0755) != 0 && errno != EEXIST) return -1;
   char mp[640];
@@ -126,7 +126,7 @@ static int st_make_tree(const char *root, const uint32_t dim[3], uint32_t nlev,
   return 0;
 }
 
-static void st_rm_tree(const char *root, uint32_t nlev) {
+static inline void st_rm_tree(const char *root, uint32_t nlev) {
   char p[720];
   for (uint32_t l = 0; l < nlev; l++) {
     snprintf(p, sizeof p, "%s/c5d/L%u/0_0_0.c5s", root, l);

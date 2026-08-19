@@ -289,6 +289,18 @@ add_test(NAME overlay COMMAND test_overlay $<TARGET_FILE:render3d>)
 set_tests_properties(overlay PROPERTIES LABELS gpu TIMEOUT 300 SKIP_RETURN_CODE 77
   ENVIRONMENT "LSAN_OPTIONS=suppressions=${CMAKE_SOURCE_DIR}/lsan.supp")
 
+add_executable(test_flatpane tests/test_flatpane.c)
+target_link_libraries(test_flatpane PRIVATE r3d_core r3d_c5d r3d_warnings r3d_sanitize)
+add_test(NAME flatpane COMMAND test_flatpane $<TARGET_FILE:render3d>)
+set_tests_properties(flatpane PROPERTIES LABELS gpu TIMEOUT 300 SKIP_RETURN_CODE 77
+  ENVIRONMENT "LSAN_OPTIONS=suppressions=${CMAKE_SOURCE_DIR}/lsan.supp")
+
+add_executable(test_netstream tests/test_netstream.c)
+target_link_libraries(test_netstream PRIVATE r3d_c5d r3d_warnings r3d_sanitize m)
+add_test(NAME netstream COMMAND test_netstream $<TARGET_FILE:render3d>)
+set_tests_properties(netstream PROPERTIES LABELS gpu TIMEOUT 300 SKIP_RETURN_CODE 77
+  ENVIRONMENT "LSAN_OPTIONS=suppressions=${CMAKE_SOURCE_DIR}/lsan.supp")
+
 add_executable(test_postfilt tests/test_postfilt.c)
 target_link_libraries(test_postfilt PRIVATE r3d_c5d r3d_warnings r3d_sanitize m)
 add_test(NAME postfilt COMMAND test_postfilt $<TARGET_FILE:render3d>)
