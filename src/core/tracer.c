@@ -3478,6 +3478,148 @@ static double tr_om_eff(const r3d_tracer *t) {
  * Cauchy(1)-robustified; the free point is x. Normalizing by omega makes
  * one whole wrap of error cost ~w — commensurate with the other O(1)
  * residuals. */
+/* ==================== spiral fill (fit_spiral analogue) ====================
+ * Populate every EMPTY grid cell from the global spiral fit. (winding, z)
+ * flood outward from the traced cells — along i the winding advances by the
+ * arc one grid step subtends (step / (2 pi rho)), along j the z advances by
+ * the row pitch measured from existing rows — and each cell lands at the
+ * fit's forward position rho = r0(z) + harmonics(theta) + omega*w about the
+ * umbilicus centerline, theta phased to the traced cells. The refine pass
+ * that follows pulls the analytic sheet onto evidence. */
+static uint32_t tr_spiral_populate(r3d_tracer *t) {
+  if (!atomic_load(&t->sp_valid) || !t->uc || !t->wind || !t->pos) return 0;
+  uint32_t W = t->W, H = t->H;
+  double om = atomic_load(&t->sp_omega);
+  if (fabs(om) < 1e-9) return 0;
+  /* grid direction calibration from existing SET pairs: z per +j step and
+   * the winding sign per +i step (magnitudes come from the fit) */
+  double dzj = 0.0, dwi = 0.0;
+  uint64_t nzj = 0, nwi = 0;
+  for (uint32_t j = 0; j + 1 < H; j++)
+    for (uint32_t i = 0; i < W; i++) {
+      size_t k = (size_t)j * W + i;
+      if (t->state[k] == R3D_TR_SET && t->state[k + W] == R3D_TR_SET) {
+        dzj += t->pos[(k + W) * 3 + 2] - t->pos[k * 3 + 2];
+        nzj++;
+      }
+      if (i + 1 < W && t->state[k] == R3D_TR_SET && t->state[k + 1] == R3D_TR_SET) {
+        dwi += (double)t->wind[k + 1] - (double)t->wind[k];
+        nwi++;
+      }
+    }
+  if (!nzj || !nwi) return 0;
+  dzj /= (double)nzj;
+  double wsign = dwi >= 0.0 ? 1.0 : -1.0;
+  if (fabs(dzj) < 1e-6) dzj = t->cfg.step; /* single-row patch: assume +z */
+  /* theta phase: any traced cell ties winding to absolute angle */
+  double thr = 0.0, wr = 0.0;
+  bool have_ref = false;
+  for (size_t k = 0; k < (size_t)W * H && !have_ref; k++)
+    if (t->state[k] == R3D_TR_SET && tr_theta_of(t, t->pos + k * 3, &thr)) {
+      wr = (double)t->wind[k];
+      have_ref = true;
+    }
+  if (!have_ref) return 0;
+  double *wf = malloc((size_t)W * H * sizeof *wf);
+  double *zf = malloc((size_t)W * H * sizeof *zf);
+  uint8_t *hav = calloc((size_t)W * H, 1);
+  if (!wf || !zf || !hav) {
+    free(wf);
+    free(zf);
+    free(hav);
+    return 0;
+  }
+  for (size_t k = 0; k < (size_t)W * H; k++)
+    if (t->state[k] == R3D_TR_SET) {
+      wf[k] = (double)t->wind[k];
+      zf[k] = t->pos[k * 3 + 2];
+      hav[k] = 1;
+    }
+  /* multi-pass flood: an empty cell takes (w, z) from any settled
+   * 4-neighbour; i-steps advance the winding, j-steps advance z */
+  bool grew = true;
+  uint32_t pass = 0;
+  while (grew && pass++ < W + H) {
+    grew = false;
+    for (uint32_t j = 0; j < H; j++)
+      for (uint32_t i = 0; i < W; i++) {
+        size_t k = (size_t)j * W + i;
+        if (hav[k]) continue;
+        static const int nb[4][2] = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}};
+        for (int o = 0; o < 4; o++) {
+          int ii = (int)i + nb[o][0], jj = (int)j + nb[o][1];
+          if (ii < 0 || jj < 0 || ii >= (int)W || jj >= (int)H) continue;
+          size_t n = (size_t)jj * W + (size_t)ii;
+          if (!hav[n]) continue;
+          if (nb[o][1] == 0) { /* horizontal: winding advances by the arc
+                                * one grid step subtends at this radius */
+            double th = thr + 2.0 * M_PI * (wf[n] - wr);
+            double r0v;
+            tr_sp_r0_at(t, zf[n], &r0v, NULL);
+            double rho = r0v + t->sp_ab[0] * cos(th) + t->sp_ab[1] * sin(th) +
+                         t->sp_ab[2] * cos(2 * th) + t->sp_ab[3] * sin(2 * th) +
+                         om * wf[n];
+            if (fabs(rho) < 4.0) rho = rho < 0 ? -4.0 : 4.0;
+            double dw = wsign * t->cfg.step / (2.0 * M_PI * fabs(rho));
+            /* the neighbour sits at i + nb0: stepping back to k moves
+             * -nb0 along i */
+            wf[k] = wf[n] - (double)nb[o][0] * dw;
+            zf[k] = zf[n];
+          } else { /* vertical: z advances by the measured row pitch */
+            wf[k] = wf[n];
+            zf[k] = zf[n] - (double)nb[o][1] * dzj;
+          }
+          hav[k] = 1;
+          grew = true;
+          break;
+        }
+      }
+  }
+  /* stamp: forward map for every still-EMPTY cell inside the growth
+   * margins, respecting the tracer's z window and the volume extent */
+  uint32_t filled = 0;
+  uint32_t mvj = t->cfg.rib_rows ? 0u : 2u;
+  uint16_t g = (uint16_t)(t->gens_done ? (t->gens_done > 65535 ? 65535 : t->gens_done)
+                                       : 1u);
+  pthread_mutex_lock(&t->mu);
+  for (uint32_t j = mvj; j + mvj < H; j++)
+    for (uint32_t i = 2; i + 2 < W; i++) {
+      size_t k = (size_t)j * W + i;
+      if (t->state[k] != R3D_TR_EMPTY || !hav[k]) continue;
+      double z = zf[k], w = wf[k];
+      if (t->cfg.z_max > t->cfg.z_min && (z < t->cfg.z_min || z > t->cfg.z_max))
+        continue;
+      if (z < 1.0 || (t->vdim[2] > 0 && z > t->vdim[2] - 2.0)) continue;
+      double cx, cy;
+      if (!tr_uc_at(t, z, &cx, &cy, NULL, NULL)) continue;
+      double th = thr + 2.0 * M_PI * (w - wr);
+      double r0v;
+      tr_sp_r0_at(t, z, &r0v, NULL);
+      double rho = r0v + t->sp_ab[0] * cos(th) + t->sp_ab[1] * sin(th) +
+                   t->sp_ab[2] * cos(2 * th) + t->sp_ab[3] * sin(2 * th) + om * w;
+      if (rho < 4.0) continue; /* inside the core: off the physical sheet */
+      double x = cx + rho * cos(th), y = cy + rho * sin(th);
+      if (x < 1.0 || y < 1.0 || (t->vdim[0] > 0 && x > t->vdim[0] - 2.0) ||
+          (t->vdim[1] > 0 && y > t->vdim[1] - 2.0))
+        continue;
+      t->pos[k * 3 + 0] = x;
+      t->pos[k * 3 + 1] = y;
+      t->pos[k * 3 + 2] = z;
+      t->state[k] = R3D_TR_SET;
+      t->conf[k] = 0.4f; /* analytic guess: below traced cells' confidence */
+      t->wind[k] = (float)w;
+      if (t->gen_of) t->gen_of[k] = g;
+      t->nset++;
+      filled++;
+    }
+  pthread_mutex_unlock(&t->mu);
+  t->gen++;
+  free(wf);
+  free(zf);
+  free(hav);
+  return filled;
+}
+
 static void tr_res_wind(tr_nlsq *acc, const r3d_tracer *t, const double x[3],
                         double wnd, double wgt) {
   const tr_wf *wfp = t->wf;
@@ -5050,6 +5192,13 @@ static void *tr_worker(void *ud) {
   }
   uint32_t nf = 0;
   bool resume = t->nset > 0;
+  if (t->spiral_fill) { /* fill the grid from the fit; the refine branch
+                         * below polishes the analytic sheet onto evidence */
+    uint32_t filled = tr_spiral_populate(t);
+    printf("tracer: spiral fill placed %u cells from the fit\n", filled);
+    t->spiral_fill = false;
+    resume = t->nset > 0;
+  }
 
   if (!resume) {
     /* vc3d seed: one 2x2 quad at the origin, 0.1-voxel extent; the first
@@ -6507,6 +6656,24 @@ int r3d_tracer_refine(r3d_tracer *t) {
   if (pthread_create(&t->th, NULL, tr_worker, t) != 0) {
     t->running = false;
     t->refine = false;
+    return -1;
+  }
+  return 0;
+}
+
+int r3d_tracer_spiral_fill(r3d_tracer *t) {
+  if (t->running || !t->pos || !t->nset) return -1;
+  if (!atomic_load(&t->sp_valid)) return -1; /* needs a trusted fit */
+  t->spiral_fill = true;
+  t->refine = true; /* fill, then the solve-only polish pass */
+  t->quit = false;
+  t->done = false;
+  t->gen++;
+  t->running = true;
+  if (pthread_create(&t->th, NULL, tr_worker, t) != 0) {
+    t->running = false;
+    t->refine = false;
+    t->spiral_fill = false;
     return -1;
   }
   return 0;

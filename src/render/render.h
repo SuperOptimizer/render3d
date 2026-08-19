@@ -99,6 +99,12 @@ void r3d_bricks_regatlas_detach(r3d_renderer *r);
 /* Flattened viewer: bake the registration atlas into the surface volume's
  * overlay channel (replaces the ink tap while on). */
 void r3d_surfvol_regtap(r3d_renderer *r, bool on);
+/* Supervision-mask overlay for the flattened pane: a grid-space u8 class
+ * image ((grid_w-1)*up x (grid_h-1)*up; 0 unlabeled, 1 background, 2 ink)
+ * composited over the flattened render when overlay_flags bit 5 is set.
+ * Upload replaces the whole image; clear removes it. */
+int r3d_surfmask(r3d_renderer *r, const uint8_t *m, uint32_t w, uint32_t h);
+void r3d_surfmask_clear(r3d_renderer *r);
 /* Swap the active overlay tree for another (drains the decode job, reopens
  * readers + atlas, re-seeds resident bricks). No-op if already active. */
 int r3d_bricks_overlay_switch(r3d_renderer *r, const char *lod_root);

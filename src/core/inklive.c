@@ -58,6 +58,7 @@ struct il_job {
   const float *xyz;
   uint8_t *img;
   uint32_t rw, rh, up, W, H, gen, tid, nth, nl;
+  bool flip; /* verso: reverse the layer order (z-flip of the slab) */
   _Atomic uint32_t *abort;
 };
 
@@ -104,7 +105,11 @@ static void *il_sample_rows(void *ud) {
         double o = (double)l - (double)(nl - 1) / 2.0;
         double q[3] = {p[0] + o * n[0], p[1] + o * n[1], p[2] + o * n[2]};
         double val = r3d_cpuvol_tri(&il->vol, 0, q, NULL);
-        img[(size_t)l * W * H + (size_t)oy * W + ox] =
+        /* verso = the same symmetric sample set with the layer order
+         * reversed (equivalent to negating the normal): the model reads
+         * the slab from the other face of the sheet */
+        uint32_t lw = jb->flip ? nl - 1u - l : l;
+        img[(size_t)lw * W * H + (size_t)oy * W + ox] =
             (uint8_t)(val < 0 ? 0 : val > 255 ? 255 : val);
       }
     }
@@ -113,7 +118,7 @@ static void *il_sample_rows(void *ud) {
 }
 
 static uint8_t *il_sample(r3d_inklive *il, const float *xyz, uint32_t rw, uint32_t rh,
-                          uint32_t up, uint32_t gen, uint32_t nl, uint32_t *ow,
+                          uint32_t up, uint32_t gen, uint32_t nl, bool flip, uint32_t *ow,
                           uint32_t *oh) {
   uint32_t W = rw * up, H = rh * up;
   uint8_t *img = calloc((size_t)W * H * nl, 1);
@@ -129,7 +134,7 @@ static uint8_t *il_sample(r3d_inklive *il, const float *xyz, uint32_t rw, uint32
   for (uint32_t t = 0; t < nth; t++) {
     jobs[t] = (struct il_job){.il = il, .xyz = xyz, .img = img, .rw = rw, .rh = rh, .up = up,
                               .W = W, .H = H, .gen = gen, .tid = t, .nth = nth,
-                              .nl = nl, .abort = &abort_flag};
+                              .nl = nl, .flip = flip, .abort = &abort_flag};
     if (t + 1 < nth) {
       if (pthread_create(&th[spawned], NULL, il_sample_rows, &jobs[t]) == 0) spawned++;
       else il_sample_rows(&jobs[t]); /* no thread: do this stripe inline */
@@ -237,6 +242,7 @@ static void *il_worker(void *ud) {
     il->req_xyz = NULL;
     uint32_t rw = il->rw, rh = il->rh, i0 = il->ri0, j0 = il->rj0, up = il->up;
     uint32_t tta = il->req_tta;
+    bool flip = il->req_flip;
     /* TTA depth-shift range S (bits 8..11) beyond the built-in 2-layer
      * slack needs a deeper sampled slab: model depth 17 + 2*S layers */
     uint32_t dsr = (tta >> 8) & 0xfu;
@@ -248,7 +254,7 @@ static void *il_worker(void *ud) {
     double t0 = il_now_ms();
     if (xyz) il_prefetch(il, xyz, rw, rh, nl);
     uint32_t W = 0, H = 0;
-    uint8_t *stack = xyz ? il_sample(il, xyz, rw, rh, up, gen, nl, &W, &H) : NULL;
+    uint8_t *stack = xyz ? il_sample(il, xyz, rw, rh, up, gen, nl, flip, &W, &H) : NULL;
     double t_sampled = il_now_ms() - t0;
     free(xyz);
     float *pred = NULL;
@@ -365,7 +371,7 @@ void r3d_inklive_stop(r3d_inklive *il) {
 }
 
 void r3d_inklive_request(r3d_inklive *il, float *xyz, uint32_t i0, uint32_t j0,
-                         uint32_t w, uint32_t h, uint32_t up, uint32_t tta) {
+                         uint32_t w, uint32_t h, uint32_t up, uint32_t tta, bool flip) {
   if (!il->th_up) {
     free(xyz);
     return;
@@ -379,6 +385,7 @@ void r3d_inklive_request(r3d_inklive *il, float *xyz, uint32_t i0, uint32_t j0,
   il->rh = h;
   il->up = up;
   il->req_tta = tta;
+  il->req_flip = flip;
   atomic_fetch_add(&il->req_gen, 1);
   pthread_cond_broadcast(&il->cv);
   pthread_mutex_unlock(&il->mu);

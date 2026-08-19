@@ -1,12 +1,19 @@
-/* rendseg: flatten a traced tifxyz segment to an image. Surface positions
- * are bilinearly upsampled `up`x and sampled from a c5d LOD volume
- * (optionally averaged over +-span along the surface normal — vc3d's
- * layered flattened view collapsed to one image). Writes 8-bit grayscale
- * PNG (or PGM when the output path ends in .pgm). */
+/* rendseg: flatten a traced tifxyz segment to an image or a layered
+ * surface volume. Surface positions are bilinearly upsampled `up`x and
+ * sampled from a c5d LOD volume (optionally averaged over +-span along the
+ * surface normal — vc3d's layered flattened view collapsed to one image).
+ * Writes 8-bit grayscale PNG (or PGM when the output path ends in .pgm);
+ * --layers N writes an N-layer surface volume (vc_render_tifxyz parity):
+ * raw layer-major by default, or one PNG per layer with --stack png. Both
+ * stack forms carry a sidecar JSON with everything a consumer needs to
+ * register the stack against the segment grid and against masks/ink maps
+ * (tools/ink9/raw2zarr.py converts the raw form to zarr). */
+#include <errno.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <zlib.h>
 
 #include "core/cpuvol.h"
@@ -18,16 +25,21 @@
 
 int main(int argc, char **argv) {
   if (argc < 4) {
-    fprintf(stderr, "usage: rendseg <vol-root> <tifxyz-dir> <out.png|.pgm|.raw> "
-                    "[--level L] [--up N] [--span S] [--layers N] [--umbilicus F]\n"
-                    "  --layers N: write an N-layer surface volume (.raw u8,\n"
-                    "  layer-major, offsets centered on the surface, 1 voxel\n"
-                    "  apart along the normal) + a .json sidecar with dims\n");
+    fprintf(stderr, "usage: rendseg <vol-root> <tifxyz-dir> <out.png|.pgm|.raw|dir> "
+                    "[--level L] [--up N] [--span S] [--layers N] [--stack raw|png] "
+                    "[--umbilicus F]\n"
+                    "  --layers N: write an N-layer surface volume (offsets\n"
+                    "  centered on the surface, 1 voxel apart along the normal)\n"
+                    "  + a sidecar JSON with dims and registration metadata\n"
+                    "  --stack raw: <out> is a raw u8 layer-major file (default)\n"
+                    "  --stack png: <out> is a directory; layer_%%03u.png per\n"
+                    "  layer + stack.json (raw2zarr.py converts raw to zarr)\n");
     return 2;
   }
   uint32_t level = 1, up = 8, layers = 0;
   double span = 0.0; /* +-span along the normal, averaged */
   const char *umbp = NULL;
+  bool stack_png = false;
   for (int i = 4; i < argc; i++) {
     if (strcmp(argv[i], "--level") == 0 && i + 1 < argc)
       level = (uint32_t)strtoul(argv[++i], NULL, 10);
@@ -39,6 +51,8 @@ int main(int argc, char **argv) {
       layers = (uint32_t)strtoul(argv[++i], NULL, 10);
     else if (strcmp(argv[i], "--umbilicus") == 0 && i + 1 < argc)
       umbp = argv[++i];
+    else if (strcmp(argv[i], "--stack") == 0 && i + 1 < argc)
+      stack_png = strcmp(argv[++i], "png") == 0;
   }
   r3d_tifxyz s;
   if (r3d_tifxyz_load(&s, argv[2]) != 0) return 1;
@@ -126,38 +140,76 @@ int main(int argc, char **argv) {
   size_t ol = strlen(argv[3]);
   int rc2;
   if (layers) {
-    FILE *f = fopen(argv[3], "wb");
-    if (!f) return 1;
-    rc2 = fwrite(img, 1, (size_t)W * H * nl, f) == (size_t)W * H * nl ? 0 : -1;
-    if (fclose(f) != 0) rc2 = -1;
+    char jp[1400];
+    if (stack_png) { /* <out> is a directory: one PNG per layer */
+      if (mkdir(argv[3], 0755) != 0 && errno != EEXIST) {
+        fprintf(stderr, "rendseg: mkdir %s failed\n", argv[3]);
+        free(img);
+        return 1;
+      }
+      rc2 = 0;
+      for (uint32_t l = 0; l < nl && rc2 == 0; l++) {
+        snprintf(jp, sizeof jp, "%s/layer_%03u.png", argv[3], l);
+        rc2 = png_write_gray(jp, img + (size_t)l * W * H, W, H);
+      }
+      snprintf(jp, sizeof jp, "%s/stack.json", argv[3]);
+    } else {
+      FILE *f = fopen(argv[3], "wb");
+      if (!f) {
+        free(img);
+        return 1;
+      }
+      rc2 = fwrite(img, 1, (size_t)W * H * nl, f) == (size_t)W * H * nl ? 0 : -1;
+      if (fclose(f) != 0) rc2 = -1;
+      int jn = snprintf(jp, sizeof jp, "%s.json", argv[3]);
+      if (jn < 0 || (size_t)jn >= sizeof jp) rc2 = -1;
+    }
     if (rc2 == 0) {
-      char jp[1300];
-      snprintf(jp, sizeof jp, "%s.json", argv[3]);
+      /* registration metadata: enough for a consumer to map stack pixels
+       * back to grid cells (pixel (x,y) <-> grid (x/up, y/up)) and to
+       * validate a mask/ink map against the same surface (gw/gh/nvalid
+       * mirror the ink-map staleness guard). Layer pitch is 1 voxel in
+       * full-resolution space; intensities are read at LOD `level`. */
       FILE *jf = fopen(jp, "w");
       if (jf) {
-        fprintf(jf,
-                "{\"layers\": %u, \"height\": %u, \"width\": %u, "
-                "\"dtype\": \"u1\", \"order\": \"layer-major\", "
-                "\"surface_layer\": %u}\n",
-                nl, H, W, (nl - 1) / 2);
-        fclose(jf);
-      }
+        int jrc = fprintf(
+            jf,
+            "{\n  \"layers\": %u, \"height\": %u, \"width\": %u,\n"
+            "  \"dtype\": \"u1\", \"order\": \"%s\", \"surface_layer\": %u,\n"
+            "  \"up\": %u, \"grid_w\": %u, \"grid_h\": %u,\n"
+            "  \"scale\": [%.9g, %.9g], \"level\": %u, \"layer_pitch_vox\": 1,\n"
+            "  \"nvalid\": %llu,\n"
+            "  \"bbox\": [[%.3f, %.3f, %.3f], [%.3f, %.3f, %.3f]],\n"
+            "  \"segment\": \"%s\", \"volume\": \"%s\",\n"
+            "  \"umbilicus_oriented\": %s\n}\n",
+            nl, H, W, stack_png ? "png-per-layer" : "layer-major", (nl - 1) / 2, up,
+            s.w, s.h, (double)s.sx, (double)s.sy, level,
+            (unsigned long long)s.nvalid, (double)s.bbox[0][0], (double)s.bbox[0][1],
+            (double)s.bbox[0][2], (double)s.bbox[1][0], (double)s.bbox[1][1],
+            (double)s.bbox[1][2], argv[2], argv[1], orient ? "true" : "false");
+        if (jrc < 0 || fclose(jf) != 0) rc2 = -1;
+      } else
+        rc2 = -1;
     }
   } else if (ol > 4 && strcmp(argv[3] + ol - 4, ".pgm") == 0) {
     FILE *f = fopen(argv[3], "wb");
-    if (!f) return 1;
+    if (!f) {
+      free(img);
+      return 1;
+    }
     fprintf(f, "P5\n%u %u\n255\n", W, H);
     rc2 = fwrite(img, 1, (size_t)W * H, f) == (size_t)W * H ? 0 : -1;
     if (fclose(f) != 0) rc2 = -1;
   } else {
     rc2 = png_write_gray(argv[3], img, W, H);
   }
+  free(img);
   if (rc2 != 0) {
     fprintf(stderr, "rendseg: write failed (%s)\n", argv[3]);
     return 1;
   }
-  printf("wrote %s (%ux%u)\n", argv[3], W, H);
-  free(img);
+  printf("wrote %s (%ux%u%s)\n", argv[3], W, H,
+         layers ? (stack_png ? ", png stack" : ", raw stack") : "");
   r3d_umbilicus_free(&umb);
   r3d_tifxyz_free(&s);
   r3d_cpuvol_close(&v);

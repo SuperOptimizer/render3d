@@ -218,6 +218,7 @@ struct r3d_renderer {
     uint64_t synced_seen;
   } lbl, reg;
   bool reg_tap; /* flattened bake reads the registration atlas */
+  r3d_vkimage surfmask; /* flattened-pane supervision mask (binding 14) */
   bool sv_use_overlay; /* include the 3D overlay atlas in the flattened
                         * bake (true for ink trees; false for surface-
                         * prediction trees, which must never dress the
@@ -703,10 +704,14 @@ static int create_pipeline(r3d_renderer *r) {
        .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
        .descriptorCount = 1,
        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT},
+      {.binding = 14, /* flattened-pane supervision mask (grid-space R8) */
+       .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+       .descriptorCount = 1,
+       .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT},
   };
   VkDescriptorSetLayoutCreateInfo dslci = {
       .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-      .bindingCount = 14,
+      .bindingCount = 15,
       .pBindings = bindings,
   };
   if (vkCreateDescriptorSetLayout(r->vk.dev, &dslci, NULL, &r->dsl) != VK_SUCCESS) return -1;
@@ -752,7 +757,7 @@ static int create_pipeline(r3d_renderer *r) {
       {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, r->tile_descriptors + 8},
       {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1},
       {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1},
-      {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 2},
+      {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 3},
   };
   VkDescriptorPoolCreateInfo dpci = {
       .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
@@ -1257,6 +1262,7 @@ static void bricks_teardown(r3d_renderer *r) {
   r->surf_active = false;
   r3d_vkimage_destroy(&r->vk, &r->sv.vol);
   r3d_vkimage_destroy(&r->vk, &r->sv.pred);
+  r3d_vkimage_destroy(&r->vk, &r->surfmask);
   r3d_vkcomp_destroy(&r->vk, &r->sv.comp);
   memset(&r->sv, 0, sizeof r->sv);
   r->bricks_lod = false;
@@ -1419,6 +1425,7 @@ void r3d_destroy(r3d_renderer *r) {
   r3d_vkimage_destroy(&r->vk, &r->surf_normals);
   r3d_vkimage_destroy(&r->vk, &r->sv.vol);
   r3d_vkimage_destroy(&r->vk, &r->sv.pred);
+  r3d_vkimage_destroy(&r->vk, &r->surfmask);
   r3d_vkcomp_destroy(&r->vk, &r->sv.comp);
   r3d_vkimage_destroy(&r->vk, &r->offscreen);
   r3d_vkswap_destroy(&r->vk, &r->swap);
@@ -1899,6 +1906,7 @@ int r3d_surfvol_inkpred(r3d_renderer *r, const float *pred, uint32_t w, uint32_t
     pres_drain(r); /* queue ops need external sync */
   vkDeviceWaitIdle(r->vk.dev);
     r3d_vkimage_destroy(&r->vk, &r->sv.pred);
+  r3d_vkimage_destroy(&r->vk, &r->surfmask);
     if (r3d_vkimage_create(&r->vk, VK_FORMAT_R32_SFLOAT, (VkExtent3D){w, h, 1}, 1,
                            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                            &r->sv.pred) != 0)
@@ -1956,6 +1964,67 @@ void r3d_surfvol_inkpred_clear(r3d_renderer *r) {
   if (!r->sv.pred_on) return;
   r->sv.pred_on = false;
   r3d_surfvol_mark(r); /* re-bake without the prediction channel */
+  r->scene_gen++;
+}
+
+/* Supervision-mask overlay for the flattened pane: a grid-space u8 class
+ * image ((gw-1)*up x (gh-1)*up, 0 unlabeled / 1 background / 2 ink)
+ * composited by the surf-mode raycast on top of the baked window. The
+ * shader derives px-per-grid from this image's dims vs surf_coords', so no
+ * new frame parameters are needed; visibility rides overlay_flags bit 5. */
+int r3d_surfmask(r3d_renderer *r, const uint8_t *m, uint32_t w, uint32_t h) {
+  if (!m || !w || !h) return -1;
+  if (r->surfmask.extent.width != w || r->surfmask.extent.height != h) {
+    pres_drain(r); /* queue ops need external sync */
+    vkDeviceWaitIdle(r->vk.dev);
+    r3d_vkimage_destroy(&r->vk, &r->surfmask);
+    if (r3d_vkimage_create(&r->vk, VK_FORMAT_R8_UNORM, (VkExtent3D){w, h, 1}, 1,
+                           VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                           &r->surfmask) != 0)
+      return -1;
+    if (r3d_vk_image_to_general(&r->vk, r->pool, &r->surfmask) != 0) return -1;
+    write_image_dset(r, 14, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, r->surfmask.view,
+                     VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL);
+  }
+  {
+    r3d_vkbuf stage = {0};
+    VkDeviceSize bytes = (VkDeviceSize)w * h;
+    if (r3d_vkbuf_create_host(&r->vk, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &stage) != 0)
+      return -1;
+    memcpy(stage.mapped, m, bytes);
+    VkCommandBuffer cmd = r3d_vk_oneshot_begin(&r->vk, r->pool);
+    if (!cmd) {
+      r3d_vkbuf_destroy(&r->vk, &stage);
+      return -1;
+    }
+    r3d_vk_image_barrier(cmd, r->surfmask.img, VK_IMAGE_LAYOUT_GENERAL,
+                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                         VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT,
+                         VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, 0, 1);
+    VkBufferImageCopy reg = {
+        .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+        .imageExtent = {w, h, 1},
+    };
+    vkCmdCopyBufferToImage(cmd, stage.buf, r->surfmask.img,
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &reg);
+    r3d_vk_image_barrier(cmd, r->surfmask.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                         VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_COPY_BIT,
+                         VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                         VK_ACCESS_2_SHADER_SAMPLED_READ_BIT, 0, 1);
+    int urc = r3d_vk_oneshot_end(&r->vk, r->pool, cmd);
+    r3d_vkbuf_destroy(&r->vk, &stage);
+    if (urc != 0) return -1;
+  }
+  r->scene_gen++;
+  return 0;
+}
+
+void r3d_surfmask_clear(r3d_renderer *r) {
+  if (!r->surfmask.img) return;
+  pres_drain(r);
+  vkDeviceWaitIdle(r->vk.dev); /* in-flight frames may sample it */
+  r3d_vkimage_destroy(&r->vk, &r->surfmask);
   r->scene_gen++;
 }
 

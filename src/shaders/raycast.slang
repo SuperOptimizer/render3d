@@ -34,6 +34,9 @@ import common;
 // 3D labelling class-id atlas: same slot-parallel scheme; the user paints
 // class ids (1..8) and each class tints with its own palette color
 [[vk::binding(12, 0)]] Sampler3D<float> label_atlas;
+// flattened-pane supervision mask: grid-space class ids (0 none,
+// 1 background, 2 ink) painted by the user for ink-model fine-tuning
+[[vk::binding(14, 0)]] Texture2D<float> surfmask;
 // registration atlas: a second scan of the same scroll, CPU-resampled onto
 // this volume's brick grid through the current alignment transform. Fused
 // green (fixed) / magenta (moving) so misalignment shows as color fringes.
@@ -613,6 +616,23 @@ void main(uint3 tid_in: SV_DispatchThreadID) {
                              : float3(mip_max * pc.density);
     if (!composite && overlay_on())
       color = lerp(color, flat_overlay_color(), saturate(ink_max * pc.overlay_gain));
+    if ((pc.overlay_flags & 32u) != 0u) {
+      /* supervision mask: grid-space class image; px-per-grid derives from
+       * the mask's dims vs the segment grid's (surf_coords), so no extra
+       * frame parameters are needed. Nearest lookup: class ids don't blend */
+      float2 g = fu * float2(pc.vol_tx, pc.vol_ty);
+      uint2 md, gd2;
+      surfmask.GetDimensions(md.x, md.y);
+      surf_coords.GetDimensions(gd2.x, gd2.y);
+      float upx = float(md.x) / max(float(gd2.x) - 1.0, 1.0);
+      float upy = float(md.y) / max(float(gd2.y) - 1.0, 1.0);
+      int2 mp = int2(g.x * upx, g.y * upy);
+      if (mp.x >= 0 && mp.y >= 0 && mp.x < int(md.x) && mp.y < int(md.y)) {
+        uint mc = uint(round(surfmask.Load(int3(mp, 0)) * 255.0));
+        if (mc == 1u) color = lerp(color, float3(0.25, 0.45, 1.0), 0.45);
+        else if (mc >= 2u) color = lerp(color, float3(1.0, 0.55, 0.10), 0.55);
+      }
+    }
     store_px(opix, tid.xy, half, float4(color, 1));
     return;
   }

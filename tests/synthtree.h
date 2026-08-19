@@ -22,9 +22,21 @@
 /* >= 0: every voxel takes this value instead of the textured pattern —
  * constant volumes are the identity fixture for the display filters */
 static int st_const_value = -1;
+/* nonzero: bright spiral shells (rho = 30 + 14*w about (128,128), sheet
+ * ~2 voxels thick) — a plausible surface-prediction volume for the tracer */
+static int st_spiral_mode = 0;
 
 static inline uint8_t st_pat(uint32_t x, uint32_t y, uint32_t z) {
   if (st_const_value >= 0) return (uint8_t)st_const_value;
+  if (st_spiral_mode) {
+    (void)z;
+    double rho = hypot((double)x - 128.0, (double)y - 128.0);
+    if (rho < 16.0) return 8; /* core: no sheet */
+    double m = fmod(rho - 30.0, 14.0);
+    if (m < 0.0) m += 14.0;
+    double d = m < 7.0 ? m : 14.0 - m; /* radial distance to a wrap */
+    return d < 1.5 ? 220 : 12;
+  }
   double v = 120.0 + 70.0 * sin((double)x * 0.113) * sin((double)y * 0.131) *
                          sin((double)z * 0.171);
   double bx = (double)x - 90.0, by = (double)y - 140.0, bz = (double)z - 100.0;

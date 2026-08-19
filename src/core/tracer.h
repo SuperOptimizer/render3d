@@ -147,6 +147,8 @@ typedef struct r3d_tracer {
    * race (and a missable cancellation). */
   _Atomic bool running, quit, done;
   bool refine; /* solve-only pass in flight (no growth) */
+  bool spiral_fill; /* populate EMPTY cells from the global spiral fit
+                     * before the solve-only pass (fit_spiral analogue) */
   /* CT edge snap (solve-only, bsurf's rule as a soft term): each trusted
    * cell looks along its frozen normal in the raw CT for the nearest
    * papyrus->void crossing of ctsnap_cut within ctsnap_dist and is pulled
@@ -232,6 +234,14 @@ void r3d_tracer_set_anchors(r3d_tracer *t, const double *pts, uint32_t n);
  * polish smooths the seams. Existing cells persist; grid dims unchanged.
  * Poll snapshots as usual; done goes true when the pass ends. */
 int r3d_tracer_refine(r3d_tracer *t);
+
+/* Spiral fill (vc3d fit_spiral analogue): populate every EMPTY grid cell
+ * from the global spiral fit — winding/z flood outward from the traced
+ * cells, positions from the fit's forward map about the umbilicus
+ * centerline — then run the solve-only refine pass so evidence pulls the
+ * analytic sheet onto the papyrus. Stopped tracer with a valid spiral fit
+ * (sp_valid) only; CT-snap remains available afterwards. */
+int r3d_tracer_spiral_fill(r3d_tracer *t);
 /* Solve-only CT edge-snap pass: pull the traced sheet (which follows the
  * predictions) onto the actual papyrus/void interface in the raw CT at
  * ct_root, each cell moving only along its frozen normal and never

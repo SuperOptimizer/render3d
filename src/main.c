@@ -66,6 +66,125 @@ enum { PHERC1218_NX = 8192, PHERC1218_NY = 8192, PHERC1218_NZ = 23552 };
  * so 2.5D ink is deterministic — computed once (tiled, native resolution)
  * and cached beside the segment store as <store>/<name>.inkmap. Live
  * per-view inference remains only for changing (tracer) grids. */
+/* Full-map tiling: each tile request carries a context margin so the model
+ * sees real receptive field at tile edges, and finished tiles are blended
+ * into the map with a linear ramp over the shared margin (prob/wsum
+ * accumulation, the same scheme the server uses between its own patches).
+ * The old 2-cell margin with a hard stitch left visible tile seams. */
+#define INKMAP_MARGIN_CELLS 16u
+static uint32_t inkmap_tile_cells(uint32_t up) {
+  uint32_t its = R3D_INKLIVE_MAX_PX / (up ? up : 1);
+  uint32_t m2 = 2u * INKMAP_MARGIN_CELLS;
+  return its > m2 + 8u ? its - m2 : 8u;
+}
+
+/* Flattened-pane supervision mask (ink fine-tuning loop): a grid-space u8
+ * class image at ink-map resolution ((gw-1)*up x (gh-1)*up), painted with
+ * the mouse on the flattened pane. 0 unlabeled, 1 background (clearly no
+ * ink), 2 ink. Exported as mask.png in the exact pixel grid of ink.png and
+ * the rendseg stack, so stack + ink + mask register for fine-tuning. */
+static uint8_t *g_smask = NULL;
+static uint32_t g_smask_w, g_smask_h, g_smask_up, g_smask_gw, g_smask_gh;
+static uint64_t g_smask_nvalid;
+static bool g_smask_show = true, g_smask_paint = false;
+static bool g_smask_gpu_dirty = false, g_smask_disk_dirty = false;
+static int g_smask_class = 2; /* 2 ink, 1 background, 0 erase */
+static float g_smask_brush = 2.0f; /* grid cells */
+static bool g_smask_stroke = false;
+static double g_smask_prev[2];
+
+#define SMASK_MAGIC 0x314B534Du /* 'MSK1' */
+
+static int smask_save_file(const char *path) {
+  if (!g_smask) return -1;
+  char tmp[1240];
+  snprintf(tmp, sizeof tmp, "%s.tmp", path);
+  FILE *f = fopen(tmp, "wb");
+  if (!f) return -1;
+  uint32_t hdr[8] = {SMASK_MAGIC, g_smask_w, g_smask_h, g_smask_up, g_smask_gw,
+                     g_smask_gh, (uint32_t)(g_smask_nvalid & 0xffffffffu),
+                     (uint32_t)(g_smask_nvalid >> 32)};
+  int ok = fwrite(hdr, sizeof hdr, 1, f) == 1 &&
+           fwrite(g_smask, 1, (size_t)g_smask_w * g_smask_h, f) ==
+               (size_t)g_smask_w * g_smask_h;
+  if (fclose(f) != 0) ok = 0;
+  if (!ok) {
+    remove(tmp);
+    return -1;
+  }
+  remove(path);
+  return rename(tmp, path);
+}
+
+static bool smask_load_file(const char *path, uint32_t gw, uint32_t gh, uint64_t nvalid) {
+  FILE *f = fopen(path, "rb");
+  if (!f) return false;
+  uint32_t hdr[8];
+  bool ok = false;
+  if (fread(hdr, sizeof hdr, 1, f) == 1 && hdr[0] == SMASK_MAGIC && hdr[1] && hdr[2] &&
+      hdr[1] < 32768 && hdr[2] < 32768 && hdr[4] == gw && hdr[5] == gh &&
+      ((uint64_t)hdr[6] | ((uint64_t)hdr[7] << 32)) == nvalid) {
+    uint8_t *m = malloc((size_t)hdr[1] * hdr[2]);
+    if (m && fread(m, 1, (size_t)hdr[1] * hdr[2], f) == (size_t)hdr[1] * hdr[2]) {
+      free(g_smask);
+      g_smask = m;
+      g_smask_w = hdr[1];
+      g_smask_h = hdr[2];
+      g_smask_up = hdr[3] ? hdr[3] : 1;
+      g_smask_gw = gw;
+      g_smask_gh = gh;
+      g_smask_nvalid = nvalid;
+      g_smask_gpu_dirty = true;
+      g_smask_disk_dirty = false;
+      ok = true;
+    } else
+      free(m);
+  }
+  fclose(f);
+  return ok;
+}
+
+/* stamp a class disc at grid coords (u, v), radius in grid cells */
+static void smask_stamp(double u, double v, double rad_cells, uint8_t cls) {
+  if (!g_smask) return;
+  double cx = u * g_smask_up, cy = v * g_smask_up, r = rad_cells * g_smask_up;
+  int64_t x0 = (int64_t)floor(cx - r), x1 = (int64_t)ceil(cx + r);
+  int64_t y0 = (int64_t)floor(cy - r), y1 = (int64_t)ceil(cy + r);
+  if (x0 < 0) x0 = 0;
+  if (y0 < 0) y0 = 0;
+  if (x1 >= (int64_t)g_smask_w) x1 = (int64_t)g_smask_w - 1;
+  if (y1 >= (int64_t)g_smask_h) y1 = (int64_t)g_smask_h - 1;
+  double r2 = r * r;
+  for (int64_t y = y0; y <= y1; y++)
+    for (int64_t x = x0; x <= x1; x++) {
+      double dx = (double)x - cx, dy = (double)y - cy;
+      if (dx * dx + dy * dy > r2) continue;
+      g_smask[(size_t)y * g_smask_w + (size_t)x] = cls;
+    }
+  g_smask_gpu_dirty = g_smask_disk_dirty = true;
+}
+
+/* autosave (when the segment has a traced dir) + free + clear the overlay;
+ * call BEFORE mv_seg / the active-segment name changes */
+static void smask_drop(r3d_renderer *renderer, const char *segname) {
+  if (g_smask && g_smask_disk_dirty && segname && segname[0]) {
+    char dir[320];
+    snprintf(dir, sizeof dir, "cache/traced/%s", segname);
+    struct stat st;
+    if (stat(dir, &st) == 0) {
+      char path[400];
+      snprintf(path, sizeof path, "%s/mask.inkmask", dir);
+      if (smask_save_file(path) == 0)
+        printf("inklive: supervision mask saved -> %s\n", path);
+    }
+  }
+  free(g_smask);
+  g_smask = NULL;
+  g_smask_gpu_dirty = g_smask_disk_dirty = false;
+  g_smask_stroke = false;
+  if (renderer) r3d_surfmask_clear(renderer);
+}
+
 static int inkmap_save(const char *path, const float *m, uint32_t w, uint32_t h,
                        uint32_t up, uint32_t gw, uint32_t gh, uint64_t nvalid) {
   char tmp[1240];
@@ -129,7 +248,7 @@ static float *inkmap_load(const char *path, uint32_t *w, uint32_t *h, uint32_t *
  * exist (segments that came from elsewhere). */
 static void inkmap_save_segdir(const char *name, const float *m, uint32_t w,
                                uint32_t h, uint32_t up, uint32_t gw, uint32_t gh,
-                               uint64_t nvalid);
+                               uint64_t nvalid, bool verso);
 
 /* CT sampler for the boundary-surface grower: cpuvol over the bricks tree,
  * base level (the papyrus/void edge is a voxel-scale feature) */
@@ -435,13 +554,14 @@ static int inkmap_save(const char *path, const float *m, uint32_t w, uint32_t h,
 
 static void inkmap_save_segdir(const char *name, const float *m, uint32_t w,
                                uint32_t h, uint32_t up, uint32_t gw, uint32_t gh,
-                               uint64_t nvalid) {
+                               uint64_t nvalid, bool verso) {
   char dir[320];
   snprintf(dir, sizeof dir, "cache/traced/%s", name);
   struct stat st;
   if (stat(dir, &st) != 0) return; /* not one of our traced segments */
+  const char *side = verso ? "-verso" : "";
   char path[400];
-  snprintf(path, sizeof path, "%s/ink.inkmap", dir);
+  snprintf(path, sizeof path, "%s/ink%s.inkmap", dir, side);
   inkmap_save(path, m, w, h, up, gw, gh, nvalid);
   uint8_t *px = malloc((size_t)w * h);
   if (px) {
@@ -449,7 +569,7 @@ static void inkmap_save_segdir(const char *name, const float *m, uint32_t w,
       float v = m[k] * 255.0f;
       px[k] = (uint8_t)(v < 0.0f ? 0.0f : (v > 255.0f ? 255.0f : v));
     }
-    snprintf(path, sizeof path, "%s/ink.png", dir);
+    snprintf(path, sizeof path, "%s/ink%s.png", dir, side);
     if (r3d_png_write_gray(path, px, w, h) == 0)
       printf("inklive: ink image -> %s\n", path);
     free(px);
@@ -1874,12 +1994,15 @@ int main(int argc, char **argv) {
                              * flattened pane (worker keeps predicting) */
   /* full-surface ink map state (see inkmap_save/load) */
   float *inkmap = NULL;
+  float *inkmap_acc = NULL, *inkmap_wsum = NULL; /* tile-blend accumulators */
   uint32_t inkmap_w = 0, inkmap_h = 0, inkmap_up = 1;
   bool inkmap_have = false, inkmap_uploaded = false, inkmap_job = false;
   /* TTA/ensemble bitmask for full-map computes (bit0 flips, bit1 depth
    * shift, bit2 intensity, bit3 checkpoint ensemble); live view stays at
    * 0 unless explicitly opted in - TTA multiplies inference cost. */
   uint32_t inkmap_tta = 0x9; /* flips + ensemble: best quality/cost */
+  bool ink_verso = false;    /* sample the slab from the reverse face
+                              * (vc3d --direction both: verso ink) */
   /* background ink queue: harvested traces are ink-mapped automatically
    * (no TTA), one at a time, without touching the display */
   char ink_q[24][160];
@@ -2375,6 +2498,10 @@ int main(int argc, char **argv) {
       inklive_up = false;
       inklive_have = false;
       free(inkmap);
+      free(inkmap_acc);
+      inkmap_acc = NULL;
+      free(inkmap_wsum);
+      inkmap_wsum = NULL;
       inkmap = NULL;
       inkmap_have = inkmap_uploaded = inkmap_job = false;
       im_req_out = false;
@@ -2822,6 +2949,7 @@ int main(int argc, char **argv) {
         sgc.act_coords = sgc.act_normals = NULL;
         pthread_mutex_unlock(&sgc.mu);
         if (r3d_surf_swap(renderer, ns.w, ns.h, co, no, ns.sx, ns.sy) == 0) {
+          smask_drop(renderer, sgc_active); /* mask belongs to the old segment */
           r3d_tifxyz_free(&mv_seg);
           r3d_segrows_free(&mv_rows);
           free(mv_normals);
@@ -2862,6 +2990,10 @@ int main(int argc, char **argv) {
                                                 * tint the new surface */
           if (!imq_active) { /* a queue job owns the buffer; leave it */
             free(inkmap);
+            free(inkmap_acc);
+            inkmap_acc = NULL;
+            free(inkmap_wsum);
+            inkmap_wsum = NULL;
             inkmap = NULL;
             inkmap_job = false;
             im_req_out = false;
@@ -2869,12 +3001,13 @@ int main(int argc, char **argv) {
           inkmap_have = inkmap_uploaded = false;
           inkmap_path[0] = 0;
           if (seg_store_path && sgc_active[0] && !imq_active) {
-            snprintf(inkmap_path, sizeof inkmap_path, "%s/%s.inkmap", seg_store_path,
-                     sgc_active);
+            snprintf(inkmap_path, sizeof inkmap_path, "%s/%s%s.inkmap", seg_store_path,
+                     sgc_active, ink_verso ? "-verso" : "");
             uint32_t lw, lh, lup;
             /* the copy living WITH the segment wins; store cache second */
             char sdp[400];
-            snprintf(sdp, sizeof sdp, "cache/traced/%s/ink.inkmap", sgc_active);
+            snprintf(sdp, sizeof sdp, "cache/traced/%s/ink%s.inkmap", sgc_active,
+                     ink_verso ? "-verso" : "");
             float *lm = inkmap_load(sdp, &lw, &lh, &lup, mv_seg.w, mv_seg.h,
                                     mv_seg.nvalid);
             if (!lm)
@@ -2888,6 +3021,11 @@ int main(int argc, char **argv) {
               inkmap_have = true; /* upload happens in the frame loop */
               printf("inklive: cached ink map found (%ux%u)\n", lw, lh);
             }
+            char smp[400]; /* the segment's saved supervision mask, if any */
+            snprintf(smp, sizeof smp, "cache/traced/%s/mask.inkmask", sgc_active);
+            if (smask_load_file(smp, mv_seg.w, mv_seg.h, mv_seg.nvalid))
+              printf("inklive: supervision mask loaded (%ux%u)\n", g_smask_w,
+                     g_smask_h);
           }
           if (r3d_tifxyz_valid(mc2) &&
               (mc2[0] >= (float)brick_shape[0] || mc2[1] >= (float)brick_shape[1] ||
@@ -3206,6 +3344,54 @@ int main(int argc, char **argv) {
         }
         if (!painted) g_lbl_stroke = false;
       }
+      { /* supervision-mask painting: plain LMB drag over the FLATTENED pane
+         * while the mask paint mode is on (plain LMB is idle there too) */
+        bool mpainted = false;
+        if (g_smask_paint && mv_seg.w > 2 && in.lmb_held && !in.ctrl &&
+            !io->WantCaptureMouse) {
+          int av = r3d_mv_hit(mv, in.mouse_xy[0], in.mouse_xy[1]);
+          if (av == R3D_MV_SEG) {
+            double su, sv;
+            r3d_mv_unproject(&mv[av], in.mouse_xy[0], in.mouse_xy[1], &su, &sv);
+            if (su >= 0.0 && sv >= 0.0 && su < (double)mv_seg.w - 1.0 &&
+                sv < (double)mv_seg.h - 1.0) {
+              if (!g_smask) { /* lazy alloc at the ink-map pixel convention */
+                uint32_t iup = (uint32_t)lround(1.0 / (double)mv_seg.sx);
+                if (iup < 1) iup = 1;
+                g_smask_up = iup;
+                g_smask_w = (mv_seg.w - 1) * iup;
+                g_smask_h = (mv_seg.h - 1) * iup;
+                g_smask_gw = mv_seg.w;
+                g_smask_gh = mv_seg.h;
+                g_smask_nvalid = mv_seg.nvalid;
+                g_smask = calloc((size_t)g_smask_w * g_smask_h, 1);
+              }
+              if (g_smask) {
+                double rad = (double)g_smask_brush;
+                uint8_t cls = (uint8_t)g_smask_class;
+                if (g_smask_stroke) { /* stamp along the drag */
+                  double dx = su - g_smask_prev[0], dy = sv - g_smask_prev[1];
+                  double dist = sqrt(dx * dx + dy * dy);
+                  double step = rad * 0.5 > 0.2 ? rad * 0.5 : 0.2;
+                  int nstep = (int)ceil(dist / step);
+                  if (nstep < 1) nstep = 1;
+                  for (int k = 1; k <= nstep; k++) {
+                    double t = (double)k / (double)nstep;
+                    smask_stamp(g_smask_prev[0] + dx * t, g_smask_prev[1] + dy * t,
+                                rad, cls);
+                  }
+                } else
+                  smask_stamp(su, sv, rad, cls);
+                g_smask_stroke = true;
+                g_smask_prev[0] = su;
+                g_smask_prev[1] = sv;
+                mpainted = true;
+              }
+            }
+          }
+        }
+        if (!mpainted) g_smask_stroke = false;
+      }
       if (in.annotate_click && in.click_ctrl) { /* Ctrl+click = set focus POI */
         int cv_ = r3d_mv_hit(mv, in.click_xy[0], in.click_xy[1]);
         bool focused = false, have_ij = false;
@@ -3352,12 +3538,15 @@ int main(int argc, char **argv) {
            * is up (the GUI button lives in a collapsed panel) */
           uint32_t iup = (uint32_t)lround(1.0 / (double)mv_seg.sx);
           if (iup < 1) iup = 1;
-          uint32_t its = R3D_INKLIVE_MAX_PX / iup;
-          its = its > 8 ? its - 8 : 8;
+          uint32_t its = inkmap_tile_cells(iup);
           inkmap_up = iup;
           inkmap_w = (mv_seg.w - 1) * iup;
           inkmap_h = (mv_seg.h - 1) * iup;
           free(inkmap);
+          free(inkmap_acc);
+          inkmap_acc = NULL;
+          free(inkmap_wsum);
+          inkmap_wsum = NULL;
           inkmap = calloc((size_t)inkmap_w * inkmap_h, sizeof *inkmap);
           if (inkmap) {
             im_ts = its;
@@ -3377,8 +3566,7 @@ int main(int argc, char **argv) {
           if (r3d_tifxyz_load(&imq_seg, dir2) == 0 && imq_seg.w > 2) {
             uint32_t iup = (uint32_t)lround(1.0 / (double)imq_seg.sx);
             if (iup < 1) iup = 1;
-            uint32_t its = R3D_INKLIVE_MAX_PX / iup;
-            its = its > 8 ? its - 8 : 8;
+            uint32_t its = inkmap_tile_cells(iup);
             /* the display map (if any) yields its buffer; its disk cache
              * survives and reloads on the next activation */
             inkmap_have = inkmap_uploaded = false;
@@ -3386,6 +3574,10 @@ int main(int argc, char **argv) {
             inkmap_w = (imq_seg.w - 1) * iup;
             inkmap_h = (imq_seg.h - 1) * iup;
             free(inkmap);
+            free(inkmap_acc);
+            inkmap_acc = NULL;
+            free(inkmap_wsum);
+            inkmap_wsum = NULL;
             inkmap = calloc((size_t)inkmap_w * inkmap_h, sizeof *inkmap);
             if (inkmap) {
               im_ts = its;
@@ -3431,7 +3623,7 @@ int main(int argc, char **argv) {
            * partial map re-uploads so progress is visible */
           uint32_t up = inkmap_up;
           const r3d_tifxyz *IMS = imq_active ? &imq_seg : &mv_seg;
-          const uint32_t m = 2; /* context margin, grid cells */
+          const uint32_t m = INKMAP_MARGIN_CELLS; /* context margin, cells */
           if (!im_req_out) {
             uint32_t c0x = im_tx * im_ts, c0y = im_ty * im_ts;
             uint32_t c1x = c0x + im_ts, c1y = c0y + im_ts;
@@ -3456,7 +3648,8 @@ int main(int argc, char **argv) {
                   }
                 }
               r3d_inklive_request(&inklive, xyz, r0x, r0y, rw, rh, up,
-                                  imq_active ? 0u : inkmap_tta);
+                                  imq_active ? 0u : inkmap_tta,
+                                  imq_active ? false : ink_verso);
               im_req_out = true;
             } else {
               free(xyz);
@@ -3470,7 +3663,7 @@ int main(int argc, char **argv) {
             { /* accept only THIS tile's result (a superseded request from
                  an aborted pass could still be in flight) */
               uint32_t e0x = im_tx * im_ts, e0y = im_ty * im_ts;
-              uint32_t er0x = e0x > 2 ? e0x - 2 : 0, er0y = e0y > 2 ? e0y - 2 : 0;
+              uint32_t er0x = e0x > m ? e0x - m : 0, er0y = e0y > m ? e0y - m : 0;
               if (pi0 != er0x || pj0 != er0y) goto ink_poll_done;
             }
             im_req_out = false;
@@ -3478,13 +3671,45 @@ int main(int argc, char **argv) {
             uint32_t c1x = c0x + im_ts, c1y = c0y + im_ts;
             if (c1x > IMS->w - 1) c1x = IMS->w - 1;
             if (c1y > IMS->h - 1) c1y = IMS->h - 1;
-            for (uint32_t py = c0y * pup; py < c1y * pup && py < inkmap_h; py++) {
-              uint32_t sy = py - pj0 * pup;
-              if (sy >= ph2) continue;
-              for (uint32_t px = c0x * pup; px < c1x * pup && px < inkmap_w; px++) {
-                uint32_t sx2 = px - pi0 * pup;
-                if (sx2 >= pw2) continue;
-                inkmap[(size_t)py * inkmap_w + px] = pred[(size_t)sy * pw2 + sx2];
+            /* blended stitch: weight 1 inside the tile core, linear ramp
+             * to 0 across the context margin; overlapping margins
+             * accumulate prob*w and w and normalize (the server's own
+             * inter-patch scheme, applied between tiles) so boundaries
+             * are seamless instead of hard-edged */
+            if (!inkmap_acc)
+              inkmap_acc = calloc((size_t)inkmap_w * inkmap_h, sizeof *inkmap_acc);
+            if (!inkmap_wsum)
+              inkmap_wsum = calloc((size_t)inkmap_w * inkmap_h, sizeof *inkmap_wsum);
+            if (!inkmap_acc || !inkmap_wsum) {
+              inkmap_job = false; /* allocation failed: abort the pass */
+              goto ink_poll_done;
+            }
+            {
+              double mpx = (double)INKMAP_MARGIN_CELLS * pup;
+              double bx0 = (double)((uint64_t)c0x * pup);
+              double bx1 = (double)((uint64_t)c1x * pup) - 1.0;
+              double by0 = (double)((uint64_t)c0y * pup);
+              double by1 = (double)((uint64_t)c1y * pup) - 1.0;
+              for (uint32_t sy = 0; sy < ph2; sy++) {
+                uint32_t py = pj0 * pup + sy;
+                if (py >= inkmap_h) break;
+                double wy = 1.0;
+                if ((double)py < by0) wy = 1.0 - (by0 - (double)py) / mpx;
+                else if ((double)py > by1) wy = 1.0 - ((double)py - by1) / mpx;
+                if (wy <= 0.0) continue;
+                for (uint32_t sx2 = 0; sx2 < pw2; sx2++) {
+                  uint32_t px = pi0 * pup + sx2;
+                  if (px >= inkmap_w) break;
+                  double wx = 1.0;
+                  if ((double)px < bx0) wx = 1.0 - (bx0 - (double)px) / mpx;
+                  else if ((double)px > bx1) wx = 1.0 - ((double)px - bx1) / mpx;
+                  if (wx <= 0.0) continue;
+                  float wgt = (float)(wx * wy);
+                  size_t k = (size_t)py * inkmap_w + px;
+                  inkmap_acc[k] += pred[(size_t)sy * pw2 + sx2] * wgt;
+                  inkmap_wsum[k] += wgt;
+                  inkmap[k] = inkmap_acc[k] / inkmap_wsum[k];
+                }
               }
             }
             if (!imq_active) { /* live progress on the displayed segment */
@@ -3511,9 +3736,13 @@ int main(int argc, char **argv) {
                 char *dot = strstr(nm, ".inkmap");
                 if (dot) *dot = 0;
                 inkmap_save_segdir(nm, inkmap, inkmap_w, inkmap_h, inkmap_up,
-                                   IMS->w, IMS->h, IMS->nvalid);
+                                   IMS->w, IMS->h, IMS->nvalid, false);
               }
               free(inkmap);
+              free(inkmap_acc);
+              inkmap_acc = NULL;
+              free(inkmap_wsum);
+              inkmap_wsum = NULL;
               inkmap = NULL;
               r3d_tifxyz_free(&imq_seg);
               memset(&imq_seg, 0, sizeof imq_seg);
@@ -3527,7 +3756,7 @@ int main(int argc, char **argv) {
                 printf("inklive: full ink map saved -> %s\n", inkmap_path);
               if (sgc_active[0]) /* the detection travels with the surface */
                 inkmap_save_segdir(sgc_active, inkmap, inkmap_w, inkmap_h,
-                                   inkmap_up, IMS->w, IMS->h, IMS->nvalid);
+                                   inkmap_up, IMS->w, IMS->h, IMS->nvalid, ink_verso);
             } else {
               printf("inklive: ink map tile %u/%u\n", im_ty * im_ntx + im_tx,
                      im_ntx * im_nty);
@@ -3775,6 +4004,7 @@ int main(int argc, char **argv) {
       if (es.xyz && r3d_segrows_build(&es, &er) == 0 &&
           mv_build_grids(&es, &eco, &eno) == 0 &&
           r3d_surf_swap(renderer, es.w, es.h, eco, eno, es.sx, es.sy) == 0) {
+        smask_drop(renderer, sgc_active); /* mask belongs to the old segment */
         r3d_tifxyz_free(&mv_seg);
         r3d_segrows_free(&mv_rows);
         free(mv_normals);
@@ -4407,6 +4637,23 @@ int main(int argc, char **argv) {
             GT->gen = 0; /* refresh the live view */
           }
         }
+        if (GT->done && GT->nset > 0 && atomic_load(&GT->tr.sp_valid)) {
+          igSameLine(0, 8);
+          if (igButton("spiral fill", (ImVec2){0, 0})) {
+            /* fit_spiral analogue: populate every empty grid cell from the
+             * global spiral fit, then polish onto evidence (no growth) */
+            r3d_tracer_stop(&GT->tr);
+            if (r3d_tracer_spiral_fill(&GT->tr) == 0) {
+              GT->done = false;
+              GT->gen = 0; /* force a fresh snapshot/live swap */
+            }
+          }
+          if (igIsItemHovered(0))
+            igSetTooltip("fill the whole grid from the fitted spiral\n"
+                         "(omega %.1f, rms %.2f) and refine onto evidence;\n"
+                         "follow with 'snap to CT edge' for the final fit",
+                         atomic_load(&GT->tr.sp_omega), atomic_load(&GT->tr.sp_rms));
+        }
         if (GT->done && GT->nset > 0 && mv_anchor_n) {
           igSameLine(0, 8);
           if (igButton("re-solve", (ImVec2){0, 0})) {
@@ -4612,6 +4859,46 @@ int main(int argc, char **argv) {
       }
     if (inklive_up && igCollapsingHeader_TreeNodeFlags("live ink", 0)) {
       igCheckbox("show ink on flattened view", &inklive_show);
+      igBeginDisabled(inkmap_job);
+      if (igCheckbox("verso (reverse side)##inkverso", &ink_verso)) {
+        /* side switch: drop the displayed map and pick up the other
+         * side's cache if it exists; otherwise 'compute' builds it */
+        inklive_have = false;
+        r3d_surfvol_inkpred_clear(renderer);
+        free(inkmap);
+        free(inkmap_acc);
+        inkmap_acc = NULL;
+        free(inkmap_wsum);
+        inkmap_wsum = NULL;
+        inkmap = NULL;
+        inkmap_have = inkmap_uploaded = false;
+        inkmap_path[0] = 0;
+        if (seg_store_path && sgc_active[0]) {
+          snprintf(inkmap_path, sizeof inkmap_path, "%s/%s%s.inkmap", seg_store_path,
+                   sgc_active, ink_verso ? "-verso" : "");
+          uint32_t lw, lh, lup;
+          char sdp[400];
+          snprintf(sdp, sizeof sdp, "cache/traced/%s/ink%s.inkmap", sgc_active,
+                   ink_verso ? "-verso" : "");
+          float *lm = inkmap_load(sdp, &lw, &lh, &lup, mv_seg.w, mv_seg.h,
+                                  mv_seg.nvalid);
+          if (!lm)
+            lm = inkmap_load(inkmap_path, &lw, &lh, &lup, mv_seg.w, mv_seg.h,
+                             mv_seg.nvalid);
+          if (lm) {
+            inkmap = lm;
+            inkmap_w = lw;
+            inkmap_h = lh;
+            inkmap_up = lup;
+            inkmap_have = true;
+          }
+        }
+      }
+      igEndDisabled();
+      if (igIsItemHovered(0))
+        igSetTooltip("run ink detection from the sheet's other face: the\n"
+                     "slab is sampled with reversed layer order (vc3d\n"
+                     "--direction both). Each side keeps its own cached map");
       if (igTreeNode_Str("TTA / ensemble")) {
         /* applied to full-map computes; each option multiplies inference
          * time (flips x4, depth +2, intensity +2, ensemble x models) */
@@ -4654,12 +4941,15 @@ int main(int argc, char **argv) {
            * disk so this only ever runs once per saved segment */
           uint32_t iup = (uint32_t)lround(1.0 / (double)mv_seg.sx);
           if (iup < 1) iup = 1;
-          uint32_t its = R3D_INKLIVE_MAX_PX / iup;
-          its = its > 8 ? its - 8 : 8; /* room for the context margin */
+          uint32_t its = inkmap_tile_cells(iup);
           inkmap_up = iup;
           inkmap_w = (mv_seg.w - 1) * iup;
           inkmap_h = (mv_seg.h - 1) * iup;
           free(inkmap);
+          free(inkmap_acc);
+          inkmap_acc = NULL;
+          free(inkmap_wsum);
+          inkmap_wsum = NULL;
           inkmap = calloc((size_t)inkmap_w * inkmap_h, sizeof *inkmap);
           if (inkmap) {
             im_ts = its;
@@ -4674,6 +4964,67 @@ int main(int argc, char **argv) {
         }
         if (sgc_active[0] == 0)
           igTextDisabled("(unsaved trace: map won't be cached to disk)");
+      }
+      if (mv_seg.w > 2 && igTreeNode_Str("supervision mask")) {
+        /* conservatively label clear strokes (ink) and trustworthy empty
+         * areas (background) on the flattened view; exported masks share
+         * ink.png's exact pixel grid, so stack + ink + mask register for
+         * fine-tuning (the post's iterative-refinement loop, in-tool) */
+        igCheckbox("paint (LMB drag on flattened pane)##smpaint", &g_smask_paint);
+        igSameLine(0, 12);
+        igCheckbox("show##smshow", &g_smask_show);
+        if (igRadioButton_Bool("ink##smc2", g_smask_class == 2)) g_smask_class = 2;
+        igSameLine(0, 10);
+        if (igRadioButton_Bool("background##smc1", g_smask_class == 1))
+          g_smask_class = 1;
+        igSameLine(0, 10);
+        if (igRadioButton_Bool("erase##smc0", g_smask_class == 0)) g_smask_class = 0;
+        igSetNextItemWidth(160);
+        igSliderFloat("brush##smbrush", &g_smask_brush, 0.25f, 16.0f, "%.2f cells", 0);
+        if (g_smask) {
+          static uint64_t smc_ink = 0, smc_bg = 0;
+          static uint32_t smc_frame = 0;
+          if (frame_index - smc_frame > 32 || smc_frame == 0) {
+            smc_frame = frame_index ? frame_index : 1;
+            smc_ink = smc_bg = 0;
+            for (size_t k = 0; k < (size_t)g_smask_w * g_smask_h; k++) {
+              smc_ink += g_smask[k] == 2;
+              smc_bg += g_smask[k] == 1;
+            }
+          }
+          igText("%llu ink px, %llu background px%s",
+                 (unsigned long long)smc_ink, (unsigned long long)smc_bg,
+                 g_smask_disk_dirty ? " (unsaved)" : "");
+          if (igButton("export mask##smexp", (ImVec2){0, 0}) && sgc_active[0]) {
+            char dir[320];
+            snprintf(dir, sizeof dir, "cache/traced/%s", sgc_active);
+            struct stat sst;
+            if (stat(dir, &sst) == 0) {
+              char pth[400];
+              snprintf(pth, sizeof pth, "%s/mask.inkmask", dir);
+              if (smask_save_file(pth) == 0) g_smask_disk_dirty = false;
+              uint8_t *px8 = malloc((size_t)g_smask_w * g_smask_h);
+              if (px8) { /* 0 / 128 / 255 = unlabeled / background / ink */
+                for (size_t k = 0; k < (size_t)g_smask_w * g_smask_h; k++)
+                  px8[k] = g_smask[k] == 2 ? 255 : g_smask[k] == 1 ? 128 : 0;
+                snprintf(pth, sizeof pth, "%s/mask.png", dir);
+                if (r3d_png_write_gray(pth, px8, g_smask_w, g_smask_h) == 0)
+                  printf("inklive: supervision mask image -> %s\n", pth);
+                free(px8);
+              }
+            } else
+              printf("inklive: mask export needs a traced segment dir\n");
+          }
+          igSameLine(0, 10);
+          if (igButton("clear all##smclr", (ImVec2){0, 0})) {
+            memset(g_smask, 0, (size_t)g_smask_w * g_smask_h);
+            g_smask_gpu_dirty = g_smask_disk_dirty = true;
+          }
+          if (sgc_active[0] == 0)
+            igTextDisabled("(unsaved trace: export/autosave unavailable)");
+        } else
+          igTextDisabled("paint to create the mask layer");
+        igTreePop();
       }
       igTextDisabled("server 127.0.0.1:%d", inklive_port);
       igTextDisabled("%s", inklive.status);
@@ -5304,6 +5655,7 @@ int main(int argc, char **argv) {
           if (nv > 4 && r3d_segrows_build(&ts, &trr) == 0 &&
               mv_build_grids(&ts, &tco, &tno) == 0 &&
               r3d_surf_swap(renderer, ts.w, ts.h, tco, tno, ts.sx, ts.sy) == 0) {
+            smask_drop(renderer, sgc_active); /* mask belongs to the old segment */
             r3d_tifxyz_free(&mv_seg);
             r3d_segrows_free(&mv_rows);
             free(mv_normals);
@@ -5597,6 +5949,10 @@ int main(int argc, char **argv) {
              * and the GPU texture) must all die with it. Background queue
              * jobs are independent of the display and keep running. */
             free(inkmap);
+            free(inkmap_acc);
+            inkmap_acc = NULL;
+            free(inkmap_wsum);
+            inkmap_wsum = NULL;
             inkmap = NULL;
             inkmap_have = inkmap_uploaded = inkmap_job = false;
             im_req_out = false;
@@ -6367,6 +6723,11 @@ int main(int argc, char **argv) {
       }
       if (g_lbl_init) /* mirror paint edits / slot churn into the label atlas */
         r3d_bricks_labels_sync(renderer, 8u);
+      if (g_smask && g_smask_gpu_dirty && (frame_index & 7u) == 0) {
+        /* throttled: strokes re-upload the whole mask image at ~1/8 frames */
+        if (r3d_surfmask(renderer, g_smask, g_smask_w, g_smask_h) == 0)
+          g_smask_gpu_dirty = false;
+      }
       if (g_reg_busy) { /* registration worker: collect NCC / refined map */
         bool rok = true;
         if (r3d_regvol_job_poll(&g_reg, &rok) == 0) {
@@ -6431,11 +6792,13 @@ int main(int argc, char **argv) {
            * blue) show only on the plane views; 2.5D INK (mint) only on the
            * flattened segment; 3D INK (red, second atlas slot) on both. */
           bool tree_ink = overlay_path && strstr(overlay_path, "ink");
-          q.overlay_flags &= ~(1u | 2u | 4u | 8u | 16u);
+          q.overlay_flags &= ~(1u | 2u | 4u | 8u | 16u | 32u);
           if (i == R3D_MV_SEG) {
             bool ink25 = inklive_have && inklive_show;
             bool baked3d = (ink3d_ok && ink3d_show && (mv_ov_mask & (1u << i))) ||
                            (tree_ink && overlay_show && (mv_ov_mask & (1u << i)));
+            if (g_smask && g_smask_show)
+              q.overlay_flags |= 32u; /* supervision-mask tint */
             if (g_reg_open && g_reg_show && g_reg_flat) {
               /* the bake's G channel carries the moving scan: magenta tint */
               q.overlay_flags |= 1u | 16u;
@@ -6676,6 +7039,10 @@ int main(int argc, char **argv) {
   r3d_umbilicus_free(&umbilicus);
   if (inklive_up) r3d_inklive_stop(&inklive);
   free(inkmap);
+  free(inkmap_acc);
+  inkmap_acc = NULL;
+  free(inkmap_wsum);
+  inkmap_wsum = NULL;
   if (multiview_path) {
     r3d_tifxyz_free(&mv_seg);
     r3d_segrows_free(&mv_rows);
@@ -6753,6 +7120,7 @@ int main(int argc, char **argv) {
       g_lbl_dir[0] = 0;
     }
   }
+  smask_drop(renderer, sgc_active); /* mask autosaves with its segment */
   if (g_reg_open) { /* registration is per volume too */
     g_reg_open = false;
     g_reg_flat = false;

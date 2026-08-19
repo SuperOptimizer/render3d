@@ -268,6 +268,11 @@ target_link_libraries(test_persist PRIVATE r3d_core r3d_c5d r3d_warnings r3d_san
 add_test(NAME persist COMMAND test_persist)
 set_tests_properties(persist PROPERTIES LABELS quick TIMEOUT 300)
 
+add_executable(test_stack tests/test_stack.c)
+target_link_libraries(test_stack PRIVATE r3d_core r3d_c5d r3d_warnings r3d_sanitize)
+add_test(NAME stack COMMAND test_stack $<TARGET_FILE:rendseg>)
+set_tests_properties(stack PROPERTIES LABELS quick TIMEOUT 120)
+
 add_executable(test_ingest tests/test_ingest.c)
 target_link_libraries(test_ingest PRIVATE r3d_core r3d_warnings r3d_sanitize)
 add_test(NAME ingest COMMAND test_ingest)

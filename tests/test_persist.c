@@ -396,6 +396,110 @@ static void test_tracer_roundtrip(const char *tmp) {
   rmdir(dir);
 }
 
+/* ---- tracer: spiral fill repopulates an erased ribbon ------------------- */
+
+static void test_spiral_fill(const char *root) {
+  /* synthetic spiral ribbon (64 x 12) on rho = r0 + omega*w about a fixed
+   * center; half the columns erased. With the fit parameters set to the
+   * true generators, r3d_tracer_spiral_fill must repopulate the erased
+   * region near the analytic sheet (the worker opens `root` as its
+   * prediction volume; the follow-up polish runs over it). */
+  r3d_tracer t = {0};
+  t.W = 64;
+  t.H = 12;
+  t.cfg.step = 6.0;
+  t.cfg.max_ring = 4;
+  t.cfg.rib_rows = 12;
+  t.cfg.wind_weight = 0.5;
+  t.cfg.z_min = 1.0;
+  t.cfg.z_max = 250.0;
+  snprintf(t.root, sizeof t.root, "%s", root);
+  uint64_t n = (uint64_t)t.W * t.H;
+  t.pos = calloc(n * 3, sizeof *t.pos);
+  t.state = calloc(n, 1);
+  t.conf = calloc(n, sizeof *t.conf);
+  t.wind = calloc(n, sizeof *t.wind);
+  t.gen_of = calloc(n, sizeof *t.gen_of);
+  CHECK(t.pos && t.state && t.conf && t.wind && t.gen_of);
+  pthread_mutex_init(&t.mu, NULL);
+  r3d_umbilicus_init(&t.umb);
+  r3d_umbilicus_set(&t.umb, 128.0, 128.0, 0.0);
+  r3d_umbilicus_set(&t.umb, 128.0, 128.0, 255.0);
+  const double om = 14.0, r0 = 30.0, ucx = 128.0, ucy = 128.0;
+  /* arc-length parameterization: one grid step = cfg.step voxels along the
+   * sheet, so the winding advances by step/(2 pi rho) per column — the same
+   * geometry the ribbon grower produces and the fill assumes */
+  double wcol[64];
+  {
+    double w = 0.0;
+    for (uint32_t i = 0; i < t.W; i++) {
+      wcol[i] = w;
+      w += t.cfg.step / (2.0 * M_PI * (r0 + om * w));
+    }
+  }
+  uint32_t kept = 0;
+  for (uint32_t j = 0; j < t.H; j++)
+    for (uint32_t i = 0; i < t.W; i++) {
+      size_t k = (size_t)j * t.W + i;
+      double w = wcol[i];
+      double th = 2.0 * M_PI * w, rho = r0 + om * w;
+      t.pos[k * 3 + 0] = ucx + rho * cos(th);
+      t.pos[k * 3 + 1] = ucy + rho * sin(th);
+      t.pos[k * 3 + 2] = 60.0 + (double)j * 6.0;
+      t.wind[k] = (float)w;
+      if (i < 32) { /* the right half of the ribbon is missing */
+        t.state[k] = R3D_TR_SET;
+        t.conf[k] = 1.0f;
+        t.gen_of[k] = 1;
+        kept++;
+      }
+    }
+  t.nset = kept;
+  /* inject the (true) fit so sp_valid gates open */
+  atomic_store(&t.sp_omega, om);
+  atomic_store(&t.sp_rms, 0.1);
+  t.sp_z0 = 0.0;
+  t.sp_dz = 256.0;
+  t.sp_k = 2;
+  t.sp_r0[0] = t.sp_r0[1] = r0;
+  memset(t.sp_ab, 0, sizeof t.sp_ab);
+  atomic_store(&t.sp_valid, true);
+  CHECK(r3d_tracer_spiral_fill(&t) == 0);
+  for (int spin = 0; spin < 1200 && t.running; spin++) usleep(100000);
+  CHECK(!t.running);
+  CHECK(t.nset > kept + 200); /* the erased half substantially refilled */
+  /* refilled cells sit near the analytic spiral (the polish may nudge
+   * them, so the gate is loose: within two grid steps) */
+  double dists[64 * 12];
+  uint32_t filled = 0;
+  for (uint32_t j = 0; j < t.H; j++)
+    for (uint32_t i = 32; i < t.W; i++) {
+      size_t k = (size_t)j * t.W + i;
+      if (t.state[k] != R3D_TR_SET) continue;
+      double w = (double)t.wind[k];
+      double th = 2.0 * M_PI * w, rho = r0 + om * w;
+      double ex = ucx + rho * cos(th), ey = ucy + rho * sin(th);
+      dists[filled++] = hypot(t.pos[k * 3 + 0] - ex, t.pos[k * 3 + 1] - ey);
+    }
+  CHECK(filled > 200);
+  /* sort for quantiles: the polish may fling a handful of low-support
+   * border cells to a neighbouring wrap; the BODY of the fill must track
+   * the analytic sheet (real flows follow with CT-snap + QC anyway) */
+  for (uint32_t a = 1; a < filled; a++)
+    for (uint32_t b = a; b > 0 && dists[b] < dists[b - 1]; b--) {
+      double tmp2 = dists[b];
+      dists[b] = dists[b - 1];
+      dists[b - 1] = tmp2;
+    }
+  double med = dists[filled / 2], p90 = dists[(filled * 9) / 10];
+  CHECK(med < t.cfg.step);
+  CHECK(p90 < 2.0 * t.cfg.step);
+  printf("spiral fill: %u refilled, median %.2f / p90 %.2f / max %.2f vox\n", filled,
+         med, p90, dists[filled - 1]);
+  r3d_tracer_stop(&t);
+  r3d_tracer_free(&t);
+}
+
 /* ---- segstore: fail-closed rebuild + recovery ---------------------------- */
 
 static void rmdir_all(const char *dir) {
@@ -494,6 +598,15 @@ int main(void) {
   test_labelvol(tmp);
   test_regvol(root, tmp, ref);
   test_tracer_roundtrip(tmp);
+  {
+    char sproot[600];
+    snprintf(sproot, sizeof sproot, "%s/sptree", tmp);
+    st_spiral_mode = 1;
+    if (st_make_tree(sproot, tdim, 2, 0) == 0) test_spiral_fill(sproot);
+    else CHECK(false);
+    st_spiral_mode = 0;
+    st_rm_tree(sproot, 2);
+  }
   test_segstore(tmp);
   free(ref);
   st_rm_tree(root, 2);

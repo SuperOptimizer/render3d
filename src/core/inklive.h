@@ -34,6 +34,7 @@ typedef struct r3d_inklive {
   uint32_t rw, rh;    /* rect size in grid CELLS */
   uint32_t ri0, rj0;  /* rect origin in grid coords */
   uint32_t req_tta;   /* TTA/ensemble bitmask for the staged request */
+  bool req_flip;      /* verso: sample the slab with reversed layer order */
   uint32_t up;        /* pixels per grid cell (= voxels per cell) */
 
   /* result (owner: worker under mu; consumed via r3d_inklive_poll) */
@@ -58,7 +59,7 @@ void r3d_inklive_stop(r3d_inklive *il);
  * shift, bit2 intensity, bit3 checkpoint ensemble; 0 = fast single pass;
  * TTA multiplies inference cost ~4-16x, so keep the live view at 0). */
 void r3d_inklive_request(r3d_inklive *il, float *xyz, uint32_t i0, uint32_t j0,
-                         uint32_t w, uint32_t h, uint32_t up, uint32_t tta);
+                         uint32_t w, uint32_t h, uint32_t up, uint32_t tta, bool flip);
 
 /* True once per fresh result; hands out the module-owned buffer (valid until
  * the next result is published). */
