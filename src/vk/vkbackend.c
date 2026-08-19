@@ -4008,6 +4008,11 @@ int r3d_bricks_begin(r3d_renderer *r, const char *c5s_path, uint32_t pool_bpa,
     if (warm_want < (256ull << 20)) warm_want = 256ull << 20;
   }
   if (warm_want > (3ull << 30)) warm_want = 3ull << 30;
+  /* the warm tier is one host-visible allocation: it must fit the device's
+   * maintenance3 single-allocation limit (Dozen: ~2 GiB) or creation is
+   * rejected outright and the whole dataset open fails */
+  if (warm_want > r->vk.caps.max_alloc_bytes - (64ull << 20))
+    warm_want = r->vk.caps.max_alloc_bytes - (64ull << 20);
   /* Atlas ceiling from the device, not a constant: image dimension limit,
    * single-allocation limit (this Adreno: 2048 / ~4 GiB -> 12^3 = 3.6 GiB),
    * and the memory budget — assuming a second identical atlas may join for

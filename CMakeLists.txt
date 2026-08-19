@@ -263,6 +263,17 @@ target_link_libraries(test_quick PRIVATE r3d_core r3d_warnings r3d_sanitize)
 add_test(NAME quick COMMAND test_quick)
 set_tests_properties(quick PROPERTIES LABELS quick TIMEOUT 30)
 
+add_executable(test_persist tests/test_persist.c)
+target_link_libraries(test_persist PRIVATE r3d_core r3d_c5d r3d_warnings r3d_sanitize)
+add_test(NAME persist COMMAND test_persist)
+set_tests_properties(persist PROPERTIES LABELS quick TIMEOUT 300)
+
+add_executable(test_seedreload tests/test_seedreload.c)
+target_link_libraries(test_seedreload PRIVATE r3d_c5d r3d_warnings r3d_sanitize m)
+add_test(NAME seedreload COMMAND test_seedreload $<TARGET_FILE:render3d>)
+set_tests_properties(seedreload PROPERTIES LABELS gpu TIMEOUT 300 SKIP_RETURN_CODE 77
+  ENVIRONMENT "LSAN_OPTIONS=suppressions=${CMAKE_SOURCE_DIR}/lsan.supp")
+
 add_executable(test_shard_safety tests/test_shard_safety.c)
 target_link_libraries(test_shard_safety PRIVATE r3d_shard r3d_warnings r3d_sanitize)
 add_test(NAME shard_safety COMMAND test_shard_safety)
