@@ -24,6 +24,7 @@
 #include "synthtree.h"
 
 #include "core/cpuvol.h"
+#include "core/flatten.h"
 #include "core/labelvol.h"
 #include "core/regvol.h"
 #include "core/segstore.h"
@@ -396,6 +397,63 @@ static void test_tracer_roundtrip(const char *tmp) {
   rmdir(dir);
 }
 
+/* ---- SLIM flattening: warped cylinder becomes isometric ------------------ */
+
+static void test_flatten(void) {
+  /* a half-cylinder (developable: perfectly flattenable) parameterized
+   * NON-uniformly along the arc (spacing varies ~3x) — the kind of stretch
+   * a drifting tracer grid produces. SLIM must recover a near-isometric
+   * embedding, and the resample must yield a grid whose 3D edges are the
+   * target step again. A hole exercises the validity handling. */
+  const uint32_t W = 80, H = 40;
+  const double R = 60.0, STEP = 4.0;
+  float *xyz = malloc((size_t)W * H * 3 * sizeof *xyz);
+  float *uv = malloc((size_t)W * H * 2 * sizeof *uv);
+  CHECK(xyz && uv);
+  for (uint32_t j = 0; j < H; j++)
+    for (uint32_t i = 0; i < W; i++) {
+      size_t k = (size_t)j * W + i;
+      double f = (double)i / (double)(W - 1);
+      double phi = pow(f, 1.6) * M_PI; /* compressed start, stretched end */
+      xyz[k * 3 + 0] = (float)(100.0 + R * cos(phi));
+      xyz[k * 3 + 1] = (float)(100.0 + R * sin(phi));
+      xyz[k * 3 + 2] = (float)(20.0 + STEP * (double)j);
+      if (i >= 30 && i < 36 && j >= 12 && j < 18) /* hole */
+        xyz[k * 3 + 0] = xyz[k * 3 + 1] = xyz[k * 3 + 2] = -1.0f;
+    }
+  r3d_flatten_stats fs = {0};
+  CHECK(r3d_flatten_slim(xyz, W, H, STEP, 200, uv, &fs) == 0);
+  CHECK(fs.nvert > 2000 && fs.ntri > 4000);
+  CHECK(fs.stretch0 > 0.15);          /* the warp was real */
+  CHECK(fs.stretch1 < 0.02);          /* ...and SLIM removed it */
+  CHECK(fs.e1 < 4.05);                /* symmetric Dirichlet floor is 4 */
+  /* resampled grid: 3D edge lengths back at the target step */
+  float *out = NULL;
+  uint32_t ow = 0, oh = 0;
+  CHECK(r3d_flatten_resample(xyz, uv, W, H, STEP, &out, &ow, &oh) == 0);
+  CHECK(out && ow > 20 && oh > 20);
+  double emean = 0.0;
+  uint64_t ne = 0;
+  for (uint32_t j = 0; j < oh; j++)
+    for (uint32_t i = 0; i + 1 < ow; i++) {
+      const float *a = out + ((size_t)j * ow + i) * 3;
+      const float *b = out + ((size_t)j * ow + i + 1) * 3;
+      if (a[0] < 0.0f || b[0] < 0.0f) continue;
+      double dx = (double)b[0] - (double)a[0], dy = (double)b[1] - (double)a[1],
+             dz = (double)b[2] - (double)a[2];
+      emean += sqrt(dx * dx + dy * dy + dz * dz);
+      ne++;
+    }
+  CHECK(ne > 500);
+  emean /= (double)ne;
+  CHECK(fabs(emean - STEP) < 0.2); /* near-isometric lattice */
+  printf("flatten: stretch %.3f -> %.4f (%u iters), resampled %ux%u, mean edge %.3f\n",
+         fs.stretch0, fs.stretch1, fs.iters, ow, oh, emean);
+  free(out);
+  free(uv);
+  free(xyz);
+}
+
 /* ---- tracer: spiral fill repopulates an erased ribbon ------------------- */
 
 static void test_spiral_fill(const char *root) {
@@ -598,6 +656,7 @@ int main(void) {
   test_labelvol(tmp);
   test_regvol(root, tmp, ref);
   test_tracer_roundtrip(tmp);
+  test_flatten();
   {
     char sproot[600];
     snprintf(sproot, sizeof sproot, "%s/sptree", tmp);

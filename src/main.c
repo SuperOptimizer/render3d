@@ -30,6 +30,7 @@ extern char **environ; /* argv-spawned browser jobs inherit the environment */
 #include "core/segstore.h"
 #include "core/tracer.h"
 #include "core/bsurf.h"
+#include "core/flatten.h"
 #include "core/labelvol.h"
 #include "core/regvol.h"
 #include "core/cpuvol.h"
@@ -183,6 +184,69 @@ static void smask_drop(r3d_renderer *renderer, const char *segname) {
   g_smask_gpu_dirty = g_smask_disk_dirty = false;
   g_smask_stroke = false;
   if (renderer) r3d_surfmask_clear(renderer);
+}
+
+/* SLIM flatten job: recompute a near-isometric parameterization of the
+ * ACTIVE segment on a worker thread (core/flatten.c), resample onto a
+ * regular lattice, and save the result as cache/traced/<name>-flat — an
+ * ordinary tifxyz segment every downstream consumer uses unchanged. */
+static _Atomic int g_flat_state; /* 0 idle, 1 running, 2 done, 3 failed */
+static pthread_t g_flat_th;
+static bool g_flat_th_up = false;
+static float *g_flat_in;  /* snapshot of the segment grid (worker-owned) */
+static uint32_t g_flat_in_w, g_flat_in_h;
+static double g_flat_step;
+static float *g_flat_out; /* resampled grid (worker result) */
+static uint32_t g_flat_out_w, g_flat_out_h;
+static r3d_flatten_stats g_flat_stats;
+static char g_flat_name[240];
+
+static void *flat_worker(void *arg) {
+  (void)arg;
+  float *uv = malloc((size_t)g_flat_in_w * g_flat_in_h * 2 * sizeof *uv);
+  int st = 3;
+  if (uv &&
+      r3d_flatten_slim(g_flat_in, g_flat_in_w, g_flat_in_h, g_flat_step, 200, uv,
+                       &g_flat_stats) == 0 &&
+      r3d_flatten_resample(g_flat_in, uv, g_flat_in_w, g_flat_in_h, g_flat_step,
+                           &g_flat_out, &g_flat_out_w, &g_flat_out_h) == 0)
+    st = 2;
+  free(uv);
+  free(g_flat_in);
+  g_flat_in = NULL;
+  atomic_store(&g_flat_state, st);
+  return NULL;
+}
+
+/* write the resampled grid as a normal segment via the tracer exporter */
+static int flat_save(const char *dir, const float *xyz, uint32_t w, uint32_t h,
+                     double step) {
+  if (mkdir(dir, 0755) != 0 && errno != EEXIST) return -1;
+  r3d_tracer t = {0};
+  t.W = w;
+  t.H = h;
+  t.cfg.step = step;
+  t.cfg.max_ring = w > 50 ? (w - 50) / 2 : 4;
+  uint64_t n = (uint64_t)w * h;
+  t.pos = calloc(n * 3, sizeof *t.pos);
+  t.state = calloc(n, 1);
+  t.conf = calloc(n, sizeof *t.conf);
+  t.gen_of = calloc(n, sizeof *t.gen_of);
+  int rc = -1;
+  if (t.pos && t.state && t.conf && t.gen_of) {
+    pthread_mutex_init(&t.mu, NULL);
+    for (uint64_t k = 0; k < n; k++) {
+      if (xyz[k * 3] < 0.0f) continue;
+      for (int a = 0; a < 3; a++) t.pos[k * 3 + (uint64_t)a] = (double)xyz[k * 3 + (uint64_t)a];
+      t.state[k] = R3D_TR_SET;
+      t.conf[k] = 1.0f;
+      t.gen_of[k] = 1;
+      t.nset++;
+    }
+    rc = t.nset ? r3d_tracer_save(&t, dir, 0.0f, false) : -1;
+  }
+  r3d_tracer_free(&t);
+  return rc;
 }
 
 static int inkmap_save(const char *path, const float *m, uint32_t w, uint32_t h,
@@ -4781,6 +4845,49 @@ int main(int argc, char **argv) {
       }
     }
     if (sgc.open && igCollapsingHeader_TreeNodeFlags("surfaces", 0)) {
+      { /* SLIM re-flattening of the active segment */
+        int fst = atomic_load(&g_flat_state);
+        igBeginDisabled(fst == 1 || mv_seg.w <= 2 || sgc_active[0] == 0);
+        if (igButton("flatten (SLIM)##flat", (ImVec2){0, 0}) && fst != 1 &&
+            mv_seg.w > 2 && sgc_active[0]) {
+          size_t nn = (size_t)mv_seg.w * mv_seg.h;
+          g_flat_in = malloc(nn * 3 * sizeof *g_flat_in);
+          if (g_flat_in) {
+            memcpy(g_flat_in, mv_seg.xyz, nn * 3 * sizeof *g_flat_in);
+            g_flat_in_w = mv_seg.w;
+            g_flat_in_h = mv_seg.h;
+            g_flat_step = 1.0 / (double)mv_seg.sx;
+            snprintf(g_flat_name, sizeof g_flat_name, "%s-flat", sgc_active);
+            if (g_flat_th_up) {
+              pthread_join(g_flat_th, NULL);
+              g_flat_th_up = false;
+            }
+            atomic_store(&g_flat_state, 1);
+            if (pthread_create(&g_flat_th, NULL, flat_worker, NULL) == 0)
+              g_flat_th_up = true;
+            else {
+              atomic_store(&g_flat_state, 0);
+              free(g_flat_in);
+              g_flat_in = NULL;
+            }
+          }
+        }
+        igEndDisabled();
+        if (igIsItemHovered(0))
+          igSetTooltip("recompute a near-isometric parameterization (SLIM,\n"
+                       "symmetric Dirichlet) and save it as %s-flat -\n"
+                       "removes the 2D stretch the distortion heatmap shows",
+                       sgc_active[0] ? sgc_active : "<segment>");
+        if (fst == 1) {
+          igSameLine(0, 10);
+          igText("flattening %ux%u...", g_flat_in_w, g_flat_in_h);
+        } else if (g_flat_stats.nvert) {
+          igSameLine(0, 10);
+          igTextDisabled("last: stretch %.3f -> %.4f (%u iters)",
+                         g_flat_stats.stretch0, g_flat_stats.stretch1,
+                         g_flat_stats.iters);
+        }
+      }
           igSetNextItemWidth(160);
           igSliderFloat("corpus lines", &mv_corpus_vis, 0.0f, 1.0f, "%.2f", 0);
           {
@@ -6742,6 +6849,56 @@ int main(int argc, char **argv) {
       }
       r3d_surfvol_regtap(renderer, g_reg_open && g_reg_flat);
       r3d_bricks_regatlas_sync(renderer, 16u);
+      { /* SLIM flatten completion: save + add to the store on this thread */
+        int fst2 = atomic_load(&g_flat_state);
+        if (fst2 == 2 || fst2 == 3) {
+          if (g_flat_th_up) {
+            pthread_join(g_flat_th, NULL);
+            g_flat_th_up = false;
+          }
+          if (fst2 == 2 && g_flat_out) {
+            char fd[560];
+            snprintf(fd, sizeof fd, "cache/traced/%s", g_flat_name);
+            if (flat_save(fd, g_flat_out, g_flat_out_w, g_flat_out_h, g_flat_step) == 0) {
+              printf("flatten: %s saved (%ux%u, stretch %.3f -> %.4f, %u iters)\n",
+                     fd, g_flat_out_w, g_flat_out_h, g_flat_stats.stretch0,
+                     g_flat_stats.stretch1, g_flat_stats.iters);
+              if (seg_store_path) { /* into the corpus, like a harvest */
+                const char *fdirs[1] = {fd};
+                if (r3d_segstore_build(seg_store_path, fdirs, 1, 2, false) > 0) {
+                  for (int oi2 = 1; oi2 < 4; oi2++) {
+                    if (!sgc_ln[oi2]) continue;
+                    for (uint32_t si = 0; si < sgc.st.n; si++) {
+                      free(sgc_ln[oi2][si].l.w);
+                      free(sgc_ln[oi2][si].l.g);
+                    }
+                    free(sgc_ln[oi2]);
+                    sgc_ln[oi2] = NULL;
+                  }
+                  sgc_close(&sgc);
+                  if (sgc_open(&sgc, seg_store_path, (size_t)1536 << 20) == 0) {
+                    for (int oi2 = 1; oi2 < 4; oi2++)
+                      sgc_ln[oi2] = calloc(sgc.st.n ? sgc.st.n : 1, sizeof *sgc_ln[oi2]);
+                    for (int oi2 = 0; oi2 < 4; oi2++) {
+                      sgc_key_slice[oi2] = 1e30;
+                      sgc_key_gen[oi2] = UINT32_MAX;
+                    }
+                    memcpy(sgc_near_focus, (double[3]){1e30, 1e30, 1e30},
+                           sizeof sgc_near_focus);
+                    printf("flatten: %s added to the store (%u surfaces)\n",
+                           g_flat_name, sgc.st.n);
+                  }
+                }
+              }
+            } else
+              printf("flatten: SAVE FAILED for %s - result discarded\n", fd);
+          } else if (fst2 == 3)
+            printf("flatten: job failed (degenerate segment?)\n");
+          free(g_flat_out);
+          g_flat_out = NULL;
+          atomic_store(&g_flat_state, 0);
+        }
+      }
       r3d_bricks_params(renderer, &p);
     }
     if (clip_mode) {

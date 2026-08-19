@@ -64,6 +64,7 @@ add_library(r3d_core STATIC
   src/core/bsurf.c
   src/core/labelvol.c
   src/core/regvol.c
+  src/core/flatten.c
   src/core/inklive.c
   src/core/surfpred.c
   src/core/odbrowse.c
