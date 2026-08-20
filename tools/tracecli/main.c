@@ -61,6 +61,25 @@ static uint32_t seeds_json_load(const char *path, r3d_tracer_cfg *cfg,
   return ns;
 }
 
+static uint32_t g_subdiv = 0; /* --subdivide N: halve the step N times
+                               * after growth, re-solving each level */
+
+static void do_subdivides(r3d_tracer *tr) {
+  for (uint32_t sd = 0; sd < g_subdiv; sd++) {
+    printf("tracecli: subdivide %u/%u\n", sd + 1, g_subdiv);
+    if (r3d_tracer_subdivide(tr) != 0) {
+      fprintf(stderr, "tracecli: subdivide failed (grid too large?)\n");
+      return;
+    }
+    bool sdone = false;
+    while (!sdone) {
+      usleep(500 * 1000);
+      r3d_tracer_snapshot(tr, NULL, NULL, NULL, NULL, NULL, &sdone);
+    }
+    r3d_tracer_stop(tr);
+  }
+}
+
 static double now_s(void) {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -93,6 +112,7 @@ static int run_trace(const char *root, const r3d_tracer_cfg *cfg,
     }
   }
   r3d_tracer_stop(&tr);
+  do_subdivides(&tr);
   int rc = 0;
   if (out && tr.nset > 8) {
     char mk[1400];
@@ -116,7 +136,7 @@ int main(int argc, char **argv) {
             "[--gens N] "
             "[--level L] [--cutoff C] [--out DIR] [--umbilicus FILE] [--nofill] "
             "[--nospiral] [--spiral-weight W] [--fuse DIR ...] [--ribbon ROWS] "
-            "[--zspan S] [--wraps N] [--ct CT-ROOT] [--ct-min V]\n");
+            "[--zspan S] [--wraps N] [--ct CT-ROOT] [--ct-min V] [--subdivide N]\n");
     return 2;
   }
   const char *root = argv[1], *out = NULL, *umbp = NULL, *seedsp = NULL;
@@ -169,6 +189,8 @@ int main(int argc, char **argv) {
       rewind_gen = (uint32_t)strtoul(argv[++i], NULL, 10);
     else if (strcmp(argv[i], "--regrow") == 0 && i + 1 < argc)
       regrow = (uint32_t)strtoul(argv[++i], NULL, 10);
+    else if (strcmp(argv[i], "--subdivide") == 0 && i + 1 < argc)
+      g_subdiv = (uint32_t)strtoul(argv[++i], NULL, 10);
     else if (strcmp(argv[i], "--derive") == 0 && i + 1 < argc)
       derive_dir = atoi(argv[++i]);
     else {
@@ -284,6 +306,7 @@ int main(int argc, char **argv) {
     }
   }
   r3d_tracer_stop(&tr);
+  do_subdivides(&tr);
   int rc = 0;
   if (out && tr.nset > 8) {
     char mk[1400];

@@ -6541,6 +6541,33 @@ static void *tr_worker(void *ud) {
     t->reopt_nrm = NULL;
     t->ctsnap = false;
   }
+  if (t->recalc_conf && !t->quit) {
+    /* subdivide finish: re-measure EVERY cell's confidence from the
+     * data at the new resolution. Midpoints inherited a discounted
+     * parent conf as a placeholder; where the predictions do not
+     * actually support the interpolated sheet the cell must lose its
+     * trust and save as an honest hole — this is what makes the
+     * effective resolution adapt to prediction quality. */
+    double rc0 = tr_now();
+    uint32_t *cl = malloc((size_t)t->nset * sizeof *cl);
+    if (cl) {
+      uint32_t ncl = 0;
+      uint64_t nn = (uint64_t)t->W * t->H;
+      for (uint64_t k = 0; k < nn && ncl < t->nset; k++)
+        if (t->state[k] == R3D_TR_SET) cl[ncl++] = (uint32_t)k;
+      for (uint32_t off = 0; off < ncl && !t->quit; off += 4096) {
+        uint32_t nb = ncl - off < 4096 ? ncl - off : 4096;
+        if (cenv.dt) td_prewarm(cenv.dt, t->pos, cl + off, nb, t->W);
+        for (uint32_t c2 = 0; c2 < nb; c2++)
+          tr_update_conf(t, &cenv, (int)(cl[off + c2] % t->W),
+                         (int)(cl[off + c2] / t->W));
+      }
+      free(cl);
+      printf("tracer: subdivide conf refresh: %u cells in %.1fs\n", ncl,
+             tr_now() - rc0);
+    }
+    t->recalc_conf = false;
+  }
   tr_wind_relax(t, 30);
   if (!t->quit) { /* zero tolerance at finish too: the refine/ctsnap/
       * inpaint paths do not pass through the generation loop's per-ring
@@ -7418,6 +7445,144 @@ int r3d_tracer_grow(r3d_tracer *t, uint32_t extra) {
   return 0;
 }
 
+int r3d_tracer_subdivide(r3d_tracer *t) {
+  if (t->running || !t->pos || !t->nset || t->W < 3 || t->H < 3) return -1;
+  uint32_t W = t->W, H = t->H;
+  uint32_t NW = 2 * W - 1, NH = 2 * H - 1;
+  if ((uint64_t)NW * NH > (uint64_t)16 << 20) return -1; /* 16M-cell cap */
+  size_t n2 = (size_t)NW * NH;
+  double *np = calloc(n2 * 3, sizeof *np);
+  uint8_t *ns = calloc(n2, 1);
+  float *nc = calloc(n2, sizeof *nc);
+  float *nw = calloc(n2, sizeof *nw);
+  float *nwe = calloc(n2, sizeof *nwe);
+  uint16_t *ng2 = calloc(n2, sizeof *ng2);
+  if (!np || !ns || !nc || !nw || !nwe || !ng2) {
+    free(np);
+    free(ns);
+    free(nc);
+    free(nw);
+    free(nwe);
+    free(ng2);
+    return -1;
+  }
+  uint32_t nset2 = 0;
+#define SD_OK(i, j) (t->state[(size_t)(j) * W + (i)] == R3D_TR_SET)
+#define SD_P(i, j) (t->pos + ((size_t)(j) * W + (i)) * 3)
+  for (uint32_t j = 0; j < H; j++)
+    for (uint32_t i = 0; i < W; i++) {
+      if (!SD_OK(i, j)) continue;
+      size_t ok = (size_t)j * W + i;
+      size_t nk = (size_t)(2 * j) * NW + 2 * i;
+      memcpy(np + nk * 3, SD_P(i, j), 3 * sizeof(double));
+      ns[nk] = R3D_TR_SET;
+      nc[nk] = t->conf[ok];
+      nw[nk] = t->wind[ok];
+      ng2[nk] = t->gen_of ? t->gen_of[ok] : 1;
+      nset2++;
+    }
+  /* midpoints: bilinear between SET parents; conf provisionally
+   * discounted (the finish-pass refresh re-measures it from data) */
+  for (uint32_t j = 0; j < H; j++)
+    for (uint32_t i = 0; i < W; i++) {
+      /* horizontal (between (i,j)-(i+1,j)) and vertical midpoints */
+      for (int a = 0; a < 2; a++) {
+        uint32_t i1 = i + (a == 0), j1 = j + (a == 1);
+        if (i1 >= W || j1 >= H || !SD_OK(i, j) || !SD_OK(i1, j1)) continue;
+        size_t nk = (size_t)(j + j1) * NW + (i + i1);
+        for (int c = 0; c < 3; c++)
+          np[nk * 3 + (size_t)c] = 0.5 * (SD_P(i, j)[c] + SD_P(i1, j1)[c]);
+        ns[nk] = R3D_TR_SET;
+        size_t ka = (size_t)j * W + i, kb = (size_t)j1 * W + i1;
+        nc[nk] = 0.75f * (t->conf[ka] < t->conf[kb] ? t->conf[ka] : t->conf[kb]);
+        nw[nk] = 0.5f * (t->wind[ka] + t->wind[kb]);
+        ng2[nk] = t->gen_of ? (t->gen_of[ka] > t->gen_of[kb] ? t->gen_of[ka]
+                                                             : t->gen_of[kb])
+                            : 1;
+        nset2++;
+      }
+      /* quad center: all four corners SET */
+      if (i + 1 < W && j + 1 < H && SD_OK(i, j) && SD_OK(i + 1, j) &&
+          SD_OK(i, j + 1) && SD_OK(i + 1, j + 1)) {
+        size_t nk = (size_t)(2 * j + 1) * NW + (2 * i + 1);
+        float cmin = 1.0f;
+        float wsum2 = 0.0f;
+        uint16_t gmax = 1;
+        for (int c = 0; c < 3; c++) np[nk * 3 + (size_t)c] = 0.0;
+        for (int dj = 0; dj < 2; dj++)
+          for (int di = 0; di < 2; di++) {
+            size_t kq = (size_t)(j + (uint32_t)dj) * W + i + (uint32_t)di;
+            for (int c = 0; c < 3; c++)
+              np[nk * 3 + (size_t)c] += 0.25 * t->pos[kq * 3 + (size_t)c];
+            if (t->conf[kq] < cmin) cmin = t->conf[kq];
+            wsum2 += 0.25f * t->wind[kq];
+            if (t->gen_of && t->gen_of[kq] > gmax) gmax = t->gen_of[kq];
+          }
+        ns[nk] = R3D_TR_SET;
+        nc[nk] = 0.75f * cmin;
+        nw[nk] = wsum2;
+        ng2[nk] = gmax;
+        nset2++;
+      }
+    }
+#undef SD_OK
+#undef SD_P
+  free(t->pos);
+  free(t->state);
+  free(t->conf);
+  free(t->wind);
+  free(t->werr);
+  free(t->gen_of);
+  t->pos = np;
+  t->state = ns;
+  t->conf = nc;
+  t->wind = nw;
+  t->werr = nwe;
+  t->gen_of = ng2;
+  t->W = NW;
+  t->H = NH;
+  t->nset = nset2;
+  t->cfg.step *= 0.5;
+  if (NW > 50) t->cfg.max_ring = (NW - 50) / 2; /* grow-sizing consistency */
+  if (t->cfg.rib_rows) t->cfg.rib_rows = NH;
+  /* derived state indexed by the OLD grid dies here */
+  tr_sfx_free(t->sfx);
+  t->sfx = NULL;
+  free(t->dsup);
+  t->dsup = NULL;
+  free(t->dcell_id);
+  free(t->dcell_uv);
+  t->dcell_id = NULL;
+  t->dcell_uv = NULL;
+  free(t->grow_mask);
+  t->grow_mask = NULL;
+  t->mask_once = false;
+  free(t->reopt_pos);
+  free(t->reopt_nrm);
+  free(t->ctsnap_tgt);
+  t->reopt_pos = NULL;
+  t->reopt_nrm = NULL;
+  t->ctsnap_tgt = NULL;
+  t->reopt_on = false;
+  atomic_store(&t->sp_valid, false); /* refit at the new resolution */
+  for (uint32_t a = 0; a < R3D_TR_MAX_ANCHORS; a++) t->anc_cell[a] = -1;
+  printf("tracer: subdivided %ux%u step %.3g -> %ux%u step %.3g (%u pts)\n", W,
+         H, t->cfg.step * 2.0, NW, NH, t->cfg.step, t->nset);
+  t->recalc_conf = true;
+  t->refine = true; /* data term re-seats every cell at the finer step */
+  t->quit = false;
+  t->done = false;
+  t->gen++;
+  t->running = true;
+  if (pthread_create(&t->th, NULL, tr_worker, t) != 0) {
+    t->running = false;
+    t->refine = false;
+    t->recalc_conf = false;
+    return -1;
+  }
+  return 0;
+}
+
 int r3d_tracer_refine(r3d_tracer *t) {
   if (t->running || !t->pos || !t->nset) return -1;
   t->refine = true;
@@ -7824,12 +7989,30 @@ int r3d_tracer_save(r3d_tracer *t, const char *dir, float cutoff, bool fill) {
         ft.gen_of[k] = t->gen_of ? t->gen_of[k] : 1;
         if (!keep[k]) continue;
         const double *src = keep[k] == 3 ? fp + k * 3 : t->pos + k * 3;
-        memcpy(ft.pos + k * 3, src, 3 * sizeof *src);
+        for (int c = 0; c < 3; c++) /* through float32: the planes store
+            * floats, and a borderline pair must not flip between this
+            * check and a reload of the written file */
+          ft.pos[k * 3 + (size_t)c] = (double)(float)src[c];
         ft.state[k] = R3D_TR_SET;
         ft.nset++;
       }
-      tr_sfx_build(&ft);
-      uint32_t nex = tr_fold_excise(&ft);
+      /* alternate the measured-gap radius and the no-gap fallback
+       * radius until BOTH report clean (each variant's same-patch gate
+       * derives from its radius, so they test different close pairs,
+       * and every cut reshapes the grid for the other): a reload — which
+       * has no gap measurement — must find nothing left to cut */
+      uint32_t nex = 0;
+      double om_save = ft.sp_om_meas;
+      for (int rd = 0; rd < 4; rd++) {
+        ft.sp_om_meas = om_save;
+        tr_sfx_build(&ft);
+        uint32_t r1 = tr_fold_excise(&ft);
+        ft.sp_om_meas = 0.0;
+        tr_sfx_build(&ft);
+        uint32_t r2 = tr_fold_excise(&ft);
+        nex += r1 + r2;
+        if (!r1 && !r2) break;
+      }
       if (nex) {
         for (uint64_t k = 0; k < n; k++)
           if (keep[k] && ft.state[k] != R3D_TR_SET) keep[k] = 0;

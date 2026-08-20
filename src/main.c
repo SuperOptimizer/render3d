@@ -4855,6 +4855,27 @@ int main(int argc, char **argv) {
               if (!GT->pos || !GT->st || !GT->cf) GT->active = false;
             }
           }
+          igSameLine(0, 8);
+          if (igButton("subdivide 2x", (ImVec2){0, 0})) { /* adaptive step:
+             * halve the step, bilinear midpoints, then the data term
+             * re-seats every cell at the finer resolution; conf is
+             * re-measured so pred-poor midpoints become honest holes */
+            r3d_tracer_stop(&GT->tr);
+            if (r3d_tracer_subdivide(&GT->tr) == 0) {
+              free(GT->pos);
+              free(GT->st);
+              free(GT->cf);
+              GT->pos = malloc((size_t)GT->tr.W * GT->tr.H * 3 * sizeof *GT->pos);
+              GT->st = calloc((size_t)GT->tr.W * GT->tr.H, 1);
+              GT->cf = calloc((size_t)GT->tr.W * GT->tr.H, sizeof *GT->cf);
+              GT->gen = 0;
+              GT->done = false;
+              GT->live_first = true;
+              if (!GT->pos || !GT->st || !GT->cf) GT->active = false;
+            } else {
+              printf("tracer: subdivide refused (grid too large?)\n");
+            }
+          }
         }
         if (GT->done && GT->nset > 0 && bricks_path) {
           /* prediction-traced sheet -> actual papyrus: bsurf's edge rule as

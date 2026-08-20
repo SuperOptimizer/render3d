@@ -147,6 +147,8 @@ typedef struct r3d_tracer {
    * race (and a missable cancellation). */
   _Atomic bool running, quit, done;
   bool refine; /* solve-only pass in flight (no growth) */
+  bool recalc_conf; /* subdivide: refresh conf of EVERY cell at finish
+                     * (midpoints inherit parent conf only provisionally) */
   bool spiral_fill; /* populate EMPTY cells from the global spiral fit
                      * before the solve-only pass (fit_spiral analogue) */
   /* CT edge snap (solve-only, bsurf's rule as a soft term): each trusted
@@ -313,6 +315,17 @@ uint64_t r3d_tracer_snapshot(r3d_tracer *t, double *pos, uint8_t *state, float *
  * only once all of them are complete, so a failed export never truncates
  * the previous one. Does not mutate solver state. */
 int r3d_tracer_save(r3d_tracer *t, const char *dir, float cutoff, bool fill);
+
+/* Adaptive-step refinement: halve the grid step by inserting midpoint
+ * cells (bilinear between SET parents), then rerun the solve-only
+ * refine pass so the data term pulls every cell onto the true sheet at
+ * the finer resolution. Coarse-to-fine: grow at step 20 (fast global
+ * search), then subdivide toward 10/5/2.5 — each level VERIFIES the
+ * last: midpoints whose local predictions disagree with the
+ * interpolated geometry lose confidence in the post-polish refresh and
+ * save as honest holes, so effective resolution adapts to prediction
+ * quality. Stopped tracer only; spawns the worker (poll done). */
+int r3d_tracer_subdivide(r3d_tracer *t);
 
 /* Cut every cell still on a >90-degree turn (the sheet doubling back)
  * to EMPTY, newest arm first; anchors are never cut. Runs automatically
