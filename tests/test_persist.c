@@ -686,6 +686,68 @@ static void test_fold_excise(void) {
   printf("fold excision OK (%u cells cut)\n", cut);
 }
 
+/* smooth fold: the 180 spread over a 3-cell crease (each turn < 90 deg,
+ * invisible to the edge-turn test), flap lying 10 vox over the sheet.
+ * The overlap phase must cut the flap interior via opposing normals +
+ * grid-path ratio, and leave the flat sheet alone. */
+static void test_fold_excise_smooth(void) {
+  enum { FW = 30, FH = 8, SEND = 17 };
+  r3d_tracer t = {0};
+  t.W = FW;
+  t.H = FH;
+  t.cfg.step = 20.0;
+  t.sp_om_meas = 24.0; /* sheet gap: overlap radius 12 */
+  uint64_t n = (uint64_t)FW * FH;
+  t.pos = calloc(n * 3, sizeof *t.pos);
+  t.state = calloc(n, 1);
+  t.conf = calloc(n, sizeof *t.conf);
+  t.gen_of = calloc(n, sizeof *t.gen_of);
+  CHECK(t.pos && t.state && t.conf && t.gen_of);
+  pthread_mutex_init(&t.mu, NULL);
+  for (uint32_t j = 0; j < FH; j++)
+    for (uint32_t i = 0; i < FW; i++) {
+      size_t k = (size_t)j * FW + i;
+      double x, z;
+      if (i <= SEND) { /* flat sheet */
+        x = 20.0 * i;
+        z = 100.0;
+      } else if (i == 18) { /* smooth crease: radius-5 U, turns < 90 deg */
+        x = 344.33;
+        z = 102.5;
+      } else if (i == 19) {
+        x = 344.33;
+        z = 107.5;
+      } else if (i == 20) {
+        x = 340.0;
+        z = 110.0;
+      } else { /* flap: x runs BACKWARD 10 vox above the sheet */
+        x = 20.0 * (2 * (SEND + 4) - (double)i - 8);
+        z = 110.0;
+      }
+      t.pos[k * 3 + 0] = x;
+      t.pos[k * 3 + 1] = 20.0 * j;
+      t.pos[k * 3 + 2] = z;
+      t.state[k] = R3D_TR_SET;
+      t.conf[k] = 1.0f;
+      t.gen_of[k] = (uint16_t)(i <= SEND ? 1 + i / 2 : 10 + (i - SEND));
+      t.nset++;
+    }
+  uint32_t cut = r3d_tracer_fold_excise(&t);
+  CHECK(cut > 0);
+  for (uint32_t j = 0; j < FH; j++) /* the ENTIRE flap is gone, every
+      * row: victims are collected against a consistent snapshot, so no
+      * cell escapes by losing its stencil to an earlier cut */
+    for (uint32_t i = 21; i < FW; i++)
+      CHECK(t.state[(size_t)j * FW + i] != R3D_TR_SET);
+  for (uint32_t j = 0; j < FH; j++) /* sheet untouched */
+    for (uint32_t i = 0; i <= SEND; i++)
+      CHECK(t.state[(size_t)j * FW + i] == R3D_TR_SET);
+  CHECK(r3d_tracer_fold_excise(&t) == 0); /* idempotent */
+  pthread_mutex_destroy(&t.mu);
+  r3d_tracer_free(&t);
+  printf("smooth-fold excision OK (%u cells cut)\n", cut);
+}
+
 int main(void) {
   char tmp[512];
   const char *base = getenv("TMPDIR");
@@ -720,6 +782,7 @@ int main(void) {
   test_tracer_roundtrip(tmp);
   test_flatten();
   test_fold_excise();
+  test_fold_excise_smooth();
   {
     char sproot[600];
     snprintf(sproot, sizeof sproot, "%s/sptree", tmp);

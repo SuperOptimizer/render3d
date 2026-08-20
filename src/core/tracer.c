@@ -4889,6 +4889,83 @@ static bool tr_qc_ok(const r3d_tracer *t, int i, int j) {
 
 static _Atomic uint64_t tr_excise_total; /* stats: fold cells cut per trace */
 
+/* 3D path length along the straight grid line between two cells, over
+ * their direct 3D distance. A legitimately tight curl reads ~1.5-3 (the
+ * path goes around the apex); a flap lying back over the sheet reads
+ * far higher (the path runs out to the crease and back). A broken path
+ * (invalid cell on the line) reads as suspect too. */
+static double tr_grid_path_ratio(const r3d_tracer *t, uint32_t ka, uint32_t kb) {
+  int i0 = (int)(ka % t->W), j0 = (int)(ka / t->W);
+  int i1 = (int)(kb % t->W), j1 = (int)(kb / t->W);
+  int di = i1 - i0, dj = j1 - j0;
+  int steps = abs(di) > abs(dj) ? abs(di) : abs(dj);
+  if (steps < 1) return 1.0;
+  double path = 0.0;
+  const double *prev = t->pos + (size_t)ka * 3;
+  for (int s2 = 1; s2 <= steps; s2++) {
+    int ci = i0 + (di * s2 + (di >= 0 ? steps / 2 : -steps / 2)) / steps;
+    int cj = j0 + (dj * s2 + (dj >= 0 ? steps / 2 : -steps / 2)) / steps;
+    if (!tr_valid(t, ci, cj)) return 1e9; /* broken path: suspect */
+    const double *cur = t->pos + ((size_t)cj * t->W + (size_t)ci) * 3;
+    double dd = 0;
+    for (int a = 0; a < 3; a++) dd += (cur[a] - prev[a]) * (cur[a] - prev[a]);
+    path += sqrt(dd);
+    prev = cur;
+  }
+  const double *A = t->pos + (size_t)ka * 3, *B = t->pos + (size_t)kb * 3;
+  double d2 = 0;
+  for (int a = 0; a < 3; a++) d2 += (B[a] - A[a]) * (B[a] - A[a]);
+  double d = sqrt(d2);
+  return d > 1e-9 ? path / d : 1e9;
+}
+
+/* cell normal for the excision scan: central differences when possible,
+ * one-sided when a neighbor is missing — a flap cell must not become
+ * invisible to the overlap test just because its neighbors were cut
+ * first (grid-edge rows too). False only with no valid neighbor on an
+ * axis or a degenerate frame. */
+static bool tr_cell_normal_f(const r3d_tracer *t, int i, int j, double n[3]) {
+  const double *c = t->pos + ((size_t)j * t->W + (size_t)i) * 3;
+  const double *u0 = tr_valid(t, i - 1, j)
+                         ? t->pos + ((size_t)j * t->W + (size_t)i - 1) * 3 : c;
+  const double *u1 = tr_valid(t, i + 1, j)
+                         ? t->pos + ((size_t)j * t->W + (size_t)i + 1) * 3 : c;
+  const double *v0 = tr_valid(t, i, j - 1)
+                         ? t->pos + ((size_t)(j - 1) * t->W + (size_t)i) * 3 : c;
+  const double *v1 = tr_valid(t, i, j + 1)
+                         ? t->pos + ((size_t)(j + 1) * t->W + (size_t)i) * 3 : c;
+  if (u0 == u1 || v0 == v1) return false;
+  double eu[3], ev[3];
+  for (int a = 0; a < 3; a++) {
+    eu[a] = u1[a] - u0[a];
+    ev[a] = v1[a] - v0[a];
+  }
+  n[0] = eu[1] * ev[2] - eu[2] * ev[1];
+  n[1] = eu[2] * ev[0] - eu[0] * ev[2];
+  n[2] = eu[0] * ev[1] - eu[1] * ev[0];
+  double l = sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+  if (l < 1e-9) return false;
+  for (int a = 0; a < 3; a++) n[a] /= l;
+  return true;
+}
+
+/* pick the excision victim of a confirmed fold pair: the newer cell
+ * (the flap was placed on top of older sheet), ties by lower conf;
+ * anchored cells are never cut. Returns SIZE_MAX when both anchored. */
+static size_t tr_fold_victim(const r3d_tracer *t, size_t k1, size_t k2) {
+  bool a1 = false, a2 = false;
+  for (uint32_t an = 0; an < t->nanc; an++) {
+    if (t->anc_cell[an] >= 0 && (size_t)t->anc_cell[an] == k1) a1 = true;
+    if (t->anc_cell[an] >= 0 && (size_t)t->anc_cell[an] == k2) a2 = true;
+  }
+  if (a1 && a2) return (size_t)-1;
+  if (a1) return k2;
+  if (a2) return k1;
+  uint16_t g1 = t->gen_of ? t->gen_of[k1] : 0, g2 = t->gen_of ? t->gen_of[k2] : 0;
+  if (g1 != g2) return g1 > g2 ? k1 : k2;
+  return t->conf[k1] <= t->conf[k2] ? k1 : k2;
+}
+
 /* Zero-tolerance fold excision (generation boundary, pool idle): any
  * cell still on a >90-degree turn AFTER the repair anneal is cut back
  * to EMPTY (retryable) right now, newest arm first — the sheet doubling
@@ -4902,6 +4979,13 @@ static uint32_t tr_fold_excise(r3d_tracer *t) {
   static const int ax2[2][2] = {{1, 0}, {0, 1}};
   int W = (int)t->W, H = (int)t->H;
   uint32_t total = 0;
+  /* victims are COLLECTED against a consistent snapshot and applied
+   * after the scan: cutting in-place made the outcome depend on scan
+   * order (a cell whose neighbors were cut earlier in the same pass
+   * loses its stencil and turns invisible — which cells survived then
+   * varied with the optimizer's floating-point choices) */
+  uint8_t *cutmap = calloc((size_t)W * (size_t)H, 1);
+  if (!cutmap) return 0;
   for (int pass = 0; pass < 16; pass++) {
     uint32_t nex = 0;
     pthread_mutex_lock(&t->mu);
@@ -4942,20 +5026,98 @@ static uint32_t tr_fold_excise(r3d_tracer *t) {
               vgen = g2;
             }
           }
-          if (victim == (size_t)-1) continue; /* all three anchored */
-          t->state[victim] = R3D_TR_EMPTY; /* retryable, not FAIL: the
-              * region regrows from better parents next generations */
-          t->conf[victim] = 0.0f;
-          if (t->gen_of) t->gen_of[victim] = 0;
-          if (t->nset) t->nset--;
+          if (victim == (size_t)-1 || cutmap[victim]) continue;
+          cutmap[victim] = 1;
           nex++;
-          if (victim == kb) break; /* b gone: second axis moot */
         }
       }
+    for (size_t k = 0; nex && k < (size_t)W * (size_t)H; k++) {
+      if (!cutmap[k]) continue;
+      cutmap[k] = 0;
+      if (t->state[k] != R3D_TR_SET) continue;
+      t->state[k] = R3D_TR_EMPTY; /* retryable, not FAIL: the region
+          * regrows from better parents next generations */
+      t->conf[k] = 0.0f;
+      if (t->gen_of) t->gen_of[k] = 0;
+      if (t->nset) t->nset--;
+    }
     pthread_mutex_unlock(&t->mu);
     total += nex;
     if (!nex) break;
   }
+  /* phase 2 — smooth doubling: a 180 spread over 2-3 cells never trips
+   * the per-edge turn test above, yet the flap then lies within a
+   * fraction of the sheet gap of the older sheet with OPPOSING normals.
+   * The solve-time hinge (tr_res_self) skips grid-close pairs to protect
+   * legitimate tight curls, which is exactly where a young flap lives —
+   * so here the grid-PATH ratio arbitrates: a curl's path goes around
+   * the apex (~1.5-3x the direct distance) while a fold's path runs out
+   * to the crease and back (far higher, or broken). Far pairs use the
+   * hinge's own fold-back criterion directly. */
+  if (t->sfx) {
+    const tr_sfx *sx = t->sfx;
+    for (int pass = 0; pass < 16; pass++) {
+      uint32_t nex = 0;
+      pthread_mutex_lock(&t->mu);
+      for (int j = 0; j < H; j++)
+        for (int i = 0; i < W; i++) {
+          size_t kb = (size_t)j * t->W + (size_t)i;
+          if (t->state[kb] != R3D_TR_SET) continue;
+          double n1[3];
+          if (!tr_cell_normal_f(t, i, j, n1)) continue;
+          const double *P = t->pos + kb * 3;
+          double rmin = 0.5 * tr_om_at(t, P);
+          if (rmin <= 1.0) continue;
+          long c0[3], c1[3];
+          for (int a = 0; a < 3; a++) {
+            c0[a] = (long)floor((P[a] - rmin) / sx->cs);
+            c1[a] = (long)floor((P[a] + rmin) / sx->cs);
+          }
+          for (long cz = c0[2]; cz <= c1[2]; cz++)
+            for (long cy = c0[1]; cy <= c1[1]; cy++)
+              for (long cx = c0[0]; cx <= c1[0]; cx++)
+                for (uint32_t e = sx->head[tr_sfx_h(sx, cx, cy, cz)]; e;
+                     e = sx->next[e - 1]) {
+                  uint32_t k2 = sx->cell[e - 1];
+                  if (k2 <= kb || t->state[k2] != R3D_TR_SET) continue;
+                  int di2 = abs((int)(k2 % t->W) - i);
+                  int dj2 = abs((int)(k2 / t->W) - j);
+                  int gd = di2 > dj2 ? di2 : dj2;
+                  if (gd < 2) continue; /* immediate neighbors: same patch */
+                  const double *Q = t->pos + (size_t)k2 * 3;
+                  double d2 = 0;
+                  for (int a = 0; a < 3; a++) d2 += (P[a] - Q[a]) * (P[a] - Q[a]);
+                  if (d2 >= rmin * rmin) continue;
+                  double n2[3];
+                  if (!tr_cell_normal_f(t, (int)(k2 % t->W), (int)(k2 / t->W), n2))
+                    continue;
+                  double ndot = n1[0] * n2[0] + n1[1] * n2[1] + n1[2] * n2[2];
+                  if (ndot >= -0.3) continue;
+                  if (gd <= 10 &&
+                      tr_grid_path_ratio(t, (uint32_t)kb, k2) < 4.0)
+                    continue; /* tight curl: the path hugs the apex */
+                  size_t victim = tr_fold_victim(t, kb, (size_t)k2);
+                  if (victim == (size_t)-1 || cutmap[victim]) continue;
+                  cutmap[victim] = 1; /* collected; applied below so the
+                      * whole pass detects against one consistent grid */
+                  nex++;
+                }
+        }
+      for (size_t k = 0; nex && k < (size_t)W * (size_t)H; k++) {
+        if (!cutmap[k]) continue;
+        cutmap[k] = 0;
+        if (t->state[k] != R3D_TR_SET) continue;
+        t->state[k] = R3D_TR_EMPTY;
+        t->conf[k] = 0.0f;
+        if (t->gen_of) t->gen_of[k] = 0;
+        if (t->nset) t->nset--;
+      }
+      pthread_mutex_unlock(&t->mu);
+      total += nex;
+      if (!nex) break;
+    }
+  }
+  free(cutmap);
   if (total && t->gen_of) {
     /* orphan cleanup: excising a crease DISCONNECTS the doubled-back
      * flap rather than exposing it cell by cell (the flap's interior is
@@ -5010,7 +5172,11 @@ static uint32_t tr_fold_excise(r3d_tracer *t) {
   return total;
 }
 
-uint32_t r3d_tracer_fold_excise(r3d_tracer *t) { return tr_fold_excise(t); }
+uint32_t r3d_tracer_fold_excise(r3d_tracer *t) {
+  tr_sfx_build(t); /* overlap phase needs current positions (no-op
+                    * without a sheet-gap estimate) */
+  return tr_fold_excise(t);
+}
 
 /* Flood-fill the exterior: mark every cell reachable 4-connected from the
  * grid border without crossing a blocked cell. What remains unblocked and
@@ -6222,6 +6388,7 @@ static void *tr_worker(void *ud) {
   if (!t->quit) { /* zero tolerance at finish too: the refine/ctsnap/
       * inpaint paths do not pass through the generation loop's per-ring
       * excision, and inpaint re-seating can fold in pathological spots */
+    tr_sfx_build(t); /* the overlap phase needs post-polish positions */
     uint32_t nex = tr_fold_excise(t);
     if (nex)
       printf("tracer: final fold excision cut %u cell%s\n", nex,
