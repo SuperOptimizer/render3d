@@ -624,6 +624,68 @@ static void test_segstore(const char *tmp) {
   rmdir_all(store);
 }
 
+/* fold excision: a flat sheet whose last columns double back 180 over
+ * the sheet (the classic hard-fold flap). The excise pass must cut the
+ * crease AND the disconnected flap remnant, leave every clean cell
+ * untouched, and be idempotent. */
+static void test_fold_excise(void) {
+  enum { FW = 24, FH = 8, SHEET_END = 17 };
+  r3d_tracer t = {0};
+  t.W = FW;
+  t.H = FH;
+  t.cfg.step = 20.0;
+  uint64_t n = (uint64_t)FW * FH;
+  t.pos = calloc(n * 3, sizeof *t.pos);
+  t.state = calloc(n, 1);
+  t.conf = calloc(n, sizeof *t.conf);
+  t.gen_of = calloc(n, sizeof *t.gen_of);
+  CHECK(t.pos && t.state && t.conf && t.gen_of);
+  pthread_mutex_init(&t.mu, NULL);
+  uint32_t nsheet = 0;
+  for (uint32_t j = 0; j < FH; j++)
+    for (uint32_t i = 0; i <= SHEET_END; i++) { /* clean sheet */
+      size_t k = (size_t)j * FW + i;
+      t.pos[k * 3 + 0] = 20.0 * i;
+      t.pos[k * 3 + 1] = 20.0 * j;
+      t.pos[k * 3 + 2] = 100.0;
+      t.state[k] = R3D_TR_SET;
+      t.conf[k] = 1.0f;
+      t.gen_of[k] = (uint16_t)(1 + i / 2);
+      t.nset++;
+      nsheet++;
+    }
+  for (uint32_t j = 2; j <= 5; j++)
+    for (uint32_t i = SHEET_END + 1; i < FW - 2; i++) { /* 180 flap: x runs
+        * BACKWARD over the sheet, 4 vox above it */
+      size_t k = (size_t)j * FW + i;
+      t.pos[k * 3 + 0] = 20.0 * (2 * SHEET_END - (double)i) + 10.0;
+      t.pos[k * 3 + 1] = 20.0 * j;
+      t.pos[k * 3 + 2] = 104.0;
+      t.state[k] = R3D_TR_SET;
+      t.conf[k] = 0.9f;
+      t.gen_of[k] = (uint16_t)(10 + (i - SHEET_END));
+      t.nset++;
+    }
+  uint32_t cut = r3d_tracer_fold_excise(&t);
+  CHECK(cut > 0);
+  /* every flap cell is gone, every sheet cell survives */
+  for (uint32_t j = 0; j < FH; j++)
+    for (uint32_t i = 0; i < FW; i++) {
+      size_t k = (size_t)j * FW + i;
+      if (i <= SHEET_END) CHECK(t.state[k] == R3D_TR_SET);
+      else CHECK(t.state[k] != R3D_TR_SET);
+    }
+  CHECK(t.nset == nsheet);
+  /* no >90-degree turn anywhere; second call is a no-op */
+  CHECK(r3d_tracer_fold_excise(&t) == 0);
+  pthread_mutex_destroy(&t.mu);
+  free(t.pos);
+  free(t.state);
+  free(t.conf);
+  free(t.gen_of);
+  printf("fold excision OK (%u cells cut)\n", cut);
+}
+
 int main(void) {
   char tmp[512];
   const char *base = getenv("TMPDIR");
@@ -657,6 +719,7 @@ int main(void) {
   test_regvol(root, tmp, ref);
   test_tracer_roundtrip(tmp);
   test_flatten();
+  test_fold_excise();
   {
     char sproot[600];
     snprintf(sproot, sizeof sproot, "%s/sptree", tmp);

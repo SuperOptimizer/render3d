@@ -310,6 +310,12 @@ uint64_t r3d_tracer_snapshot(r3d_tracer *t, double *pos, uint8_t *state, float *
  * the previous one. Does not mutate solver state. */
 int r3d_tracer_save(r3d_tracer *t, const char *dir, float cutoff, bool fill);
 
+/* Cut every cell still on a >90-degree turn (the sheet doubling back)
+ * to EMPTY, newest arm first; anchors are never cut. Runs automatically
+ * at every generation boundary — public for tests and for repairing
+ * loaded traces. Stopped tracer only. Returns cells cut. */
+uint32_t r3d_tracer_fold_excise(r3d_tracer *t);
+
 /* Synthetic self-check of the spiral winding frame + global fit (used by
  * the unit tests; no volume access). Returns 0 on success. */
 int r3d_tracer_spiral_selftest(void);

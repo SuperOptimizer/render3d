@@ -4887,6 +4887,131 @@ static bool tr_qc_ok(const r3d_tracer *t, int i, int j) {
   return tr_valid(t, i, j) && t->conf[(size_t)j * t->W + (size_t)i] > 0.25f;
 }
 
+static _Atomic uint64_t tr_excise_total; /* stats: fold cells cut per trace */
+
+/* Zero-tolerance fold excision (generation boundary, pool idle): any
+ * cell still on a >90-degree turn AFTER the repair anneal is cut back
+ * to EMPTY (retryable) right now, newest arm first — the sheet doubling
+ * back on itself must never survive into the next generation or the
+ * live view. Because this runs every generation, a fold flap can never
+ * grow deeper than the ring that created it: the crease flags on the
+ * flap's first cells, each excision exposes the next flap cell as a new
+ * crease, and the pass loop unwinds the whole chain. User anchors are
+ * never excised. Returns the number of cells cut. */
+static uint32_t tr_fold_excise(r3d_tracer *t) {
+  static const int ax2[2][2] = {{1, 0}, {0, 1}};
+  int W = (int)t->W, H = (int)t->H;
+  uint32_t total = 0;
+  for (int pass = 0; pass < 16; pass++) {
+    uint32_t nex = 0;
+    pthread_mutex_lock(&t->mu);
+    for (int j = 0; j < H; j++)
+      for (int i = 0; i < W; i++) {
+        size_t kb = (size_t)j * t->W + (size_t)i;
+        if (t->state[kb] != R3D_TR_SET) continue;
+        for (int a = 0; a < 2; a++) {
+          int ai = i - ax2[a][0], aj = j - ax2[a][1];
+          int ci = i + ax2[a][0], cj = j + ax2[a][1];
+          if (!tr_valid(t, ai, aj) || !tr_valid(t, ci, cj)) continue;
+          size_t ka = (size_t)aj * t->W + (size_t)ai;
+          size_t kc = (size_t)cj * t->W + (size_t)ci;
+          const double *pa = t->pos + ka * 3, *pb = t->pos + kb * 3,
+                       *pc = t->pos + kc * 3;
+          double d1[3], d2[3], l1 = 0, l2 = 0, dot = 0;
+          for (int c2 = 0; c2 < 3; c2++) {
+            d1[c2] = pb[c2] - pa[c2];
+            d2[c2] = pc[c2] - pb[c2];
+            l1 += d1[c2] * d1[c2];
+            l2 += d2[c2] * d2[c2];
+            dot += d1[c2] * d2[c2];
+          }
+          if (l1 < 1e-12 || l2 < 1e-12 || dot >= 0.0) continue;
+          /* victim: the newest of the three (the doubling-back arm was
+           * placed on top of older sheet), skipping anchored cells */
+          size_t cand[3] = {kb, ka, kc};
+          size_t victim = (size_t)-1;
+          uint32_t vgen = 0;
+          for (int v = 0; v < 3; v++) {
+            bool anch = false;
+            for (uint32_t an = 0; an < t->nanc && !anch; an++)
+              anch = t->anc_cell[an] >= 0 && (size_t)t->anc_cell[an] == cand[v];
+            if (anch) continue;
+            uint32_t g2 = t->gen_of ? t->gen_of[cand[v]] : 0;
+            if (victim == (size_t)-1 || g2 > vgen) {
+              victim = cand[v];
+              vgen = g2;
+            }
+          }
+          if (victim == (size_t)-1) continue; /* all three anchored */
+          t->state[victim] = R3D_TR_EMPTY; /* retryable, not FAIL: the
+              * region regrows from better parents next generations */
+          t->conf[victim] = 0.0f;
+          if (t->gen_of) t->gen_of[victim] = 0;
+          if (t->nset) t->nset--;
+          nex++;
+          if (victim == kb) break; /* b gone: second axis moot */
+        }
+      }
+    pthread_mutex_unlock(&t->mu);
+    total += nex;
+    if (!nex) break;
+  }
+  if (total && t->gen_of) {
+    /* orphan cleanup: excising a crease DISCONNECTS the doubled-back
+     * flap rather than exposing it cell by cell (the flap's interior is
+     * locally smooth and passes the turn test). Anything no longer
+     * 4-connected to a seed cell (gen 1) or an anchor only ever grew
+     * from folded parents — cut it too; it regrows clean. */
+    uint64_t n = (uint64_t)t->W * t->H;
+    uint8_t *reach = calloc(n, 1);
+    uint32_t *q = malloc(n * sizeof *q);
+    if (reach && q) {
+      uint32_t qn = 0;
+      pthread_mutex_lock(&t->mu);
+      for (uint64_t k = 0; k < n; k++)
+        if (t->state[k] == R3D_TR_SET && t->gen_of[k] <= 1) {
+          reach[k] = 1;
+          q[qn++] = (uint32_t)k;
+        }
+      for (uint32_t a = 0; a < t->nanc; a++)
+        if (t->anc_cell[a] >= 0 && t->state[t->anc_cell[a]] == R3D_TR_SET &&
+            !reach[t->anc_cell[a]]) {
+          reach[t->anc_cell[a]] = 1;
+          q[qn++] = (uint32_t)t->anc_cell[a];
+        }
+      for (uint32_t h2 = 0; h2 < qn; h2++) {
+        uint32_t k = q[h2];
+        int i = (int)(k % t->W), j = (int)(k / t->W);
+        static const int o4[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+        for (int o = 0; o < 4; o++) {
+          int ii = i + o4[o][0], jj = j + o4[o][1];
+          if (ii < 0 || jj < 0 || ii >= (int)t->W || jj >= (int)t->H) continue;
+          uint32_t k2 = (uint32_t)jj * t->W + (uint32_t)ii;
+          if (reach[k2] || t->state[k2] != R3D_TR_SET) continue;
+          reach[k2] = 1;
+          q[qn++] = k2;
+        }
+      }
+      if (qn) /* no seed marked = a loaded grid without gen data: skip */
+        for (uint64_t k = 0; k < n; k++)
+          if (t->state[k] == R3D_TR_SET && !reach[k]) {
+            t->state[k] = R3D_TR_EMPTY;
+            t->conf[k] = 0.0f;
+            t->gen_of[k] = 0;
+            if (t->nset) t->nset--;
+            total++;
+          }
+      pthread_mutex_unlock(&t->mu);
+    }
+    free(reach);
+    free(q);
+  }
+  if (total) atomic_fetch_add(&tr_excise_total, total);
+  return total;
+}
+
+uint32_t r3d_tracer_fold_excise(r3d_tracer *t) { return tr_fold_excise(t); }
+
 /* Flood-fill the exterior: mark every cell reachable 4-connected from the
  * grid border without crossing a blocked cell. What remains unblocked and
  * unmarked is enclosed (a hole). Shared by the QC hole metric and the
@@ -5872,6 +5997,19 @@ static void *tr_worker(void *ud) {
         pool.env[pe].ws_dist = pool.env[pe].ws_straight = pool.env[pe].ws_snap = 0.0;
       co_tm[6] += tr_now() - co5;
     }
+    if (!t->quit) {
+      /* zero tolerance: any fold the anneal could not flatten — or that
+       * hid below the QC trust threshold — is CUT now. A fold never
+       * survives a generation boundary, so the live view and every
+       * downstream consumer only ever see fold-free geometry; the cells
+       * retry from better parents as growth continues. */
+      uint32_t nex = tr_fold_excise(t);
+      if (nex) {
+        printf("tracer: gen %u: excised %u fold cell%s the anneal could not "
+               "flatten\n", generation, nex, nex == 1 ? "" : "s");
+        tr_qc2(t, false); /* panel counters reflect the cut */
+      }
+    }
     tr_anc_assign(t); /* adopt/assign user anchors, then re-seat their
                        * neighborhoods so a correction shows immediately
                        * instead of waiting for the every-8th global solve */
@@ -6081,6 +6219,14 @@ static void *tr_worker(void *ud) {
     t->ctsnap = false;
   }
   tr_wind_relax(t, 30);
+  if (!t->quit) { /* zero tolerance at finish too: the refine/ctsnap/
+      * inpaint paths do not pass through the generation loop's per-ring
+      * excision, and inpaint re-seating can fold in pathological spots */
+    uint32_t nex = tr_fold_excise(t);
+    if (nex)
+      printf("tracer: final fold excision cut %u cell%s\n", nex,
+             nex == 1 ? "" : "s");
+  }
   /* final QC: a >90-degree fold is never legitimate papyrus � surviving
    * folds are marked untrusted so the save writes an honest hole there
    * instead of doubled-back geometry */
@@ -6117,6 +6263,9 @@ static void *tr_worker(void *ud) {
     printf("tracer: ng bytes loaded: blob %.2f GB, indexes %.2f GB\n",
            (double)atomic_load(&ng_blob_bytes) / 1073741824.0,
            (double)atomic_load(&ng_idx_bytes) / 1073741824.0);
+    if (atomic_load(&tr_excise_total))
+      printf("tracer: %llu fold cell(s) excised across the trace\n",
+             (unsigned long long)atomic_load(&tr_excise_total));
     printf("tracer: coordinator serial: conf %.1fs omega %.1fs fit/don/sfx %.1fs "
            "windrelax %.1fs qc2 %.1fs foldrepair %.1fs\n",
            co_tm[1], co_tm[2], co_tm[3], co_tm[4], co_tm[5], co_tm[6]);
