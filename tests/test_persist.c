@@ -805,6 +805,10 @@ static void test_fold_excise_early(void) {
 }
 
 int main(void) {
+  /* the synthetic spiral fixtures curl far tighter (r0 = 30 vox) than
+   * real papyrus; relax the physical bend-radius floor so the barrier
+   * machinery runs without fighting the analytic geometry */
+  setenv("R3D_BEND_RMIN", "12", 1);
   char tmp[512];
   const char *base = getenv("TMPDIR");
   snprintf(tmp, sizeof tmp, "%s/r3d_persist_XXXXXX", base && *base ? base : "/tmp");

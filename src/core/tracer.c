@@ -29,6 +29,8 @@
 #define TR_SDIR_EPS_REL 1e-2
 #define TR_DT_TH 128.0 /* prediction "on sheet" threshold for the DT */
 #define TR_W_FOLD 2.0     /* anti-double-back hinge (inactive above 90 deg) */
+#define TR_W_BEND 3.0     /* physical bend-radius barrier (inactive within
+                           * the material's minimum curl radius) */
 #define TR_FOLD_COS 0.0   /* hinge threshold: cos(90 deg) */
 #define TR_W_PLANAR 0.25  /* quad twist: free corner vs other-3 plane */
 #define TR_W_CTSNAP 2.0   /* CT edge pull along the frozen normal (ctsnap) */
@@ -1049,9 +1051,14 @@ typedef struct tr_env { /* one per solving thread */
    * by LRU replacement within the 8-probe window. */
   struct { int plane, slice, slot; ng_grid *g; uint32_t use; uint8_t used; } gc[256];
   uint32_t gtick;
-  int gl_plane, gl_slice, gl_slot; /* last-answer memo (gl_plane -1 = unset):
-      * consecutive residuals overwhelmingly hit the same slice */
-  ng_grid *gl_g;
+  /* last-answer memos, PER PLANE: residual evals alternate between the
+   * three plane families, so a single-entry memo missed almost every
+   * call (15% of small-step trace CPU in the eget hash alone).
+   * gl_slice INT32_MIN = unset. gl_hood entries are validated by field
+   * comparison, so a rebuilt slot simply falls through. */
+  int gl_slice[3], gl_slot[3];
+  ng_grid *gl_g[3];
+  ng_hood *gl_hood[3];
   /* staged weight relaxation (G9, vc3d correction/inpaint continuation
    * schedule): scale factors on DistLoss, StraightLoss(+planar) and the
    * ncp snap component. 0 means "not set" and reads as 1.0 — envs are
@@ -1109,6 +1116,15 @@ static ng_hood *ng_hood_get(tr_env *e, ng_grid *g, int plane, int slice, double 
                             double my) {
   if (!e->hood) return NULL;
   int qx = (int)floor(mx / 16.0), qy = (int)floor(my / 16.0);
+  {
+    ng_hood *m = e->gl_hood[plane];
+    if (m && m->plane == plane && m->slice == slice && m->qx == qx &&
+        m->qy == qy && m->g == g) {
+      m->use = ++e->htick;
+      atomic_fetch_add_explicit(&ng_hood_hits, 1, memory_order_relaxed);
+      return m;
+    }
+  }
   for (uint32_t p = ng_hood_hash(plane, slice, qx, qy), n = 0; n < 4096;
        p = (p + 1) & 4095u, n++) {
     uint16_t ent = e->hidx[p];
@@ -1117,6 +1133,7 @@ static ng_hood *ng_hood_get(tr_env *e, ng_grid *g, int plane, int slice, double 
     if (h->plane == plane && h->slice == slice && h->qx == qx && h->qy == qy &&
         h->g == g) {
       h->use = ++e->htick;
+      e->gl_hood[plane] = h;
       atomic_fetch_add_explicit(&ng_hood_hits, 1, memory_order_relaxed);
       return h;
     }
@@ -1232,9 +1249,9 @@ static ng_hood *ng_hood_get(tr_env *e, ng_grid *g, int plane, int slice, double 
 /* env-level grid handle cache: refs released by tr_env_flush */
 static ng_grid *ng_eget(tr_env *e, int plane, int slice, int *slot_out) {
   slice = ng_snap(e->ngv, slice); /* sparse store: snap to published */
-  if (plane == e->gl_plane && slice == e->gl_slice) {
-    *slot_out = e->gl_slot;
-    return e->gl_g;
+  if (slice == e->gl_slice[plane]) {
+    *slot_out = e->gl_slot[plane];
+    return e->gl_g[plane];
   }
   uint32_t h = (((uint32_t)plane << 30) ^ (uint32_t)slice * 2654435761u) >> 24;
   uint32_t victim = h & 255u;
@@ -1249,10 +1266,9 @@ static ng_grid *ng_eget(tr_env *e, int plane, int slice, int *slot_out) {
     if (e->gc[k].plane == plane && e->gc[k].slice == slice) {
       e->gc[k].use = ++e->gtick;
       *slot_out = e->gc[k].slot;
-      e->gl_plane = plane;
-      e->gl_slice = slice;
-      e->gl_slot = e->gc[k].slot;
-      e->gl_g = e->gc[k].g;
+      e->gl_slice[plane] = slice;
+      e->gl_slot[plane] = e->gc[k].slot;
+      e->gl_g[plane] = e->gc[k].g;
       atomic_fetch_add_explicit(&ng_eget_hit, 1, memory_order_relaxed);
       return e->gc[k].g;
     }
@@ -1266,8 +1282,9 @@ static ng_grid *ng_eget(tr_env *e, int plane, int slice, int *slot_out) {
   ng_grid *g = ng_get(e->ngv, plane, slice, &slot);
   if (e->gc[victim].used) {
     ng_put(e->ngv, e->gc[victim].slot, e->gc[victim].g);
-    if (e->gl_plane == e->gc[victim].plane && e->gl_slice == e->gc[victim].slice)
-      e->gl_plane = -9; /* memo died with its ref */
+    int vp = e->gc[victim].plane;
+    if (vp >= 0 && vp < 3 && e->gl_slice[vp] == e->gc[victim].slice)
+      e->gl_slice[vp] = INT32_MIN; /* memo died with its ref */
   }
   e->gc[victim].plane = plane;
   e->gc[victim].slice = slice;
@@ -1275,17 +1292,19 @@ static ng_grid *ng_eget(tr_env *e, int plane, int slice, int *slot_out) {
   e->gc[victim].g = g; /* NULL cached too */
   e->gc[victim].use = ++e->gtick;
   e->gc[victim].used = 1;
-  e->gl_plane = plane;
-  e->gl_slice = slice;
-  e->gl_slot = slot;
-  e->gl_g = g;
+  e->gl_slice[plane] = slice;
+  e->gl_slot[plane] = slot;
+  e->gl_g[plane] = g;
   *slot_out = slot;
   return g;
 }
 
 static void tr_env_flush(tr_env *e) {
-  e->gl_plane = -9; /* refs release below: the memo must not outlive them */
-  e->gl_g = NULL;
+  for (int p2 = 0; p2 < 3; p2++) { /* refs release below: memos must not
+                                    * outlive them */
+    e->gl_slice[p2] = INT32_MIN;
+    e->gl_g[p2] = NULL;
+  }
   for (uint32_t i = 0; i < 256; i++)
     if (e->gc[i].used) {
       ng_put(e->ngv, e->gc[i].slot, e->gc[i].g);
@@ -2999,7 +3018,7 @@ static void tr_res_self(tr_nlsq *acc, const r3d_tracer *t, const double x[3],
     int gdj = abs((int)(bk_hinge / t->W) - (int)(self_k / t->W));
     int gd = gdi > gdj ? gdi : gdj;
     bool fold_back = ok1 && ok2 && ndot < -0.3;
-    bool interpen = ok1 && ok2 && ndot > 0.3 && gd > 20;
+    bool interpen = ok1 && ok2 && ndot > 0.3 && (double)gd * t->cfg.step > 400.0;
     if (fold_back || interpen || (!ok1 || !ok2)) {
       double d = sqrt(bd2);
       if (d > 1e-6) {
@@ -3584,6 +3603,58 @@ static void tr_res_straight(tr_nlsq *acc, const double a[3], const double b[3],
   nq_add(acc, r, J);
 }
 
+/* Minimum physical bend radius, voxels. Papyrus cannot curl tighter
+ * than roughly a millimeter even at the umbilicus; anything sharper is
+ * a tracing artifact (doubling back, kinks). ~120 vox at ~8 um pitch.
+ * R3D_BEND_RMIN overrides (voxels). */
+static double tr_bend_rmin(void) {
+  static _Atomic int mr = -1;
+  int v = atomic_load_explicit(&mr, memory_order_relaxed);
+  if (v < 0) {
+    const char *ev = getenv("R3D_BEND_RMIN");
+    v = ev ? atoi(ev) : 120;
+    if (v < 8) v = 8;
+    atomic_store(&mr, v);
+  }
+  return (double)v;
+}
+
+/* Physical curvature barrier: the turn over a FIXED ARC (~40 vox — per
+ * grid edge the angle drowns in position noise at small steps) must not
+ * exceed arc / R_MIN radians. Zero cost inside the bound, linear +
+ * quadratic beyond: the data term can bend the sheet up to the material
+ * limit and no further — a front cannot even START doubling back into
+ * the direction it came from. Same triple/role layout as
+ * tr_res_straight; cmax = cos(max turn). */
+static void tr_res_bend(tr_nlsq *acc, const double a[3], const double b[3],
+                        const double c[3], int role, double cmax, double w) {
+  double d1[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]};
+  double d2[3] = {c[0] - b[0], c[1] - b[1], c[2] - b[2]};
+  double l1s = d1[0] * d1[0] + d1[1] * d1[1] + d1[2] * d1[2];
+  double l2s = d2[0] * d2[0] + d2[1] * d2[1] + d2[2] * d2[2];
+  if (l1s <= 1e-24 || l2s <= 1e-24) return;
+  double l1 = sqrt(l1s), l2 = sqrt(l2s);
+  double dot = (d1[0] * d2[0] + d1[1] * d2[1] + d1[2] * d2[2]) / (l1 * l2);
+  if (dot >= cmax) return; /* within the material limit: free */
+  double pen = cmax - dot;
+  double r = w * pen + 4.0 * w * pen * pen;
+  double g = -(w + 8.0 * w * pen);
+  double gd1[3], gd2[3];
+  for (int k = 0; k < 3; k++) {
+    gd1[k] = d2[k] / (l1 * l2) - dot * d1[k] / l1s;
+    gd2[k] = d1[k] / (l1 * l2) - dot * d2[k] / l2s;
+  }
+  double J[3];
+  for (int k = 0; k < 3; k++) {
+    double dd;
+    if (role == 0) dd = -gd1[k];
+    else if (role == 1) dd = gd1[k] - gd2[k];
+    else dd = gd2[k];
+    J[k] = g * dd;
+  }
+  nq_add(acc, r, J);
+}
+
 /* Hard hinge against doubling back: consecutive grid edges must not turn
  * past TR_FOLD_COS (90 deg). tr_res_straight's curvature cost is gentle
  * enough that a 180-degree fold can still win when the data term prefers
@@ -3980,6 +4051,28 @@ static void tr_eval(tr_ctx *c, const double x[3], tr_nlsq *acc) {
           tr_res_fold(acc, tr_at(c, ai, aj, x), tr_at(c, bi, bj, x),
                       tr_at(c, ci, cj, x), -w0, TR_W_FOLD);
       }
+    { /* physical bend-radius barrier over a fixed ~40-vox arc */
+      int bd = (int)(20.0 / t->cfg.step + 0.5);
+      if (bd < 1) bd = 1;
+      double arc = 2.0 * (double)bd * t->cfg.step;
+      double thmax = arc / tr_bend_rmin();
+      if (thmax > 2.0) thmax = 2.0; /* keep the hinge meaningful (this
+          * clamp implies a floor of arc/2 on the effective radius, so
+          * it must stay above what R3D_BEND_RMIN can ask for) */
+      double cmax = cos(thmax);
+      static const int axb[2][2] = {{1, 0}, {0, 1}};
+      for (int a = 0; a < 2; a++)
+        for (int w0 = -2; w0 <= 0; w0++) { /* free cell as A, B, or C */
+          int ai = i + w0 * bd * axb[a][0], aj = j + w0 * bd * axb[a][1];
+          int bi = ai + bd * axb[a][0], bj = aj + bd * axb[a][1];
+          int ci = bi + bd * axb[a][0], cj = bj + bd * axb[a][1];
+          if (!tr_valid(t, ai, aj) || !tr_valid(t, bi, bj) ||
+              !tr_valid(t, ci, cj))
+            continue;
+          tr_res_bend(acc, tr_at(c, ai, aj, x), tr_at(c, bi, bj, x),
+                      tr_at(c, ci, cj, x), -w0, cmax, TR_W_BEND);
+        }
+    }
     if (sparse > 0.05) /* gap prior: continue the established curvature */
       for (int a = 0; a < 2; a++)
         for (int w0 = -2; w0 <= -1; w0++) { /* 4-tuple starts at p + w0*axis */
@@ -4790,7 +4883,7 @@ static void tr_pool_init(tr_pool *pl, r3d_tracer *t, ng_vol *ngv) {
   for (uint32_t i = 0; i < want; i++) {
     tr_env *e = &pl->env[pl->nth];
     memset(e, 0, sizeof *e);
-    e->gl_plane = -9; /* eget memo starts invalid (0 is a real plane) */
+    for (int p2 = 0; p2 < 3; p2++) e->gl_slice[p2] = INT32_MIN;
     e->ngv = ngv;
     e->in_pool = true;
     e->pl = pl;
@@ -4898,7 +4991,10 @@ static _Atomic uint64_t tr_excise_total; /* stats: fold cells cut per trace */
  * their direct 3D distance. A legitimately tight curl reads ~1.5-3 (the
  * path goes around the apex); a flap lying back over the sheet reads
  * far higher (the path runs out to the crease and back). A broken path
- * (invalid cell on the line) reads as suspect too. */
+ * (hole on the line) returns -1 = UNKNOWN: at small steps the growth
+ * rim is full of holes, and treating unknown as suspect excised ~20
+ * healthy rim cells per generation. A real flap's path to the sheet
+ * beneath runs through its own crease, which is intact. */
 static double tr_grid_path_ratio(const r3d_tracer *t, uint32_t ka, uint32_t kb) {
   int i0 = (int)(ka % t->W), j0 = (int)(ka / t->W);
   int i1 = (int)(kb % t->W), j1 = (int)(kb / t->W);
@@ -4910,7 +5006,7 @@ static double tr_grid_path_ratio(const r3d_tracer *t, uint32_t ka, uint32_t kb) 
   for (int s2 = 1; s2 <= steps; s2++) {
     int ci = i0 + (di * s2 + (di >= 0 ? steps / 2 : -steps / 2)) / steps;
     int cj = j0 + (dj * s2 + (dj >= 0 ? steps / 2 : -steps / 2)) / steps;
-    if (!tr_valid(t, ci, cj)) return 1e9; /* broken path: suspect */
+    if (!tr_valid(t, ci, cj)) return -1.0; /* broken path: unknown */
     const double *cur = t->pos + ((size_t)cj * t->W + (size_t)ci) * 3;
     double dd = 0;
     for (int a = 0; a < 3; a++) dd += (cur[a] - prev[a]) * (cur[a] - prev[a]);
@@ -5076,7 +5172,8 @@ static uint32_t tr_fold_excise(r3d_tracer *t) {
            * within a third of a step (grid-far, normals opposed) are
            * definitionally a doubled sheet */
           double rmin = om > 0 ? 0.5 * om : 0.35 * t->cfg.step;
-          if (rmin <= 1.0) continue;
+          if (rmin < 4.0) rmin = 4.0; /* sheet gaps are absolute (~11
+              * vox): a step-scaled radius went inert at small steps */
           long c0[3], c1[3];
           for (int a = 0; a < 3; a++) {
             c0[a] = (long)floor((P[a] - rmin) / sx->cs);
@@ -5092,7 +5189,9 @@ static uint32_t tr_fold_excise(r3d_tracer *t) {
                   int di2 = abs((int)(k2 % t->W) - i);
                   int dj2 = abs((int)(k2 / t->W) - j);
                   int gd = di2 > dj2 ? di2 : dj2;
-                  if (gd < 2) continue; /* immediate neighbors: same patch */
+                  if (gd < 2 || (double)gd * t->cfg.step < 2.0 * rmin)
+                    continue; /* same patch: closer along the sheet than
+                               * twice the overlap radius */
                   const double *Q = t->pos + (size_t)k2 * 3;
                   double d2 = 0;
                   for (int a = 0; a < 3; a++) d2 += (P[a] - Q[a]) * (P[a] - Q[a]);
@@ -5102,9 +5201,12 @@ static uint32_t tr_fold_excise(r3d_tracer *t) {
                     continue;
                   double ndot = n1[0] * n2[0] + n1[1] * n2[1] + n1[2] * n2[2];
                   if (ndot >= -0.3) continue;
-                  if (gd <= 10 &&
-                      tr_grid_path_ratio(t, (uint32_t)kb, k2) < 4.0)
-                    continue; /* tight curl: the path hugs the apex */
+                  if ((double)gd * t->cfg.step <= 200.0) {
+                    double pr = tr_grid_path_ratio(t, (uint32_t)kb, k2);
+                    if (pr < 4.0) /* tight curl (path hugs the apex) or
+                                   * unknown (-1, broken path): no cut */
+                      continue;
+                  }
                   size_t victim = tr_fold_victim(t, kb, (size_t)k2);
                   if (victim == (size_t)-1 || cutmap[victim]) continue;
                   cutmap[victim] = 1; /* collected; applied below so the
@@ -5324,6 +5426,50 @@ static void tr_qc2(r3d_tracer *t, bool clamp_folds) {
     sl95 = slant[nsl - 1 - nsl / 20];
   }
   free(slant);
+  { /* flatness: equivalent bend radius over a fixed ~40-vox arc (per
+     * grid edge the angle drowns in noise at small steps) */
+    int bd = (int)(20.0 / t->cfg.step + 0.5);
+    if (bd < 1) bd = 1;
+    double arc = 2.0 * (double)bd * t->cfg.step;
+    float *rads = malloc((size_t)W * (size_t)H * sizeof *rads);
+    size_t nr = 0;
+    if (rads) {
+      for (int j = 0; j < H; j++)
+        for (int i = 0; i < W; i++) {
+          if (!tr_qc_ok(t, i, j)) continue;
+          for (int a = 0; a < 2; a++) {
+            int ai = i - bd * ax2[a][0], aj = j - bd * ax2[a][1];
+            int ci = i + bd * ax2[a][0], cj = j + bd * ax2[a][1];
+            if (!tr_qc_ok(t, ai, aj) || !tr_qc_ok(t, ci, cj)) continue;
+            const double *pa = t->pos + ((size_t)aj * t->W + (size_t)ai) * 3;
+            const double *pb = t->pos + ((size_t)j * t->W + (size_t)i) * 3;
+            const double *pc = t->pos + ((size_t)cj * t->W + (size_t)ci) * 3;
+            double d1[3], d2[3], l1 = 0, l2 = 0, dot = 0;
+            for (int k = 0; k < 3; k++) {
+              d1[k] = pb[k] - pa[k];
+              d2[k] = pc[k] - pb[k];
+              l1 += d1[k] * d1[k];
+              l2 += d2[k] * d2[k];
+              dot += d1[k] * d2[k];
+            }
+            if (l1 < 1e-12 || l2 < 1e-12) continue;
+            double cth = dot / sqrt(l1 * l2);
+            if (cth > 1.0) cth = 1.0;
+            if (cth < -1.0) cth = -1.0;
+            double th = acos(cth);
+            rads[nr++] = th > 1e-4 ? (float)(arc / th) : 1e30f;
+          }
+        }
+      if (nr) {
+        qsort(rads, nr, sizeof *rads, tr_fcmp);
+        t->qc_bend_p5 = rads[nr / 20];
+        t->qc_bend_med = rads[nr / 2];
+      } else {
+        t->qc_bend_p5 = t->qc_bend_med = 1e30f;
+      }
+      free(rads);
+    }
+  }
   /* enclosed holes: untrusted cells unreachable from the grid border */
   uint32_t holes = 0;
   uint64_t bba = 0;
@@ -5724,8 +5870,10 @@ static void *tr_worker(void *ud) {
       }
     }
   }
-  tr_env cenv = {.dt = dt, .ngv = &ng, .gl_plane = -9}; /* coordinator's
-      * solve env (gl_plane -9: eget memo starts invalid) */
+  tr_env cenv = {.dt = dt,
+                 .ngv = &ng,
+                 .gl_slice = {INT32_MIN, INT32_MIN, INT32_MIN}};
+  /* coordinator's solve env; eget memos start invalid */
   cenv.hood = calloc(NG_NHOOD, sizeof *cenv.hood);
   if (cenv.hood)
     for (int hi = 0; hi < NG_NHOOD; hi++) cenv.hood[hi].plane = -1;
@@ -6408,11 +6556,14 @@ static void *tr_worker(void *ud) {
    * instead of doubled-back geometry */
   tr_qc2(t, true);
   printf("tracer: QC %u folds, %u kinks, twist %.2f | area %.3g vx2, "
-         "bbox %ux%u, fill %.2f, holes %.3f, slant p95 %.3f\n",
+         "bbox %ux%u, fill %.2f, holes %.3f, slant p95 %.3f, bend p5 %.0f "
+         "med %.0f vox\n",
          t->qc_folds, t->qc_kinks, (double)t->qc_twist, t->qc_area_vx2,
          t->qc_bbox[2] >= t->qc_bbox[0] ? t->qc_bbox[2] - t->qc_bbox[0] + 1 : 0,
          t->qc_bbox[3] >= t->qc_bbox[1] ? t->qc_bbox[3] - t->qc_bbox[1] + 1 : 0,
-         (double)t->qc_fill, (double)t->qc_hole, (double)t->qc_slant_p95);
+         (double)t->qc_fill, (double)t->qc_hole, (double)t->qc_slant_p95,
+         t->qc_bend_p5 >= 1e30f ? 0.0 : (double)t->qc_bend_p5,
+         t->qc_bend_med >= 1e30f ? 0.0 : (double)t->qc_bend_med);
   if (t->uc)
     printf("tracer: QC wrap-jump fraction %.4f, werr p95 %.3f\n",
            (double)t->qc_wrap_frac, (double)t->qc_werr_p95);

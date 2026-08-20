@@ -4683,11 +4683,17 @@ int main(int argc, char **argv) {
           struct gtrace *g = &gts[ti];
           if (!g->active) continue;
           igPushID_Int(ti);
-          char tar[48] = "";
+          char tar[80] = "";
           if (vox_um > 0.0 && g->tr.qc_area_vx2 > 0.0) {
             char ab[32];
             fmt_area_phys(g->tr.qc_area_vx2, vox_um, ab, sizeof ab);
-            snprintf(tar, sizeof tar, ", %s", ab);
+            float bp5 = g->tr.qc_bend_p5;
+            if (bp5 > 0.0f && bp5 < 1e30f) /* flatness: sharpest-5% bend
+                * radius; papyrus stays above ~1 mm */
+              snprintf(tar, sizeof tar, ", %s, bend %.1fmm", ab,
+                       (double)bp5 * vox_um * 1e-3);
+            else
+              snprintf(tar, sizeof tar, ", %s", ab);
           }
           igText("%s trace %d: %u/%u, %u pts%s%s", ti == gt_sel ? ">" : " ", ti,
                  g->ring, g->tr.cfg.max_ring, g->nset, tar,

@@ -189,6 +189,10 @@ typedef struct r3d_tracer {
   float qc_fill;       /* trusted cells / bbox area */
   float qc_hole;       /* enclosed (border-unreachable) untrusted / bbox */
   float qc_slant_p95;  /* |e_u.e_v|/|e_u|^2 — coherent shear detector */
+  float qc_bend_p5, qc_bend_med; /* flatness: equivalent bend radius in
+      * voxels over a fixed ~40-vox arc; p5 = the sharpest 5% (the metric
+      * the bend barrier enforces; papyrus stays above ~120 vox). 1e30 =
+      * no measurable turning. */
   /* donor agreement (fused runs only; <=2000 sampled trusted cells) */
   float qc_don_mean, qc_don_rms, qc_don_p95; /* voxels */
   float qc_don_cov; /* fraction with a donor within 2 grid steps */
