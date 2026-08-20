@@ -5050,6 +5050,44 @@ static bool tr_cell_normal_f(const r3d_tracer *t, int i, int j, double n[3]) {
   return true;
 }
 
+/* segment (p,q) strictly crossing triangle (a,b,c) interior
+ * (Moller-Trumbore with t in (0,1)) */
+static bool tr_seg_tri(const double p[3], const double q[3], const double a[3],
+                       const double b[3], const double c[3]) {
+  double dir[3], e1[3], e2[3], pv[3], tv[3], qv[3];
+  for (int k = 0; k < 3; k++) {
+    dir[k] = q[k] - p[k];
+    e1[k] = b[k] - a[k];
+    e2[k] = c[k] - a[k];
+  }
+  pv[0] = dir[1] * e2[2] - dir[2] * e2[1];
+  pv[1] = dir[2] * e2[0] - dir[0] * e2[2];
+  pv[2] = dir[0] * e2[1] - dir[1] * e2[0];
+  double det = e1[0] * pv[0] + e1[1] * pv[1] + e1[2] * pv[2];
+  if (det > -1e-12 && det < 1e-12) return false; /* parallel/coplanar */
+  double inv = 1.0 / det;
+  for (int k = 0; k < 3; k++) tv[k] = p[k] - a[k];
+  double u = (tv[0] * pv[0] + tv[1] * pv[1] + tv[2] * pv[2]) * inv;
+  if (u < 0.0 || u > 1.0) return false;
+  qv[0] = tv[1] * e1[2] - tv[2] * e1[1];
+  qv[1] = tv[2] * e1[0] - tv[0] * e1[2];
+  qv[2] = tv[0] * e1[1] - tv[1] * e1[0];
+  double v = (dir[0] * qv[0] + dir[1] * qv[1] + dir[2] * qv[2]) * inv;
+  if (v < 0.0 || u + v > 1.0) return false;
+  double tt = (e2[0] * qv[0] + e2[1] * qv[1] + e2[2] * qv[2]) * inv;
+  return tt > 1e-9 && tt < 1.0 - 1e-9;
+}
+
+/* do two triangles intersect? (edges-vs-faces both ways; coplanar
+ * overlap is measure-zero in floats and ignored) */
+static bool tr_tri_tri(const double *A[3], const double *B[3]) {
+  for (int e = 0; e < 3; e++) {
+    if (tr_seg_tri(A[e], A[(e + 1) % 3], B[0], B[1], B[2])) return true;
+    if (tr_seg_tri(B[e], B[(e + 1) % 3], A[0], A[1], A[2])) return true;
+  }
+  return false;
+}
+
 /* pick the excision victim of a confirmed fold pair: the newer cell
  * (the flap was placed on top of older sheet), ties by lower conf;
  * anchored cells are never cut. Returns SIZE_MAX when both anchored. */
@@ -5211,6 +5249,133 @@ static uint32_t tr_fold_excise(r3d_tracer *t) {
                   if (victim == (size_t)-1 || cutmap[victim]) continue;
                   cutmap[victim] = 1; /* collected; applied below so the
                       * whole pass detects against one consistent grid */
+                  nex++;
+                }
+        }
+      for (size_t k = 0; nex && k < (size_t)W * (size_t)H; k++) {
+        if (!cutmap[k]) continue;
+        cutmap[k] = 0;
+        if (t->state[k] != R3D_TR_SET) continue;
+        t->state[k] = R3D_TR_EMPTY;
+        t->conf[k] = 0.0f;
+        if (t->gen_of) t->gen_of[k] = 0;
+        if (t->nset) t->nset--;
+      }
+      pthread_mutex_unlock(&t->mu);
+      total += nex;
+      if (!nex) break;
+    }
+  }
+  /* phase 3 — SELF-INTERSECTION: exact triangle-triangle tests between
+   * non-adjacent quads. Fold-backs have opposing normals, but a sheet
+   * can also CROSS itself (or a neighboring wrap) at parallel/oblique
+   * normals, which phases 1-2 deliberately ignore. Actual geometric
+   * intersection is unconditionally invalid papyrus — no normal-angle
+   * heuristics apply. Victim: newest non-anchor corner of the pair. */
+  if (t->sfx) {
+    const tr_sfx *sx = t->sfx;
+    for (int pass = 0; pass < 16; pass++) {
+      uint32_t nex = 0;
+      pthread_mutex_lock(&t->mu);
+      for (int j = 0; j + 1 < H; j++)
+        for (int i = 0; i + 1 < W; i++) {
+          size_t q00 = (size_t)j * t->W + (size_t)i;
+          if (t->state[q00] != R3D_TR_SET || !tr_valid(t, i + 1, j) ||
+              !tr_valid(t, i, j + 1) || !tr_valid(t, i + 1, j + 1))
+            continue;
+          const double *P00 = t->pos + q00 * 3;
+          const double *P10 = t->pos + ((size_t)j * t->W + (size_t)i + 1) * 3;
+          const double *P01 = t->pos + ((size_t)(j + 1) * t->W + (size_t)i) * 3;
+          const double *P11 = t->pos + ((size_t)(j + 1) * t->W + (size_t)i + 1) * 3;
+          double cen[3], rad2 = 0;
+          for (int k = 0; k < 3; k++)
+            cen[k] = 0.25 * (P00[k] + P10[k] + P01[k] + P11[k]);
+          const double *cor[4] = {P00, P10, P01, P11};
+          for (int q = 0; q < 4; q++) {
+            double d2 = 0;
+            for (int k = 0; k < 3; k++)
+              d2 += (cor[q][k] - cen[k]) * (cor[q][k] - cen[k]);
+            if (d2 > rad2) rad2 = d2;
+          }
+          /* centroid gate radius: a truly crossing pair (doubled sheet)
+           * has nearly coincident centroids; discretization chording — a
+           * coarse flat quad nicking a neighboring wrap it does not
+           * really cross — keeps them a full sheet gap apart */
+          double omq = tr_om_at(t, cen);
+          double cgate = omq > 0 ? 0.5 * omq : 0.35 * t->cfg.step;
+          if (cgate < 4.0) cgate = 4.0;
+          double R = sqrt(rad2) + cgate + 1.0; /* find a partner corner */
+          long c0[3], c1[3];
+          for (int k = 0; k < 3; k++) {
+            c0[k] = (long)floor((cen[k] - R) / sx->cs);
+            c1[k] = (long)floor((cen[k] + R) / sx->cs);
+          }
+          for (long cz = c0[2]; cz <= c1[2]; cz++)
+            for (long cy = c0[1]; cy <= c1[1]; cy++)
+              for (long cx = c0[0]; cx <= c1[0]; cx++)
+                for (uint32_t e = sx->head[tr_sfx_h(sx, cx, cy, cz)]; e;
+                     e = sx->next[e - 1]) {
+                  uint32_t k2 = sx->cell[e - 1];
+                  int i2 = (int)(k2 % t->W), j2 = (int)(k2 / t->W);
+                  /* k2 anchors the partner quad; process each unordered
+                   * pair once and skip quads sharing any vertex */
+                  int di2 = i2 - i > 0 ? i2 - i : i - i2;
+                  int dj2 = j2 - j > 0 ? j2 - j : j - j2;
+                  int gd = di2 > dj2 ? di2 : dj2;
+                  if (gd < 2 || (size_t)k2 <= q00) continue;
+                  if (i2 + 1 >= W || j2 + 1 >= H) continue;
+                  if (t->state[k2] != R3D_TR_SET || !tr_valid(t, i2 + 1, j2) ||
+                      !tr_valid(t, i2, j2 + 1) || !tr_valid(t, i2 + 1, j2 + 1))
+                    continue;
+                  const double *Q00 = t->pos + (size_t)k2 * 3;
+                  const double *Q10 =
+                      t->pos + ((size_t)j2 * t->W + (size_t)i2 + 1) * 3;
+                  const double *Q01 =
+                      t->pos + ((size_t)(j2 + 1) * t->W + (size_t)i2) * 3;
+                  const double *Q11 =
+                      t->pos + ((size_t)(j2 + 1) * t->W + (size_t)i2 + 1) * 3;
+                  {
+                    double qcen[3], dc2 = 0;
+                    for (int k = 0; k < 3; k++) {
+                      qcen[k] = 0.25 * (Q00[k] + Q10[k] + Q01[k] + Q11[k]);
+                      dc2 += (qcen[k] - cen[k]) * (qcen[k] - cen[k]);
+                    }
+                    if (dc2 > cgate * cgate) continue; /* chording, not
+                                                        * a doubled sheet */
+                  }
+                  const double *TA[2][3] = {{P00, P10, P01}, {P10, P11, P01}};
+                  const double *TB[2][3] = {{Q00, Q10, Q01}, {Q10, Q11, Q01}};
+                  bool hit = false;
+                  for (int ta = 0; ta < 2 && !hit; ta++)
+                    for (int tb = 0; tb < 2 && !hit; tb++)
+                      hit = tr_tri_tri(TA[ta], TB[tb]);
+                  if (!hit) continue;
+                  /* newest non-anchor corner of either quad */
+                  size_t cand2[8] = {
+                      q00,
+                      (size_t)j * t->W + (size_t)i + 1,
+                      (size_t)(j + 1) * t->W + (size_t)i,
+                      (size_t)(j + 1) * t->W + (size_t)i + 1,
+                      (size_t)k2,
+                      (size_t)j2 * t->W + (size_t)i2 + 1,
+                      (size_t)(j2 + 1) * t->W + (size_t)i2,
+                      (size_t)(j2 + 1) * t->W + (size_t)i2 + 1};
+                  size_t victim = (size_t)-1;
+                  uint32_t vgen = 0;
+                  for (int v = 0; v < 8; v++) {
+                    bool anch = false;
+                    for (uint32_t an = 0; an < t->nanc && !anch; an++)
+                      anch = t->anc_cell[an] >= 0 &&
+                             (size_t)t->anc_cell[an] == cand2[v];
+                    if (anch || cutmap[cand2[v]]) continue;
+                    uint32_t g2 = t->gen_of ? t->gen_of[cand2[v]] : 0;
+                    if (victim == (size_t)-1 || g2 > vgen) {
+                      victim = cand2[v];
+                      vgen = g2;
+                    }
+                  }
+                  if (victim == (size_t)-1) continue;
+                  cutmap[victim] = 1;
                   nex++;
                 }
         }
