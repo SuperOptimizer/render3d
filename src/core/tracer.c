@@ -158,6 +158,40 @@ static const uint8_t *td_chunk(td_cache *c, int64_t cx, int64_t cy, int64_t cz) 
   return lru->d;
 }
 
+/* Prediction repair before the DT (2025 surface-detection winners'
+ * playbook, the additive-only parts): every top solution spent most of
+ * its effort closing holes and breaks in the predicted sheets, because
+ * topology errors in the mask dominate everything downstream. Here the
+ * mask feeds the tracer's DT data term, so the same defects become
+ * stopped fronts, dropped confidence, and honest holes. Two safe
+ * repairs, R3D_PRED_REPAIR=0 to disable:
+ *  - hysteresis: weak predictions (>= 0.6*TH) count when 6-connected to
+ *    a strong core (>= TH) — the discrete cousin of the 5th place's
+ *    SDF-over-binary insight; a global threshold cannot keep faint but
+ *    continuous sheet without also keeping noise.
+ *  - sandwich gap fill (9th place): a <=2-voxel break flanked by sheet
+ *    on BOTH sides along an axis is filled. Additive only.
+ * Deliberately NO median filtering: at level 1 our sheets are ~1 voxel
+ * thin and iterated medians destroy exactly such structures (the
+ * 18th-place analysis).
+ * DEFAULT OFF, measured: what helps a Dice/topology metric hurts a
+ * TRACER. A/B on p343 showed step 20 unchanged and step 3 clearly
+ * worse (kinks 4 -> 229, holes 3x, +50% wall): the thickened field
+ * jitters the space-line term and gap bridges risk fusing adjacent
+ * sheets — false attractors cost the tracer more than holes, which the
+ * membrane machinery already crosses geometrically. R3D_PRED_REPAIR=1
+ * opts in for prediction sets weak enough that fronts stall. */
+static int tr_pred_repair_on(void) {
+  static _Atomic int on = -1;
+  int v = atomic_load_explicit(&on, memory_order_relaxed);
+  if (v < 0) {
+    const char *ev = getenv("R3D_PRED_REPAIR");
+    v = ev ? atoi(ev) : 0;
+    atomic_store(&on, v);
+  }
+  return v;
+}
+
 /* compute one DT chunk standalone: thread-safe (cpuvol reads only, no
  * cache mutation) — the parallel conf prewarm builds chunks on worker
  * threads and inserts them on the coordinator */
@@ -165,6 +199,13 @@ static void td_build_raw(r3d_cpuvol *vol, uint32_t level, int64_t cx, int64_t cy
                          int64_t cz, float *sq, uint8_t *out) {
   /* occupancy of the extended block, squared-EDT seeds */
   const double sc = (double)vol->lev[level].scale;
+  const size_t NE = (size_t)TD_EXT * TD_EXT * TD_EXT;
+  uint8_t *occ = tr_pred_repair_on() ? malloc(NE) : NULL;
+  uint32_t *bq = occ ? malloc(NE * sizeof *bq) : NULL;
+  if (occ && !bq) {
+    free(occ);
+    occ = NULL;
+  }
   for (int64_t lz = 0; lz < TD_EXT; lz++)
     for (int64_t ly = 0; ly < TD_EXT; ly++)
       for (int64_t lx = 0; lx < TD_EXT; lx++) {
@@ -172,9 +213,63 @@ static void td_build_raw(r3d_cpuvol *vol, uint32_t level, int64_t cx, int64_t cy
         double by = ((double)(cy * TD_CORE - TD_BORD + ly) + 0.5) * sc;
         double bz = ((double)(cz * TD_CORE - TD_BORD + lz) + 0.5) * sc;
         uint8_t v = r3d_cpuvol_at(vol, level, bx, by, bz);
-        sq[((size_t)lz * TD_EXT + (size_t)ly) * TD_EXT + (size_t)lx] =
-            (double)v >= TR_DT_TH ? 0.0f : 1e30f;
+        size_t k = ((size_t)lz * TD_EXT + (size_t)ly) * TD_EXT + (size_t)lx;
+        if (occ)
+          occ[k] = (double)v >= TR_DT_TH ? 2 : ((double)v >= 0.6 * TR_DT_TH ? 1 : 0);
+        else
+          sq[k] = (double)v >= TR_DT_TH ? 0.0f : 1e30f;
       }
+  if (occ) {
+    /* hysteresis: flood from cores (2) through weak (1); survivors are
+     * foreground (3) */
+    uint32_t qn = 0;
+    for (size_t k = 0; k < NE; k++)
+      if (occ[k] == 2) {
+        occ[k] = 3;
+        bq[qn++] = (uint32_t)k;
+      }
+    const long SX = 1, SY = TD_EXT, SZ = (long)TD_EXT * TD_EXT;
+    for (uint32_t h = 0; h < qn; h++) {
+      long k = (long)bq[h];
+      long x = k % TD_EXT, y = (k / TD_EXT) % TD_EXT, z = k / SZ;
+      const long off[6] = {SX, -SX, SY, -SY, SZ, -SZ};
+      const long lim0[6] = {x + 1, x - 1, y + 1, y - 1, z + 1, z - 1};
+      for (int o = 0; o < 6; o++) {
+        if (lim0[o] < 0 || lim0[o] >= TD_EXT) continue;
+        long k2 = k + off[o];
+        if (occ[k2] == 1) {
+          occ[k2] = 3;
+          bq[qn++] = (uint32_t)k2;
+        }
+      }
+    }
+    /* sandwich gap fill: <=2 background voxels flanked by foreground
+     * along an axis (computed against the pre-fill state, then OR-ed) */
+    for (int ax = 0; ax < 3; ax++) {
+      const long st = ax == 0 ? SX : (ax == 1 ? SY : SZ);
+      const long n0 = TD_EXT;
+      for (long a = 0; a < n0; a++)
+        for (long b = 0; b < n0; b++) {
+          long base = ax == 0 ? a * SY + b * SZ
+                              : (ax == 1 ? a * SX + b * SZ : a * SX + b * SY);
+          for (long c = 1; c + 1 < n0; c++) {
+            long k = base + c * st;
+            if (occ[k] >= 3) continue;
+            bool g1 = occ[k - st] >= 3 && occ[k + st] >= 3;
+            bool g2 = !g1 && c + 2 < n0 && occ[k - st] >= 3 && occ[k + st] < 3 &&
+                      occ[k + 2 * st] >= 3;
+            if (g1) occ[k] |= 4;
+            if (g2) {
+              occ[k] |= 4;
+              occ[k + st] |= 4;
+            }
+          }
+        }
+    }
+    for (size_t k = 0; k < NE; k++) sq[k] = occ[k] >= 3 ? 0.0f : 1e30f;
+    free(occ);
+    free(bq);
+  }
   static _Thread_local float line[TD_EXT];
   for (int z2 = 0; z2 < TD_EXT; z2++) /* x pass */
     for (int y2 = 0; y2 < TD_EXT; y2++) {
