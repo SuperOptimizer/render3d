@@ -2875,12 +2875,17 @@ static void tr_sfx_free(tr_sfx *x) {
 
 /* rebuild from all SET cells (coordinator, pool idle) */
 static void tr_sfx_build(r3d_tracer *t) {
-  if (tr_om_eff(t) <= 0) return;
+  /* no gap estimate yet (first ~200 cells): build anyway with a
+   * step-derived cell size — the fold excision runs from generation 1
+   * and folds form EARLY (a seed placed near a crease can double over
+   * by generation 3) */
+  double gs = tr_om_eff(t) > 0 ? tr_om_eff(t) : t->cfg.step;
+  if (gs <= 0) return;
   tr_sfx *old = t->sfx;
   uint64_t N = (uint64_t)t->W * t->H;
   tr_sfx *x = calloc(1, sizeof *x);
   if (!x) return;
-  x->cs = 2.0 * tr_om_eff(t);
+  x->cs = 2.0 * gs;
   if (x->cs < 8.0) x->cs = 8.0;
   uint32_t nb = 1;
   while (nb < t->nset / 2 + 64) nb <<= 1;
@@ -5066,7 +5071,11 @@ static uint32_t tr_fold_excise(r3d_tracer *t) {
           double n1[3];
           if (!tr_cell_normal_f(t, i, j, n1)) continue;
           const double *P = t->pos + kb * 3;
-          double rmin = 0.5 * tr_om_at(t, P);
+          double om = tr_om_at(t, P);
+          /* before the sheet gap is measured, cells of the same grid
+           * within a third of a step (grid-far, normals opposed) are
+           * definitionally a doubled sheet */
+          double rmin = om > 0 ? 0.5 * om : 0.35 * t->cfg.step;
           if (rmin <= 1.0) continue;
           long c0[3], c1[3];
           for (int a = 0; a < 3; a++) {
@@ -7639,6 +7648,50 @@ int r3d_tracer_save(r3d_tracer *t, const char *dir, float cutoff, bool fill) {
             keep[k] = 3; /* filled (enclosed, untorn): read from fp */
       }
     }
+  }
+  if (rc == 0) {
+    /* the SHIPPED grid must be fold-free under the same detector growth
+     * uses: membrane re-seating can re-introduce shallow doubling, and
+     * infilled cells never went through the per-generation excision.
+     * Run the detector over the assembled output (pos/fp per keep) and
+     * drop whatever it cuts — an honest hole beats doubled papyrus.
+     * Radius: the stricter of the measured gap and the step fallback. */
+    r3d_tracer ft = {0};
+    ft.W = t->W;
+    ft.H = t->H;
+    ft.cfg.step = t->cfg.step;
+    double ome2 = tr_om_eff(t);
+    ft.sp_om_meas = ome2 > 0.7 * t->cfg.step ? ome2 : 0.7 * t->cfg.step;
+    ft.pos = malloc(n * 3 * sizeof *ft.pos);
+    ft.state = calloc(n, 1);
+    ft.conf = malloc(n * sizeof *ft.conf);
+    ft.gen_of = malloc(n * sizeof *ft.gen_of);
+    if (ft.pos && ft.state && ft.conf && ft.gen_of) {
+      pthread_mutex_init(&ft.mu, NULL);
+      for (uint64_t k = 0; k < n; k++) {
+        ft.conf[k] = 1.0f;
+        ft.gen_of[k] = t->gen_of ? t->gen_of[k] : 1;
+        if (!keep[k]) continue;
+        const double *src = keep[k] == 3 ? fp + k * 3 : t->pos + k * 3;
+        memcpy(ft.pos + k * 3, src, 3 * sizeof *src);
+        ft.state[k] = R3D_TR_SET;
+        ft.nset++;
+      }
+      tr_sfx_build(&ft);
+      uint32_t nex = tr_fold_excise(&ft);
+      if (nex) {
+        for (uint64_t k = 0; k < n; k++)
+          if (keep[k] && ft.state[k] != R3D_TR_SET) keep[k] = 0;
+        printf("tracer: save dropped %u fold cell%s from the export\n", nex,
+               nex == 1 ? "" : "s");
+      }
+      pthread_mutex_destroy(&ft.mu);
+    }
+    free(ft.pos);
+    free(ft.state);
+    free(ft.conf);
+    free(ft.gen_of);
+    tr_sfx_free(ft.sfx);
   }
   /* min-size gate + bbox crop (G15, vc3d min_area/vc_tifxyz_trim): a
    * seed that landed in noise must not leave a plausible tifxyz behind
