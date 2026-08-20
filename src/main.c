@@ -630,6 +630,19 @@ static double *msurf_fit(const double (*pts)[3], uint32_t n, double step,
   return grid;
 }
 
+/* human-readable physical area from full-res voxel^2 and voxel pitch */
+static void fmt_area_phys(double vx2, double um, char *out, size_t n) {
+  double a = vx2 * um * um; /* um^2 */
+  if (a >= 1e12)
+    snprintf(out, n, "%.3f m^2", a / 1e12);
+  else if (a >= 1e8)
+    snprintf(out, n, "%.2f cm^2", a / 1e8);
+  else if (a >= 1e6)
+    snprintf(out, n, "%.2f mm^2", a / 1e6);
+  else
+    snprintf(out, n, "%.0f um^2", a);
+}
+
 /* Trace segment name at FINISH time: yyyymmddhhmmss (sorts
  * chronologically = alphabetically), suffixed -2, -3... when several
  * traces finish within one second. */
@@ -2406,12 +2419,35 @@ int main(int argc, char **argv) {
     return EXIT_FAILURE;
   }
 
+  double vox_um = 0.0; /* physical voxel pitch; 0 = unknown */
   if (bricks_path) {
     const char *pfe = getenv("R3D_POSTFILT"); /* headless/bench: force the
                                                * display filter (mode bits) */
     if (pfe) r3d_bricks_postfilter(renderer, (uint32_t)strtoul(pfe, NULL, 0), 1.0f, 1u);
     if (r3d_bricks_begin(renderer, bricks_path, (uint32_t)pool_bpa, (uint32_t)warm_mb) != 0)
       return EXIT_FAILURE;
+    { /* voxel pitch: scroll volumes carry "...um" in the source URL
+       * (e.g. 8.640um); fall back to a token in the local path. Feeds
+       * the physical-size readouts (trace area etc). */
+      char sjp[1200], sj[8192];
+      const char *sl = strrchr(bricks_path, '/');
+      if (sl)
+        snprintf(sjp, sizeof sjp, "%.*s/source.json", (int)(sl - bricks_path),
+                 bricks_path);
+      else
+        snprintf(sjp, sizeof sjp, "source.json");
+      FILE *sf = fopen(sjp, "rb");
+      if (sf) {
+        size_t sn = fread(sj, 1, sizeof sj - 1, sf);
+        fclose(sf);
+        sj[sn] = 0;
+        vox_um = r3d_regvol_parse_um(sj);
+      }
+      if (vox_um <= 0.0) vox_um = r3d_regvol_parse_um(bricks_path);
+      if (vox_um > 0.0)
+        printf("bricks: voxel pitch %.4g um%s\n", vox_um,
+               sf ? "" : " (from path)");
+    }
     r3d_bricks_shape(renderer, brick_shape);
     r3d_bricks_stats initial_bst;
     r3d_bricks_get_stats(renderer, &initial_bst);
@@ -4647,8 +4683,15 @@ int main(int argc, char **argv) {
           struct gtrace *g = &gts[ti];
           if (!g->active) continue;
           igPushID_Int(ti);
-          igText("%s trace %d: %u/%u, %u pts%s", ti == gt_sel ? ">" : " ", ti,
-                 g->ring, g->tr.cfg.max_ring, g->nset, g->done ? " (done)" : "");
+          char tar[48] = "";
+          if (vox_um > 0.0 && g->tr.qc_area_vx2 > 0.0) {
+            char ab[32];
+            fmt_area_phys(g->tr.qc_area_vx2, vox_um, ab, sizeof ab);
+            snprintf(tar, sizeof tar, ", %s", ab);
+          }
+          igText("%s trace %d: %u/%u, %u pts%s%s", ti == gt_sel ? ">" : " ", ti,
+                 g->ring, g->tr.cfg.max_ring, g->nset, tar,
+                 g->done ? " (done)" : "");
           if (ti != gt_sel) {
             igSameLine(0, 8);
             if (igSmallButton("show")) {
