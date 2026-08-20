@@ -72,6 +72,7 @@ add_library(r3d_core STATIC
 # hot numeric TUs: fast-math (finite data by construction; the tracer's
 # guards are explicit range checks, not NaN probes)
 set_source_files_properties(src/core/tracer.c src/core/cpuvol.c
+  src/core/flatten.c src/core/bsurf.c
   PROPERTIES COMPILE_OPTIONS "-ffast-math;-funroll-loops")
 target_include_directories(r3d_core PUBLIC src)
 target_link_libraries(r3d_core PRIVATE r3d_warnings r3d_sanitize

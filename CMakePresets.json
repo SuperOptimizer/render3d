@@ -27,7 +27,9 @@
       "binaryDir": "${sourceDir}/build/release",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "CMAKE_INTERPROCEDURAL_OPTIMIZATION": "ON"
+        "CMAKE_INTERPROCEDURAL_OPTIMIZATION": "ON",
+        "CMAKE_C_FLAGS_RELEASE": "-O3 -DNDEBUG -march=native",
+        "CMAKE_CXX_FLAGS_RELEASE": "-O3 -DNDEBUG -march=native"
       }
     },
     {
@@ -35,8 +37,8 @@
       "inherits": "release",
       "binaryDir": "${sourceDir}/build/native",
       "cacheVariables": {
-        "CMAKE_C_FLAGS_RELEASE": "-O3 -DNDEBUG -mcpu=native",
-        "CMAKE_CXX_FLAGS_RELEASE": "-O3 -DNDEBUG -mcpu=native"
+        "CMAKE_C_FLAGS_RELEASE": "-O3 -DNDEBUG -march=native",
+        "CMAKE_CXX_FLAGS_RELEASE": "-O3 -DNDEBUG -march=native"
       }
     },
     {
@@ -50,19 +52,49 @@
     }
   ],
   "buildPresets": [
-    { "name": "dev", "configurePreset": "dev" },
-    { "name": "release", "configurePreset": "release" },
-    { "name": "native", "configurePreset": "native" },
-    { "name": "tsan", "configurePreset": "tsan" }
+    {
+      "name": "dev",
+      "configurePreset": "dev"
+    },
+    {
+      "name": "release",
+      "configurePreset": "release"
+    },
+    {
+      "name": "native",
+      "configurePreset": "native"
+    },
+    {
+      "name": "tsan",
+      "configurePreset": "tsan"
+    }
   ],
   "testPresets": [
-    { "name": "dev", "configurePreset": "dev", "output": { "outputOnFailure": true } },
-    { "name": "native", "configurePreset": "native", "output": { "outputOnFailure": true } },
+    {
+      "name": "dev",
+      "configurePreset": "dev",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "native",
+      "configurePreset": "native",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
     {
       "name": "quick",
       "configurePreset": "dev",
-      "filter": { "include": { "label": "quick" } },
-      "output": { "outputOnFailure": true }
+      "filter": {
+        "include": {
+          "label": "quick"
+        }
+      },
+      "output": {
+        "outputOnFailure": true
+      }
     }
   ]
 }

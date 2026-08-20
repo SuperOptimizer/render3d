@@ -5,6 +5,9 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#if defined(__GLIBC__) || defined(__linux__)
+#include <malloc.h>
+#endif
 #include <string.h>
 #include <sys/stat.h>
 #include <tiffio.h>
@@ -353,6 +356,8 @@ static double td_tri(td_cache *c, const double p[3], double grad[3]) {
  * connectivity, which is what stops wrap-jumping. Files are fetched on
  * demand ("%s/<plane>/%06d.grid"), cached on disk, decoded whole. */
 
+static _Atomic uint64_t ng_blob_bytes, ng_idx_bytes; /* footprint split */
+
 static uint32_t ng_be32(const uint8_t *p) {
   return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
 }
@@ -383,35 +388,38 @@ typedef struct ng_grid {
   int32_t bx, by;       /* bounds origin (always 0 in published grids) */
   uint32_t w, h;        /* slice extent, px */
   uint32_t cell, gw, gh; /* bucket grid */
-  uint32_t npaths;
   uint8_t *blob;        /* paths region verbatim: {u32be sx, sy, noff,
                          * int8 deltas[noff]} records — 4x smaller than
                          * decoded float pairs; decoded per hood build */
   size_t blob_n;
-  uint32_t *precoff;    /* [npaths] byte offset of each record (sorted) */
   uint32_t *bidx;       /* [gw*gh+1] CSR into boff */
-  uint32_t *boff;       /* path INDEX per bucket record (byte offsets in
-                         * the file, resolved to precoff indices once at
-                         * load: the per-record binary search in ng_query
-                         * was ~12% of trace CPU) */
+  uint32_t *boff;       /* blob-relative record OFFSET per bucket entry,
+                         * verbatim from the file. Offsets are unique per
+                         * path, so queries dedup and decode on them
+                         * directly — no path-index table (a precoff[]
+                         * array was half an xz grid's index RAM, and
+                         * building it needed a full record walk + hash
+                         * at every load) */
   bool empty;
 } ng_grid;
 
 static void ng_grid_free(ng_grid *g) {
   if (!g) return;
   free(g->blob);
-  free(g->precoff);
   free(g->bidx);
   free(g->boff);
   free(g);
 }
 
-/* decode path pi into pts (caller cap >= npts); returns point count */
-static uint32_t ng_path_decode(const ng_grid *g, uint32_t pi, float *pts,
+/* decode the path record at blob offset `po` into pts (caller cap >=
+ * npts); returns point count, 0 on a malformed offset */
+static uint32_t ng_path_decode(const ng_grid *g, uint32_t po, float *pts,
                                uint32_t cap) {
-  const uint8_t *r = g->blob + g->precoff[pi];
+  if ((size_t)po + 12 > g->blob_n) return 0;
+  const uint8_t *r = g->blob + po;
   double cx = ng_be32(r), cy = ng_be32(r + 4);
   uint32_t noff = ng_be32(r + 8), n = 0;
+  if ((size_t)po + 12 + noff > g->blob_n || (noff & 1u)) return 0;
   const int8_t *dl = (const int8_t *)(r + 12);
   if (n < cap) {
     pts[n * 2] = (float)cx;
@@ -470,66 +478,27 @@ static ng_grid *ng_grid_load(const char *path) {
   if (nbuck != g->gw * g->gh) goto bad;
   if ((size_t)bio + 4u * (nbuck + 1) > n || po > n) goto bad;
   size_t pend = jmo && jmo <= n ? jmo : n;
-  /* walk path records sequentially: {u32 sx, u32 sy, u32 noff, int8[]} */
-  uint32_t cap = 256, np = 0;
-  g->precoff = malloc(cap * sizeof *g->precoff);
-  if (!g->precoff) goto bad;
-  size_t off = po;
-  while (off + 12 <= pend) {
-    uint32_t noff = ng_be32(d + off + 8);
-    if (off + 12 + noff > pend || (noff & 1u)) break;
-    if (np + 1 > cap) {
-      cap *= 2;
-      uint32_t *nr = realloc(g->precoff, cap * sizeof *nr);
-      if (!nr) goto bad;
-      g->precoff = nr;
-    }
-    g->precoff[np++] = (uint32_t)(off - po);
-    off += 12 + noff;
-  }
-  g->npaths = np;
-  g->blob_n = off - po;
+  if (po > pend) goto bad;
+  g->blob_n = pend - po;
   g->blob = malloc(g->blob_n ? g->blob_n : 1);
   if (!g->blob) goto bad;
   memcpy(g->blob, d + po, g->blob_n);
-  /* bucket CSR: resolve record offsets to path indices once */
+  /* bucket CSR + record offsets, verbatim (offsets are validated at
+   * decode time against blob_n) */
   uint32_t nboff = ng_be32(d + bio + 4u * nbuck);
   if ((size_t)po - bio - 4u * (nbuck + 1) < 4u * (size_t)nboff) goto bad;
   g->bidx = malloc((nbuck + 1) * sizeof *g->bidx);
   g->boff = malloc((nboff ? nboff : 1) * sizeof *g->boff);
   if (!g->bidx || !g->boff) goto bad;
   for (uint32_t i = 0; i <= nbuck; i++) g->bidx[i] = ng_be32(d + bio + 4u * i);
-  { /* offset -> path index via a throwaway hash: O(npaths + nboff).
-     * (A per-record binary search here was 78% of trace CPU.) */
-    uint32_t hbits = 4;
-    while ((1u << hbits) < np * 2u && hbits < 31) hbits++;
-    uint32_t hn = 1u << hbits;
-    uint32_t *hk = malloc((size_t)hn * sizeof *hk);
-    uint32_t *hv = malloc((size_t)hn * sizeof *hv);
-    if (!hk || !hv) {
-      free(hk);
-      free(hv);
-      goto bad;
-    }
-    memset(hk, 0xff, (size_t)hn * sizeof *hk);
-    for (uint32_t i = 0; i < np; i++) {
-      uint32_t h2 = (g->precoff[i] * 2654435761u) >> (32 - hbits);
-      while (hk[h2] != UINT32_MAX) h2 = (h2 + 1) & (hn - 1);
-      hk[h2] = g->precoff[i];
-      hv[h2] = i;
-    }
-    for (uint32_t i = 0; i < nboff; i++) {
-      uint32_t rec = ng_be32(d + bio + 4u * (nbuck + 1) + 4u * i);
-      uint32_t h2 = (rec * 2654435761u) >> (32 - hbits);
-      while (hk[h2] != UINT32_MAX && hk[h2] != rec) h2 = (h2 + 1) & (hn - 1);
-      g->boff[i] = hk[h2] == rec ? hv[h2] : UINT32_MAX;
-    }
-    free(hk);
-    free(hv);
-  }
+  for (uint32_t i = 0; i < nboff; i++)
+    g->boff[i] = ng_be32(d + bio + 4u * (nbuck + 1) + 4u * i);
   free(d);
-  g->bytes = sizeof *g + g->blob_n + (size_t)np * sizeof(uint32_t) +
-             (size_t)(nbuck + 1 + nboff) * sizeof(uint32_t);
+  g->bytes = sizeof *g + g->blob_n + (size_t)(nbuck + 1 + nboff) * sizeof(uint32_t);
+  atomic_fetch_add_explicit(&ng_blob_bytes, g->blob_n, memory_order_relaxed);
+  atomic_fetch_add_explicit(&ng_idx_bytes,
+                            (size_t)(nbuck + 1 + nboff) * sizeof(uint32_t),
+                            memory_order_relaxed);
   return g;
 bad:
   free(d);
@@ -541,7 +510,7 @@ bad:
  * appends unique path indices to out[] (caller-sized), returns count */
 static uint32_t ng_query(const ng_grid *g, double cx, double cy, double radius,
                          uint32_t *out, uint32_t max) {
-  if (!g || g->empty || !g->npaths) return 0;
+  if (!g || g->empty || !g->blob_n) return 0;
   int x0 = (int)(cx - radius) - g->bx, y0 = (int)(cy - radius) - g->by;
   int sz = (int)(radius * 2.0);
   int x1 = x0 + sz, y1 = y0 + sz;
@@ -559,11 +528,11 @@ static uint32_t ng_query(const ng_grid *g, double cx, double cy, double radius,
     for (uint32_t bx2 = bx0; bx2 <= bx1; bx2++) {
       uint32_t b = by2 * g->gw + bx2;
       for (uint32_t k = g->bidx[b]; k < g->bidx[b + 1]; k++) {
-        uint32_t pi = g->boff[k]; /* resolved to a path index at load */
-        if (pi == UINT32_MAX) continue;
+        uint32_t po = g->boff[k]; /* blob-relative record offset: unique
+                                   * per path, so it IS the identity */
         bool dup = false;
-        for (uint32_t q = 0; q < nout && !dup; q++) dup = out[q] == pi;
-        if (!dup && nout < max) out[nout++] = pi;
+        for (uint32_t q = 0; q < nout && !dup; q++) dup = out[q] == po;
+        if (!dup && nout < max) out[nout++] = po;
       }
     }
   return nout;
@@ -581,7 +550,9 @@ static uint32_t ng_query(const ng_grid *g, double cx, double cy, double radius,
 #define NG_IDXMASK (NG_IDXN - 1u)
 #define NG_QMAX 64    /* paths per neighborhood query */
 #define NG_NHOOD 2048 /* cached segment neighborhoods (per solver thread; ~40 MB) */
-#define NG_HOODSEG 384 /* segments per neighborhood */
+#define NG_HOODSEG 128 /* segments per neighborhood (measured: mean 55,
+                         * max 104 on p343 — ng_hoodseg_binds counts any
+                         * store that saturates this) */
 
 /* phase timers, atomic ns: accumulated from every worker thread */
 static _Atomic uint64_t tr_tm_ns[6]; /* 0 place 1 lopt 2 conf 3 ngfetch
@@ -596,6 +567,7 @@ static _Atomic uint64_t ng_qmax_binds, ng_hoodseg_binds;
 static _Atomic uint64_t ng_loads, ng_evicts, ng_bytes_peak;
 static _Atomic uint64_t ng_eget_hit, ng_eget_miss;
 static _Atomic uint64_t ng_hood_hits, ng_hood_builds;
+static _Atomic uint64_t ng_hood_seg_sum, ng_hood_seg_max;
 /* coordinator serial-phase wall timers (one thread, plain doubles) */
 static double co_tm[8]; /* 0 dead 1 conf 2 omega 3 fit/don/sfx 4 windrelax
                          * 5 qc2 6 foldrepair */
@@ -619,6 +591,13 @@ typedef struct ng_hood {
   uint32_t nseg;
   float sg[NG_HOODSEG][13]; /* ax ay bx by nx ny prevx prevy nextx nexty
                              * dx dy invL2 (pt-seg without divides) */
+  /* SoA sidecars for the hot residual pass: contiguous lanes vectorize
+   * where the 13-float AoS records could not */
+  float smidx[NG_HOODSEG], smidy[NG_HOODSEG]; /* segment midpoint */
+  float snx[NG_HOODSEG], sny[NG_HOODSEG];     /* unit normal */
+  float sgr2[NG_HOODSEG]; /* snap gate: (halflen + trig + slack)^2 — a
+                           * segment farther than this from the chord end
+                           * cannot pass the 4-px snap trigger */
   uint8_t nb[NG_HOODSEG];   /* bit0: prev exists, bit1: next exists */
   uint64_t use;
 } ng_hood;
@@ -811,6 +790,9 @@ static void ng_idx_del(ng_vol *v, int plane, int slice) {
 
 static void ng_close(ng_vol *v) {
   atomic_fetch_sub(&ng_nopen, 1);
+  /* the decoded-grid gigabytes free here, but glibc keeps the arena
+   * pages resident (measured: RSS unchanged after eviction); hand them
+   * back so a GUI session recovers the RAM between traces */
   if (v->nfth) {
     pthread_mutex_lock(&v->fmu);
     v->fquit = true;
@@ -825,6 +807,9 @@ static void ng_close(ng_vol *v) {
   pthread_mutex_destroy(&v->gmu);
   if (v->curl) curl_easy_cleanup(v->curl);
   memset(v, 0, sizeof *v);
+#if defined(__GLIBC__)
+  malloc_trim(0); /* see the comment at the top of this function */
+#endif
 }
 
 /* fetch one slice file to disk with the given handle; thread-safe
@@ -1064,6 +1049,9 @@ typedef struct tr_env { /* one per solving thread */
    * by LRU replacement within the 8-probe window. */
   struct { int plane, slice, slot; ng_grid *g; uint32_t use; uint8_t used; } gc[256];
   uint32_t gtick;
+  int gl_plane, gl_slice, gl_slot; /* last-answer memo (gl_plane -1 = unset):
+      * consecutive residuals overwhelmingly hit the same slice */
+  ng_grid *gl_g;
   /* staged weight relaxation (G9, vc3d correction/inpaint continuation
    * schedule): scale factors on DistLoss, StraightLoss(+planar) and the
    * ncp snap component. 0 means "not set" and reads as 1.0 — envs are
@@ -1178,7 +1166,8 @@ static ng_hood *ng_hood_get(tr_env *e, ng_grid *g, int plane, int slice, double 
   for (uint32_t p = 0; p < np && h->nseg < NG_HOODSEG; p++) {
     /* size the scratch from the record header — xy cross-sections are
      * long spirals and MUST NOT be truncated */
-    uint32_t want = 1 + ng_be32(g->blob + g->precoff[paths[p]] + 8) / 2;
+    if ((size_t)paths[p] + 12 > g->blob_n) continue;
+    uint32_t want = 1 + ng_be32(g->blob + paths[p] + 8) / 2;
     if (dec_cap < want) {
       uint32_t nc2 = dec_cap ? dec_cap : 4096;
       while (nc2 < want) nc2 *= 2;
@@ -1220,10 +1209,22 @@ static ng_hood *ng_hood_get(tr_env *e, ng_grid *g, int plane, int slice, double 
         nb |= 2;
       }
       h->nb[h->nseg] = nb;
+      h->smidx[h->nseg] = (float)smx;
+      h->smidy[h->nseg] = (float)smy;
+      h->snx[h->nseg] = sg[4];
+      h->sny[h->nseg] = sg[5];
+      float gr = 0.5f * tl + 4.5f; /* NCP_SNAP_TRIG + slack */
+      h->sgr2[h->nseg] = gr * gr;
       h->nseg++;
     }
   }
   if (h->nseg == NG_HOODSEG) atomic_fetch_add(&ng_hoodseg_binds, 1);
+  { /* occupancy stats: size NG_HOODSEG from data, not guesswork */
+    atomic_fetch_add_explicit(&ng_hood_seg_sum, h->nseg, memory_order_relaxed);
+    uint64_t pmx = atomic_load_explicit(&ng_hood_seg_max, memory_order_relaxed);
+    while (h->nseg > pmx &&
+           !atomic_compare_exchange_weak(&ng_hood_seg_max, &pmx, h->nseg)) {}
+  }
   tr_tm_add(5, t0);
   return h;
 }
@@ -1231,6 +1232,10 @@ static ng_hood *ng_hood_get(tr_env *e, ng_grid *g, int plane, int slice, double 
 /* env-level grid handle cache: refs released by tr_env_flush */
 static ng_grid *ng_eget(tr_env *e, int plane, int slice, int *slot_out) {
   slice = ng_snap(e->ngv, slice); /* sparse store: snap to published */
+  if (plane == e->gl_plane && slice == e->gl_slice) {
+    *slot_out = e->gl_slot;
+    return e->gl_g;
+  }
   uint32_t h = (((uint32_t)plane << 30) ^ (uint32_t)slice * 2654435761u) >> 24;
   uint32_t victim = h & 255u;
   uint32_t vuse = UINT32_MAX;
@@ -1244,6 +1249,10 @@ static ng_grid *ng_eget(tr_env *e, int plane, int slice, int *slot_out) {
     if (e->gc[k].plane == plane && e->gc[k].slice == slice) {
       e->gc[k].use = ++e->gtick;
       *slot_out = e->gc[k].slot;
+      e->gl_plane = plane;
+      e->gl_slice = slice;
+      e->gl_slot = e->gc[k].slot;
+      e->gl_g = e->gc[k].g;
       atomic_fetch_add_explicit(&ng_eget_hit, 1, memory_order_relaxed);
       return e->gc[k].g;
     }
@@ -1255,18 +1264,28 @@ static ng_grid *ng_eget(tr_env *e, int plane, int slice, int *slot_out) {
   atomic_fetch_add_explicit(&ng_eget_miss, 1, memory_order_relaxed);
   int slot;
   ng_grid *g = ng_get(e->ngv, plane, slice, &slot);
-  if (e->gc[victim].used) ng_put(e->ngv, e->gc[victim].slot, e->gc[victim].g);
+  if (e->gc[victim].used) {
+    ng_put(e->ngv, e->gc[victim].slot, e->gc[victim].g);
+    if (e->gl_plane == e->gc[victim].plane && e->gl_slice == e->gc[victim].slice)
+      e->gl_plane = -9; /* memo died with its ref */
+  }
   e->gc[victim].plane = plane;
   e->gc[victim].slice = slice;
   e->gc[victim].slot = slot;
   e->gc[victim].g = g; /* NULL cached too */
   e->gc[victim].use = ++e->gtick;
   e->gc[victim].used = 1;
+  e->gl_plane = plane;
+  e->gl_slice = slice;
+  e->gl_slot = slot;
+  e->gl_g = g;
   *slot_out = slot;
   return g;
 }
 
 static void tr_env_flush(tr_env *e) {
+  e->gl_plane = -9; /* refs release below: the memo must not outlive them */
+  e->gl_g = NULL;
   for (uint32_t i = 0; i < 256; i++)
     if (e->gc[i].used) {
       ng_put(e->ngv, e->gc[i].slot, e->gc[i].g);
@@ -1516,31 +1535,53 @@ static void ncp_residual4(tr_env *e, int plane, const double Qr[4][3], int fxr,
   ng_hood *hd = ng_hood_get(e, g, plane, s0, m0x, m0y);
   if (!hd || !hd->nseg) return; /* G3 */
   float fm0x = (float)m0x, fm0y = (float)m0y;
-  double wsum = 0.0; /* frozen: identical for every variant */
-  double nsum[4] = {0, 0, 0, 0};
-  uint32_t nacc = 0;
+  float wsum = 0.0f; /* frozen: identical for every variant */
+  float nsum[4] = {0, 0, 0, 0};
+  float naccf = 0.0f;
   const float *bsg = NULL; /* frozen snap target */
   int bdsn = 0;
   float bscore = -1.0f;
-  for (uint32_t k = 0; k < hd->nseg; k++) {
-    const float *sg = hd->sg[k];
-    float smx = (sg[0] + sg[2]) * 0.5f, smy = (sg[1] + sg[3]) * 0.5f;
-    float dmx = smx - fm0x, dmy = smy - fm0y;
+  /* invalid variants keep venx/veny = 0 so the unconditional 4-lane
+   * accumulation below stays garbage-free; their nsum lanes are unused */
+  for (int v = 0; v < 4; v++)
+    if (!ok[v]) venx[v] = veny[v] = 0.0f;
+  const uint32_t ns = hd->nseg;
+  const float *restrict midx = hd->smidx, *restrict midy = hd->smidy;
+  const float *restrict snx = hd->snx, *restrict sny = hd->sny;
+  /* pass 1 — branchless SoA sweep: ROI weight + normal alignment.
+   * (The AoS record loop with branches would not vectorize; this pass
+   * was the tracer's single hottest loop.) */
+  for (uint32_t k = 0; k < ns; k++) {
+    float dmx = midx[k] - fm0x, dmy = midy[k] - fm0y;
     float d2 = dmx * dmx + dmy * dmy; /* BASE distance: frozen ROI + weight */
-    if (d2 <= (float)NCP_ROI2) {
-      float dd = d2 < 10.0f ? 10.0f : d2;
-      nacc++;
-      wsum += (double)(1.0f / dd);
-      for (int v = 0; v < 4; v++) /* only the alignment differentiates */
-        if (ok[v]) {
-          float dot = fabsf(venx[v] * sg[4] + veny[v] * sg[5]);
-          nsum[v] += (double)((1.0f - dot) / dd);
-        }
-    }
-    /* snap-target selection from the BASE pose only */
-    float tt = ((vex4[0] - sg[0]) * sg[10] + (vey4[0] - sg[1]) * sg[11]) * sg[12];
+    float in = d2 <= (float)NCP_ROI2 ? 1.0f : 0.0f;
+    float dd = d2 < 10.0f ? 10.0f : d2;
+    float w = in / dd;
+    naccf += in;
+    wsum += w;
+    float d0 = fabsf(venx[0] * snx[k] + veny[0] * sny[k]);
+    float d1 = fabsf(venx[1] * snx[k] + veny[1] * sny[k]);
+    float d2v = fabsf(venx[2] * snx[k] + veny[2] * sny[k]);
+    float d3 = fabsf(venx[3] * snx[k] + veny[3] * sny[k]);
+    nsum[0] += (1.0f - d0) * w;
+    nsum[1] += (1.0f - d1) * w;
+    nsum[2] += (1.0f - d2v) * w;
+    nsum[3] += (1.0f - d3) * w;
+  }
+  uint32_t nacc = (uint32_t)naccf;
+  /* pass 2 — snap-target selection from the BASE pose only, gated by
+   * midpoint distance: a segment farther than halflen+trig from the
+   * chord end cannot pass the 4-px trigger, and that excludes nearly
+   * every segment */
+  const float ex0 = vex4[0], ey0 = vey4[0];
+  const float *restrict gr2 = hd->sgr2;
+  for (uint32_t k = 0; k < ns; k++) {
+    float gdx = midx[k] - ex0, gdy = midy[k] - ey0;
+    if (gdx * gdx + gdy * gdy > gr2[k]) continue;
+    const float *sg = hd->sg[k];
+    float tt = ((ex0 - sg[0]) * sg[10] + (ey0 - sg[1]) * sg[11]) * sg[12];
     tt = tt < 0.0f ? 0.0f : (tt > 1.0f ? 1.0f : tt);
-    float qex = sg[0] + tt * sg[10] - vex4[0], qey = sg[1] + tt * sg[11] - vey4[0];
+    float qex = sg[0] + tt * sg[10] - ex0, qey = sg[1] + tt * sg[11] - ey0;
     float d2e = qex * qex + qey * qey;
     if (d2e < (float)(NCP_SNAP_TRIG * NCP_SNAP_TRIG)) {
       for (int dsn = 0; dsn < 2; dsn++) {
@@ -1566,7 +1607,7 @@ static void ncp_residual4(tr_env *e, int plane, const double Qr[4][3], int fxr,
   if (!nacc) return; /* G3: nothing in the ROI -> no evidence, no penalty */
   for (int v = 0; v < 4; v++) {
     if (!ok[v]) continue;
-    double normal_loss = wsum > 1e-9 ? nsum[v] / wsum : 0.0;
+    double normal_loss = wsum > 1e-9f ? (double)nsum[v] / (double)wsum : 0.0;
     double snap_loss = 1.0;
     if (bsg) { /* distances to the FROZEN segment carry the derivative */
       const float *sg = bsg;
@@ -3207,7 +3248,7 @@ static tr_wf *tr_wf_build(r3d_tracer *t, ng_vol *ngv, double nx_vox, double ny_v
   int slice = (int)llround(t->cfg.seed[2]);
   int slot;
   ng_grid *g = ng_get(ngv, 0, slice, &slot);
-  if (!g || g->empty || !g->npaths) {
+  if (!g || g->empty || !g->blob_n) {
     ng_put(ngv, slot, g);
     return NULL;
   }
@@ -3223,16 +3264,22 @@ static tr_wf *tr_wf_build(r3d_tracer *t, ng_vol *ngv, double nx_vox, double ny_v
   double *rg = calloc(N, sizeof *rg);
   tr_wf *w = calloc(1, sizeof *w);
   float *r1f = calloc(N, sizeof *r1f);
-  uint32_t maxpts = 4096;
+  uint32_t maxpts = 4096, npaths = 0;
   float *pts = malloc((size_t)maxpts * 2 * sizeof *pts);
   bool oom = !c2 || !s2 || !fnx || !fny || !coh || !xs || !b || !rg || !w ||
              !r1f || !pts;
   if (!oom) {
-    /* rasterize doubled-angle normals along every polyline */
-    for (uint32_t pi = 0; pi < g->npaths; pi++) {
-      const uint8_t *rec = g->blob + g->precoff[pi];
+    /* rasterize doubled-angle normals along every polyline (records are
+     * consecutive in the blob: walk them, no path table needed) */
+    npaths = 0;
+    for (size_t po2 = 0; po2 + 12 <= g->blob_n;) {
+      const uint8_t *rec = g->blob + po2;
       uint32_t noff = (uint32_t)rec[8] << 24 | (uint32_t)rec[9] << 16 |
                       (uint32_t)rec[10] << 8 | rec[11];
+      if (po2 + 12 + noff > g->blob_n || (noff & 1u)) break;
+      uint32_t pi = (uint32_t)po2;
+      po2 += 12 + noff;
+      npaths++;
       if (noff + 2 > maxpts) {
         maxpts = noff + 2;
         float *np = realloc(pts, (size_t)maxpts * 2 * sizeof *np);
@@ -3312,7 +3359,7 @@ static tr_wf *tr_wf_build(r3d_tracer *t, ng_vol *ngv, double nx_vox, double ny_v
     w->dec = dec;
     w->ok = true;
     printf("tracer: winding field %ux%u (dec %.0f) from %u polylines in %.1fs\n",
-           W, H, dec, g->npaths, tr_now() - t0);
+           W, H, dec, npaths, tr_now() - t0);
   }
   ng_put(ngv, slot, g);
   free(c2);
@@ -4738,6 +4785,7 @@ static void tr_pool_init(tr_pool *pl, r3d_tracer *t, ng_vol *ngv) {
   for (uint32_t i = 0; i < want; i++) {
     tr_env *e = &pl->env[pl->nth];
     memset(e, 0, sizeof *e);
+    e->gl_plane = -9; /* eget memo starts invalid (0 is a real plane) */
     e->ngv = ngv;
     e->in_pool = true;
     e->pl = pl;
@@ -5320,9 +5368,9 @@ static bool tr_reopt_snapshot(r3d_tracer *t) {
 static void *tr_worker(void *ud) {
   r3d_tracer *t = ud;
   r3d_cpuvol vol;
-  /* 384 bricks (768 MB): conf/DT sampling over a 60-gen trace re-decoded
+  /* 256 bricks (512 MB): conf/DT sampling over a 60-gen trace re-decoded
    * bricks constantly at 96 (b_decode_sub was 17% of trace CPU) */
-  if (r3d_cpuvol_open(&vol, t->root, 384) != 0) goto fail_open;
+  if (r3d_cpuvol_open(&vol, t->root, 256) != 0) goto fail_open;
   td_cache *dt = td_open(&vol, t->cfg.level);
   if (!dt) {
     r3d_cpuvol_close(&vol);
@@ -5376,7 +5424,8 @@ static void *tr_worker(void *ud) {
       }
     }
   }
-  tr_env cenv = {.dt = dt, .ngv = &ng}; /* coordinator's solve env */
+  tr_env cenv = {.dt = dt, .ngv = &ng, .gl_plane = -9}; /* coordinator's
+      * solve env (gl_plane -9: eget memo starts invalid) */
   cenv.hood = calloc(NG_NHOOD, sizeof *cenv.hood);
   if (cenv.hood)
     for (int hi = 0; hi < NG_NHOOD; hi++) cenv.hood[hi].plane = -1;
@@ -6057,9 +6106,17 @@ static void *tr_worker(void *ud) {
            (double)atomic_load(&ng_bytes_peak) / 1073741824.0,
            (unsigned long long)atomic_load(&ng_eget_hit),
            (unsigned long long)atomic_load(&ng_eget_miss));
-    printf("tracer: hood hits %llu builds %llu\n",
-           (unsigned long long)atomic_load(&ng_hood_hits),
-           (unsigned long long)atomic_load(&ng_hood_builds));
+    {
+      uint64_t hbld = atomic_load(&ng_hood_builds);
+      printf("tracer: hood hits %llu builds %llu segs mean %.0f max %llu\n",
+             (unsigned long long)atomic_load(&ng_hood_hits),
+             (unsigned long long)hbld,
+             hbld ? (double)atomic_load(&ng_hood_seg_sum) / (double)hbld : 0.0,
+             (unsigned long long)atomic_load(&ng_hood_seg_max));
+    }
+    printf("tracer: ng bytes loaded: blob %.2f GB, indexes %.2f GB\n",
+           (double)atomic_load(&ng_blob_bytes) / 1073741824.0,
+           (double)atomic_load(&ng_idx_bytes) / 1073741824.0);
     printf("tracer: coordinator serial: conf %.1fs omega %.1fs fit/don/sfx %.1fs "
            "windrelax %.1fs qc2 %.1fs foldrepair %.1fs\n",
            co_tm[1], co_tm[2], co_tm[3], co_tm[4], co_tm[5], co_tm[6]);
@@ -6586,7 +6643,7 @@ int r3d_tracer_derive(r3d_tracer *t, const char *pred_root, int dir,
                       const char *out_dir) {
   if (t->running || !t->pos || !t->nset || !dir) return -1;
   r3d_cpuvol vol;
-  if (r3d_cpuvol_open(&vol, pred_root, 384) != 0) return -1;
+  if (r3d_cpuvol_open(&vol, pred_root, 256) != 0) return -1;
   td_cache *dt = td_open(&vol, t->cfg.level);
   if (!dt) {
     r3d_cpuvol_close(&vol);
