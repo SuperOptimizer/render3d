@@ -16,16 +16,110 @@
 #include "core/tracer.h"
 #include "core/umbilicus.h"
 
+/* seeds.json (written by the GUI "export seeds" button):
+ * {"step": S, "gens": N, "level": L, "cutoff": C, "seeds": [[x,y,z], ...]}
+ * Missing scalars keep the command-line/default values. */
+#define SEEDS_JSON_MAX 256
+static uint32_t seeds_json_load(const char *path, r3d_tracer_cfg *cfg,
+                                double seeds[][3], uint32_t max) {
+  FILE *f = fopen(path, "rb");
+  if (!f) {
+    fprintf(stderr, "tracecli: cannot open %s\n", path);
+    return 0;
+  }
+  static char buf[1 << 20];
+  size_t n = fread(buf, 1, sizeof buf - 1, f);
+  fclose(f);
+  buf[n] = 0;
+  const char *q;
+  if ((q = strstr(buf, "\"step\"")) && (q = strchr(q, ':')))
+    cfg->step = strtod(q + 1, NULL);
+  if ((q = strstr(buf, "\"gens\"")) && (q = strchr(q, ':')))
+    cfg->max_ring = (uint32_t)strtoul(q + 1, NULL, 10);
+  if ((q = strstr(buf, "\"level\"")) && (q = strchr(q, ':')))
+    cfg->level = (uint32_t)strtoul(q + 1, NULL, 10);
+  if ((q = strstr(buf, "\"cutoff\"")) && (q = strchr(q, ':')))
+    cfg->thresh = strtof(q + 1, NULL);
+  const char *a = strstr(buf, "\"seeds\"");
+  if (!a || !(a = strchr(a, '['))) return 0;
+  a++; /* inside the outer array */
+  uint32_t ns = 0;
+  while (ns < max && (a = strchr(a, '['))) {
+    char *e = NULL;
+    double x = strtod(a + 1, &e);
+    if (e == a + 1) break;
+    while (*e == ',' || *e == ' ' || *e == '\n') e++;
+    double y = strtod(e, &e);
+    while (*e == ',' || *e == ' ' || *e == '\n') e++;
+    double z = strtod(e, &e);
+    seeds[ns][0] = x;
+    seeds[ns][1] = y;
+    seeds[ns][2] = z;
+    ns++;
+    a = e;
+  }
+  return ns;
+}
+
+static double now_s(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+/* grow one seed to completion and save; returns 0 on success */
+static int run_trace(const char *root, const r3d_tracer_cfg *cfg,
+                     const r3d_umbilicus *umb, const char **fuse, uint32_t nfuse,
+                     const char *out, bool fill) {
+  r3d_tracer tr;
+  if (r3d_tracer_start_fused(&tr, root, cfg, umb, fuse, nfuse) != 0) {
+    fprintf(stderr, "tracecli: tracer start failed\n");
+    return 1;
+  }
+  uint32_t last_ring = 0;
+  bool done = false;
+  while (!done) {
+    usleep(500 * 1000);
+    uint32_t ring = 0, nset = 0;
+    r3d_tracer_snapshot(&tr, NULL, NULL, NULL, &ring, &nset, &done);
+    if (ring != last_ring || done) {
+      if (tr.sp_valid)
+        printf("tracecli: generation %u/%u, %u points (omega %.1f rms %.1f)\n",
+               ring, tr.cfg.max_ring, nset, tr.sp_omega, tr.sp_rms);
+      else
+        printf("tracecli: generation %u/%u, %u points\n", ring, tr.cfg.max_ring,
+               nset);
+      last_ring = ring;
+    }
+  }
+  r3d_tracer_stop(&tr);
+  int rc = 0;
+  if (out && tr.nset > 8) {
+    char mk[1400];
+    snprintf(mk, sizeof mk, "mkdir -p '%s'", out);
+    if (system(mk) != 0 || r3d_tracer_save(&tr, out, tr.cfg.thresh, fill) != 0) {
+      fprintf(stderr, "tracecli: save failed (%s)\n", out);
+      rc = 1;
+    } else {
+      printf("tracecli: saved %s (%ux%u, %u pts, cutoff %.2f)\n", out, tr.W, tr.H,
+             tr.nset, (double)tr.cfg.thresh);
+    }
+  }
+  r3d_tracer_free(&tr);
+  return rc;
+}
+
 int main(int argc, char **argv) {
   if (argc < 2) {
     fprintf(stderr,
-            "usage: tracecli <pred-root> [--seed x y z] [--step S] [--gens N] "
+            "usage: tracecli <pred-root> [--seed x y z] [--seeds FILE.json] [--step S] "
+            "[--gens N] "
             "[--level L] [--cutoff C] [--out DIR] [--umbilicus FILE] [--nofill] "
             "[--nospiral] [--spiral-weight W] [--fuse DIR ...] [--ribbon ROWS] "
             "[--zspan S] [--wraps N] [--ct CT-ROOT] [--ct-min V]\n");
     return 2;
   }
-  const char *root = argv[1], *out = NULL, *umbp = NULL;
+  const char *root = argv[1], *out = NULL, *umbp = NULL, *seedsp = NULL;
   const char *fuse[16], *loadp = NULL;
   uint32_t nfuse = 0, rewind_gen = 0, regrow = 0;
   int derive_dir = 0;
@@ -37,7 +131,9 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "--seed") == 0 && i + 3 < argc) {
       for (int a = 0; a < 3; a++) cfg.seed[a] = strtod(argv[++i], NULL);
       have_seed = true;
-    } else if (strcmp(argv[i], "--step") == 0 && i + 1 < argc)
+    } else if (strcmp(argv[i], "--seeds") == 0 && i + 1 < argc)
+      seedsp = argv[++i];
+    else if (strcmp(argv[i], "--step") == 0 && i + 1 < argc)
       cfg.step = strtod(argv[++i], NULL);
     else if (strcmp(argv[i], "--gens") == 0 && i + 1 < argc)
       cfg.max_ring = (uint32_t)strtoul(argv[++i], NULL, 10);
@@ -102,6 +198,36 @@ int main(int argc, char **argv) {
   if (spiral && cfg.wind_weight == 0.0 && umb.count >= 2)
     cfg.wind_weight = 0.5; /* spiral prior on by default with an umbilicus */
   if (!spiral) cfg.wind_weight = 0.0;
+  if (seedsp) { /* batch: every seed from the json, sequentially */
+    static double seeds[SEEDS_JSON_MAX][3];
+    uint32_t ns = seeds_json_load(seedsp, &cfg, seeds, SEEDS_JSON_MAX);
+    if (!ns) {
+      fprintf(stderr, "tracecli: no seeds in %s\n", seedsp);
+      return 1;
+    }
+    if (spiral && cfg.wind_weight == 0.0 && umb.count >= 2) cfg.wind_weight = 0.5;
+    if (!spiral) cfg.wind_weight = 0.0;
+    printf("tracecli: %u seed%s from %s (step %.0f gens %u level L%u spiral %s)\n",
+           ns, ns == 1 ? "" : "s", seedsp, cfg.step, cfg.max_ring, cfg.level,
+           cfg.wind_weight > 0 ? "on" : "off");
+    int bad = 0;
+    double tall = now_s();
+    for (uint32_t si = 0; si < ns; si++) {
+      r3d_tracer_cfg c2 = cfg;
+      memcpy(c2.seed, seeds[si], sizeof c2.seed);
+      char od[1300];
+      snprintf(od, sizeof od, "%s/seed-%03u", out ? out : "traced-seeds", si);
+      printf("tracecli: [%u/%u] seed %.0f,%.0f,%.0f -> %s\n", si + 1, ns,
+             c2.seed[0], c2.seed[1], c2.seed[2], od);
+      double t0 = now_s();
+      bad += run_trace(root, &c2, &umb, fuse, nfuse, od, fill) != 0;
+      printf("tracecli: [%u/%u] %.1fs\n", si + 1, ns, now_s() - t0);
+    }
+    printf("tracecli: batch done, %u/%u ok, %.1fs total\n", ns - (uint32_t)bad, ns,
+           now_s() - tall);
+    r3d_umbilicus_free(&umb);
+    return bad ? 1 : 0;
+  }
   printf("tracecli: seed %.0f,%.0f,%.0f step %.0f gens %u level L%u spiral %s\n",
          cfg.seed[0], cfg.seed[1], cfg.seed[2], cfg.step, cfg.max_ring, cfg.level,
          cfg.wind_weight > 0 ? "on" : "off");

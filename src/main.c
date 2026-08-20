@@ -4621,6 +4621,26 @@ int main(int argc, char **argv) {
           }
           igSameLine(0, 8);
           if (igButton("trace all seeds", (ImVec2){0, 0})) mv_seeds_go = true;
+          igSameLine(0, 8);
+          if (igButton("export seeds##seedjson", (ImVec2){0, 0})) {
+            /* headless companion: tracecli <pred> --seeds seeds.json runs
+             * these without the GUI (profiling / batch reruns) */
+            FILE *sf = fopen("seeds.json", "wb");
+            if (sf) {
+              fprintf(sf,
+                      "{\n  \"step\": %.1f,\n  \"gens\": %d,\n  \"level\": 1,\n"
+                      "  \"cutoff\": %.2f,\n  \"seeds\": [\n",
+                      (double)mv_tr_step, mv_tr_rings, (double)mv_tr_thresh);
+              for (uint32_t si = 0; si < mv_seeds_n; si++)
+                fprintf(sf, "    [%.1f, %.1f, %.1f]%s\n", mv_seeds[si * 3],
+                        mv_seeds[si * 3 + 1], mv_seeds[si * 3 + 2],
+                        si + 1 < mv_seeds_n ? "," : "");
+              fprintf(sf, "  ]\n}\n");
+              fclose(sf);
+              printf("tracer: %u seed%s -> seeds.json\n", mv_seeds_n,
+                     mv_seeds_n == 1 ? "" : "s");
+            }
+          }
           (void)nact;
         }
         for (int ti = 0; ti < GT_MAX; ti++) { /* the live trace list */
