@@ -2420,6 +2420,7 @@ int main(int argc, char **argv) {
   }
 
   double vox_um = 0.0; /* physical voxel pitch; 0 = unknown */
+  float gt_step_default = 0.0f; /* 48-um-pitch step (approved-GT norm) */
   if (bricks_path) {
     const char *pfe = getenv("R3D_POSTFILT"); /* headless/bench: force the
                                                * display filter (mode bits) */
@@ -2444,9 +2445,19 @@ int main(int argc, char **argv) {
         vox_um = r3d_regvol_parse_um(sj);
       }
       if (vox_um <= 0.0) vox_um = r3d_regvol_parse_um(bricks_path);
-      if (vox_um > 0.0)
+      if (vox_um > 0.0) {
         printf("bricks: voxel pitch %.4g um%s\n", vox_um,
                sf ? "" : " (from path)");
+        /* default trace step from the approved-GT convention: every
+         * PHercParis4 ground-truth segment is traced at a 48-um grid
+         * pitch (step 20 at 2.4 um) — derive the same physical pitch
+         * for this volume (6 at 8.64 um, 20 at 2.4 um) */
+        gt_step_default = (float)lround(48.0 / vox_um);
+        if (gt_step_default < 2.0f) gt_step_default = 2.0f;
+        if (gt_step_default > 20.0f) gt_step_default = 20.0f;
+        printf("tracer: default step %.0f (%.0f um pitch, GT convention)\n",
+               (double)gt_step_default, (double)gt_step_default * vox_um);
+      }
     }
     r3d_bricks_shape(renderer, brick_shape);
     r3d_bricks_stats initial_bst;
@@ -2727,7 +2738,11 @@ int main(int argc, char **argv) {
   double mv_seeds[SEEDS_MAX * 3];
   uint32_t mv_seeds_n = 0;
   bool mv_seeds_go = false; /* draining: keep starting as slots free */
-  float mv_tr_step = 20.0f, mv_tr_thresh = 0.35f;
+  /* default trace step from the approved-GT convention: every
+   * PHercParis4 ground-truth segment uses a 48-um grid pitch (step 20
+   * at 2.4 um => 6 at 8.64 um); fall back to 20 with no known pitch */
+  float mv_tr_step = gt_step_default > 0.0f ? gt_step_default : 20.0f;
+  float mv_tr_thresh = 0.35f;
   int mv_tr_rings = 60, mv_tr_nsaved = 0;
   bool mv_tr_spiral = true;
   bool mv_tr_fill = true;

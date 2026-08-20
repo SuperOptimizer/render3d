@@ -1557,10 +1557,65 @@ static double ncp_residual(tr_env *e, int plane, const double A[3],
  * where ROI/snap identities flip between probes. And where the grids have
  * no coverage at all, the residual must be exactly 0, not a constant
  * orientation penalty. R3D_NCP_LEGACY=1 restores the old behavior. */
+static bool tr_uc_at(const r3d_tracer *t, double z, double *cx, double *cy,
+                     double *dxz, double *dyz);
+static void tr_sp_r0_at(const r3d_tracer *t, double z, double *r0, double *slope);
+
+/* in-plane (u,v) at slice s0 back to world (inverse of ncp_2d) */
+static inline void ncp_3d(int plane, double u, double v, double s0, double M[3]) {
+  if (plane == 0) {
+    M[0] = u;
+    M[1] = v;
+    M[2] = s0;
+  } else if (plane == 1) {
+    M[0] = u;
+    M[1] = s0;
+    M[2] = v;
+  } else {
+    M[0] = s0;
+    M[1] = u;
+    M[2] = v;
+  }
+}
+
+/* De-adhesion (the problem every 2025 surface-detection winner named as
+ * unsolved): where two wraps touch, the predictions merge and the snap
+ * term can lock a cell onto the NEIGHBORING wrap's polyline — the seed
+ * of every wrong-wrap capture. The winners had only the mask; we hold a
+ * spiral frame, so a snap candidate is VETTED against the cell's own
+ * winding: its radius must sit within half a wrap of where this cell's
+ * wrap runs. R3D_DEADHESION=0 disables (A/B). */
+static bool tr_snap_wrap_ok(const r3d_tracer *t, float wind, const double M[3]) {
+  static _Atomic int on = -1;
+  int v = atomic_load_explicit(&on, memory_order_relaxed);
+  if (v < 0) {
+    const char *ev = getenv("R3D_DEADHESION");
+    v = ev ? atoi(ev) : 1;
+    atomic_store(&on, v);
+  }
+  if (!v) return true;
+  double cx, cy;
+  if (!tr_uc_at(t, M[2], &cx, &cy, NULL, NULL)) return true;
+  double ux = M[0] - cx, uy = M[1] - cy;
+  double rho = sqrt(ux * ux + uy * uy);
+  if (rho < 1e-6) return true;
+  double om = atomic_load(&t->sp_omega);
+  if (fabs(om) < 1e-9) return true;
+  double r0v, r0s;
+  tr_sp_r0_at(t, M[2], &r0v, &r0s);
+  double th = atan2(uy, ux);
+  const double *ab = t->sp_ab;
+  double H = ab[0] * cos(th) + ab[1] * sin(th) + ab[2] * cos(2 * th) +
+             ab[3] * sin(2 * th);
+  double dev = rho - (r0v + H + om * (double)wind);
+  return fabs(dev) < 0.45 * fabs(om);
+}
+
 static void ncp_residual4_legacy(tr_env *e, int plane, const double Qr[4][3],
                                  int fxr, double h, double out[4]);
 
-static void ncp_residual4(tr_env *e, int plane, const double Qr[4][3], int fxr,
+static void ncp_residual4(tr_env *e, const r3d_tracer *t, float wind, bool wvet,
+                          int plane, const double Qr[4][3], int fxr,
                           double h, double out[4]) {
   static _Atomic int legacy = -1;
   int lg = atomic_load_explicit(&legacy, memory_order_relaxed);
@@ -1620,9 +1675,9 @@ static void ncp_residual4(tr_env *e, int plane, const double Qr[4][3], int fxr,
     ok[v] = false;
     double bnr = Bn[axis] - A[axis], cr = C[axis] - A[axis];
     if (fabs(bnr - cr) < 1e-9) continue;
-    double t = -cr / (bnr - cr);
+    double tt = -cr / (bnr - cr);
     double E[3];
-    for (int a = 0; a < 3; a++) E[a] = C[a] + t * (Bn[a] - C[a]);
+    for (int a = 0; a < 3; a++) E[a] = C[a] + tt * (Bn[a] - C[a]);
     double a2[2], e2[2];
     ncp_2d(plane, A, a2);
     ncp_2d(plane, E, e2);
@@ -1698,6 +1753,11 @@ static void ncp_residual4(tr_env *e, int plane, const double Qr[4][3], int fxr,
     float qex = sg[0] + tt * sg[10] - ex0, qey = sg[1] + tt * sg[11] - ey0;
     float d2e = qex * qex + qey * qey;
     if (d2e < (float)(NCP_SNAP_TRIG * NCP_SNAP_TRIG)) {
+      if (wvet) { /* de-adhesion: reject a snap target on another wrap */
+        double M3[3];
+        ncp_3d(plane, (double)midx[k], (double)midy[k], (double)s0, M3);
+        if (!tr_snap_wrap_ok(t, wind, M3)) continue;
+      }
       for (int dsn = 0; dsn < 2; dsn++) {
         if (!(hd->nb[k] & (dsn ? 2u : 1u))) continue;
         double qax = dsn ? (double)sg[2] : (double)sg[6];
@@ -3698,16 +3758,19 @@ static void tr_res_straight(tr_nlsq *acc, const double a[3], const double b[3],
   nq_add(acc, r, J);
 }
 
-/* Minimum physical bend radius, voxels. Papyrus cannot curl tighter
- * than roughly a millimeter even at the umbilicus; anything sharper is
- * a tracing artifact (doubling back, kinks). ~120 vox at ~8 um pitch.
+/* Minimum physical bend radius, voxels. Calibrated against all 81
+ * approved PHercParis4 ground-truth segments (matched ~345-um arcs):
+ * the sharpest segment's p5 bend radius is 0.91 mm (innermost wraps,
+ * w128-129); typical segments sit at 1.2-1.6 mm. The floor sits just
+ * under the GT minimum — 100 vox at 8.64 um = 0.86 mm — so approved
+ * geometry is never fought while doubling back stays unreachable.
  * R3D_BEND_RMIN overrides (voxels). */
 static double tr_bend_rmin(void) {
   static _Atomic int mr = -1;
   int v = atomic_load_explicit(&mr, memory_order_relaxed);
   if (v < 0) {
     const char *ev = getenv("R3D_BEND_RMIN");
-    v = ev ? atoi(ev) : 120;
+    v = ev ? atoi(ev) : 100;
     if (v < 8) v = 8;
     atomic_store(&mr, v);
   }
@@ -4232,6 +4295,14 @@ static void tr_eval(tr_ctx *c, const double x[3], tr_nlsq *acc) {
   }
   if ((c->flags & TRF_NCP) && ng_on) {
     double tt0 = tr_now();
+    /* de-adhesion context: the vet needs the cell's own winding, which
+     * only exists once the cell is committed (placement solves run
+     * before wind assignment) and only means anything under a valid
+     * spiral frame */
+    size_t nck = (size_t)j * t->W + (size_t)i;
+    bool ncp_wvet = t->state[nck] == R3D_TR_SET && t->uc &&
+                    atomic_load(&t->sp_valid);
+    float ncp_wind = t->wind[nck];
     /* every quad containing the free cell x 3 planes x 4 corner
      * rotations (vc3d gen_normal_loss); gradients by central difference
      * — vc3d autodiffs through the same frozen path choice */
@@ -4260,7 +4331,7 @@ static void tr_eval(tr_ctx *c, const double x[3], tr_nlsq *acc) {
             if (rot[rr][c2] == fx) fxrot = c2;
           }
           double r4[4];
-          ncp_residual4(e, pl, Qrot, fxrot, 0.5, r4);
+          ncp_residual4(e, t, ncp_wind, ncp_wvet, pl, Qrot, fxrot, 0.5, r4);
           if (r4[0] == 0.0) continue; /* non-straddling plane */
           double J[3];
           for (int a = 0; a < 3; a++) J[a] = (r4[1 + a] - r4[0]) / 0.5;
