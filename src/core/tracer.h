@@ -129,6 +129,23 @@ typedef struct r3d_tracer {
    * pull/adoption must not fire) + donor-grid uv of the closest point */
   int8_t *dcell_id;
   float *dcell_uv; /* [W*H*2] */
+  /* world-space strike map: fold excisions stamp a coarse (32-vox)
+   * bucket at the cut cell's POSITION. The spiral re-enters a bad
+   * region on every wrap with fresh grid cells, so grid-keyed strikes
+   * cannot contain a pathological zone (measured: 880 cuts clustered
+   * in one ~300-vox region, recurring every generation). A cell whose
+   * solve LANDS in a bucket with >= 6 strikes FAILs outright — the
+   * region is untraceable at this resolution and becomes an honest
+   * hole. Reset by rewind/reopt/grow/subdivide. */
+  uint64_t *xbl_k; /* [1<<16] open-addressed bucket keys (0 = empty) */
+  uint8_t *xbl_c;  /* [1<<16] strike counts */
+  uint8_t *excnt; /* [W*H] times a cell was fold-excised: at 3 strikes
+                   * it FAILs instead of retrying — a front that folds
+                   * at the same spot every generation is answering the
+                   * same ambiguous data and will fold forever (measured:
+                   * excisions ramped 10/gen -> 73/gen on a long trace).
+                   * An honest edge beats an accelerating churn. Cleared
+                   * by rewind/reopt so corrections can regrow. */
   uint16_t *gen_of; /* [W*H] generation each cell was placed (seed = 1);
                      * saved as generations.tif — the rewind substrate */
   uint8_t *grow_mask; /* optional: candidates allowed only where nonzero

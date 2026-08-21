@@ -662,6 +662,8 @@ static _Atomic uint64_t ng_qmax_binds, ng_hoodseg_binds;
  * peak decoded footprint — decides whether the budget or the parse cost
  * is the lever */
 static _Atomic uint64_t ng_loads, ng_evicts, ng_bytes_peak;
+static void tr_xbl_stamp(r3d_tracer *t, const double p[3]);
+static bool tr_xbl_bad(const r3d_tracer *t, const double p[3]);
 static _Atomic uint64_t ng_eget_hit, ng_eget_miss;
 static _Atomic uint64_t ng_hood_hits, ng_hood_builds;
 static _Atomic uint64_t ng_hood_seg_sum, ng_hood_seg_max;
@@ -4652,6 +4654,29 @@ static void tr_wind_assign(r3d_tracer *t, size_t k, int i, int j) {
 static bool tr_place_cand(r3d_tracer *t, tr_env *e, uint32_t cell, unsigned *rng) {
   uint32_t W = t->W;
   int i = (int)(cell % W), j = (int)(cell / W);
+  if (t->excnt) {
+    /* 3-strike edge propagation: three-strike cells mark territory where
+     * every attempt folds (the sheet has ended, or the data is a wall of
+     * ambiguity — the strongest attractor is the traced surface itself).
+     * The front routes AROUND single failed cells and folds at fresh
+     * ones (measured: per-generation excisions kept ramping with cell-
+     * local strikes alone), so a candidate next to 2+ such cells is
+     * refused outright: the edge grows, the churn stops. */
+    int nfail = 0;
+    for (int dj = -2; dj <= 2; dj++)
+      for (int di = -2; di <= 2; di++) {
+        int ii = i + di, jj = j + dj;
+        if (ii < 0 || jj < 0 || ii >= (int)t->W || jj >= (int)t->H) continue;
+        size_t kq = (size_t)jj * t->W + (size_t)ii;
+        if (t->state[kq] == R3D_TR_FAIL && t->excnt[kq] >= 3) nfail++;
+      }
+    if (nfail >= 2) {
+      pthread_mutex_lock(&t->mu);
+      t->state[(size_t)j * t->W + (size_t)i] = R3D_TR_FAIL;
+      pthread_mutex_unlock(&t->mu);
+      return false;
+    }
+  }
   /* best parent: the 3x3-neighbor with the most valid 3x3-neighbors */
   int bi = -1, bj = -1, bcnt = -1;
   for (int dj = -1; dj <= 1; dj++)
@@ -4790,6 +4815,18 @@ static bool tr_place_cand(r3d_tracer *t, tr_env *e, uint32_t cell, unsigned *rng
   tr_local_opt(t, e, i, j, 3, 3, false);
   const double *fp = t->pos + k * 3; /* the ONLY legitimate hole: the
                                       * point left the scroll volume */
+  if (tr_xbl_bad(t, fp)) { /* solved into a no-go strike zone: this
+      * region folds every wrap, every generation - an honest hole */
+    pthread_mutex_lock(&t->mu);
+    t->state[k] = R3D_TR_FAIL;
+    if (t->gen_of) t->gen_of[k] = 0;
+    if (t->nset) t->nset--;
+    for (uint32_t s2 = 0; s2 < dsnap_n; s2++)
+      memcpy(t->pos + (size_t)dsnap_k[s2] * 3, dsnap + (size_t)s2 * 3,
+             3 * sizeof(double));
+    pthread_mutex_unlock(&t->mu);
+    return false;
+  }
   static _Atomic int fold_gate = -1;
   int fg = atomic_load_explicit(&fold_gate, memory_order_relaxed);
   if (fg < 0) {
@@ -5254,6 +5291,42 @@ static bool tr_tri_tri(const double *A[3], const double *B[3]) {
   return false;
 }
 
+#define TR_XBL_N (1u << 16)
+#define TR_XBL_CS 32.0 /* strike-bucket size, voxels */
+#define TR_XBL_TH 4    /* strikes before a bucket becomes no-go */
+
+static uint64_t tr_xbl_key(const double p[3]) {
+  long x = (long)floor(p[0] / TR_XBL_CS), y = (long)floor(p[1] / TR_XBL_CS),
+       z = (long)floor(p[2] / TR_XBL_CS);
+  return 1u + (((uint64_t)(uint32_t)x & 0x1FFFFF) |
+               (((uint64_t)(uint32_t)y & 0x1FFFFF) << 21) |
+               (((uint64_t)(uint32_t)z & 0x1FFFFF) << 42));
+}
+
+static void tr_xbl_stamp(r3d_tracer *t, const double p[3]) {
+  if (!t->xbl_k) return;
+  uint64_t key = tr_xbl_key(p);
+  uint32_t h = (uint32_t)(key * 0x9E3779B97F4A7C15ull >> 48) & (TR_XBL_N - 1);
+  for (uint32_t n = 0; n < 64; n++, h = (h + 1) & (TR_XBL_N - 1)) {
+    if (!t->xbl_k[h]) t->xbl_k[h] = key;
+    if (t->xbl_k[h] == key) {
+      if (t->xbl_c[h] < 255) t->xbl_c[h]++;
+      return;
+    }
+  }
+}
+
+static bool tr_xbl_bad(const r3d_tracer *t, const double p[3]) {
+  if (!t->xbl_k) return false;
+  uint64_t key = tr_xbl_key(p);
+  uint32_t h = (uint32_t)(key * 0x9E3779B97F4A7C15ull >> 48) & (TR_XBL_N - 1);
+  for (uint32_t n = 0; n < 64; n++, h = (h + 1) & (TR_XBL_N - 1)) {
+    if (!t->xbl_k[h]) return false;
+    if (t->xbl_k[h] == key) return t->xbl_c[h] >= TR_XBL_TH;
+  }
+  return false;
+}
+
 /* pick the excision victim of a confirmed fold pair: the newer cell
  * (the flap was placed on top of older sheet), ties by lower conf;
  * anchored cells are never cut. Returns SIZE_MAX when both anchored. */
@@ -5340,8 +5413,15 @@ static uint32_t tr_fold_excise(r3d_tracer *t) {
       if (!cutmap[k]) continue;
       cutmap[k] = 0;
       if (t->state[k] != R3D_TR_SET) continue;
-      t->state[k] = R3D_TR_EMPTY; /* retryable, not FAIL: the region
-          * regrows from better parents next generations */
+      if (getenv("R3D_EXCISE_DUMP"))
+        fprintf(stderr, "XD1 %.0f %.0f %.0f\n", t->pos[k * 3], t->pos[k * 3 + 1],
+                t->pos[k * 3 + 2]);
+      tr_xbl_stamp(t, t->pos + k * 3);
+      if (t->excnt && t->excnt[k] < 255) t->excnt[k]++;
+      /* three strikes: a cell that folds every time it is regrown is
+       * answering the same ambiguous data and will fold forever — FAIL
+       * it (honest edge) instead of churning */
+      t->state[k] = t->excnt && t->excnt[k] >= 3 ? R3D_TR_FAIL : R3D_TR_EMPTY;
       t->conf[k] = 0.0f;
       if (t->gen_of) t->gen_of[k] = 0;
       if (t->nset) t->nset--;
@@ -5422,7 +5502,12 @@ static uint32_t tr_fold_excise(r3d_tracer *t) {
         if (!cutmap[k]) continue;
         cutmap[k] = 0;
         if (t->state[k] != R3D_TR_SET) continue;
-        t->state[k] = R3D_TR_EMPTY;
+        if (getenv("R3D_EXCISE_DUMP"))
+          fprintf(stderr, "XD2 %.0f %.0f %.0f\n", t->pos[k * 3], t->pos[k * 3 + 1],
+                  t->pos[k * 3 + 2]);
+        tr_xbl_stamp(t, t->pos + k * 3);
+        if (t->excnt && t->excnt[k] < 255) t->excnt[k]++;
+        t->state[k] = t->excnt && t->excnt[k] >= 3 ? R3D_TR_FAIL : R3D_TR_EMPTY;
         t->conf[k] = 0.0f;
         if (t->gen_of) t->gen_of[k] = 0;
         if (t->nset) t->nset--;
@@ -5549,7 +5634,12 @@ static uint32_t tr_fold_excise(r3d_tracer *t) {
         if (!cutmap[k]) continue;
         cutmap[k] = 0;
         if (t->state[k] != R3D_TR_SET) continue;
-        t->state[k] = R3D_TR_EMPTY;
+        if (getenv("R3D_EXCISE_DUMP"))
+          fprintf(stderr, "XD2 %.0f %.0f %.0f\n", t->pos[k * 3], t->pos[k * 3 + 1],
+                  t->pos[k * 3 + 2]);
+        tr_xbl_stamp(t, t->pos + k * 3);
+        if (t->excnt && t->excnt[k] < 255) t->excnt[k]++;
+        t->state[k] = t->excnt && t->excnt[k] >= 3 ? R3D_TR_FAIL : R3D_TR_EMPTY;
         t->conf[k] = 0.0f;
         if (t->gen_of) t->gen_of[k] = 0;
         if (t->nset) t->nset--;
@@ -5599,7 +5689,9 @@ static uint32_t tr_fold_excise(r3d_tracer *t) {
       if (qn) /* no seed marked = a loaded grid without gen data: skip */
         for (uint64_t k = 0; k < n; k++)
           if (t->state[k] == R3D_TR_SET && !reach[k]) {
-            t->state[k] = R3D_TR_EMPTY;
+            if (t->excnt && t->excnt[k] < 255) t->excnt[k]++;
+            t->state[k] = t->excnt && t->excnt[k] >= 3 ? R3D_TR_FAIL
+                                                       : R3D_TR_EMPTY;
             t->conf[k] = 0.0f;
             t->gen_of[k] = 0;
             if (t->nset) t->nset--;
@@ -6659,8 +6751,15 @@ static void *tr_worker(void *ud) {
        * retry from better parents as growth continues. */
       uint32_t nex = tr_fold_excise(t);
       if (nex) {
-        printf("tracer: gen %u: excised %u fold cell%s the anneal could not "
-               "flatten\n", generation, nex, nex == 1 ? "" : "s");
+        uint64_t nfailed = 0;
+        if (t->excnt) {
+          uint64_t nn3 = (uint64_t)t->W * t->H;
+          for (uint64_t k2 = 0; k2 < nn3; k2++)
+            if (t->state[k2] == R3D_TR_FAIL && t->excnt[k2] >= 3) nfailed++;
+        }
+        printf("tracer: gen %u: excised %u fold cell%s (%llu at the "
+               "3-strike edge)\n", generation, nex, nex == 1 ? "" : "s",
+               (unsigned long long)nfailed);
         tr_qc2(t, false); /* panel counters reflect the cut */
       }
     }
@@ -7071,6 +7170,9 @@ int r3d_tracer_start_fused(r3d_tracer *t, const char *pred_root,
   t->wind = calloc((size_t)t->W * t->H, sizeof *t->wind);
   t->werr = calloc((size_t)t->W * t->H, sizeof *t->werr);
   t->gen_of = calloc((size_t)t->W * t->H, sizeof *t->gen_of);
+  t->excnt = calloc((size_t)t->W * t->H, sizeof *t->excnt);
+  t->xbl_k = calloc(TR_XBL_N, sizeof *t->xbl_k);
+  t->xbl_c = calloc(TR_XBL_N, sizeof *t->xbl_c);
   t->rng = 0x1234567u;
   if (!t->pos || !t->state || !t->conf || !t->wind || !t->werr || !t->gen_of) {
     r3d_tracer_free(t);
@@ -7355,6 +7457,9 @@ int r3d_tracer_load(r3d_tracer *t, const char *dir, const char *pred_root) {
   t->wind = calloc(n, sizeof *t->wind);
   t->werr = calloc(n, sizeof *t->werr);
   t->gen_of = calloc(n, sizeof *t->gen_of);
+  t->excnt = calloc((size_t)t->W * t->H, sizeof *t->excnt);
+  t->xbl_k = calloc(TR_XBL_N, sizeof *t->xbl_k);
+  t->xbl_c = calloc(TR_XBL_N, sizeof *t->xbl_c);
   if (!t->pos || !t->state || !t->conf || !t->wind || !t->werr || !t->gen_of) {
     free(sj);
     r3d_tracer_free(t);
@@ -7456,15 +7561,19 @@ int r3d_tracer_rewind(r3d_tracer *t, uint32_t gen) {
     if (t->state[k] == R3D_TR_FAIL || t->state[k] == R3D_TR_PROC) {
       t->state[k] = R3D_TR_EMPTY; /* everything is retryable after rewind */
       t->gen_of[k] = 0;
+      if (t->excnt) t->excnt[k] = 0; /* strikes reset with the correction */
       continue;
     }
     if (t->state[k] != R3D_TR_SET || t->gen_of[k] <= gen) continue;
     t->state[k] = R3D_TR_EMPTY;
     t->gen_of[k] = 0;
+    if (t->excnt) t->excnt[k] = 0;
     t->conf[k] = 0.0f;
     if (t->nset) t->nset--;
     dropped++;
   }
+  if (t->xbl_k) memset(t->xbl_k, 0, TR_XBL_N * sizeof *t->xbl_k);
+  if (t->xbl_c) memset(t->xbl_c, 0, TR_XBL_N * sizeof *t->xbl_c);
   if (t->gens_done > gen) t->gens_done = gen;
   if (t->ring > gen) t->ring = gen;
   t->gen++;
@@ -7680,9 +7789,12 @@ int r3d_tracer_reopt(r3d_tracer *t, const double p[3], int radius) {
     if (!reg[k]) continue;
     t->state[k] = R3D_TR_EMPTY;
     if (t->gen_of) t->gen_of[k] = 0;
+    if (t->excnt) t->excnt[k] = 0; /* strikes reset with the correction */
     t->conf[k] = 0.0f;
     if (t->nset) t->nset--;
   }
+  if (t->xbl_k) memset(t->xbl_k, 0, TR_XBL_N * sizeof *t->xbl_k);
+  if (t->xbl_c) memset(t->xbl_c, 0, TR_XBL_N * sizeof *t->xbl_c);
   free(t->grow_mask);
   t->grow_mask = reg; /* growth confined to the reopened region */
   t->mask_once = true;
@@ -7761,6 +7873,10 @@ int r3d_tracer_grow(r3d_tracer *t, uint32_t extra) {
   }
   free(t->gen_of);
   t->gen_of = ng2;
+  free(t->excnt); /* strikes reset with the regrow: a fresh chance */
+  t->excnt = calloc((size_t)NW * NW, sizeof *t->excnt);
+  if (t->xbl_k) memset(t->xbl_k, 0, TR_XBL_N * sizeof *t->xbl_k);
+  if (t->xbl_c) memset(t->xbl_c, 0, TR_XBL_N * sizeof *t->xbl_c);
   t->W = t->H = NW;
   t->cfg.max_ring = nr;
   for (uint32_t a = 0; a < R3D_TR_MAX_ANCHORS; a++)
@@ -7864,6 +7980,10 @@ int r3d_tracer_subdivide(r3d_tracer *t) {
   free(t->wind);
   free(t->werr);
   free(t->gen_of);
+  free(t->excnt); /* strikes reset at the finer step */
+  t->excnt = calloc(n2, sizeof *t->excnt);
+  if (t->xbl_k) memset(t->xbl_k, 0, TR_XBL_N * sizeof *t->xbl_k);
+  if (t->xbl_c) memset(t->xbl_c, 0, TR_XBL_N * sizeof *t->xbl_c);
   t->pos = np;
   t->state = ns;
   t->conf = nc;
@@ -7987,6 +8107,9 @@ void r3d_tracer_free(r3d_tracer *t) {
   free(t->reopt_nrm);
   free(t->ctsnap_tgt);
   free(t->gen_of);
+  free(t->excnt);
+  free(t->xbl_k);
+  free(t->xbl_c);
   free(t->grow_mask);
   free(t->dcell_id);
   free(t->dcell_uv);
