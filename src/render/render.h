@@ -58,6 +58,7 @@ int r3d_bricks_overlay(r3d_renderer *r, const char *lod_root);
  * surface predictions and 3D ink display TOGETHER. Same geometry rules. */
 int r3d_bricks_ink3d(r3d_renderer *r, const char *lod_root);
 int r3d_bricks_ink3d_switch(r3d_renderer *r, const char *lod_root);
+int r3d_bricks_ink3d_refresh(r3d_renderer *r);
 /* Post-decode 3D display filter, applied once per brick as it streams in
  * (all views see it). mode low byte = primary filter (0 none, 1 median
  * 3^3, 2 median 5^3, 3 max pool 3^3, 4 max pool 5^3); bit 8 adds a 3D

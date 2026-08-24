@@ -1952,6 +1952,113 @@ static void od_browser_window(od_state *od, bool *open, char *next_bricks, size_
   igEnd();
 }
 
+/* --- 3D ink (volume): tools/ink3d worker glue. Unlike "live ink" (2.5D on
+ * the flattened surface volume), 3D ink runs directly on CT chunks and
+ * caches into a local zarr; the GUI only computes the footprint, spawns the
+ * worker, and refreshes the red overlay. */
+
+/* spawn argv (n items, NULL-terminated by us) with stdout+stderr merged
+ * onto a returned nonblocking pipe; argv only, no shell */
+static int i3_spawn(const char *const *args, int n, pid_t *pid_out, int *fd_out) {
+  char *argv[16];
+  if (n <= 0 || n >= 16) return -1;
+  for (int i = 0; i < n; i++) argv[i] = (char *)args[i];
+  argv[n] = NULL;
+  int fds[2];
+  if (pipe2(fds, O_CLOEXEC) != 0) return -1;
+  posix_spawn_file_actions_t fa;
+  if (posix_spawn_file_actions_init(&fa) != 0) {
+    close(fds[0]);
+    close(fds[1]);
+    return -1;
+  }
+  int rc = posix_spawn_file_actions_adddup2(&fa, fds[1], 1);
+  if (rc == 0) rc = posix_spawn_file_actions_adddup2(&fa, fds[1], 2);
+  if (rc == 0 && fds[1] > 2) rc = posix_spawn_file_actions_addclose(&fa, fds[1]);
+  pid_t pid = 0;
+  if (rc == 0) rc = posix_spawnp(&pid, argv[0], &fa, NULL, argv, environ);
+  posix_spawn_file_actions_destroy(&fa);
+  close(fds[1]);
+  if (rc != 0) {
+    close(fds[0]);
+    errno = rc;
+    return -1;
+  }
+  fcntl(fds[0], F_SETFL, fcntl(fds[0], F_GETFL) | O_NONBLOCK);
+  *pid_out = pid;
+  *fd_out = fds[0];
+  return 0;
+}
+
+/* chunk footprint of a surface: every 256^3 volume chunk within +-pad
+ * voxels of a valid grid point, one "cz cy cx" line each. Returns the
+ * chunk count (0 = no valid points or IO error). */
+static uint32_t i3_footprint(const r3d_tifxyz *s, double pad, const char *path) {
+  enum { HB = 21 }; /* 2M-slot set; real footprints are thousands */
+  const uint32_t hn = 1u << HB, mask = hn - 1;
+  uint64_t *set = calloc(hn, sizeof *set);
+  if (!set) return 0;
+  uint32_t cnt = 0;
+  for (uint64_t k = 0, n = (uint64_t)s->w * s->h; k < n; k++) {
+    const float *p = s->xyz + k * 3;
+    if (p[0] < 0.0f) continue;
+    for (int c = 0; c < 8 && cnt < hn / 2; c++) {
+      double x = (double)p[0] + ((c & 1) ? pad : -pad),
+             y = (double)p[1] + ((c & 2) ? pad : -pad),
+             z = (double)p[2] + ((c & 4) ? pad : -pad);
+      if (x < 0.0 || y < 0.0 || z < 0.0) continue;
+      uint64_t key = ((uint64_t)(z / 256.0) << 42) | ((uint64_t)(y / 256.0) << 21) |
+                     (uint64_t)(x / 256.0);
+      uint64_t h = key * 0x9e3779b97f4a7c15ull; /* 0 stays free: store key+1 */
+      for (uint32_t i = (uint32_t)(h >> 43) & mask;; i = (i + 1) & mask) {
+        if (set[i] == key + 1) break;
+        if (set[i] == 0) {
+          set[i] = key + 1;
+          cnt++;
+          break;
+        }
+      }
+    }
+  }
+  FILE *f = fopen(path, "w");
+  if (!f) {
+    free(set);
+    return 0;
+  }
+  for (uint32_t i = 0; i < hn; i++)
+    if (set[i]) {
+      uint64_t key = set[i] - 1;
+      fprintf(f, "%llu %llu %llu\n", (unsigned long long)(key >> 42),
+              (unsigned long long)((key >> 21) & 0x1fffffu),
+              (unsigned long long)(key & 0x1fffffu));
+    }
+  free(set);
+  return fclose(f) == 0 ? cnt : 0;
+}
+
+/* drop the overlay cache's negative knowledge so freshly computed chunks
+ * re-stream: zero-size .c5b absent markers plus the coarse seed cache */
+static void i3_clear_absent(const char *root) {
+  char p[1400];
+  snprintf(p, sizeof p, "%s/seed.raw", root);
+  unlink(p);
+  for (int l = 0;; l++) {
+    char d[700];
+    snprintf(d, sizeof d, "%s/bricks/L%d", root, l);
+    DIR *dir = opendir(d);
+    if (!dir) break;
+    struct dirent *e;
+    while ((e = readdir(dir))) {
+      size_t bn = strlen(e->d_name);
+      if (bn < 4 || strcmp(e->d_name + bn - 4, ".c5b") != 0) continue;
+      snprintf(p, sizeof p, "%s/%s", d, e->d_name);
+      struct stat st;
+      if (stat(p, &st) == 0 && st.st_size == 0) unlink(p);
+    }
+    closedir(dir);
+  }
+}
+
 static void gui_event_hook(void *ud, const SDL_Event *ev) {
   r3d_gui_event((r3d_renderer *)ud, ev);
 }
@@ -2102,6 +2209,16 @@ int main(int argc, char **argv) {
   int inklive_port = 0;             /* --inklive: live 2.5D ink on the seg view */
   r3d_inklive inklive = {.fd = -1};
   bool inklive_up = false, inklive_have = false;
+  /* --- 3D ink (volume): background tools/ink3d worker state */
+  pid_t i3_pid = 0;
+  int i3_fd = -1;
+  int i3_step = 0; /* 1 = infer running, 2 = scene build running */
+  char i3_line[192] = "";
+  char i3_acc[192];
+  int i3_an = 0;
+  char i3_py[512] = "", i3_script[600] = "";
+  char i3_zarr[640] = "", i3_sroot[640] = "";
+  char ct_src_url[1200] = ""; /* CT tree's source.json url (ink3d input) */
   bool inklive_show = true; /* GUI toggle: display the ink overlay on the
                              * flattened pane (worker keeps predicting) */
   /* full-surface ink map state (see inkmap_save/load) */
@@ -2443,6 +2560,17 @@ int main(int argc, char **argv) {
         fclose(sf);
         sj[sn] = 0;
         vox_um = r3d_regvol_parse_um(sj);
+        const char *uu = strstr(sj, "\"url\": \""); /* 3D ink reads its CT
+                                                     * chunks straight from
+                                                     * the same source */
+        if (uu) {
+          uu += 8;
+          const char *ue = strchr(uu, '"');
+          if (ue && (size_t)(ue - uu) < sizeof ct_src_url) {
+            memcpy(ct_src_url, uu, (size_t)(ue - uu));
+            ct_src_url[ue - uu] = 0;
+          }
+        }
       }
       if (vox_um <= 0.0) vox_um = r3d_regvol_parse_um(bricks_path);
       if (vox_um > 0.0) {
@@ -5109,7 +5237,120 @@ int main(int argc, char **argv) {
           }
     }
       }
-    if (inklive_up && igCollapsingHeader_TreeNodeFlags("live ink", 0)) {
+    /* ---- 3D ink (volume): detect directly on CT chunks the surface passes
+     * through; cached once into a local zarr, shown as the red overlay */
+    if (bricks_path) {
+      if (i3_pid) { /* pump the worker pipe; keep the last ink3d: line */
+        char pb[512];
+        for (;;) {
+          ssize_t rn = read(i3_fd, pb, sizeof pb);
+          if (rn > 0) {
+            for (ssize_t k = 0; k < rn; k++) {
+              if (pb[k] == '\n' || i3_an + 1 >= (int)sizeof i3_acc) {
+                i3_acc[i3_an] = 0;
+                if (strstr(i3_acc, "ink3d:"))
+                  snprintf(i3_line, sizeof i3_line, "%s", i3_acc);
+                i3_an = 0;
+              } else if (pb[k] != '\r')
+                i3_acc[i3_an++] = pb[k];
+            }
+            continue;
+          }
+          if (rn < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+          close(i3_fd); /* EOF: reap and advance the step machine */
+          i3_fd = -1;
+          int st = 0;
+          pid_t rp;
+          do rp = waitpid(i3_pid, &st, 0);
+          while (rp < 0 && errno == EINTR);
+          i3_pid = 0;
+          if (!(rp > 0 && WIFEXITED(st) && WEXITSTATUS(st) == 0)) {
+            snprintf(i3_line, sizeof i3_line, "worker failed: %s",
+                     i3_acc[0] ? i3_acc : "see console");
+            i3_step = 0;
+          } else if (i3_step == 1) { /* infer done -> (re)build the scene */
+            const char *sa[] = {i3_py,    i3_script, "scene", "--zarr",
+                                i3_zarr,  "--out",   i3_sroot};
+            if (i3_spawn(sa, 7, &i3_pid, &i3_fd) == 0) i3_step = 2;
+            else {
+              snprintf(i3_line, sizeof i3_line, "scene spawn failed");
+              i3_step = 0;
+            }
+          } else { /* scene done -> attach or refresh the red overlay */
+            i3_clear_absent(i3_sroot);
+            if (ink3d_ok && strcmp(ink3d_root, i3_sroot) == 0) {
+              r3d_bricks_ink3d_refresh(renderer);
+            } else if (r3d_bricks_ink3d_switch(renderer, i3_sroot) == 0) {
+              snprintf(ink3d_root, sizeof ink3d_root, "%s", i3_sroot);
+              ink3d_ok = ink3d_show = true;
+            }
+            snprintf(i3_line, sizeof i3_line, "done - 3D ink overlay refreshed");
+            i3_step = 0;
+          }
+          break;
+        }
+      }
+      if (igCollapsingHeader_TreeNodeFlags("3D ink (volume)", 0)) {
+        bool have_surf = mv_seg.xyz && mv_seg.nvalid > 0;
+        igBeginDisabled(!have_surf || !ct_src_url[0] || i3_pid != 0);
+        if (igButton("detect 3D ink on this surface", (ImVec2){0, 0})) {
+          mkdir_p("cache");
+          const char *chf = "cache/ink3d-chunks.txt";
+          uint32_t nch = i3_footprint(&mv_seg, 64.0, chf);
+          if (nch == 0) {
+            snprintf(i3_line, sizeof i3_line, "no valid surface points");
+          } else {
+            const char *py = getenv("R3D_INK3D_PY"), *hm = getenv("HOME");
+            if (py) snprintf(i3_py, sizeof i3_py, "%s", py);
+            else
+              snprintf(i3_py, sizeof i3_py,
+                       "%s/villa-ink/ink-detection/.venv/bin/python", hm ? hm : "");
+            const char *sc = getenv("R3D_INK3D_SCRIPT");
+            if (sc) snprintf(i3_script, sizeof i3_script, "%s", sc);
+            else {
+              char ed[512]; /* build/<preset>/ -> repo tools/ */
+              od_exe_dir(ed);
+              snprintf(i3_script, sizeof i3_script, "%s/../../tools/ink3d/ink3d.py",
+                       ed);
+            }
+            char dirb[512]; /* "paris4-lod/manifest.json" -> volid "paris4" */
+            snprintf(dirb, sizeof dirb, "%s", bricks_path);
+            char *sl2 = strrchr(dirb, '/');
+            if (sl2) *sl2 = 0;
+            else snprintf(dirb, sizeof dirb, ".");
+            const char *bn = strrchr(dirb, '/');
+            bn = bn ? bn + 1 : dirb;
+            char volid[160];
+            snprintf(volid, sizeof volid, "%s", bn);
+            size_t vl = strlen(volid);
+            if (vl > 4 && strcmp(volid + vl - 4, "-lod") == 0) volid[vl - 4] = 0;
+            snprintf(i3_zarr, sizeof i3_zarr, "%s-ink3d.zarr", volid);
+            snprintf(i3_sroot, sizeof i3_sroot, "%s-ink3d-local", volid);
+            const char *a[] = {i3_py,     i3_script,  "infer", "--chunks-file",
+                               chf,       "--source", ct_src_url, "--out",
+                               i3_zarr};
+            i3_an = 0;
+            if (i3_spawn(a, 9, &i3_pid, &i3_fd) == 0) {
+              i3_step = 1;
+              snprintf(i3_line, sizeof i3_line,
+                       "computing %u chunks -> %s ...", nch, i3_zarr);
+            } else
+              snprintf(i3_line, sizeof i3_line, "spawn failed: %s",
+                       strerror(errno));
+          }
+        }
+        igEndDisabled();
+        if (igIsItemHovered(0) && !i3_pid) {
+          if (!have_surf) igSetTooltip("open or trace a surface first");
+          else if (!ct_src_url[0]) igSetTooltip("CT tree has no source.json url");
+          else
+            igSetTooltip("runs tools/ink3d on every 256^3 CT chunk the surface\n"
+                         "touches; cached chunks are skipped (computed once)");
+        }
+        if (i3_line[0]) igTextDisabled("%s", i3_line);
+      }
+    }
+    if (inklive_up && igCollapsingHeader_TreeNodeFlags("live ink (2.5D surface)", 0)) {
       igCheckbox("show ink on flattened view", &inklive_show);
       igBeginDisabled(inkmap_job);
       if (igCheckbox("verso (reverse side)##inkverso", &ink_verso)) {

@@ -4607,7 +4607,8 @@ static void ni_overlay_source(r3d_renderer *r, int ov) {
 
 static int bricks_overlay_open(r3d_renderer *r, const char *lod_root, int ov);
 
-static int bricks_overlay_switch_ov(r3d_renderer *r, const char *lod_root, int ov) {
+static int bricks_overlay_switch_ov(r3d_renderer *r, const char *lod_root, int ov,
+                                    bool force) {
   char *oroot = ov ? r->ink2_root : r->ink_root;
   r3d_brlod_reader **ordp = ov ? &r->ink2_readers : &r->ink_readers;
   r3d_vkimage *oatlas = ov ? &r->ink2_atlas : &r->ink_atlas;
@@ -4615,7 +4616,7 @@ static int bricks_overlay_switch_ov(r3d_renderer *r, const char *lod_root, int o
   char *ourl = ov ? r->ni.url3 : r->ni.url2;
   r->scene_gen++; /* GPU-visible data changes: pane cache must miss */
   if (!*oact) return bricks_overlay_open(r, lod_root, ov);
-  if (strcmp(oroot, lod_root) == 0) return 0;
+  if (!force && strcmp(oroot, lod_root) == 0) return 0;
   /* drain the async decode job — its worker reads the overlay readers */
   pthread_mutex_lock(&r->bs.mu);
   while (r->bs.job_state == 1 || r->bs.job_state == 2)
@@ -4670,11 +4671,21 @@ static int bricks_overlay_switch_ov(r3d_renderer *r, const char *lod_root, int o
 }
 
 int r3d_bricks_overlay_switch(r3d_renderer *r, const char *lod_root) {
-  return bricks_overlay_switch_ov(r, lod_root, 0);
+  return bricks_overlay_switch_ov(r, lod_root, 0, false);
 }
 
 int r3d_bricks_ink3d_switch(r3d_renderer *r, const char *lod_root) {
-  return bricks_overlay_switch_ov(r, lod_root, 1);
+  return bricks_overlay_switch_ov(r, lod_root, 1, false);
+}
+
+/* force-close and reopen the active 3D-ink overlay: bricks the cache holds
+ * as absent re-stream from the source, picking up chunks the ink3d worker
+ * computed since (the caller drops the absent markers first) */
+int r3d_bricks_ink3d_refresh(r3d_renderer *r) {
+  if (!r->ink2_active) return -1;
+  char root[640];
+  snprintf(root, sizeof root, "%s", r->ink2_root);
+  return bricks_overlay_switch_ov(r, root, 1, true);
 }
 
 static int bricks_overlay_open(r3d_renderer *r, const char *lod_root, int ov) {
