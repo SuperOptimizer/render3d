@@ -607,7 +607,10 @@ void main(uint3 tid_in: SV_DispatchThreadID) {
         }
       }
       if (overlay_on())
-        col = lerp(col, flat_overlay_color(), saturate(vk.g * pc.overlay_gain));
+        /* the flattened bake's G channel taps 3D ink when that overlay is
+         * active (it wins the binding), so its gain follows */
+        col = lerp(col, flat_overlay_color(),
+                   saturate(vk.g * (overlay2_on() ? pc.ink3d_gain : pc.overlay_gain)));
       acc.rgb += (1.0 - acc.a) * a * col;
       acc.a += (1.0 - acc.a) * a;
       if (acc.a >= ALPHA_CUTOFF) break;
@@ -615,7 +618,8 @@ void main(uint3 tid_in: SV_DispatchThreadID) {
     float3 color = composite ? acc.rgb + (1.0 - acc.a) * bg.rgb
                              : float3(mip_max * pc.density);
     if (!composite && overlay_on())
-      color = lerp(color, flat_overlay_color(), saturate(ink_max * pc.overlay_gain));
+      color = lerp(color, flat_overlay_color(),
+                   saturate(ink_max * (overlay2_on() ? pc.ink3d_gain : pc.overlay_gain)));
     if ((pc.overlay_flags & 32u) != 0u) {
       /* supervision mask: grid-space class image; px-per-grid derives from
        * the mask's dims vs the segment grid's (surf_coords), so no extra
@@ -1004,7 +1008,7 @@ void main(uint3 tid_in: SV_DispatchThreadID) {
         }
         if (is_bricks() && bricks_is_lod() && overlay2_on() && b_ok) {
           /* 3D ink on top: red wins where both overlays light up */
-          float k = bricks_fetch_ink2(b_slot, b_bl, blod, b_inv) * pc.overlay_gain;
+          float k = bricks_fetch_ink2(b_slot, b_bl, blod, b_inv) * pc.ink3d_gain;
           col = lerp(col, INK3D_RED, saturate(k));
         }
         if (is_bricks() && bricks_is_lod() && labels_on() && b_ok) {
@@ -1032,7 +1036,7 @@ void main(uint3 tid_in: SV_DispatchThreadID) {
     color = float3(mip_max * pc.density);
     if (reg_on()) color = reg_fuse(color, reg_max * pc.density);
     if (overlay_on()) color = lerp(color, overlay_color(), saturate(ink_max * pc.overlay_gain));
-    if (overlay2_on()) color = lerp(color, INK3D_RED, saturate(ink2_max * pc.overlay_gain));
+    if (overlay2_on()) color = lerp(color, INK3D_RED, saturate(ink2_max * pc.ink3d_gain));
     if (labels_on() && lbl_max > 0.0) color = lerp(color, label_color(lbl_max), LBL_ALPHA);
   }
   store_px(opix, tid.xy, half, float4(color, 1));

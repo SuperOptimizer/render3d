@@ -39,6 +39,8 @@ struct FrameParams {
   // overlay volume (ink): bit 0 of flags enables, gain scales the value
   float overlay_gain;
   uint overlay_flags;
+  // 3D ink (red overlay): independent intensity for the ink probabilities
+  float ink3d_gain;
 };
 
 // world -> volume space (R^T rotate about the box center, minus translation)

@@ -2648,6 +2648,8 @@ int main(int argc, char **argv) {
   }
   bool overlay_show = overlay_path != NULL;
   float overlay_gain = 1.5f;
+  float ink3d_gain = 1.5f; /* red 3D-ink intensity, independent of the blue
+                            * surface-prediction gain */
 
   /* vc3d-style 2x2 multi-view: flattened segment (TL, milestone C — an XY
    * overview until then) + XY/XZ/YZ ortho plane views, shared focus POI */
@@ -5779,6 +5781,14 @@ int main(int argc, char **argv) {
           igSetNextItemWidth(140);
           igSliderFloat("gain", &overlay_gain, 0.25f, 8.0f, "%.2f",
                         ImGuiSliderFlags_Logarithmic);
+          if (ink3d_ok) {
+            igSetNextItemWidth(140);
+            igSliderFloat("3D ink gain", &ink3d_gain, 0.25f, 8.0f, "%.2f",
+                          ImGuiSliderFlags_Logarithmic);
+            if (igIsItemHovered(0))
+              igSetTooltip("the model's smooth 0..1 ink probability is scaled\n"
+                           "by this before it drives the red tint");
+          }
           if (multiview_path) {
             igText("show in:");
             static const char *ov_pane[4] = {"seg##ovp", "XY##ovp", "XZ##ovp", "YZ##ovp"};
@@ -7041,6 +7051,7 @@ int main(int argc, char **argv) {
         .threshold = low_cut / 255.0f,
         .skip_gate = fmaxf(low_cut, tf_min_v - 0.5f) / 255.0f,
         .overlay_gain = overlay_gain,
+        .ink3d_gain = ink3d_gain,
         /* live 2.5D ink shows even without a 3D overlay tree. The palette
          * follows the source: bit 8 = surface-prediction cyan for the plane
          * views' overlay tree, bit 1 = the flat pane carries live ink and
