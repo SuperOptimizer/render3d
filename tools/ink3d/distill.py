@@ -285,15 +285,29 @@ def cmd_train(args):
     sched = torch.optim.lr_scheduler.LambdaLR(
         opt, lambda s: min(1.0, (s + 1) / warm) *
         (0.5 * (1.0 + np.cos(np.pi * min(s, args.steps) / args.steps))))
+    start, best_dice = 1, -1.0
+    if args.resume:  # continue a killed run: weights, EMA, optimizer, step
+        ck = torch.load(args.resume, map_location="cpu", weights_only=False)
+        if ck["student_config"] != cfg:
+            sys.exit(f"distill: --resume config {ck['student_config']} != {cfg}")
+        net.load_state_dict(ck["model"])
+        ema.load_state_dict(ck["ema_model"])
+        if "optimizer" in ck:
+            opt.load_state_dict(ck["optimizer"])
+        start = int(ck.get("step", 0)) + 1
+        best_dice = float(ck.get("val", {}).get("dice", -1.0))
+        for _ in range(start - 1):
+            sched.step()
+        print(f"distill: resumed {args.resume} at step {start} "
+              f"(best dice {best_dice:.3f})")
     buf = ChunkBuffer(tr, args.cache_chunks, rng)
     bce = torch.nn.BCEWithLogitsLoss()
-    best_dice = -1.0
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     t_start = time.time()
     ema_d = 0.999
     run_loss = None
-    for step in range(1, args.steps + 1):
+    for step in range(start, args.steps + 1):
         xs, ts = zip(*(buf.sample_crop(args.crop) for _ in range(args.bs)))
         x = torch.from_numpy(np.stack(xs)).float()[:, None].cuda(non_blocking=True)
         t = torch.from_numpy(np.stack(ts)).float()[:, None].cuda(non_blocking=True)
@@ -312,7 +326,7 @@ def cmd_train(args):
                 be.copy_(bn)
         run_loss = loss.item() if run_loss is None else 0.98 * run_loss + 0.02 * loss.item()
         if step % 100 == 0:
-            r = (time.time() - t_start) / step
+            r = (time.time() - t_start) / (step - start + 1)
             print(f"distill: step {step}/{args.steps} loss {run_loss:.4f} "
                   f"lr {sched.get_last_lr()[0]:.2e} {r:.2f}s/step "
                   f"eta {(args.steps - step) * r / 60:.0f}m", flush=True)
@@ -325,6 +339,7 @@ def cmd_train(args):
                 best_dice = dice
                 torch.save({"student_config": cfg, "model": net.state_dict(),
                             "ema_model": ema.state_dict(), "step": step,
+                            "optimizer": opt.state_dict(),
                             "val": {"mae": mae, "dice": dice}}, out)
                 tag = f" -> saved {out}"
             print(f"distill: val@{step}: dice {dice:.3f} mae {mae:.4f} "
@@ -382,6 +397,7 @@ def main():
     t.add_argument("--cache-chunks", type=int, default=64,
                    help="replay-buffer size in 256^3 chunks (~48MB each)")
     t.add_argument("--seed", type=int, default=7)
+    t.add_argument("--resume", help="checkpoint to continue from (same preset)")
     t.set_defaults(fn=cmd_train)
     e = sub.add_parser("eval", help="held-out metrics + runtime for a student")
     e.add_argument("--data", required=True)
