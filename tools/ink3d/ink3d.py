@@ -56,6 +56,7 @@ def load_model(ckpt_path, device="cuda"):
     from vesuvius.models.run.inference import _normalize_train_py_model_config
     from vesuvius.models.build.build_network_from_config import NetworkFromConfig
 
+    torch.backends.cudnn.benchmark = True  # fixed 256^3 shapes: autotune convs
     ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     mc = _normalize_train_py_model_config(ck)
 
@@ -82,8 +83,10 @@ def load_model(ckpt_path, device="cuda"):
 
 
 def normalize(patch):
-    """Per-patch p1/p99 min-max to [0,1], matching training."""
-    lo, hi = np.percentile(patch, (1.0, 99.0))
+    """Per-patch p1/p99 min-max to [0,1], matching training. Percentiles are
+    taken on an 8x-strided subsample: indistinguishable on 16M-voxel patches
+    and much cheaper than a full sort."""
+    lo, hi = np.percentile(patch[::2, ::2, ::2], (1.0, 99.0))
     d = float(hi - lo)
     if d <= 1e-8:
         return np.zeros_like(patch, dtype=np.float32)
@@ -126,7 +129,8 @@ def infer_region(net, region, halo, tta=False):
                 p = region[oz:oz + CHUNK, oy:oy + CHUNK, ox:ox + CHUNK]
                 if p.max() == 0:
                     continue  # masked air: prob 0, weight via wac stays 0 -> 0
-                x = torch.from_numpy(normalize(p))[None, None].to("cuda")
+                x = torch.from_numpy(normalize(p)).pin_memory()
+                x = x[None, None].to("cuda", non_blocking=True)
                 pr = torch.zeros((CHUNK, CHUNK, CHUNK), device="cuda")
                 with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
                     for f in flips:
@@ -279,23 +283,42 @@ def cmd_infer(args):
     out0 = root["0"]
     halo = args.halo
 
-    # prefetch source regions one chunk ahead so S3 reads overlap the GPU
+    # prefetch source regions ahead of the GPU: several fetcher threads so
+    # the (many-small-request) S3 reads never gate inference
     fetched = {}
+    next_i = [0]
     lock = threading.Lock()
     cv = threading.Condition(lock)
+    NFETCH, DEPTH = 4, 8
 
     def fetcher():
-        for c in todo:
-            cz, cy, cx = c
-            reg = read_region(src, cz * CHUNK - halo, cy * CHUNK - halo,
-                              cx * CHUNK - halo, CHUNK + 2 * halo)
+        while True:
             with cv:
-                while len(fetched) >= 2:
+                while next_i[0] < len(todo) and len(fetched) >= DEPTH:
                     cv.wait()
+                if next_i[0] >= len(todo):
+                    return
+                c = todo[next_i[0]]
+                next_i[0] += 1
+                fetched[c] = None  # claimed
+            cz, cy, cx = c
+            for attempt in range(4):
+                try:
+                    reg = read_region(src, cz * CHUNK - halo, cy * CHUNK - halo,
+                                      cx * CHUNK - halo, CHUNK + 2 * halo)
+                    break
+                except Exception as e:
+                    if attempt == 3:  # sys.exit only kills this thread
+                        print(f"ink3d: source read failed for chunk {c}: {e}",
+                              file=sys.stderr, flush=True)
+                        os._exit(1)
+                    time.sleep(2 << attempt)
+            with cv:
                 fetched[c] = reg
                 cv.notify_all()
 
-    threading.Thread(target=fetcher, daemon=True).start()
+    for _ in range(NFETCH):
+        threading.Thread(target=fetcher, daemon=True).start()
 
     written = []
     flushed = 0
@@ -303,7 +326,7 @@ def cmd_infer(args):
     for i, c in enumerate(todo):
         cz, cy, cx = c
         with cv:
-            while c not in fetched:
+            while fetched.get(c) is None:
                 cv.wait()
             region = fetched.pop(c)
             cv.notify_all()
@@ -377,8 +400,9 @@ def main():
     ai.add_argument("--ckpt", default=DEFAULT_CKPT)
     ai.add_argument("--pad", type=int, default=64,
                     help="surface dilation in voxels (default 64 = 154um)")
-    ai.add_argument("--halo", type=int, default=64,
-                    help="context halo; 0 = fast, seams at chunk borders")
+    ai.add_argument("--halo", type=int, default=0,
+                    help="context halo in voxels; 0 (default) = one forward per "
+                         "chunk, fastest; 64 = 8 blended patches, no border seams")
     ai.add_argument("--tta", action="store_true",
                     help="8-flip mirroring TTA (~4.5x slower, closest to published)")
     ai.add_argument("--force", action="store_true", help="recompute cached chunks")
