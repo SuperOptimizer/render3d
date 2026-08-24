@@ -12,6 +12,10 @@ pairs with soft BCE + soft Dice. Run from villa's ink-detection env.
     # 2. train a student (tiny ~1.3M params ~111x smaller, small ~15M ~9x)
     distill.py train --data ~/r3d-data/ink3d-distill \
         --out ~/r3d-data/ink3d-ckpt/student-tiny.pth --preset tiny
+    #    ... or over the WHOLE scroll: chunks stream from S3 as training
+    #    runs (~1 fresh chunk/s/loader, write-through cached up to a cap)
+    distill.py train --stream --data ~/r3d-data/ink3d-distill \
+        --out ~/r3d-data/ink3d-ckpt/student-small.pth --preset small --steps 100000
 
     # 3. metrics vs the teacher on the held-out split
     distill.py eval --data ~/r3d-data/ink3d-distill \
@@ -69,13 +73,14 @@ def is_val(cz, cy, cx):
 
 # ---------------------------------------------------------------- harvest
 
-def cmd_harvest(args):
-    rng = np.random.default_rng(args.seed)
-    out = Path(args.out)
-    out.mkdir(parents=True, exist_ok=True)
-    t5 = open_level(args.teacher, 5)
-    t0 = open_level(args.teacher, 0)
-    s0 = open_level(args.source, 0)
+def score_chunks(teacher, out_dir):
+    """Per-256^3-chunk mean teacher prediction over the whole volume, from
+    the L5 pyramid (one L0 chunk = an 8^3 block). Cached as score.npy."""
+    cache = Path(out_dir) / "score.npy"
+    if cache.exists():
+        return np.load(cache)
+    t5 = open_level(teacher, 5)
+    t0 = open_level(teacher, 0)
     Z, Y, X = t0.shape
     gz, gy, gx = (Z + CHUNK - 1) // CHUNK, (Y + CHUNK - 1) // CHUNK, (X + CHUNK - 1) // CHUNK
     print(f"distill: scoring {gz}x{gy}x{gx} chunks via teacher L5 {t5.shape}")
@@ -94,6 +99,42 @@ def cmd_harvest(args):
         # near-zero background papyrus
         blk[b.min(axis=(1, 3, 5)) >= 120] = 0.0
         score[z0 // 8:z0 // 8 + blk.shape[0], :blk.shape[1], :blk.shape[2]] = blk
+    np.save(cache, score)
+    return score
+
+
+def fetch_pair(s0, t0, c):
+    """(CT u8, teacher u8) 256^3 pair for chunk c, or None if the CT is
+    empty. Mask fill (~127) over empty CT is zeroed: it is not a label."""
+    Z, Y, X = t0.shape
+    cz, cy, cx = c
+    z0, y0, x0 = cz * CHUNK, cy * CHUNK, cx * CHUNK
+    ct = np.zeros((CHUNK, CHUNK, CHUNK), np.uint8)
+    pr = np.zeros((CHUNK, CHUNK, CHUNK), np.uint8)
+    a = s0[z0:min(z0 + CHUNK, Z), y0:min(y0 + CHUNK, Y), x0:min(x0 + CHUNK, X)]
+    ct[:a.shape[0], :a.shape[1], :a.shape[2]] = a
+    if ct.max() == 0:
+        return None
+    b = t0[z0:min(z0 + CHUNK, Z), y0:min(y0 + CHUNK, Y), x0:min(x0 + CHUNK, X)]
+    pr[:b.shape[0], :b.shape[1], :b.shape[2]] = b
+    pr[ct == 0] = 0
+    return ct, pr
+
+
+def save_pair(f, ct, pr):
+    tmp = f.with_suffix(".tmp.npz")
+    np.savez_compressed(tmp, ct=ct, pred=pr)
+    tmp.rename(f)
+
+
+def cmd_harvest(args):
+    rng = np.random.default_rng(args.seed)
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    t0 = open_level(args.teacher, 0)
+    s0 = open_level(args.source, 0)
+    score = score_chunks(args.teacher, out)
+    gz, gy, gx = score.shape
     ink_mask = score >= args.ink_thresh
     print(f"distill: {ink_mask.sum()} ink-bearing chunks "
           f"(score >= {args.ink_thresh}), max score {score.max():.1f}")
@@ -135,21 +176,12 @@ def cmd_harvest(args):
                 with lock:
                     stats["skip"] += 1
                 continue
-            z0, y0, x0 = cz * CHUNK, cy * CHUNK, cx * CHUNK
-            ct = np.zeros((CHUNK, CHUNK, CHUNK), np.uint8)
-            pr = np.zeros((CHUNK, CHUNK, CHUNK), np.uint8)
-            a = s0[z0:min(z0 + CHUNK, Z), y0:min(y0 + CHUNK, Y), x0:min(x0 + CHUNK, X)]
-            ct[:a.shape[0], :a.shape[1], :a.shape[2]] = a
-            if ct.max() == 0:
+            pair = fetch_pair(s0, t0, c)
+            if pair is None:
                 with lock:
                     stats["empty"] += 1
                 continue
-            b = t0[z0:min(z0 + CHUNK, Z), y0:min(y0 + CHUNK, Y), x0:min(x0 + CHUNK, X)]
-            pr[:b.shape[0], :b.shape[1], :b.shape[2]] = b
-            pr[ct == 0] = 0  # mask fill (~127 = sigmoid 0.5) is not a label
-            tmp = f.with_suffix(".tmp.npz")
-            np.savez_compressed(tmp, ct=ct, pred=pr)
-            tmp.rename(f)
+            save_pair(f, *pair)
             with lock:
                 stats["done"] += 1
                 n = stats["done"]
@@ -175,36 +207,43 @@ class ChunkBuffer:
     """Replay buffer of normalized chunks; a loader thread cycles fresh
     chunks in from disk while training samples crops from what's loaded."""
 
-    def __init__(self, files, cap, rng):
-        self.files, self.rng = files, rng
-        self.cap = min(cap, len(files))
+    def __init__(self, load_one, cap, rng, nthreads=1):
+        """load_one() -> (ct u8, pred u8) 256^3 or None (retry)."""
+        self.load_one, self.rng = load_one, rng
+        self.cap = cap
         self.buf = []  # list of (ct f16 norm, pred f16 prob)
+        self.loaded = 0
         self.lock = threading.Lock()
         self.quit = False
-        self.th = threading.Thread(target=self._loader, daemon=True)
-        self.th.start()
+        self.ths = [threading.Thread(target=self._loader, daemon=True)
+                    for _ in range(nthreads)]
+        for t in self.ths:
+            t.start()
         while True:  # block until minimally warm
             with self.lock:
                 if len(self.buf) >= min(8, self.cap):
                     break
             time.sleep(0.2)
 
-    def _load_one(self):
-        f = self.files[self.rng.integers(len(self.files))]
-        d = np.load(f)
-        ct = normalize(d["ct"]).astype(np.float16)
-        pr = (d["pred"].astype(np.float16) / 255.0)
-        return ct, pr
-
     def _loader(self):
         while not self.quit:
-            item = self._load_one()
+            try:
+                pair = self.load_one()
+            except Exception as e:  # transient S3 hiccup: log, move on
+                print(f"distill: loader error {e}", file=sys.stderr, flush=True)
+                time.sleep(2)
+                continue
+            if pair is None:
+                continue
+            item = (normalize(pair[0]).astype(np.float16),
+                    pair[1].astype(np.float16) / 255.0)
             with self.lock:
                 if len(self.buf) >= self.cap:
                     self.buf.pop(0)
                 self.buf.append(item)
+                self.loaded += 1
             if len(self.buf) >= self.cap:
-                time.sleep(0.5)  # steady state: ~2 fresh chunks/s max
+                time.sleep(0.5)  # steady state: ~2 fresh chunks/s per thread
 
     def sample_crop(self, crop):
         with self.lock:
@@ -267,8 +306,10 @@ def cmd_train(args):
     torch.manual_seed(args.seed)
     torch.backends.cudnn.benchmark = True
     tr, va = split_files(args.data)
-    if not tr:
+    if not tr and not args.stream:
         sys.exit(f"distill: no training pairs in {args.data} (run harvest)")
+    if not va:
+        sys.exit(f"distill: no held-out pairs in {args.data} (run harvest first)")
     print(f"distill: {len(tr)} train / {len(va)} val chunks")
     if args.features:
         cfg = {"features": [int(v) for v in args.features.split(",")],
@@ -300,7 +341,57 @@ def cmd_train(args):
             sched.step()
         print(f"distill: resumed {args.resume} at step {start} "
               f"(best dice {best_dice:.3f})")
-    buf = ChunkBuffer(tr, args.cache_chunks, rng)
+    if args.stream:
+        # whole-scroll sampling: ink-weighted random chunks (+ ~20% silent
+        # neighbours) from the teacher score grid, streamed from S3, with
+        # write-through to the local shard dir up to --cache-limit-gb. The
+        # held-out hash split is excluded so validation stays honest.
+        data = Path(args.data)
+        score = score_chunks(args.teacher, data)
+        ink_idx = np.argwhere(score >= args.ink_thresh)
+        w = score[tuple(ink_idx.T)] ** 0.5
+        w /= w.sum()
+        gz, gy, gx = score.shape
+        s0, t0 = open_level(args.source, 0), open_level(args.teacher, 0)
+        srng = np.random.default_rng(args.seed + 1)
+        slock = threading.Lock()
+        cache_bytes = [sum(f.stat().st_size for f in data.glob("*_*_*.npz"))]
+        print(f"distill: streaming from {len(ink_idx)} ink-bearing chunks "
+              f"(local cache {cache_bytes[0] / 1e9:.1f} GB, cap {args.cache_limit_gb} GB)")
+
+        def load_stream():
+            with slock:
+                i = srng.choice(len(ink_idx), p=w)
+                c = tuple(int(v) for v in ink_idx[i])
+                if srng.random() < 0.2:  # silent neighbour
+                    d = srng.integers(-2, 3, size=3)
+                    c = (c[0] + int(d[0]), c[1] + int(d[1]), c[2] + int(d[2]))
+            if not (0 <= c[0] < gz and 0 <= c[1] < gy and 0 <= c[2] < gx):
+                return None
+            if is_val(*c):
+                return None
+            f = data / f"{c[0]}_{c[1]}_{c[2]}.npz"
+            if f.exists():
+                d = np.load(f)
+                return d["ct"], d["pred"]
+            pair = fetch_pair(s0, t0, c)
+            if pair is None:
+                return None
+            with slock:
+                room = cache_bytes[0] < args.cache_limit_gb * 1e9
+            if room:
+                save_pair(f, *pair)
+                with slock:
+                    cache_bytes[0] += f.stat().st_size
+            return pair
+
+        buf = ChunkBuffer(load_stream, args.cache_chunks, rng, nthreads=args.loaders)
+    else:
+        def load_local():
+            d = np.load(tr[rng.integers(len(tr))])
+            return d["ct"], d["pred"]
+
+        buf = ChunkBuffer(load_local, min(args.cache_chunks, len(tr)), rng)
     bce = torch.nn.BCEWithLogitsLoss()
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -329,7 +420,8 @@ def cmd_train(args):
             r = (time.time() - t_start) / (step - start + 1)
             print(f"distill: step {step}/{args.steps} loss {run_loss:.4f} "
                   f"lr {sched.get_last_lr()[0]:.2e} {r:.2f}s/step "
-                  f"eta {(args.steps - step) * r / 60:.0f}m", flush=True)
+                  f"eta {(args.steps - step) * r / 60:.0f}m "
+                  f"({buf.loaded} chunks seen)", flush=True)
         if step % args.val_every == 0 or step == args.steps:
             ema.eval()
             mae, dice, nv = validate(ema, va, "cuda")
@@ -398,6 +490,15 @@ def main():
                    help="replay-buffer size in 256^3 chunks (~48MB each)")
     t.add_argument("--seed", type=int, default=7)
     t.add_argument("--resume", help="checkpoint to continue from (same preset)")
+    t.add_argument("--stream", action="store_true",
+                   help="sample chunks from the WHOLE scroll via S3 instead of "
+                        "only the harvested shards (write-through cached)")
+    t.add_argument("--teacher", default=DEFAULT_TEACHER)
+    t.add_argument("--source", default=DEFAULT_SOURCE)
+    t.add_argument("--ink-thresh", type=float, default=4.0)
+    t.add_argument("--cache-limit-gb", type=float, default=200.0,
+                   help="stop growing the local shard cache past this size")
+    t.add_argument("--loaders", type=int, default=4, help="stream fetch threads")
     t.set_defaults(fn=cmd_train)
     e = sub.add_parser("eval", help="held-out metrics + runtime for a student")
     e.add_argument("--data", required=True)
