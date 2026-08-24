@@ -2919,6 +2919,14 @@ static void *ni_worker(void *arg) {
             curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buf);
             crc = curl_easy_perform(curl);
             curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+            if (strncmp(url, "file://", 7) == 0) { /* local zarr source: no
+                   * HTTP codes; a missing chunk file is the 404 analogue */
+              if (crc == CURLE_OK) code = 200;
+              else if (crc == CURLE_FILE_COULDNT_READ_FILE) {
+                crc = CURLE_OK;
+                code = 404;
+              }
+            }
             if (crc == CURLE_OK && (code == 200 || code == 404)) break;
             if (crc == CURLE_WRITE_ERROR) break; /* over cap / OOM: no retry */
             if (r->ni.quit) break;
