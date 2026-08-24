@@ -44,7 +44,8 @@ sys.path.insert(0, str(Path.home() / "villa/vesuvius/src"))
 
 DEFAULT_SOURCE = ("https://vesuvius-challenge-open-data.s3.amazonaws.com/"
                   "PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr")
-DEFAULT_CKPT = str(Path.home() / "r3d-data/ink3d-ckpt/ckpt_78k_fullsup.pth")
+DEFAULT_CKPT = os.environ.get(
+    "R3D_INK3D_CKPT", str(Path.home() / "r3d-data/ink3d-ckpt/ckpt_78k_fullsup.pth"))
 CHUNK = 256
 NLEVELS = 6
 
@@ -53,11 +54,31 @@ NLEVELS = 6
 
 def load_model(ckpt_path, device="cuda"):
     import torch
-    from vesuvius.models.run.inference import _normalize_train_py_model_config
-    from vesuvius.models.build.build_network_from_config import NetworkFromConfig
 
     torch.backends.cudnn.benchmark = True  # fixed 256^3 shapes: autotune convs
     ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    if "student_config" in ck:  # distilled student (tools/ink3d/distill.py)
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import studentnet
+
+        net = studentnet.build(ck["student_config"])
+        net.load_state_dict(ck.get("ema_model") or ck["model"])
+
+        class Wrap(torch.nn.Module):  # match the teacher's {'ink': ...} output
+            def __init__(self, m):
+                super().__init__()
+                self.m = m
+
+            def forward(self, x):
+                return {"ink": self.m(x)}
+
+        w = Wrap(net).eval().to(device)
+        print(f"ink3d: student model loaded (step {ck.get('step')}, "
+              f"val {ck.get('val')})")
+        return w
+    from vesuvius.models.run.inference import _normalize_train_py_model_config
+    from vesuvius.models.build.build_network_from_config import NetworkFromConfig
+
     mc = _normalize_train_py_model_config(ck)
 
     class Mgr:
