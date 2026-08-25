@@ -51,28 +51,34 @@ def auc_score(scores, labels):
     return float((ranks[pos].sum() - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg))
 
 
-def run_stack(net, stack, device, pad_to=16, tile=None):
-    """stack u8 (Z,H,W) -> prob f32 (Z,H,W)."""
+def run_stack(net, stack, device, tile=256):
+    """stack u8 (Z,H,W) -> prob f32 (Z,H,W). Depth is edge-padded to a
+    multiple of 16, or 64 if the network needs it (7-stage teacher)."""
     import torch
     Z, H, W = stack.shape
-    Zp = (Z + pad_to - 1) // pad_to * pad_to
-    x = np.zeros((Zp, H, W), np.float32)
-    x[:Z] = normalize(stack)
-    x[Z:] = x[Z - 1:Z]
-    xt = torch.from_numpy(x)[None, None].to(device)
-    with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+    last = None
+    for pad_to in (16, 64):
+        Zp = (Z + pad_to - 1) // pad_to * pad_to
+        x = np.zeros((Zp, H, W), np.float32)
+        x[:Z] = normalize(stack)
+        x[Z:] = x[Z - 1:Z]
+        xt = torch.from_numpy(x)[None, None].to(device)
         try:
-            out = net(xt)
-            p = torch.sigmoid(out["ink"].float())[0, 0]
-        except torch.cuda.OutOfMemoryError:
+            with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+                try:
+                    p = torch.sigmoid(net(xt)["ink"].float())[0, 0]
+                except torch.cuda.OutOfMemoryError:
+                    torch.cuda.empty_cache()
+                    p = torch.zeros((Zp, H, W), device=device)
+                    for y in range(0, H, tile):
+                        for xx in range(0, W, tile):
+                            o = net(xt[:, :, :, y:y + tile, xx:xx + tile])
+                            p[:, y:y + tile, xx:xx + tile] = torch.sigmoid(o["ink"].float())[0, 0]
+            return p[:Z].cpu().numpy()
+        except RuntimeError as e:  # shape mismatch inside the net: pad more
+            last = e
             torch.cuda.empty_cache()
-            p = torch.zeros((Zp, H, W), device=device)
-            t = tile or 256
-            for y in range(0, H, t):
-                for xx in range(0, W, t):
-                    o = net(xt[:, :, :, y:y + t, xx:xx + t])
-                    p[:, y:y + t, xx:xx + t] = torch.sigmoid(o["ink"].float())[0, 0]
-    return p[:Z].cpu().numpy()
+    raise last
 
 
 def main():
