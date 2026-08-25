@@ -266,7 +266,10 @@ def split_files(data_dir):
     files = sorted(Path(data_dir).glob("*_*_*.npz"))
     tr, va = [], []
     for f in files:
-        cz, cy, cx = map(int, f.stem.split("_"))
+        try:
+            cz, cy, cx = map(int, f.stem.split("_"))
+        except ValueError:
+            continue  # partial *.tmp.npz left by a killed save
         (va if is_val(cz, cy, cx) else tr).append(f)
     return tr, va
 
