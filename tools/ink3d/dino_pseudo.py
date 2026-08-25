@@ -163,18 +163,19 @@ def _read_ct_edgepad(vol, grid):
 
 
 def add_dino(path, dino_u8, extra=None):
-    d = dict(np.load(path, allow_pickle=False))
-    d["dino"] = dino_u8
-    if extra:
-        d.update(extra)
-    tmp = path.with_suffix(".tmp.npz")
-    np.savez_compressed(tmp, **d)
-    os.replace(tmp, path)
+    with corpus.block_lock(path):
+        d = dict(np.load(path, allow_pickle=False))
+        d["dino"] = dino_u8
+        if extra:
+            d.update(extra)
+        tmp = path.with_suffix(".tmp.npz")
+        np.savez_compressed(tmp, **d)
+        os.replace(tmp, path)
 
 
 # ----------------------------------------------------------------- CLI
 def _blocks(root, sample, grid):
-    return sorted(Path(root, sample, grid).glob("*.npz"))
+    return corpus.list_blocks(root, sample, grid)
 
 
 def cmd_check(args):
@@ -245,9 +246,12 @@ def cmd_run(args):
         files = [f for f in files if f.name.startswith(args.vol)]
     todo = []
     for f in files:
-        with np.load(f, allow_pickle=False) as d:
-            if "dino" not in d.files or args.force:
-                todo.append(f)
+        try:
+            with np.load(f, allow_pickle=False) as d:
+                if "dino" not in d.files or args.force:
+                    todo.append(f)
+        except (FileNotFoundError, ValueError, OSError):
+            continue
     if args.limit:
         todo = todo[:args.limit]
     print(f"dino: {len(todo)}/{len(files)} blocks to score")

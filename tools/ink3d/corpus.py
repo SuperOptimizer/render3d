@@ -138,6 +138,34 @@ def load_manifest(root=DEFAULT_ROOT):
     return json.load(open(f))
 
 
+# ---------------------------------------------------------------- locks
+class block_lock:
+    """Cross-process lock for read-modify-write of one block file."""
+
+    def __init__(self, path):
+        self.lock_path = str(path) + ".lock"
+
+    def __enter__(self):
+        import fcntl
+        self.fd = open(self.lock_path, "w")
+        fcntl.flock(self.fd, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *a):
+        import fcntl
+        fcntl.flock(self.fd, fcntl.LOCK_UN)
+        self.fd.close()
+        try:
+            os.unlink(self.lock_path)
+        except OSError:
+            pass
+
+
+def list_blocks(root, sample, grid):
+    """Finished block files only (no .tmp.npz being written)."""
+    return sorted(f for f in Path(root, sample, grid).glob("*.npz") if ".tmp" not in f.name)
+
+
 # --------------------------------------------------------------- access
 _LEVEL_CACHE = {}
 

@@ -51,7 +51,7 @@ def auc_score(scores, labels):
     return float((ranks[pos].sum() - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg))
 
 
-def run_stack(net, stack, device, tile=256):
+def run_stack(net, stack, device, tile=256, force_tile=False):
     """stack u8 (Z,H,W) -> prob f32 (Z,H,W). Depth is edge-padded to a
     multiple of 16, or 64 if the network needs it (7-stage teacher)."""
     import torch
@@ -66,6 +66,8 @@ def run_stack(net, stack, device, tile=256):
         try:
             with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
                 try:
+                    if force_tile:
+                        raise torch.cuda.OutOfMemoryError()
                     p = torch.sigmoid(net(xt)["ink"].float())[0, 0]
                 except torch.cuda.OutOfMemoryError:
                     torch.cuda.empty_cache()
@@ -90,6 +92,7 @@ def main():
     ap.add_argument("--zpad", type=int, default=2, help="average prob over z in [32-zpad, 32+zpad]")
     ap.add_argument("--thresh", type=float, default=0.5)
     ap.add_argument("--report", help="append a json line here")
+    ap.add_argument("--tile", type=int, default=512, help="<512 forces xy tiling (memory)")
     args = ap.parse_args()
     import tifffile
     import torch
@@ -108,7 +111,7 @@ def main():
         msk = tifffile.imread(root / "supervision_masks" / c["label_tif"])[LABEL_Z] > 0
         if msk.sum() == 0:
             continue
-        p = run_stack(net, img, device)
+        p = run_stack(net, img, device, tile=args.tile, force_tile=args.tile < 512)
         z0, z1 = LABEL_Z - args.zpad, LABEL_Z + args.zpad + 1
         s = p[z0:z1].mean(axis=0)
         sm, lm = s[msk], lab[msk]

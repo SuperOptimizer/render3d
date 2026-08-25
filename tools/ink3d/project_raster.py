@@ -281,7 +281,7 @@ _SAVE_LOCK = threading.Lock()
 
 def save_block(path, ct, ink, weight, meta):
     path.parent.mkdir(parents=True, exist_ok=True)
-    with _SAVE_LOCK:
+    with corpus.block_lock(path):
         if path.exists():
             old = np.load(path, allow_pickle=False)
             ow, oi = old["weight"].astype(np.float32), old["ink"].astype(np.float32)

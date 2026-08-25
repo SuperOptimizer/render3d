@@ -56,7 +56,7 @@ def cmd_add_teacher(args):
     volume has an ink-detection-3d zarr (PHerc Paris 4 2.4um)."""
     man = corpus.load_manifest(args.root)
     for g in args.grid.split(","):
-        files = sorted(Path(args.root, args.sample, g).glob("*.npz"))
+        files = corpus.list_blocks(args.root, args.sample, g)
         todo = []
         for f in files:
             with np.load(f, allow_pickle=False) as d:
@@ -68,29 +68,30 @@ def cmd_add_teacher(args):
         levels = {}
 
         def work(f):
-            d = dict(np.load(f, allow_pickle=False))
-            meta = json.loads(str(d["meta"]))
-            vol = man["volumes"][meta["vol"]]
-            preds = vol["predictions"].get("ink-detection-3d-zarr")
-            if not preds:
-                return 0
-            url = corpus.BUCKET + "/" + preds[0].rstrip("/")
-            gg = vol["grids"][g]
-            L, fac = gg["level"], gg["f"]
-            key = (url, L)
-            with lock:
-                if key not in levels:
-                    levels[key] = corpus.open_level(url, L)
-            a = levels[key]
-            origin = meta["origin"]
-            vrow = dict(vol, url=url)
-            t = corpus.read_block(vrow, g, tuple(origin))
-            t[d["ct"] == 0] = 0
-            d["teacher"] = t
-            tmp = f.with_suffix(".tmp.npz")
-            np.savez_compressed(tmp, **d)
-            os.replace(tmp, f)
-            return 1
+            with corpus.block_lock(f):
+                d = dict(np.load(f, allow_pickle=False))
+                meta = json.loads(str(d["meta"]))
+                vol = man["volumes"][meta["vol"]]
+                preds = vol["predictions"].get("ink-detection-3d-zarr")
+                if not preds:
+                    return 0
+                url = corpus.BUCKET + "/" + preds[0].rstrip("/")
+                gg = vol["grids"][g]
+                L, fac = gg["level"], gg["f"]
+                key = (url, L)
+                with lock:
+                    if key not in levels:
+                        levels[key] = corpus.open_level(url, L)
+                a = levels[key]
+                origin = meta["origin"]
+                vrow = dict(vol, url=url)
+                t = corpus.read_block(vrow, g, tuple(origin))
+                t[d["ct"] == 0] = 0
+                d["teacher"] = t
+                tmp = f.with_suffix(".tmp.npz")
+                np.savez_compressed(tmp, **d)
+                os.replace(tmp, f)
+                return 1
 
         lock = threading.Lock()
         t0 = time.time()
@@ -116,7 +117,7 @@ def build_index(root, pairs_dir=None, holdout=(), exclude_segments=()):
         for gd in sorted(sd.iterdir()):
             if not gd.is_dir():
                 continue
-            files = sorted(gd.glob("*.npz"))
+            files = [f for f in sorted(gd.glob("*.npz")) if ".tmp" not in f.name]
             if not files:
                 continue
             idx.setdefault((sd.name, gd.name, "blocks"), []).extend(files)
