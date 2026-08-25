@@ -47,8 +47,13 @@ import corpus  # noqa: E402
 BLOCK = corpus.BLOCK
 SRC_RASTER25D = 1
 # bands in micrometres (converted to canonical voxels per grid)
-INK_BAND_UM = 10.0     # +-K around the surface carries the raster value
-BG_BAND_UM = 20.0      # K < |k| <= B, raster < BG_THRESH -> background (< half the ~48um wrap pitch)
+# The published teacher's ink probability is spread over ~+-20 voxels (2.4um)
+# around the traced surface (whole sheet thickness), so the ink band covers
+# +-24um with a gaussian taper; a separate background band beyond it would
+# reach the neighbouring wrap (~48um pitch), so negatives come only from
+# raster < BG_THRESH inside the same band (same sheet, no ink).
+INK_BAND_UM = 24.0     # +-K around the surface carries the raster value
+BG_BAND_UM = 24.0      # K < |k| <= B, raster < BG_THRESH -> background (disabled: == INK)
 BG_THRESH = 0.10
 W_INK, W_BG = 200, 120
 
