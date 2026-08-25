@@ -413,6 +413,9 @@ def cmd_train(args):
         torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
         opt.step()
         sched.step()
+        if args.sleep > 0:  # yield the GPU to other work between steps
+            torch.cuda.synchronize()
+            time.sleep(args.sleep)
         with torch.no_grad():
             for pe, pn in zip(ema.parameters(), net.parameters()):
                 pe.lerp_(pn, 1.0 - ema_d)
@@ -502,6 +505,8 @@ def main():
     t.add_argument("--cache-limit-gb", type=float, default=200.0,
                    help="stop growing the local shard cache past this size")
     t.add_argument("--loaders", type=int, default=4, help="stream fetch threads")
+    t.add_argument("--sleep", type=float, default=0.0,
+                   help="seconds to idle after each step (share the GPU)")
     t.set_defaults(fn=cmd_train)
     e = sub.add_parser("eval", help="held-out metrics + runtime for a student")
     e.add_argument("--data", required=True)
