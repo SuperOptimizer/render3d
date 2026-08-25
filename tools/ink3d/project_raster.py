@@ -209,13 +209,18 @@ def block_index_grid(geom, raster, rfac):
     return out
 
 
-def choose_blocks(blocks, max_blocks, rng, bg_share=0.25, min_cells=3):
+def choose_blocks(blocks, max_blocks, rng, bg_share=0.35, min_cells=3):
+    """Prefer blocks with MIXED ink/background (rank by s*(1-s), so a block
+    entirely inside a letter stroke ranks like one with no ink), plus a
+    random background share -- otherwise the surface band is ~80% ink and
+    the model learns 'band = ink'."""
     keys = [k for k, (s, n) in blocks.items() if n >= min_cells]
     if max_blocks <= 0 or len(keys) <= max_blocks:
         return keys
     sc = np.array([blocks[k][0] for k in keys])
+    mixed = sc * (1.0 - sc) + 0.02 * sc
     n_ink = int(max_blocks * (1 - bg_share))
-    order = np.argsort(-sc)
+    order = np.argsort(-mixed)
     ink_keys = [keys[i] for i in order[:n_ink]]
     rest = order[n_ink:]
     n_bg = min(max_blocks - n_ink, len(rest))
