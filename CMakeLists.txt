@@ -167,6 +167,21 @@ target_compile_definitions(r3d_c5d PUBLIC
 target_link_libraries(r3d_c5d PUBLIC m Threads::Threads PRIVATE r3d_sanitize)
 target_link_libraries(r3d_core PUBLIC r3d_c5d r3d_fysics) # segstore: tifxyz; regvol: fysics
 
+# --- stable headless ABI (no viewer/Vulkan dependency) ---
+add_library(render3d_headless SHARED src/headless/headless.c)
+target_include_directories(render3d_headless PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>)
+target_include_directories(render3d_headless PRIVATE src)
+target_link_libraries(render3d_headless PRIVATE r3d_core r3d_c5d r3d_warnings r3d_sanitize)
+set_target_properties(render3d_headless PROPERTIES
+  VERSION 1.0.0 SOVERSION 1 C_VISIBILITY_PRESET hidden VISIBILITY_INLINES_HIDDEN YES)
+include(GNUInstallDirs)
+install(TARGETS render3d_headless
+  LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
+install(FILES include/render3d/headless.h
+  DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/render3d)
+
 # --- shard store: vendored dct3d codec + zarr-v3 shard reader ---
 if(NOT EXISTS "${CMAKE_SOURCE_DIR}/tools/3ddct/dct3d.c")
   message(FATAL_ERROR "3ddct not vendored — run tools/fetch_3ddct.sh first")
@@ -260,6 +275,11 @@ target_link_libraries(zarr2c5d PRIVATE r3d_core r3d_c5d ${BLOSC_LIB} CURL::libcu
 
 # --- tests ---
 enable_testing()
+add_executable(test_headless tests/test_headless.c)
+target_link_libraries(test_headless PRIVATE render3d_headless m r3d_warnings r3d_sanitize)
+add_test(NAME headless COMMAND test_headless)
+set_tests_properties(headless PROPERTIES LABELS quick TIMEOUT 30)
+
 add_executable(test_quick tests/test_quick.c)
 target_link_libraries(test_quick PRIVATE r3d_core r3d_warnings r3d_sanitize)
 add_test(NAME quick COMMAND test_quick)

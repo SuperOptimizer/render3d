@@ -111,12 +111,45 @@ static int fl_mesh_build(struct fl_mesh *m, const float *xyz, uint32_t w, uint32
   m->tri = malloc((size_t)(w - 1) * (h - 1) * 2 * sizeof *m->tri);
   m->x = malloc((size_t)m->nv * 2 * sizeof *m->x);
   if (!m->vgrid || !m->tri || !m->x) return -1;
+  /* Start from cumulative physical edge lengths.  A uniform i*step/j*step
+   * embedding bakes tracing-grid drift into the texture before SLIM even
+   * starts.  Column/row mean physical lengths are monotone and preserve the
+   * regular-grid orientation while using every supported edge. */
+  double *cu = calloc(w, sizeof *cu), *cv = calloc(h, sizeof *cv);
+  uint32_t *nu = calloc(w, sizeof *nu), *nv = calloc(h, sizeof *nv);
+  if (!cu || !cv || !nu || !nv) {
+    free(cu); free(cv); free(nu); free(nv);
+    return -1;
+  }
+  for (uint32_t j = 0; j < h; j++)
+    for (uint32_t i = 0; i + 1 < w; i++) {
+      size_t a = (size_t)j * w + i, b = a + 1;
+      if (m->vid[a] == UINT32_MAX || m->vid[b] == UINT32_MAX) continue;
+      double dx = (double)xyz[b * 3] - (double)xyz[a * 3];
+      double dy = (double)xyz[b * 3 + 1] - (double)xyz[a * 3 + 1];
+      double dz = (double)xyz[b * 3 + 2] - (double)xyz[a * 3 + 2];
+      cu[i + 1] += sqrt(dx * dx + dy * dy + dz * dz);
+      nu[i + 1]++;
+    }
+  for (uint32_t j = 0; j + 1 < h; j++)
+    for (uint32_t i = 0; i < w; i++) {
+      size_t a = (size_t)j * w + i, b = a + w;
+      if (m->vid[a] == UINT32_MAX || m->vid[b] == UINT32_MAX) continue;
+      double dx = (double)xyz[b * 3] - (double)xyz[a * 3];
+      double dy = (double)xyz[b * 3 + 1] - (double)xyz[a * 3 + 1];
+      double dz = (double)xyz[b * 3 + 2] - (double)xyz[a * 3 + 2];
+      cv[j + 1] += sqrt(dx * dx + dy * dy + dz * dz);
+      nv[j + 1]++;
+    }
+  for (uint32_t i = 1; i < w; i++) cu[i] = cu[i - 1] + (nu[i] ? cu[i] / nu[i] : step);
+  for (uint32_t j = 1; j < h; j++) cv[j] = cv[j - 1] + (nv[j] ? cv[j] / nv[j] : step);
   for (size_t k = 0; k < n; k++)
     if (m->vid[k] != UINT32_MAX) {
       m->vgrid[m->vid[k]] = (uint32_t)k;
-      m->x[(size_t)m->vid[k] * 2 + 0] = (double)(k % w) * step;
-      m->x[(size_t)m->vid[k] * 2 + 1] = (double)(k / w) * step;
+      m->x[(size_t)m->vid[k] * 2 + 0] = cu[k % w];
+      m->x[(size_t)m->vid[k] * 2 + 1] = cv[k / w];
     }
+  free(cu); free(cv); free(nu); free(nv);
   for (uint32_t j = 0; j + 1 < h; j++)
     for (uint32_t i = 0; i + 1 < w; i++) {
       size_t k = (size_t)j * w + i;

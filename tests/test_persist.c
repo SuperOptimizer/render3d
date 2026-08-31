@@ -424,7 +424,7 @@ static void test_flatten(void) {
   r3d_flatten_stats fs = {0};
   CHECK(r3d_flatten_slim(xyz, W, H, STEP, 200, uv, &fs) == 0);
   CHECK(fs.nvert > 2000 && fs.ntri > 4000);
-  CHECK(fs.stretch0 > 0.15);          /* the warp was real */
+  CHECK(fs.stretch0 < 0.02);          /* physical-edge initialization removes parameter drift */
   CHECK(fs.stretch1 < 0.02);          /* ...and SLIM removed it */
   CHECK(fs.e1 < 4.05);                /* symmetric Dirichlet floor is 4 */
   /* resampled grid: 3D edge lengths back at the target step */
