@@ -134,8 +134,10 @@ contract `~/tsm/dev/annot_export.py` writes to). The annotation output is a
 The primary view is a single z slice of the CT with the exporter's labels
 composited over it (faces red/blue, ignore dimmed grey, `rv_class` as tinted
 bands, predictions as a dashed variant, each toggleable) and the correction on
-top in saturated colours. The 3D raycast of the same crop renders behind the
-panes as a secondary view.
+top in saturated colours. The status line under the slice reads out the voxel
+under the cursor in both packet and scroll coordinates, with its CT value, its
+exporter label, and its `source` and `rv_class` values. The 3D raycast of the
+same crop renders behind the panes as a secondary view.
 
 | input | action |
 | --- | --- |

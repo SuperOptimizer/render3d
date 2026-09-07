@@ -44,6 +44,9 @@ enum {
 };
 /* File basenames without the ".u8" suffix, indexed by the enum above. */
 extern const char *const r3d_annot_layer_file[R3D_ANNOT_NLAYER];
+/* source.u8 / rv_class.u8 value names (spec/annot.md). */
+extern const char *const r3d_annot_source_name[4];
+extern const char *const r3d_annot_rv_name[4];
 
 typedef struct r3d_annot_packet {
   char dir[1024];

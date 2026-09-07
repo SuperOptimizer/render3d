@@ -377,15 +377,25 @@ static void ui_canvas(annot_ui *a) {
   }
   ImDrawList_PopClipRect(dl);
 
-  if (inside)
-    igText("voxel x %d  y %d  z %d   scroll z %lld  y %lld  x %lld   corr %s", px, py, a->z,
-           (long long)(a->pkt.origin[0] + a->z), (long long)(a->pkt.origin[1] + py),
-           (long long)(a->pkt.origin[2] + px),
-           r3d_annot_class_name[a->pkt.correction[((size_t)(uint32_t)a->z * a->pkt.ny +
-                                                   (uint32_t)py) *
-                                                      a->pkt.nx +
-                                                  (uint32_t)px]]);
-  else
+  if (inside) {
+    size_t vi = ((size_t)(uint32_t)a->z * a->pkt.ny + (uint32_t)py) * a->pkt.nx + (uint32_t)px;
+    const uint8_t *srcl = a->pkt.layer[R3D_ANNOT_L_SOURCE];
+    const uint8_t *rvl = a->pkt.layer[R3D_ANNOT_L_RV_CLASS];
+    igText("voxel x %d  y %d  z %d   scroll z %lld  y %lld  x %lld   ct %u   corr %s"
+           "   label %s   source %s   rv %s",
+           px, py, a->z, (long long)(a->pkt.origin[0] + a->z),
+           (long long)(a->pkt.origin[1] + py), (long long)(a->pkt.origin[2] + px),
+           a->pkt.layer[R3D_ANNOT_L_CT][vi], r3d_annot_class_name[a->pkt.correction[vi]],
+           a->pkt.layer[R3D_ANNOT_L_FACES_IN] && a->pkt.layer[R3D_ANNOT_L_FACES_IN][vi]
+               ? "in"
+               : a->pkt.layer[R3D_ANNOT_L_FACES_OUT] && a->pkt.layer[R3D_ANNOT_L_FACES_OUT][vi]
+                     ? "out"
+                     : a->pkt.layer[R3D_ANNOT_L_IGNORE] && a->pkt.layer[R3D_ANNOT_L_IGNORE][vi]
+                           ? "ignore"
+                           : "-",
+           srcl && srcl[vi] < 4u ? r3d_annot_source_name[srcl[vi]] : "-",
+           rvl && rvl[vi] < 4u ? r3d_annot_rv_name[rvl[vi]] : "-");
+  } else
     igText("zoom %.2f px/voxel   wheel zoom, shift+wheel slice, middle-drag pan", (double)a->zoom);
 }
 

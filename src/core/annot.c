@@ -15,6 +15,9 @@ const char *const r3d_annot_class_name[R3D_ANNOT_NCLASS] = {
 const char *const r3d_annot_layer_file[R3D_ANNOT_NLAYER] = {
     "ct", "faces_in", "faces_out", "ignore", "source", "rv_class", "pred_in", "pred_out"};
 
+const char *const r3d_annot_source_name[4] = {"none", "rectoverso", "ct", "human"};
+const char *const r3d_annot_rv_name[4] = {"bg", "recto", "verso", "contact"};
+
 /* ===================== minimal JSON scanning ============================= */
 
 static const char *skip_ws(const char *p, const char *end) {
