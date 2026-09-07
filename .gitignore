@@ -10,3 +10,5 @@ cache/
 pyramid/
 *.vcs
 imgui.ini
+__pycache__/
+*.pyc

@@ -117,6 +117,60 @@ can be displayed without per-tile pop-in. This ring uses about 5.4 GB here;
 jump cache, the maximum annotation-mode cache footprint is about 9.2 GB on this
 machine. The benchmark script also runs a repeatable 20-slice fine-scroll test.
 
+**Faces annotation mode** (`--annot`) corrects TSM's two-face voxel labels on
+small exported crops. A packet is a directory of raw `(z,y,x)` uint8 volumes —
+CT plus the exporter's `faces_in`/`faces_out`/`ignore`/`source`/`rv_class` and
+optionally `pred_in`/`pred_out` — described by `meta.json`, and `packet.json`
+lists a whole batch of them (see [spec/annot.md](spec/annot.md), which is the
+contract `~/tsm/dev/annot_export.py` writes to). The annotation output is a
+`correction.u8` of identical shape written back into the packet directory:
+0 untouched, 1 in-face, 2 out-face, 3 ignore, 4 erase.
+
+```sh
+./build/release/render3d --annot /path/to/packets/packet.json --tf 1
+./build/release/render3d --annot /path/to/packets/p000        # one packet
+```
+
+The primary view is a single z slice of the CT with the exporter's labels
+composited over it (faces red/blue, ignore dimmed grey, `rv_class` as tinted
+bands, predictions as a dashed variant, each toggleable) and the correction on
+top in saturated colours. The 3D raycast of the same crop renders behind the
+panes as a secondary view.
+
+| input | action |
+| --- | --- |
+| `1`-`4` | paint class: in-face, out-face, ignore, erase |
+| `0` / Esc | pan tool (no painting) |
+| left-drag | paint the current class with a circular brush |
+| right-drag | erase the correction back to 0 (untouched) |
+| Shift+click ×2 | fill line: a 1-voxel line of the current class between the two points |
+| `[` / `]` | brush radius |
+| `D`, `,` / `.` | depth mode on/off, and ±k slices — a stroke paints a short cylinder through z |
+| `R` / `F`, PgUp/PgDn | slice ±1 / ±16 |
+| wheel, Shift+wheel | zoom about the cursor, slice ±1 |
+| middle-drag | pan |
+| `N` / `P` | next / previous packet (saves first) |
+| Ctrl+Z, Ctrl+S | undo one stroke (64 levels), force a save |
+
+`correction.u8` is republished (temp file + rename) after every stroke, on
+packet switch and at exit, so an interrupted session loses nothing and reopening
+a packet resumes from what is on disk. The panel carries the packet index and
+origin, the slice, class, brush, layer toggles, per-class painted-voxel counts,
+and a "mark packet done" checkbox that sets `"done": true` in `meta.json`
+without disturbing any other key.
+
+The same stroke code runs without a GPU:
+
+```sh
+./build/release/render3d --annot-apply <packet> <strokes.json>
+```
+
+applies a stroke script — `{"strokes":[{"op":"brush","class":1,"z":10,
+"radius":3,"depth":1,"points":[[x,y],...]}, {"op":"line",...}, {"op":"undo"}]}`
+— and writes `correction.u8`, which is how `tests/test_annot.c` covers brush
+geometry, the depth window, undo, atomic writes and manifest parsing against
+synthetic packets from `tests/annotsynth.h`.
+
 ### 2x2 multi-view (vc3d-style) on AWS open data
 
 `--multiview <tifxyz-dir>` opens the volume-cartographer layout: top-left the

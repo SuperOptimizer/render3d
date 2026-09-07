@@ -2194,8 +2194,12 @@ int main(int argc, char **argv) {
       return r3d_annot_apply_cli(argv[i + 1], argv[i + 2]) == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
   }
-  for (int i = 1; i < argc - 1; i++) {
+  for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--annot") != 0) continue;
+    if (i + 1 >= argc) {
+      fprintf(stderr, "--annot needs a packet directory or packet.json\n");
+      return EXIT_FAILURE;
+    }
     r3d_annot_opts ao = {.path = argv[i + 1], .tf_preset = -1, .win_w = 1280, .win_h = 800};
     for (int k = 1; k < argc; k++) {
       if (k < argc - 1 && strcmp(argv[k], "--tf") == 0) ao.tf_preset = atoi(argv[k + 1]);
