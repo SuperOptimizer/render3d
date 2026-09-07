@@ -83,9 +83,11 @@ static inline int annotsynth_packet(const char *dir, uint32_t nz, uint32_t ny, u
   return rc;
 }
 
-/* Writes <root>/packet.json plus `count` packet directories p000.. under it. */
-static inline int annotsynth_corpus(const char *root, uint32_t count, uint32_t nz, uint32_t ny,
-                                    uint32_t nx) {
+/* Writes <root>/packet.json plus `count` packet directories p000.. under it.
+ * `dims_step` grows each successive packet (0 = every packet identical), which
+ * is what exercises a viewer's texture-resize path. */
+static inline int annotsynth_corpus_varied(const char *root, uint32_t count, uint32_t nz,
+                                           uint32_t ny, uint32_t nx, uint32_t dims_step) {
   if (mkdir(root, 0777) != 0 && errno != EEXIST) return -1;
   char json[8192];
   int off = snprintf(json, sizeof json,
@@ -99,16 +101,22 @@ static inline int annotsynth_corpus(const char *root, uint32_t count, uint32_t n
     char sub[1024];
     if (snprintf(sub, sizeof sub, "%s/p%03u", root, i) >= (int)sizeof sub) return -1;
     int64_t origin[3] = {(int64_t)i * 100, 200, 300};
-    if (annotsynth_packet(sub, nz, ny, nx, origin, i % 2 == 0) != 0) return -1;
+    uint32_t py = ny + i * dims_step, px = nx + i * dims_step;
+    if (annotsynth_packet(sub, nz, py, px, origin, i % 2 == 0) != 0) return -1;
     off += snprintf(json + off, sizeof json - (size_t)off,
                     "    {\"path\": \"p%03u\", \"origin_zyx\": [%lld, 200, 300], "
                     "\"dims_zyx\": [%u, %u, %u]}%s\n",
-                    i, (long long)origin[0], nz, ny, nx, i + 1 < count ? "," : "");
+                    i, (long long)origin[0], nz, py, px, i + 1 < count ? "," : "");
     if (off <= 0 || off >= (int)sizeof json) return -1;
   }
   off += snprintf(json + off, sizeof json - (size_t)off, "  ]\n}\n");
   if (off <= 0 || off >= (int)sizeof json) return -1;
   return annotsynth_write(root, "packet.json", json, (size_t)off);
+}
+
+static inline int annotsynth_corpus(const char *root, uint32_t count, uint32_t nz, uint32_t ny,
+                                    uint32_t nx) {
+  return annotsynth_corpus_varied(root, count, nz, ny, nx, 0);
 }
 
 #endif /* R3D_TESTS_ANNOTSYNTH_H */

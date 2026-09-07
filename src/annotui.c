@@ -11,6 +11,7 @@
 #include "cimgui.h"
 #include "core/annot.h"
 #include "core/camera.h"
+#include "core/screenshot.h"
 #include "core/transfer.h"
 #include "core/volume.h"
 #include "render/render.h"
@@ -70,6 +71,11 @@ typedef struct annot_ui {
 
   uint8_t *rgba;       /* nx*ny*4 composite of the current slice */
   ImTextureData *tex;
+  /* A texture the backend has seen may not be freed until it has destroyed
+   * its own GPU resources, which only happens inside a later draw (or the
+   * backend's shutdown) — so a resized packet retires the old one here. */
+  ImTextureData *retired[8];
+  uint32_t n_retired;
   uint32_t tex_w, tex_h;
   bool image_stale;
 
@@ -96,15 +102,28 @@ __attribute__((format(printf, 2, 3))) static void ui_status(annot_ui *a, const c
   va_end(ap);
 }
 
-static void ui_free_texture(annot_ui *a) {
+static void ui_retire_texture(annot_ui *a) {
   if (!a->tex) return;
-  igUnregisterUserTexture(a->tex);
-  ImTextureData_destroy(a->tex);
+  a->tex->WantDestroyNextFrame = true; /* ImGui -> WantDestroy -> the backend */
+  if (a->n_retired < 8u) a->retired[a->n_retired++] = a->tex;
   a->tex = NULL;
 }
 
+/* Free the retired textures the backend has finished with. */
+static void ui_reap_textures(annot_ui *a) {
+  for (uint32_t i = 0; i < a->n_retired;) {
+    if (a->retired[i]->Status == ImTextureStatus_Destroyed) {
+      igUnregisterUserTexture(a->retired[i]);
+      ImTextureData_destroy(a->retired[i]);
+      a->retired[i] = a->retired[--a->n_retired];
+    } else {
+      i++;
+    }
+  }
+}
+
 static bool ui_make_texture(annot_ui *a) {
-  ui_free_texture(a);
+  ui_retire_texture(a);
   a->tex = ImTextureData_ImTextureData();
   if (!a->tex) return false;
   ImTextureData_Create(a->tex, ImTextureFormat_RGBA32, (int)a->pkt.nx, (int)a->pkt.ny);
@@ -268,12 +287,15 @@ static void ui_canvas(annot_ui *a) {
   if (a->tex)
     ImDrawList_AddImage(dl, ImTextureData_GetTexRef(a->tex), img0, img1, (ImVec2){0, 0},
                         (ImVec2){1, 1}, 0xffffffffu);
-  ImDrawList_AddRect(dl, img0, img1, 0xff606060u, 0.0f, 0, 1.0f);
+  ImDrawList_AddRect(dl, img0, img1, 0xff606060u, 0.0f, 1.0f, 0);
 
   ImGuiIO *io = igGetIO_Nil();
   ImVec2 mp = igGetMousePos();
   double vx = ((double)mp.x - (double)img0.x) / (double)a->zoom;
   double vy = ((double)mp.y - (double)img0.y) / (double)a->zoom;
+  /* ImGui reports +-FLT_MAX when there is no mouse: clamp before narrowing */
+  if (!(vx > -1e6) || !(vx < 1e6)) vx = -1e6;
+  if (!(vy > -1e6) || !(vy < 1e6)) vy = -1e6;
   int32_t px = (int32_t)floor(vx), py = (int32_t)floor(vy);
   bool inside = hovered && vx >= 0.0 && vy >= 0.0 && px < (int32_t)a->pkt.nx &&
                 py < (int32_t)a->pkt.ny;
@@ -473,6 +495,11 @@ int r3d_annot_run(const r3d_annot_opts *o) {
   printf("annot: %u packet%s from %s\n", a.man.count, a.man.count == 1 ? "" : "s",
          a.man.path[0] ? a.man.path : a.man.ent[0].path);
 
+  /* test hook: step to the next packet every N frames so an automated run
+   * covers packet switching, the save-on-switch and the texture resize */
+  const char *cyc = getenv("R3D_ANNOT_CYCLE");
+  uint32_t cycle = cyc ? (uint32_t)strtoul(cyc, NULL, 10) : 0u;
+
   r3d_camera cam;
   r3d_camera_init(&cam, (r3d_v3){0.5f, 0.5f, -1.6f});
   uint32_t frame = 0;
@@ -485,6 +512,7 @@ int r3d_annot_run(const r3d_annot_opts *o) {
     }
     if (quit) break;
     if (r3d_gui_begin(renderer) != 0) break;
+    ui_reap_textures(&a);
 
     ui_keys(&a, renderer, &quit);
     ImGuiViewport *vp = igGetMainViewport();
@@ -531,16 +559,32 @@ int r3d_annot_run(const r3d_annot_opts *o) {
       break;
     }
     frame++;
+    if (cycle && frame % cycle == 0)
+      (void)ui_open(&a, renderer, (a.index + 1u) % a.man.count);
     if (o->exit_frames && frame >= o->exit_frames) quit = true;
   }
 
+  if (o->shot_path) { /* headless verification: the composited panes as PPM */
+    uint32_t w = 0, h = 0;
+    if (r3d_read_frame(renderer, NULL, &w, &h) == 0) {
+      uint8_t *px = malloc((size_t)w * h * 4u);
+      if (px && r3d_read_frame(renderer, px, &w, &h) == 0 &&
+          r3d_screenshot_ppm(o->shot_path, px, w, h) == 0)
+        printf("annot: wrote %s (%ux%u)\n", o->shot_path, w, h);
+      free(px);
+    }
+  }
+
   ui_save(&a);
-  ui_free_texture(&a);
   free(a.rgba);
   r3d_annot_packet_free(&a.pkt);
   r3d_annot_undo_destroy(a.undo);
   r3d_annot_manifest_free(&a.man);
+  /* the ImGui Vulkan backend walks the texture list during ITS shutdown, so
+   * the buffers outlive the renderer and are released only afterwards */
+  ui_retire_texture(&a);
   r3d_destroy(renderer);
+  for (uint32_t i = 0; i < a.n_retired; i++) ImTextureData_destroy(a.retired[i]);
   if (win) SDL_DestroyWindow(win);
   SDL_Quit();
   return rc;

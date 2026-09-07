@@ -250,6 +250,8 @@ add_executable(test_annot tests/test_annot.c)
 target_link_libraries(test_annot PRIVATE r3d_core r3d_warnings r3d_sanitize)
 add_test(NAME annot COMMAND test_annot $<TARGET_FILE:render3d>)
 set_tests_properties(annot PROPERTIES LABELS quick TIMEOUT 60)
+add_test(NAME annot_gui COMMAND test_annot $<TARGET_FILE:render3d> gui)
+set_tests_properties(annot_gui PROPERTIES LABELS gpu TIMEOUT 300)
 
 add_executable(test_quick tests/test_quick.c)
 target_link_libraries(test_quick PRIVATE r3d_core r3d_warnings r3d_sanitize)

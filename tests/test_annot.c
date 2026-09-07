@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "annotsynth.h"
@@ -67,6 +68,31 @@ int main(int argc, char **argv) {
   char root[] = "/tmp/render3d-annot-XXXXXX";
   assert(mkdtemp(root) != NULL);
   assert(annotsynth_corpus(root, 3, NZ, NY, NX) == 0);
+
+  /* "gui" mode: drive the real --annot window path headlessly. The renderer
+   * skips the ImGui draw when there is no swapchain, but every widget call,
+   * the compositor and the texture registration still run — and ImGui's
+   * assert-on-error is live, so a malformed call fails the test. */
+  if (argc > 2 && strcmp(argv[2], "gui") == 0) {
+    char cmd[4096];
+    rmtree(root); /* re-made with packets of DIFFERING dims: cycling through
+                   * them exercises the viewer's texture-resize path too */
+    assert(mkdir(root, 0777) == 0);
+    assert(annotsynth_corpus_varied(root, 3, NZ, NY, NX, 5) == 0);
+    snprintf(cmd, sizeof cmd,
+             "R3D_ANNOT_CYCLE=3 %s --annot %s --headless --frames 12 --size 640 480 "
+             "--shot %s/f.ppm",
+             argv[1], root, root);
+    int rc = system(cmd);
+    char shot[1100];
+    snprintf(shot, sizeof shot, "%s/f.ppm", root);
+    FILE *sf = fopen(shot, "rb");
+    assert(rc == 0 && sf != NULL);
+    assert(fclose(sf) == 0);
+    rmtree(root);
+    printf("annot gui: ok\n");
+    return 0;
+  }
 
   /* ---- manifest ---------------------------------------------------- */
   r3d_annot_manifest m = {0};

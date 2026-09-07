@@ -2205,6 +2205,7 @@ int main(int argc, char **argv) {
       }
       if (k < argc - 1 && strcmp(argv[k], "--frames") == 0)
         ao.exit_frames = (uint32_t)atoi(argv[k + 1]);
+      if (k < argc - 1 && strcmp(argv[k], "--shot") == 0) ao.shot_path = argv[k + 1];
       if (strcmp(argv[k], "--headless") == 0) ao.headless = true;
       if (strcmp(argv[k], "--no-vsync") == 0) ao.no_vsync = true;
     }
