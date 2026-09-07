@@ -42,6 +42,7 @@ extern char **environ; /* argv-spawned browser jobs inherit the environment */
 #include "core/inklive.h"
 #include "core/stats.h"
 #include "core/tifxyz.h"
+#include "annotui.h"
 #include "core/umbilicus.h"
 #include "render/render.h"
 #include "vk/vkctx.h"
@@ -2180,6 +2181,38 @@ static int write_bench_json(const char *path, const char *scenario, int width, i
 }
 
 int main(int argc, char **argv) {
+  /* Faces annotation: two self-contained modes handled before any of the
+   * viewer's own state exists. --annot-apply renders nothing at all (no SDL,
+   * no Vulkan) so tests and batch fixups can drive the same stroke code the
+   * mouse drives; --annot opens its own window over one packet at a time. */
+  for (int i = 1; i < argc; i++) {
+    if (strcmp(argv[i], "--annot-apply") == 0) {
+      if (i + 2 >= argc) {
+        fprintf(stderr, "--annot-apply needs <packet> <strokes.json>\n");
+        return EXIT_FAILURE;
+      }
+      return r3d_annot_apply_cli(argv[i + 1], argv[i + 2]) == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+  }
+  for (int i = 1; i < argc - 1; i++) {
+    if (strcmp(argv[i], "--annot") != 0) continue;
+    r3d_annot_opts ao = {.path = argv[i + 1], .tf_preset = -1, .win_w = 1280, .win_h = 800};
+    for (int k = 1; k < argc; k++) {
+      if (k < argc - 1 && strcmp(argv[k], "--tf") == 0) ao.tf_preset = atoi(argv[k + 1]);
+      if (k < argc - 2 && strcmp(argv[k], "--size") == 0) {
+        ao.win_w = atoi(argv[k + 1]);
+        ao.win_h = atoi(argv[k + 2]);
+      }
+      if (k < argc - 1 && strcmp(argv[k], "--frames") == 0)
+        ao.exit_frames = (uint32_t)atoi(argv[k + 1]);
+      if (strcmp(argv[k], "--headless") == 0) ao.headless = true;
+      if (strcmp(argv[k], "--no-vsync") == 0) ao.no_vsync = true;
+    }
+    if (ao.win_w < 64) ao.win_w = 64;
+    if (ao.win_h < 64) ao.win_h = 64;
+    return r3d_annot_run(&ao);
+  }
+
   if (argc > 1 && strcmp(argv[1], "--probe") == 0) {
     r3d_vkctx vk;
     if (r3d_vkctx_create(&vk, NULL, 0, false) != 0) return EXIT_FAILURE;
