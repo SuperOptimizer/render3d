@@ -173,6 +173,50 @@ applies a stroke script — `{"strokes":[{"op":"brush","class":1,"z":10,
 geometry, the depth window, undo, atomic writes and manifest parsing against
 synthetic packets from `tests/annotsynth.h`.
 
+### Model view mode
+
+`--view` inspects TSM **view packets** — one CT crop plus any number of named
+uint8 layers (student heads, teacher outputs, label stores, human bands), each
+tagged with a *kind* that says how to decode and draw it. The layer list is
+data-driven: `meta.json`'s `layers[]` is the authority, so a packet gains a new
+head without a line of viewer code. [spec/view.md](spec/view.md) is the
+contract `~/tsm/dev/view_export.py` and `tsm serve` write to.
+
+```sh
+./build/release/render3d --view /path/to/view/view.json      # a batch
+./build/release/render3d --view /path/to/view/v000           # one packet
+./build/release/render3d --view /path/to/view --view-serve localhost:9760
+```
+
+The slice pane composites the layers over the CT on the CPU and hands the RGBA
+result to ImGui as a texture, exactly as `--annot` does. Axis toggle (z/y/x),
+slice slider, wheel zoom, shift+wheel slice, drag pan; the panel groups every
+layer by its `group` with show / colour / opacity, a threshold for `prob`,
+`density` and `count`, a tolerance and signed-heatmap toggle for `sdf`, and a
+one-click **solo**. Three `signed` layers sharing a `vec` name draw as one RGB
+normal image. **Compare** picks any two layers of the same kind and paints
+agreement / A-only / B-only, with the counts and a Dice number for the current
+slice. Hovering reads out every visible layer's decoded value (class layers by
+palette name) plus the scroll-space coordinate. F12 writes a PNG of the
+composited slice; N/P step through the packets in `view.json`.
+
+With `--view-serve host:port` the panel gains a **predict** button that ships
+the packet's box — or one walked by the arrow keys — to `tsm serve` over the
+`TSV1`/`TSVR`/`TSVE` protocol on a worker thread, and merges the returned
+layers back into the packet without blocking the UI.
+
+The compositor also runs with no window and no GPU:
+
+```sh
+./build/release/render3d --view-shot <packet> <out.png> \
+    [--axis z|y|x] [--slice N] [--show group.name,...] \
+    [--compare group.name,group.name]
+```
+
+which is what `tests/test_view.c` drives end to end alongside the decodings,
+the compositor's pixel colours, the spec's hard-error cases and the live client
+against an in-test TCP server.
+
 ### 2x2 multi-view (vc3d-style) on AWS open data
 
 `--multiview <tifxyz-dir>` opens the volume-cartographer layout: top-left the
