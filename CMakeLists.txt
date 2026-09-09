@@ -342,7 +342,7 @@ add_test(NAME blocks COMMAND test_blocks)
 set_tests_properties(blocks PROPERTIES LABELS quick TIMEOUT 60)
 
 add_executable(test_block_atlas tests/test_block_atlas.c)
-target_link_libraries(test_block_atlas PRIVATE r3d_core r3d_vk r3d_warnings r3d_sanitize)
+target_link_libraries(test_block_atlas PRIVATE r3d_vk r3d_core r3d_warnings r3d_sanitize)
 target_compile_definitions(test_block_atlas PRIVATE R3D_SPV_DIR="${R3D_SPV_DIR}")
 add_dependencies(test_block_atlas r3d_shaders)
 add_test(NAME block_atlas COMMAND test_block_atlas)
