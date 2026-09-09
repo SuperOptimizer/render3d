@@ -182,6 +182,19 @@ int r3d_view_compare(const r3d_view_packet *p, const r3d_view_opts *o, r3d_view_
 uint32_t r3d_view_hover(const r3d_view_packet *p, const r3d_view_opts *o, uint32_t u,
                         uint32_t v, char *out, size_t cap);
 
+/* ---- selection --------------------------------------------------------- */
+
+/* Resolve a `--show` list and a `--compare` pair onto a packet's display state.
+ * `show` is "group.name,..." and hides every layer it does not name; `compare`
+ * is "group.name,group.name" and must name two layers of the same kind.
+ *
+ * A `compare` given WITHOUT a `show` list hides every other layer, so the
+ * slice shows only the three-class agree / A-only / B-only mask over the CT —
+ * the whole point of compare mode, and not something the caller should have to
+ * remember. An explicit `show` list always wins.  Returns 0 on success. */
+int r3d_view_select(r3d_view_packet *p, r3d_view_opts *o, const char *show,
+                    const char *compare);
+
 /* ---- headless shot ----------------------------------------------------- */
 
 /* `--view-shot`: load, composite, write an RGBA PNG.  No window, no GPU.

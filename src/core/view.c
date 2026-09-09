@@ -972,6 +972,40 @@ static int apply_show(r3d_view_packet *p, const char *list) {
   return 0;
 }
 
+int r3d_view_select(r3d_view_packet *p, r3d_view_opts *o, const char *show,
+                    const char *compare) {
+  if (!p || !o) return -1;
+  if (compare) {
+    const char *comma = strchr(compare, ',');
+    if (!comma) {
+      fprintf(stderr, "view: --compare needs group.name,group.name\n");
+      return -1;
+    }
+    char a[192], b[192];
+    size_t an = (size_t)(comma - compare);
+    if (an >= sizeof a) an = sizeof a - 1u;
+    memcpy(a, compare, an);
+    a[an] = 0;
+    snprintf(b, sizeof b, "%s", comma + 1);
+    o->cmp_a = r3d_view_find(p, a);
+    o->cmp_b = r3d_view_find(p, b);
+    if (o->cmp_a < 0 || o->cmp_b < 0) {
+      fprintf(stderr, "view: --compare names no layer (%s / %s)\n", a, b);
+      return -1;
+    }
+    if (p->layer[o->cmp_a].kind != p->layer[o->cmp_b].kind) {
+      fprintf(stderr, "view: --compare layers are of different kinds\n");
+      return -1;
+    }
+  }
+  if (show) return apply_show(p, show);
+  /* compare on its own is a mask over the CT, not a mask over every other
+   * layer's own rendering: hide the rest unless the caller asked for it */
+  if (compare)
+    for (uint32_t i = 0; i < p->count; i++) p->layer[i].show = false;
+  return 0;
+}
+
 int r3d_view_shot(const char *packet, const char *out_png, int axis, int64_t slice,
                   const char *show, const char *compare) {
   if (!packet || !out_png) return -1;
@@ -992,31 +1026,7 @@ int r3d_view_shot(const char *packet, const char *out_png, int axis, int64_t sli
   uint32_t ns = r3d_view_slice_count(&p, o.axis);
   o.slice = slice < 0 ? ns / 2u : (uint32_t)(slice >= (int64_t)ns ? ns - 1u : slice);
 
-  int rc = 0;
-  if (show && apply_show(&p, show) != 0) rc = -1;
-  if (rc == 0 && compare) {
-    char a[192], b[192];
-    const char *comma = strchr(compare, ',');
-    if (!comma) {
-      fprintf(stderr, "view: --compare needs group.name,group.name\n");
-      rc = -1;
-    } else {
-      size_t an = (size_t)(comma - compare);
-      if (an >= sizeof a) an = sizeof a - 1u;
-      memcpy(a, compare, an);
-      a[an] = 0;
-      snprintf(b, sizeof b, "%s", comma + 1);
-      o.cmp_a = r3d_view_find(&p, a);
-      o.cmp_b = r3d_view_find(&p, b);
-      if (o.cmp_a < 0 || o.cmp_b < 0) {
-        fprintf(stderr, "view: --compare names no layer (%s / %s)\n", a, b);
-        rc = -1;
-      } else if (p.layer[o.cmp_a].kind != p.layer[o.cmp_b].kind) {
-        fprintf(stderr, "view: --compare layers are of different kinds\n");
-        rc = -1;
-      }
-    }
-  }
+  int rc = r3d_view_select(&p, &o, show, compare);
 
   uint32_t w = 0, h = 0;
   r3d_view_slice_dims(&p, o.axis, &w, &h);

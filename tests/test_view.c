@@ -21,6 +21,7 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#include <zlib.h>
 
 #define NZ 8u
 #define NY 12u
@@ -172,6 +173,58 @@ static int find(const r3d_view_packet *p, const char *spec) {
 static void only(r3d_view_packet *p, const char *spec) {
   for (uint32_t i = 0; i < p->count; i++) p->layer[i].show = false;
   p->layer[find(p, spec)].show = true;
+}
+
+/* Decode one of our own PNGs (8-bit RGBA, filter "none" on every row) back to
+ * pixels, so the --view-shot assertions can look at what was actually written
+ * rather than only at the header. */
+static uint8_t *png_read(const char *path, uint32_t *w, uint32_t *h) {
+  FILE *f = fopen(path, "rb");
+  if (!f) return NULL;
+  assert(fseek(f, 0, SEEK_END) == 0);
+  long fn = ftell(f);
+  assert(fn > 8 && fseek(f, 0, SEEK_SET) == 0);
+  uint8_t *file = malloc((size_t)fn);
+  assert(file && fread(file, 1, (size_t)fn, f) == (size_t)fn);
+  assert(fclose(f) == 0);
+
+  uint8_t *idat = NULL;
+  size_t idat_n = 0;
+  *w = *h = 0;
+  for (size_t at = 8; at + 12 <= (size_t)fn;) {
+    uint32_t len = ((uint32_t)file[at] << 24) | ((uint32_t)file[at + 1] << 16) |
+                   ((uint32_t)file[at + 2] << 8) | file[at + 3];
+    const char *type = (const char *)file + at + 4;
+    const uint8_t *data = file + at + 8;
+    if (memcmp(type, "IHDR", 4) == 0) {
+      *w = ((uint32_t)data[0] << 24) | ((uint32_t)data[1] << 16) | ((uint32_t)data[2] << 8) |
+           data[3];
+      *h = ((uint32_t)data[4] << 24) | ((uint32_t)data[5] << 16) | ((uint32_t)data[6] << 8) |
+           data[7];
+      assert(data[8] == 8 && data[9] == 6); /* 8-bit RGBA */
+    } else if (memcmp(type, "IDAT", 4) == 0) {
+      idat = realloc(idat, idat_n + len);
+      assert(idat);
+      memcpy(idat + idat_n, data, len);
+      idat_n += len;
+    }
+    at += (size_t)len + 12u;
+  }
+  assert(*w && *h && idat);
+  size_t rown = (size_t)*w * 4u + 1u;
+  uLongf raw_n = (uLongf)(rown * *h);
+  uint8_t *raw = malloc(raw_n);
+  assert(raw && uncompress(raw, &raw_n, idat, (uLong)idat_n) == Z_OK && raw_n == rown * *h);
+  uint8_t *rgba = malloc((size_t)*w * *h * 4u);
+  assert(rgba);
+  for (uint32_t j = 0; j < *h; j++) {
+    assert(raw[(size_t)j * rown] == 0); /* filter: none */
+    memcpy(rgba + (size_t)j * *w * 4u, raw + (size_t)j * rown + 1u, (size_t)*w * 4u);
+  }
+  free(raw);
+  free(idat);
+  free(file);
+  return rgba;
 }
 
 /* ---- an in-test tsm serve ------------------------------------------------ */
@@ -531,6 +584,32 @@ int main(int argc, char **argv) {
   }
   o.cmp_a = o.cmp_b = -1;
 
+  /* r3d_view_select: a --compare with no --show is a mask over the CT, not a
+   * mask over every other layer's own rendering. Start from "everything on",
+   * which is what a freshly loaded packet looks like. */
+  {
+    for (uint32_t i = 0; i < p.count; i++) p.layer[i].show = p.layer[i].kind != R3D_VIEW_CT;
+    r3d_view_opts so;
+    r3d_view_opts_default(&so);
+    so.slice = 4;
+    r3d_view_composite(&p, &so, rgba);
+    assert(!grey(px_at(rgba, NX, 2, 3), 100u)); /* 10 layers cover the CT */
+    assert(r3d_view_select(&p, &so, NULL, "student.sdf_in,label.sdf_in") == 0);
+    assert(so.cmp_a == L_SDF && so.cmp_b == L_LSDF);
+    for (uint32_t i = 0; i < p.count; i++) assert(!p.layer[i].show);
+    r3d_view_composite(&p, &so, rgba);
+    assert(grey(px_at(rgba, NX, 2, 3), 100u)); /* outside both bands: bare CT */
+    assert(!grey(px_at(rgba, NX, 5, 3), 100u)); /* inside: the agree colour */
+    /* an explicit --show still wins, alongside the compare pair */
+    for (uint32_t i = 0; i < p.count; i++) p.layer[i].show = false;
+    assert(r3d_view_select(&p, &so, "student.thickness",
+                           "student.sdf_in,label.sdf_in") == 0);
+    assert(p.layer[L_THK].show && !p.layer[L_CLS].show);
+    /* and the pair itself is still refused when the kinds differ */
+    assert(r3d_view_select(&p, &so, NULL, "student.sdf_in,student.ink") != 0);
+    assert(r3d_view_select(&p, &so, NULL, "student.sdf_in") != 0);
+  }
+
   /* ---- hover readout ----------------------------------------------------- */
   {
     only(&p, "human.rv_class");
@@ -653,11 +732,53 @@ int main(int argc, char **argv) {
     assert(ph == NZ);
     assert(fclose(f) == 0);
 
-    /* compare mode, and the failure modes of the two list arguments */
+    /* with no --show at all every layer draws, so the CT is covered */
+    snprintf(cmd, sizeof cmd, "%s --view-shot %s %s --axis z --slice 4", argv[1],
+             m.ent[0].path, png);
+    assert(system(cmd) == 0);
+    {
+      uint32_t pxw = 0, pxh = 0;
+      uint8_t *img = png_read(png, &pxw, &pxh);
+      assert(img && pxw == NX && pxh == NY);
+      assert(!grey(px_at(img, NX, 2, 3), 100u));
+      free(img);
+    }
+
+    /* compare mode: only the three-class mask, the CT visible everywhere else */
     snprintf(cmd, sizeof cmd,
              "%s --view-shot %s %s --slice 4 --compare student.sdf_in,label.sdf_in", argv[1],
              m.ent[0].path, png);
     assert(system(cmd) == 0);
+    {
+      uint32_t pxw = 0, pxh = 0;
+      uint8_t *img = png_read(png, &pxw, &pxh);
+      assert(img && pxw == NX && pxh == NY);
+      /* outside both zero-crossing bands the composite is the bare CT grey */
+      assert(grey(px_at(img, NX, 0, 3), 100u));
+      assert(grey(px_at(img, NX, 2, 3), 100u));
+      assert(grey(px_at(img, NX, 9, 3), 100u));
+      /* A's band is x 4..6, B's x 5..7: agree green, A-only red, B-only blue */
+      const uint8_t *ag = px_at(img, NX, 5, 3), *ao = px_at(img, NX, 4, 3),
+                    *bo = px_at(img, NX, 7, 3);
+      assert(ag[1] > ag[0] && ag[1] > ag[2]);
+      assert(ao[0] > ao[1] && ao[0] > ao[2]);
+      assert(bo[2] > bo[0] && bo[2] > bo[1]);
+      free(img);
+    }
+
+    /* an explicit --show alongside --compare keeps that layer drawing */
+    snprintf(cmd, sizeof cmd,
+             "%s --view-shot %s %s --slice 4 --compare student.sdf_in,label.sdf_in "
+             "--show human.rv_class",
+             argv[1], m.ent[0].path, png);
+    assert(system(cmd) == 0);
+    {
+      uint32_t pxw = 0, pxh = 0;
+      uint8_t *img = png_read(png, &pxw, &pxh);
+      assert(img && !grey(px_at(img, NX, 2, 3), 100u)); /* class 2 at x = 2 */
+      assert(grey(px_at(img, NX, 0, 3), 100u));         /* class 0 stays clear */
+      free(img);
+    }
     snprintf(cmd, sizeof cmd, "%s --view-shot %s %s --show student.nope 2>/dev/null", argv[1],
              m.ent[0].path, png);
     assert(system(cmd) != 0);
