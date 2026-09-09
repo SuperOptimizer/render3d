@@ -73,3 +73,41 @@ int r3d_png_write_gray(const char *path, const uint8_t *img, uint32_t w,
   free(z);
   return rc;
 }
+
+int r3d_png_write_rgba(const char *path, const uint8_t *img, uint32_t w,
+                       uint32_t h) {
+  size_t rown = (size_t)w * 4u + 1u;
+  uint8_t *raw = malloc(rown * h);
+  if (!raw) return -1;
+  for (uint32_t j = 0; j < h; j++) {
+    raw[j * rown] = 0; /* filter: none */
+    memcpy(raw + j * rown + 1, img + (size_t)j * w * 4u, (size_t)w * 4u);
+  }
+  uLongf zcap = compressBound((uLong)(rown * h));
+  uint8_t *z = malloc(zcap);
+  if (!z || compress2(z, &zcap, raw, (uLong)(rown * h), 6) != Z_OK) {
+    free(raw);
+    free(z);
+    return -1;
+  }
+  free(raw);
+  FILE *f = fopen(path, "wb");
+  int rc = -1;
+  if (f) {
+    static const uint8_t sig[8] = {137, 80, 78, 71, 13, 10, 26, 10};
+    uint8_t ihdr[13];
+    png_be32(ihdr, w);
+    png_be32(ihdr + 4, h);
+    ihdr[8] = 8;  /* bit depth */
+    ihdr[9] = 6;  /* truecolour with alpha */
+    ihdr[10] = ihdr[11] = ihdr[12] = 0;
+    rc = fwrite(sig, 1, 8, f) == 8 && png_chunk(f, "IHDR", ihdr, 13) == 0 &&
+                 png_chunk(f, "IDAT", z, (uint32_t)zcap) == 0 &&
+                 png_chunk(f, "IEND", NULL, 0) == 0
+             ? 0
+             : -1;
+    if (fclose(f) != 0) rc = -1;
+  }
+  free(z);
+  return rc;
+}
