@@ -57,6 +57,7 @@ add_library(r3d_core STATIC
   src/core/transfer.c
   src/core/umbilicus.c
   src/core/annot.c
+  src/core/view.c
   src/core/input.c
   src/core/tifxyz.c
   src/core/segtrace.c
@@ -203,7 +204,7 @@ target_link_libraries(r3d_vk PUBLIC Vulkan::Vulkan SDL3::SDL3 CURL::libcurl r3d_
 include(src/shaders/shaders.cmake)
 
 # --- app ---
-add_executable(render3d src/main.c src/annotui.c)
+add_executable(render3d src/main.c src/annotui.c src/viewui.c)
 target_compile_definitions(render3d PRIVATE R3D_SPV_DIR="${R3D_SPV_DIR}")
 add_dependencies(render3d r3d_shaders)
 target_link_libraries(render3d PRIVATE r3d_core r3d_vk r3d_imgui SDL3::SDL3
@@ -252,6 +253,13 @@ add_test(NAME annot COMMAND test_annot $<TARGET_FILE:render3d>)
 set_tests_properties(annot PROPERTIES LABELS quick TIMEOUT 60)
 add_test(NAME annot_gui COMMAND test_annot $<TARGET_FILE:render3d> gui)
 set_tests_properties(annot_gui PROPERTIES LABELS gpu TIMEOUT 300)
+
+add_executable(test_view tests/test_view.c)
+target_link_libraries(test_view PRIVATE r3d_core r3d_warnings r3d_sanitize)
+add_test(NAME view COMMAND test_view $<TARGET_FILE:render3d>)
+set_tests_properties(view PROPERTIES LABELS quick TIMEOUT 120)
+add_test(NAME view_gui COMMAND test_view $<TARGET_FILE:render3d> gui)
+set_tests_properties(view_gui PROPERTIES LABELS gpu TIMEOUT 300)
 
 add_executable(test_quick tests/test_quick.c)
 target_link_libraries(test_quick PRIVATE r3d_core r3d_warnings r3d_sanitize)

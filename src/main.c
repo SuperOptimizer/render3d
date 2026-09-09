@@ -43,6 +43,8 @@ extern char **environ; /* argv-spawned browser jobs inherit the environment */
 #include "core/stats.h"
 #include "core/tifxyz.h"
 #include "annotui.h"
+#include "core/view.h"
+#include "viewui.h"
 #include "core/umbilicus.h"
 #include "render/render.h"
 #include "vk/vkctx.h"
@@ -2194,6 +2196,55 @@ int main(int argc, char **argv) {
       return r3d_annot_apply_cli(argv[i + 1], argv[i + 2]) == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
   }
+  /* Model view (spec/view.md): --view-shot composites one slice with no SDL
+   * and no Vulkan at all (tests and TSM's report tooling drive it), --view
+   * opens its own window over one view packet at a time. */
+  for (int i = 1; i < argc; i++) {
+    if (strcmp(argv[i], "--view-shot") != 0) continue;
+    if (i + 2 >= argc) {
+      fprintf(stderr, "--view-shot needs <packet> <out.png>\n");
+      return EXIT_FAILURE;
+    }
+    int axis = R3D_VIEW_AXIS_Z;
+    int64_t slice = -1;
+    const char *show = NULL, *compare = NULL;
+    for (int k = 1; k < argc - 1; k++) {
+      if (strcmp(argv[k], "--axis") == 0) {
+        const char *ax = argv[k + 1];
+        axis = ax[0] == 'y' ? R3D_VIEW_AXIS_Y : ax[0] == 'x' ? R3D_VIEW_AXIS_X : R3D_VIEW_AXIS_Z;
+      }
+      if (strcmp(argv[k], "--slice") == 0) slice = atoll(argv[k + 1]);
+      if (strcmp(argv[k], "--show") == 0) show = argv[k + 1];
+      if (strcmp(argv[k], "--compare") == 0) compare = argv[k + 1];
+    }
+    return r3d_view_shot(argv[i + 1], argv[i + 2], axis, slice, show, compare) == 0
+               ? EXIT_SUCCESS
+               : EXIT_FAILURE;
+  }
+  for (int i = 1; i < argc; i++) {
+    if (strcmp(argv[i], "--view") != 0) continue;
+    if (i + 1 >= argc) {
+      fprintf(stderr, "--view needs a packet directory or view.json\n");
+      return EXIT_FAILURE;
+    }
+    r3d_viewui_opts vo = {.path = argv[i + 1], .win_w = 1400, .win_h = 900};
+    for (int k = 1; k < argc; k++) {
+      if (k < argc - 2 && strcmp(argv[k], "--size") == 0) {
+        vo.win_w = atoi(argv[k + 1]);
+        vo.win_h = atoi(argv[k + 2]);
+      }
+      if (k < argc - 1 && strcmp(argv[k], "--frames") == 0)
+        vo.exit_frames = (uint32_t)atoi(argv[k + 1]);
+      if (k < argc - 1 && strcmp(argv[k], "--shot") == 0) vo.shot_path = argv[k + 1];
+      if (k < argc - 1 && strcmp(argv[k], "--view-serve") == 0) vo.serve = argv[k + 1];
+      if (strcmp(argv[k], "--headless") == 0) vo.headless = true;
+      if (strcmp(argv[k], "--no-vsync") == 0) vo.no_vsync = true;
+    }
+    if (vo.win_w < 64) vo.win_w = 64;
+    if (vo.win_h < 64) vo.win_h = 64;
+    return r3d_viewui_run(&vo);
+  }
+
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--annot") != 0) continue;
     if (i + 1 >= argc) {
