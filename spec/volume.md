@@ -5,17 +5,17 @@
 - Flat array of unsigned 8-bit voxels, x-fastest order: `index = (z*ny + y)*nx + x`.
 - No header; dimensions come from the command line (or a `.json` sidecar where one
   exists, e.g. compressor corpus bricks). Single byte per voxel, no endianness issues.
-- Coordinate convention matches the c5d corpus: arrays are indexed `[z][y][x]`
+- Coordinate convention matches the volcomp corpus: arrays are indexed `[z][y][x]`
   (zarr order); world space maps x→+X, y→+Y, z→+Z with uniform voxel pitch
   (`voxel_um`, informational in M1).
 
-## Spatial hierarchy (inherited from c5d, normative for later milestones)
+## Spatial hierarchy (inherited from volcomp, normative for later milestones)
 
-- 16³ **chunk** — transform/coding unit (c5d).
+- 16³ **chunk** — transform/coding unit (volcomp).
 - 128³ **brick** — random-access / streaming / cache unit. `bricks are the atom of
   residency`: the renderer's future virtual-texture atlas, occupancy structure,
   and LOD selection all operate on bricks, never on whole volumes.
-- 1024³ **shard** — file/S3-object unit (`.c5s`, footer-indexed; see
+- 1024³ **shard** — file/S3-object unit (`.vcs`, footer-indexed; see
   ~/compressor/spec/format.md).
 - LOD levels are fully separate volumes (per-level shards), factor-2 downsampling
   per level.

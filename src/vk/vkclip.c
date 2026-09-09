@@ -1,3 +1,4 @@
+#include "core/thread.h"
 #include "vk/vkclip.h"
 
 #include <fcntl.h>
@@ -572,7 +573,7 @@ int r3d_vkclip_create(r3d_vkclip **out, r3d_vkctx *c,
   pthread_mutex_init(&cl->mu, NULL);
   pthread_cond_init(&cl->cv, NULL);
   cl->mu_up = true;
-  if (pthread_create(&cl->worker, NULL, clip_worker, cl) != 0) goto fail;
+  if (r3d_thread_create(&cl->worker, NULL, clip_worker, cl) != 0) goto fail;
   cl->worker_up = true;
   *out = cl;
   return 0;

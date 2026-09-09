@@ -85,4 +85,7 @@ int r3d_regvol_job_start(r3d_regvol *rv, const char *fixed_root, int mode,
  * gen bumped on the first poll that sees it); *ok=false if the job failed */
 int r3d_regvol_job_poll(r3d_regvol *rv, bool *ok);
 
+/* Renderer callbacks use 16^3 block coordinates and a 4096-byte output. */
+uint32_t r3d_regvol_blockgen(void *v, uint32_t l, uint32_t x, uint32_t y, uint32_t z);
+void r3d_regvol_blockfetch(void *v, uint32_t l, uint32_t x, uint32_t y, uint32_t z, uint8_t *out);
 #endif /* R3D_REGVOL_H */

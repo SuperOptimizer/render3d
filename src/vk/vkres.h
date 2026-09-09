@@ -1,4 +1,4 @@
-/* Small hand-rolled resource helpers (no VMA; c5d vk.c style). */
+/* Small hand-rolled resource helpers (no VMA; volcomp vk.c style). */
 #ifndef R3D_VKRES_H
 #define R3D_VKRES_H
 

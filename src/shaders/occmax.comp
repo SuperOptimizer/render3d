@@ -16,8 +16,8 @@ layout(push_constant) uniform PC {
 
 void main() {
   uint id = gl_GlobalInvocationID.x;
-  if (id >= 16u * 16u * 16u) return;
-  ivec3 lb = ivec3(int(id & 15u), int((id >> 4u) & 15u), int(id >> 8u));
+  if (id >= 8u) return;
+  ivec3 lb = ivec3(int(id & 1u), int((id >> 1u) & 1u), int(id >> 2u));
   ivec3 base = ivec3(int(pc.sx), int(pc.sy), int(pc.sz)) + lb * 8;
   float m = 0.0;
   for (int dz = 0; dz < 8; dz++)

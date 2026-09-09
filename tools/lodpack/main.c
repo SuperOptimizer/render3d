@@ -1,16 +1,16 @@
-/* lodpack -- build a standard Zarr-v3 multiscale pyramid and matching c5d
+/* lodpack -- build a standard Zarr-v3 multiscale pyramid and matching volcomp
  * shards without materialising an uncompressed volume.
  *
  * Source is render3d's mirrored dct3d store:
  *   <source>/<z>_<y>_<x>.shard
  * Output is:
  *   <output>/zarr/L<level>/c/<z>/<y>/<x>       (Zarr v3)
- *   <output>/c5d/L<level>/<z>_<y>_<x>.c5s     (c5d)
+ *   <output>/volcomp/L<level>/<z>_<y>_<x>.vcs     (volcomp)
  *   <output>/manifest.json                    (renderer LOD manifest)
  *
  * Each 16^3 output Zarr chunk is a rounded 2x box reduction of eight decoded
  * parent chunks.  The chunk is encoded to dct3d and decoded again before it is
- * assembled into its c5d brick: c5d is therefore a true transcode of the Zarr
+ * assembled into its volcomp brick: volcomp is therefore a true transcode of the Zarr
  * LOD, not a parallel encode of a subtly different source.  Writes are atomic
  * and completed shard pairs are skipped, making long builds resumable. */
 #include <errno.h>
@@ -59,7 +59,7 @@ typedef struct shard_job {
   blob *zchunks;
   blob *cbricks;
   uint8_t *czero;
-  float zq, ztau, c5quality;
+  float zq, ztau, vcquality;
   _Atomic uint32_t next;
   _Atomic int failed;
   uint32_t level;
@@ -148,9 +148,9 @@ static void zarr_shard_path(char path[2048], const char *out, uint32_t level, ui
            (unsigned long long)z, (unsigned long long)y, (unsigned long long)x);
 }
 
-static void c5d_shard_path(char path[2048], const char *out, uint32_t level, uint64_t z,
+static void volcomp_shard_path(char path[2048], const char *out, uint32_t level, uint64_t z,
                            uint64_t y, uint64_t x) {
-  snprintf(path, 2048, "%s/c5d/L%u/%llu_%llu_%llu.c5s", out, level,
+  snprintf(path, 2048, "%s/volcomp/L%u/%llu_%llu_%llu.vcs", out, level,
            (unsigned long long)z, (unsigned long long)y, (unsigned long long)x);
 }
 
@@ -269,7 +269,7 @@ static void *brick_worker(void *arg) {
           uint32_t gcz = bz * BRICK_CPA + lz, gcy = by * BRICK_CPA + ly,
                    gcx = bx * BRICK_CPA + lx;
           size_t ci = ((size_t)gcz * (SHARD / INNER) + gcy) * (SHARD / INNER) + gcx;
-          const uint8_t *for_c5d = chunk;
+          const uint8_t *for_volcomp = chunk;
           if (j->downsample) {
             if (!all_zero(chunk, DCT3D_N3)) {
               size_t n = dct3d_encode_u8(chunk, j->zq, 0.0f, j->ztau, enc);
@@ -281,21 +281,21 @@ static void *brick_worker(void *arg) {
               }
               memcpy(copy, enc, n);
               j->zchunks[ci] = (blob){copy, (uint32_t)n};
-              for_c5d = recon; /* c5d is a transcode of decoded Zarr */
+              for_volcomp = recon; /* volcomp is a transcode of decoded Zarr */
             } else {
               j->zchunks[ci] = (blob){0}; /* Zarr missing == fill zero */
             }
           }
-          scatter_chunk(raw, lz, ly, lx, for_c5d);
+          scatter_chunk(raw, lz, ly, lx, for_volcomp);
         }
     if (all_zero(raw, (size_t)BRICK * BRICK * BRICK)) {
       j->czero[b] = 1;
       continue;
     }
-    c5d_brick_params p = c5d_brick_defaults(1.0f);
+    volcomp_brick_params p = volcomp_brick_defaults(1.0f);
     size_t encoded_n = 0;
-    p.q = j->c5quality;
-    if (c5d_brick_encode(&p, raw, BRICK, &j->cbricks[b].p, &encoded_n) != 0 ||
+    p.q = j->vcquality;
+    if (volcomp_brick_encode(&p, raw, BRICK, &j->cbricks[b].p, &encoded_n) != 0 ||
         encoded_n > UINT32_MAX) {
       atomic_store(&j->failed, 1);
       goto worker_done;
@@ -335,7 +335,7 @@ static int write_zarr_shard(const char *path, blob *chunks) {
     off += chunks[ci].n;
   }
   if (rc == 0) {
-    put_u32le(idx + ZARR_INDEX_BYTES, c5d_crc32c(idx, ZARR_INDEX_BYTES));
+    put_u32le(idx + ZARR_INDEX_BYTES, volcomp_crc32c(idx, ZARR_INDEX_BYTES));
     if (fwrite(idx, 1, ZARR_INDEX_BYTES + 4u, f) != ZARR_INDEX_BYTES + 4u || fflush(f) != 0 ||
         fsync(fileno(f)) != 0)
       rc = -1;
@@ -347,17 +347,17 @@ static int write_zarr_shard(const char *path, blob *chunks) {
   return rc;
 }
 
-static int write_c5d_shard(const char *path, uint32_t level, blob *bricks, uint8_t *zero) {
+static int write_volcomp_shard(const char *path, uint32_t level, blob *bricks, uint8_t *zero) {
   if (mkdirs(path, false) != 0) return -1;
   char tmp[2112];
   snprintf(tmp, sizeof tmp, "%s.tmp.%ld", path, (long)getpid());
-  c5d_shard_writer *w = c5d_shard_create(tmp, SHARD, BRICK, level, 0.0f);
+  volcomp_shard_writer *w = volcomp_shard_create(tmp, SHARD, BRICK, level, 0.0f);
   if (!w) return -1;
   int rc = 0;
   for (uint32_t b = 0; b < NBRICKS && rc == 0; b++)
-    rc = zero[b] ? c5d_shard_put_zero(w, b)
-                 : c5d_shard_put(w, b, bricks[b].p, bricks[b].n);
-  if (c5d_shard_close(w) != 0) rc = -1;
+    rc = zero[b] ? volcomp_shard_put_zero(w, b)
+                 : volcomp_shard_put(w, b, bricks[b].p, bricks[b].n);
+  if (volcomp_shard_close(w) != 0) rc = -1;
   if (rc == 0 && rename(tmp, path) != 0) rc = -1;
   if (rc != 0) unlink(tmp);
   return rc;
@@ -365,13 +365,13 @@ static int write_c5d_shard(const char *path, uint32_t level, blob *bricks, uint8
 
 static int process_shard(const char *source, const char *out, dims3 base, uint32_t level,
                          uint64_t oz, uint64_t oy, uint64_t ox, uint32_t threads,
-                         float c5r0, bool c5d_only, bool force) {
-  bool downsample = level > 0 && !c5d_only;
+                         float vcq0, bool volcomp_only, bool force) {
+  bool downsample = level > 0 && !volcomp_only;
   uint32_t src_level = downsample ? level - 1u : level;
   dims3 src_grid = shard_grid(level_shape(base, src_level));
   char zp[2048], cp[2048];
   zarr_shard_path(zp, out, level, oz, oy, ox);
-  c5d_shard_path(cp, out, level, oz, oy, ox);
+  volcomp_shard_path(cp, out, level, oz, oy, ox);
   if (!force && (!downsample || file_exists(zp)) && file_exists(cp)) return 1;
 
   parent_set parents;
@@ -391,15 +391,15 @@ static int process_shard(const char *source, const char *out, dims3 base, uint32
   }
   float zq = 8.0f / (float)(1u << (level < 4u ? level : 3u));
   if (zq < 1.0f) zq = 1.0f;
-  float quality = c5r0 / (float)(1u << (level < 3u ? level : 3u));
-  if (quality < 0.25f) quality = 0.25f;
+  float quality = vcq0 / (float)(1u << (level < 3u ? level : 3u));
+  if (quality < 1.0f) quality = 1.0f;
   shard_job job = {.parents = &parents,
                    .zchunks = zchunks,
                    .cbricks = cbricks,
                    .czero = czero,
                    .zq = zq,
                    .ztau = zq * 2.0f,
-                   .c5quality = quality,
+                   .vcquality = quality,
                    .level = level,
                    .downsample = downsample};
   uint32_t nt = threads ? threads : 1u;
@@ -415,7 +415,7 @@ static int process_shard(const char *source, const char *out, dims3 base, uint32
 
   int rc = atomic_load(&job.failed) ? -1 : 0;
   if (rc == 0 && downsample) rc = write_zarr_shard(zp, zchunks);
-  if (rc == 0) rc = write_c5d_shard(cp, level, cbricks, czero);
+  if (rc == 0) rc = write_volcomp_shard(cp, level, cbricks, czero);
   for (size_t i = 0; i < NCHUNKS; i++)
     if (zchunks) free_blob(&zchunks[i]);
   for (uint32_t i = 0; i < NBRICKS; i++) free_blob(&cbricks[i]);
@@ -470,7 +470,7 @@ static int link_l0(const char *source, const char *out, dims3 base) {
   return write_level_metadata(out, base, 0);
 }
 
-static int write_manifests(const char *out, dims3 base, uint32_t levels, float c5r0) {
+static int write_manifests(const char *out, dims3 base, uint32_t levels, float vcq0) {
   char *json = calloc(1, 16384);
   char *group = calloc(1, 16384);
   if (!json || !group) {
@@ -479,7 +479,7 @@ static int write_manifests(const char *out, dims3 base, uint32_t levels, float c
     return -1;
   }
   size_t n = (size_t)snprintf(json, 16384,
-                              "{\n  \"format\": \"render3d.c5d-lod.v1\",\n"
+                              "{\n  \"format\": \"render3d.volcomp-lod.v1\",\n"
                               "  \"shape\": [%llu, %llu, %llu],\n"
                               "  \"shard_shape\": [1024, 1024, 1024],\n"
                               "  \"brick_shape\": [128, 128, 128],\n  \"levels\": [\n",
@@ -494,15 +494,15 @@ static int write_manifests(const char *out, dims3 base, uint32_t levels, float c
       "{\"name\": \"x\", \"type\": \"space\"}],\n      \"datasets\": [\n");
   for (uint32_t l = 0; l < levels; l++) {
     dims3 s = level_shape(base, l), g = shard_grid(s);
-    float quality = c5r0 / (float)(1u << (l < 3u ? l : 3u));
-    if (quality < 0.25f) quality = 0.25f;
+    float quality = vcq0 / (float)(1u << (l < 3u ? l : 3u));
+    if (quality < 1.0f) quality = 1.0f;
     n += (size_t)snprintf(json + n, 16384 - n,
                           "    {\"level\": %u, \"scale\": %u, "
                           "\"shape\": [%llu, %llu, %llu], "
                           "\"shards\": [%llu, %llu, %llu], "
                           "\"zarr\": \"zarr/L%u\", "
-                          "\"c5d\": \"c5d/L%u/{z}_{y}_{x}.c5s\", "
-                          "\"c5d_quality\": %.6g}%s\n",
+                          "\"volcomp\": \"volcomp/L%u/{z}_{y}_{x}.vcs\", "
+                          "\"volcomp_quality\": %.6g}%s\n",
                           l, 1u << l, (unsigned long long)s.z, (unsigned long long)s.y,
                           (unsigned long long)s.x, (unsigned long long)g.z,
                           (unsigned long long)g.y, (unsigned long long)g.x, l, l,
@@ -537,8 +537,8 @@ int main(int argc, char **argv) {
   if (argc < 7) {
     fprintf(stderr,
             "usage: lodpack <source-flat-dir> <output-dir> <nz> <ny> <nx> <max-level> "
-            "[--threads N] [--c5d-quality Q] [--only-level L] [--limit N] "
-            "[--only-shard z,y,x] [--skip-c5d0] [--c5d-only] [--force]\n");
+            "[--threads N] [--volcomp-quality Q] [--only-level L] [--limit N] "
+            "[--only-shard z,y,x] [--skip-volcomp0] [--volcomp-only] [--force]\n");
     return 2;
   }
   const char *source = argv[1], *out = argv[2];
@@ -549,14 +549,14 @@ int main(int argc, char **argv) {
   uint64_t limit = UINT64_MAX;
   dims3 only_shard = {0};
   bool have_only_shard = false;
-  float c5r0 = 2.0f;
-  bool skip_c5d0 = false;
-  bool c5d_only = false, force = false;
+  float vcq0 = 2.0f;
+  bool skip_volcomp0 = false;
+  bool volcomp_only = false, force = false;
   for (int i = 7; i < argc; i++) {
     if (strcmp(argv[i], "--threads") == 0 && i + 1 < argc)
       threads = (uint32_t)strtoul(argv[++i], NULL, 10);
-    else if (strcmp(argv[i], "--c5d-quality") == 0 && i + 1 < argc)
-      c5r0 = strtof(argv[++i], NULL);
+    else if (strcmp(argv[i], "--volcomp-quality") == 0 && i + 1 < argc)
+      vcq0 = strtof(argv[++i], NULL);
     else if (strcmp(argv[i], "--only-level") == 0 && i + 1 < argc)
       only_level = (uint32_t)strtoul(argv[++i], NULL, 10);
     else if (strcmp(argv[i], "--limit") == 0 && i + 1 < argc)
@@ -567,10 +567,10 @@ int main(int argc, char **argv) {
       only_shard = (dims3){z, y, x};
       have_only_shard = true;
     }
-    else if (strcmp(argv[i], "--skip-c5d0") == 0)
-      skip_c5d0 = true;
-    else if (strcmp(argv[i], "--c5d-only") == 0)
-      c5d_only = true;
+    else if (strcmp(argv[i], "--skip-volcomp0") == 0)
+      skip_volcomp0 = true;
+    else if (strcmp(argv[i], "--volcomp-only") == 0)
+      volcomp_only = true;
     else if (strcmp(argv[i], "--force") == 0)
       force = true;
     else {
@@ -578,19 +578,19 @@ int main(int argc, char **argv) {
       return 2;
     }
   }
-  if (!base.z || !base.y || !base.x || max_level >= MAX_LEVELS || c5r0 <= 0.0f) return 2;
+  if (!base.z || !base.y || !base.x || max_level >= MAX_LEVELS || vcq0 <= 0.0f) return 2;
   if (!threads) {
     long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
     threads = ncpu > 0 ? (uint32_t)ncpu : 1u;
   }
   if (mkdirs(out, true) != 0 || link_l0(source, out, base) != 0 ||
-      write_manifests(out, base, max_level + 1u, c5r0) != 0) {
+      write_manifests(out, base, max_level + 1u, vcq0) != 0) {
     fprintf(stderr, "lodpack: cannot initialise output metadata/layout\n");
     return 1;
   }
 
   for (uint32_t level = 0; level <= max_level; level++) {
-    if (level == 0 && skip_c5d0) continue;
+    if (level == 0 && skip_volcomp0) continue;
     if (only_level != UINT32_MAX && level != only_level) continue;
     dims3 shape = level_shape(base, level), grid = shard_grid(shape);
     if (level > 0 && write_level_metadata(out, shape, level) != 0) return 1;
@@ -614,7 +614,7 @@ int main(int argc, char **argv) {
       uint64_t y = have_only_shard ? only_shard.y : (i / grid.x) % grid.y;
       uint64_t x = have_only_shard ? only_shard.x : i % grid.x;
       double one = now_seconds();
-      int rc = process_shard(source, out, base, level, z, y, x, threads, c5r0, c5d_only,
+      int rc = process_shard(source, out, base, level, z, y, x, threads, vcq0, volcomp_only,
                              force);
       if (rc < 0) {
         fprintf(stderr, "lodpack: L%u shard %llu/%llu/%llu failed\n", level,

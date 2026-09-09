@@ -3,7 +3,7 @@
 #include "core/cpuvol.h"
 #include "core/flatten.h"
 
-#include <tifxyz.h> /* c5d TFX1/tifxyz codec, not core/tifxyz.h */
+#include <tifxyz.h> /* R3F1 surface storage, not core/tifxyz.h */
 
 #include <errno.h>
 #include <math.h>
@@ -114,7 +114,7 @@ void r3d_headless_surface_release_v1(r3d_headless_surface *surface,
   *surface = (r3d_headless_surface){0};
 }
 
-static r3d_headless_status hl_surface_from_c5d(const c5d_tifxyz *source,
+static r3d_headless_status hl_surface_from_volcomp(const r3d_surface_data *source,
                                                const r3d_headless_allocator *allocator,
                                                r3d_headless_surface *out) {
   r3d_headless_allocator a;
@@ -140,7 +140,7 @@ static r3d_headless_status hl_surface_from_c5d(const c5d_tifxyz *source,
   return R3D_HEADLESS_OK;
 }
 
-r3d_headless_status r3d_headless_tfx1_encode_v1(
+r3d_headless_status r3d_headless_surface_encode_v1(
     uint32_t width, uint32_t height, const float *xyz, const uint8_t *metadata,
     size_t metadata_size, int32_t log2_quantization,
     const r3d_headless_allocator *allocator, const r3d_headless_callbacks *callbacks,
@@ -159,15 +159,15 @@ r3d_headless_status r3d_headless_tfx1_encode_v1(
   if (!hl_mul(n, sizeof(float), &plane_bytes)) return R3D_HEADLESS_E_INVALID_ARGUMENT;
   float *planes = malloc(plane_bytes * 3u);
   if (planes == NULL) return R3D_HEADLESS_E_OUT_OF_MEMORY;
-  c5d_tifxyz source = {.w = width, .h = height,
+  r3d_surface_data source = {.w = width, .h = height,
                        .meta = (uint8_t *)metadata, .meta_len = metadata_size};
   for (size_t c = 0u; c < 3u; ++c) source.plane[c] = planes + c * n;
   for (size_t k = 0u; k < n; ++k)
     for (size_t c = 0u; c < 3u; ++c) source.plane[c][k] = xyz[k * 3u + c];
   uint8_t *encoded = NULL;
   size_t encoded_size = 0u;
-  hl_progress(callbacks, "tfx1-encode", 0u, 1u);
-  const int rc = c5d_tifxyz_encode(&source, (int)log2_quantization, &encoded, &encoded_size);
+  hl_progress(callbacks, "surface-encode", 0u, 1u);
+  const int rc = r3d_surface_encode(&source, (int)log2_quantization, &encoded, &encoded_size);
   free(planes);
   if (rc != 0 || encoded == NULL) {
     free(encoded);
@@ -188,11 +188,11 @@ r3d_headless_status r3d_headless_tfx1_encode_v1(
     free(encoded);
   }
   *out_bytes = (r3d_headless_bytes){copy, encoded_size};
-  hl_progress(callbacks, "tfx1-encode", 1u, 1u);
+  hl_progress(callbacks, "surface-encode", 1u, 1u);
   return R3D_HEADLESS_OK;
 }
 
-r3d_headless_status r3d_headless_tfx1_encode_file_v1(
+r3d_headless_status r3d_headless_surface_encode_file_v1(
     const char *path, uint32_t width, uint32_t height, const float *xyz,
     const uint8_t *metadata, size_t metadata_size, int32_t log2_quantization,
     const r3d_headless_callbacks *callbacks) {
@@ -201,7 +201,7 @@ r3d_headless_status r3d_headless_tfx1_encode_file_v1(
   if (lstat(path, &st) == 0) return R3D_HEADLESS_E_EXISTS;
   if (errno != ENOENT) return R3D_HEADLESS_E_IO;
   r3d_headless_bytes encoded = {0};
-  r3d_headless_status status = r3d_headless_tfx1_encode_v1(
+  r3d_headless_status status = r3d_headless_surface_encode_v1(
       width, height, xyz, metadata, metadata_size, log2_quantization,
       NULL, callbacks, &encoded);
   if (status != R3D_HEADLESS_OK) return status;
@@ -248,20 +248,20 @@ r3d_headless_status r3d_headless_tfx1_encode_file_v1(
   return status;
 }
 
-r3d_headless_status r3d_headless_tfx1_decode_v1(
+r3d_headless_status r3d_headless_surface_decode_v1(
     const uint8_t *bytes, size_t size, const r3d_headless_allocator *allocator,
     const r3d_headless_callbacks *callbacks, r3d_headless_surface *out_surface) {
   if (bytes == NULL || size == 0u || out_surface == NULL)
     return R3D_HEADLESS_E_INVALID_ARGUMENT;
   if (hl_cancelled(callbacks)) return R3D_HEADLESS_E_CANCELLED;
-  c5d_tifxyz decoded = {0};
-  hl_progress(callbacks, "tfx1-decode", 0u, 1u);
-  if (c5d_tifxyz_decode(bytes, size, &decoded) != 0) return R3D_HEADLESS_E_FORMAT;
+  r3d_surface_data decoded = {0};
+  hl_progress(callbacks, "surface-decode", 0u, 1u);
+  if (r3d_surface_decode(bytes, size, &decoded) != 0) return R3D_HEADLESS_E_FORMAT;
   r3d_headless_status status = hl_cancelled(callbacks)
       ? R3D_HEADLESS_E_CANCELLED
-      : hl_surface_from_c5d(&decoded, allocator, out_surface);
-  c5d_tifxyz_free(&decoded);
-  if (status == R3D_HEADLESS_OK) hl_progress(callbacks, "tfx1-decode", 1u, 1u);
+      : hl_surface_from_volcomp(&decoded, allocator, out_surface);
+  r3d_surface_free(&decoded);
+  if (status == R3D_HEADLESS_OK) hl_progress(callbacks, "surface-decode", 1u, 1u);
   return status;
 }
 
@@ -271,13 +271,13 @@ r3d_headless_status r3d_headless_tifxyz_load_v1(
   if (directory == NULL || directory[0] == '\0' || out_surface == NULL)
     return R3D_HEADLESS_E_INVALID_ARGUMENT;
   if (hl_cancelled(callbacks)) return R3D_HEADLESS_E_CANCELLED;
-  c5d_tifxyz loaded = {0};
+  r3d_surface_data loaded = {0};
   hl_progress(callbacks, "tifxyz-load", 0u, 1u);
-  if (c5d_tifxyz_load_dir(directory, &loaded) != 0) return R3D_HEADLESS_E_IO;
+  if (r3d_surface_load_dir(directory, &loaded) != 0) return R3D_HEADLESS_E_IO;
   r3d_headless_status status = hl_cancelled(callbacks)
       ? R3D_HEADLESS_E_CANCELLED
-      : hl_surface_from_c5d(&loaded, allocator, out_surface);
-  c5d_tifxyz_free(&loaded);
+      : hl_surface_from_volcomp(&loaded, allocator, out_surface);
+  r3d_surface_free(&loaded);
   if (status == R3D_HEADLESS_OK) hl_progress(callbacks, "tifxyz-load", 1u, 1u);
   return status;
 }
@@ -321,13 +321,13 @@ r3d_headless_status r3d_headless_tifxyz_save_v1(
     hl_remove_stage(stage);
     return R3D_HEADLESS_E_OUT_OF_MEMORY;
   }
-  c5d_tifxyz target = {.w = surface->width, .h = surface->height,
+  r3d_surface_data target = {.w = surface->width, .h = surface->height,
                        .meta = surface->metadata, .meta_len = surface->metadata_size};
   for (size_t c = 0u; c < 3u; ++c) target.plane[c] = planes + c * n;
   for (size_t k = 0u; k < n; ++k)
     for (size_t c = 0u; c < 3u; ++c) target.plane[c][k] = surface->xyz[k * 3u + c];
   hl_progress(callbacks, "tifxyz-save", 0u, 1u);
-  int rc = c5d_tifxyz_save_dir(stage, &target);
+  int rc = r3d_surface_save_dir(stage, &target);
   free(planes);
   if (rc == 0 && hl_cancelled(callbacks)) {
     hl_remove_stage(stage);
@@ -344,17 +344,17 @@ r3d_headless_status r3d_headless_tifxyz_save_v1(
 }
 
 r3d_headless_status r3d_headless_volume_open_v1(
-    const char *root, uint32_t cache_bricks, const r3d_headless_allocator *allocator,
+    const char *root, uint32_t cache_blocks, const r3d_headless_allocator *allocator,
     r3d_headless_volume **out_volume) {
   r3d_headless_allocator a;
-  if (root == NULL || root[0] == '\0' || cache_bricks == 0u || out_volume == NULL ||
+  if (root == NULL || root[0] == '\0' || cache_blocks == 0u || out_volume == NULL ||
       !hl_allocator(allocator, &a))
     return R3D_HEADLESS_E_INVALID_ARGUMENT;
   r3d_headless_volume *volume = a.allocate(a.user, sizeof *volume);
   if (volume == NULL) return R3D_HEADLESS_E_OUT_OF_MEMORY;
   memset(volume, 0, sizeof *volume);
   volume->allocator = a;
-  if (r3d_cpuvol_open(&volume->core, root, cache_bricks) != 0) {
+  if (r3d_cpuvol_open(&volume->core, root, cache_blocks) != 0) {
     a.release(a.user, volume);
     return R3D_HEADLESS_E_IO;
   }

@@ -7,7 +7,7 @@
 #include <string.h>
 #include <sys/stat.h>
 
-#include <tifxyz.h> /* c5d codec (angle include: render3d's core/tifxyz.h differs) */
+#include <tifxyz.h> /* volcomp codec (angle include: render3d's core/tifxyz.h differs) */
 
 /* magic/version bumped together: a checksum and explicit version field were
  * added to the header, so a store written by the previous format is
@@ -257,7 +257,7 @@ static int sgs_encode_grid(const r3d_tifxyz *s, uint32_t stride, const uint8_t *
   uint64_t np = (uint64_t)w * h;
   float *planes = malloc(np * 3 * sizeof *planes);
   if (!planes) return -1;
-  c5d_tifxyz ct = {.w = w, .h = h, .meta = (uint8_t *)meta, .meta_len = meta_len};
+  r3d_surface_data ct = {.w = w, .h = h, .meta = (uint8_t *)meta, .meta_len = meta_len};
   for (uint64_t a = 0; a < 3; a++) ct.plane[a] = planes + a * np;
   for (uint32_t j = 0; j < h; j++)
     for (uint32_t i = 0; i < w; i++) {
@@ -269,7 +269,7 @@ static int sgs_encode_grid(const r3d_tifxyz *s, uint32_t stride, const uint8_t *
     }
   uint8_t *enc = NULL;
   size_t enc_n = 0;
-  int rc = c5d_tifxyz_encode(&ct, log2q, &enc, &enc_n);
+  int rc = r3d_surface_encode(&ct, log2q, &enc, &enc_n);
   if (rc == 0) rc = sgs_write_file(path, enc, enc_n);
   free(enc);
   free(planes);
@@ -282,8 +282,8 @@ static int sgs_decode_tfx(const char *path, r3d_tifxyz *out) {
   size_t enc_n = 0;
   uint8_t *enc = sgs_read_file(path, &enc_n);
   if (!enc) return -1;
-  c5d_tifxyz ct;
-  int rc = c5d_tifxyz_decode(enc, enc_n, &ct);
+  r3d_surface_data ct;
+  int rc = r3d_surface_decode(enc, enc_n, &ct);
   free(enc);
   if (rc != 0) return -1;
   memset(out, 0, sizeof *out);
@@ -308,7 +308,7 @@ static int sgs_decode_tfx(const char *path, r3d_tifxyz *out) {
   uint64_t np = (uint64_t)ct.w * ct.h;
   out->xyz = malloc(np * 3 * sizeof *out->xyz);
   if (!out->xyz) {
-    c5d_tifxyz_free(&ct);
+    r3d_surface_free(&ct);
     return -1;
   }
   float bb[2][3] = {{1e30f, 1e30f, 1e30f}, {-1e30f, -1e30f, -1e30f}};
@@ -328,7 +328,7 @@ static int sgs_decode_tfx(const char *path, r3d_tifxyz *out) {
   }
   memcpy(out->bbox, bb, sizeof bb);
   out->nvalid = nvalid;
-  c5d_tifxyz_free(&ct);
+  r3d_surface_free(&ct);
   return 0;
 }
 
@@ -634,12 +634,12 @@ int r3d_segstore_load(const r3d_segstore *st, uint32_t i, uint32_t stride, r3d_t
   size_t enc_n = 0;
   uint8_t *enc = sgs_read_file(path, &enc_n);
   if (!enc) return -1;
-  c5d_tifxyz ct;
-  int rc = c5d_tifxyz_decode(enc, enc_n, &ct);
+  r3d_surface_data ct;
+  int rc = r3d_surface_decode(enc, enc_n, &ct);
   free(enc);
   if (rc != 0) return -1;
   if (ct.w != sw || ct.h != sh) {
-    c5d_tifxyz_free(&ct);
+    r3d_surface_free(&ct);
     return -1;
   }
   memset(out, 0, sizeof *out);
@@ -649,7 +649,7 @@ int r3d_segstore_load(const r3d_segstore *st, uint32_t i, uint32_t stride, r3d_t
   out->sy = m->sy / (float)stride;
   out->xyz = malloc((uint64_t)out->w * out->h * 3 * sizeof *out->xyz);
   if (!out->xyz) {
-    c5d_tifxyz_free(&ct);
+    r3d_surface_free(&ct);
     return -1;
   }
   float bb[2][3] = {{1e30f, 1e30f, 1e30f}, {-1e30f, -1e30f, -1e30f}};
@@ -671,7 +671,7 @@ int r3d_segstore_load(const r3d_segstore *st, uint32_t i, uint32_t stride, r3d_t
     }
   memcpy(out->bbox, bb, sizeof bb);
   out->nvalid = nvalid;
-  c5d_tifxyz_free(&ct);
+  r3d_surface_free(&ct);
   return 0;
 }
 

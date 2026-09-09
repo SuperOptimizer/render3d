@@ -12,7 +12,7 @@ import common;
 [[vk::binding(2, 0)]] RWTexture2D<float4> out_image;
 // per-8^3-block max, dilated 1 block (nearest sampler) — empty-space skipping
 [[vk::binding(3, 0)]] Sampler3D<float> occ;
-// bricks mode: c5d GPU-decoded brick atlas + page table
+// bricks mode: CPU-decoded 16^3 brick atlas + page table
 // page[bi] = slot_index | brick_max<<24, 0xFFFFFFFF = not resident
 [[vk::binding(4, 0)]] Sampler3D<float> brick_atlas;
 [[vk::binding(5, 0)]] StructuredBuffer<uint> page;
@@ -82,25 +82,25 @@ float3 flat_overlay_color() {
 
 float bricks_fetch_ink(float3 slot_org, float3 bl_off, float lod, float inv_adim) {
   float inset = max(0.5 * exp2(lod), 0.5);
-  float3 l = clamp(bl_off, float3(inset), float3(128.0 - inset));
+  float3 l = clamp(bl_off, float3(inset), float3(16.0 - inset));
   return ink_atlas.SampleLevel((slot_org + l) * inv_adim, lod);
 }
 
 float bricks_fetch_ink2(float3 slot_org, float3 bl_off, float lod, float inv_adim) {
   float inset = max(0.5 * exp2(lod), 0.5);
-  float3 l = clamp(bl_off, float3(inset), float3(128.0 - inset));
+  float3 l = clamp(bl_off, float3(inset), float3(16.0 - inset));
   return ink2_atlas.SampleLevel((slot_org + l) * inv_adim, lod);
 }
 
 float bricks_fetch_label(float3 slot_org, float3 bl_off, float inv_adim) {
   /* class ids must not blend: snap to the texel center so the linear
    * sampler degenerates to nearest */
-  float3 l = clamp(floor(bl_off) + 0.5, float3(0.5), float3(127.5));
+  float3 l = clamp(floor(bl_off) + 0.5, float3(0.5), float3(15.5));
   return label_atlas.SampleLevel((slot_org + l) * inv_adim, 0.0);
 }
 
 float bricks_fetch_reg(float3 slot_org, float3 bl_off, float inv_adim) {
-  float3 l = clamp(bl_off, float3(0.5), float3(127.5));
+  float3 l = clamp(bl_off, float3(0.5), float3(15.5));
   float v = reg_atlas.SampleLevel((slot_org + l) * inv_adim, 0.0);
   /* mirror the fixed volume's low-cut so aligned content fuses to gray
    * instead of a global magenta cast where the CT was gated */
@@ -151,9 +151,8 @@ struct BrickCtx {
   float world_brick; /* chosen brick edge in renderer/world units */
 };
 
-// slot geometry: 132^3 = 128 payload + 2-voxel apron per side (seamless
-// trilinear across bricks; clamp only guards coarse mips)
-static const float BR_SLOT = 128.0;
+// Slot geometry: 16^3 payload, no padding. Filtering clamps within a slot.
+static const float BR_SLOT = 16.0;
 static const float BR_AP = 0.0;
 static const uint BR_LOD_FLAG = 0x20000u;
 static const uint BR_PAGE_HEADER = 64u;
@@ -163,8 +162,8 @@ bool bricks_is_lod() { return (pc.brick_mode & BR_LOD_FLAG) != 0u; }
 BrickCtx bricks_locate(float3 p) {
   uint bpa = pc.brick_mode & 0xffu;
   uint abpa = (pc.brick_mode >> 8) & 0xffu;
-  float3 vp = saturate(p) * float(bpa * 128u);
-  uint3 bc = min(uint3(vp) >> 7u, uint3(bpa - 1u));
+  float3 vp = saturate(p) * float(bpa * 16u);
+  uint3 bc = min(uint3(vp) >> 4u, uint3(bpa - 1u));
   uint e = page[(bc.z * bpa + bc.y) * bpa + bc.x];
   BrickCtx c;
   c.ok = e != 0xFFFFFFFFu;
@@ -172,7 +171,7 @@ BrickCtx bricks_locate(float3 p) {
   uint slot = e & 0xFFFFFFu;
   uint3 sc = uint3(slot % abpa, (slot / abpa) % abpa, slot / (abpa * abpa));
   c.slot_org = float3(sc) * BR_SLOT + BR_AP; /* payload texel origin */
-  c.bl = vp - float3(bc << 7u);
+  c.bl = vp - float3(bc << 4u);
   c.atlas_lod = 0.0;
   c.grad_vox = 1.0;
   c.world_brick = 1.0 / float(bpa);
@@ -221,9 +220,9 @@ BrickCtx bricks_lod_locate_ex(float3 p, float lod, out uint scale_out, out uint3
       if (li < 0 || li > last || (step == 3u && li <= desired + 2)) continue;
       uint h = 4u + uint(li) * 4u;
       uint off = page[h], packed = page[h + 1u], scale = page[h + 2u];
-      uint3 bd = uint3(packed & 1023u, (packed >> 10u) & 1023u, packed >> 20u);
+      uint3 bd = uint3(packed, page[36u + uint(li) * 2u], page[37u + uint(li) * 2u]);
       float3 lv = base_v / float(scale);
-      uint3 bc = min(uint3(lv) >> 7u, bd - 1u);
+      uint3 bc = min(uint3(lv) >> 4u, bd - 1u);
       uint bi = off + (bc.z * bd.y + bc.y) * bd.x + bc.x;
       uint e = page[bi];
       if (e == 0xFFFFFFFFu) continue;
@@ -232,7 +231,7 @@ BrickCtx bricks_lod_locate_ex(float3 p, float lod, out uint scale_out, out uint3
       c.ok = true;
       c.maxv = float(e >> 24u) / 255.0;
       c.slot_org = float3(sc) * BR_SLOT + BR_AP;
-      c.bl = lv - float3(bc << 7u);
+      c.bl = lv - float3(bc << 4u);
       /* The disk pyramid is the LOD hierarchy.  Per-slot atlas mips are
        * intentionally disabled: independently replaced slots cannot form a
        * globally continuous mip image. */
@@ -260,10 +259,10 @@ BrickCtx bricks_lod_locate_cached(float3 p, float lod, inout LodCache lc) {
     float maxdim = max(base_shape.x, max(base_shape.y, base_shape.z));
     float3 base_v = clamp(p * maxdim, float3(0), max(base_shape - 0.001, float3(0)));
     float3 lv = base_v / float(lc.scale);
-    uint3 bc = uint3(lv) >> 7u;
+    uint3 bc = uint3(lv) >> 4u;
     if (all(bc == lc.bc)) {
       BrickCtx c = lc.c;
-      c.bl = lv - float3(bc << 7u);
+      c.bl = lv - float3(bc << 4u);
       return c;
     }
   }
@@ -283,7 +282,7 @@ BrickCtx bricks_lod_locate_cached(float3 p, float lod, inout LodCache lc) {
  * clamps once a mip's footprint would pass the 2-voxel apron. */
 float bricks_fetch(float3 slot_org, float3 bl_off, float lod, float inv_adim) {
   float inset = max(0.5 * exp2(lod) - BR_AP, 0.5);
-  float3 l = clamp(bl_off, float3(inset), float3(128.0 - inset));
+  float3 l = clamp(bl_off, float3(inset), float3(16.0 - inset));
   return brick_atlas.SampleLevel((slot_org + l) * inv_adim, lod);
 }
 
@@ -456,9 +455,9 @@ float vol_sample(float3 p, float lod) {
 
 bool is_ortho() { return (pc.view_flags & 1u) != 0u; }
 
-void store_px(uint2 opix, uint2 lp, bool half, float4 c) {
+void store_px(uint2 opix, uint2 lp, bool half_res, float4 c) {
   out_image[opix] = c;
-  if (half) {
+  if (half_res) {
     bool xin = lp.x + 1u < pc.viewport.x, yin = lp.y + 1u < pc.viewport.y;
     if (xin) out_image[opix + uint2(1, 0)] = c;
     if (yin) out_image[opix + uint2(0, 1)] = c;
@@ -478,7 +477,7 @@ float3 ray_dir(uint2 pix) {
 }
 
 /* ortho views offset the origin across the image plane instead of fanning
- * directions; cam_right/up carry the half-extents of the visible rect */
+ * directions; cam_right/up carry the half_res-extents of the visible rect */
 float3 ray_origin(uint2 pix) {
   if (!is_ortho()) return pc.cam_origin;
   float2 ndc = pix_ndc(pix);
@@ -505,10 +504,10 @@ float2 box_hit(float3 o, float3 d, float3 lo, float3 hi) {
 [shader("compute")]
 [numthreads(WG_X, WG_Y, 1)]
 void main(uint3 tid_in: SV_DispatchThreadID) {
-  /* half-res interaction mode: each thread owns a 2x2 pixel block, traces
+  /* half_res-res interaction mode: each thread owns a 2x2 pixel block, traces
    * the ray through its centre and stores to all four pixels */
-  bool half = (pc.view_flags & 32u) != 0u; /* R3D_VIEW_HALF */
-  uint3 tid = half ? uint3(tid_in.xy * 2u, 0) : tid_in;
+  bool half_res = (pc.view_flags & 32u) != 0u; /* R3D_VIEW_HALF */
+  uint3 tid = half_res ? uint3(tid_in.xy * 2u, 0) : tid_in;
   if (tid.x >= pc.viewport.x || tid.y >= pc.viewport.y) return;
   uint2 opix = tid.xy + uint2(pc.view_org & 0xffffu, pc.view_org >> 16);
 
@@ -517,7 +516,7 @@ void main(uint3 tid_in: SV_DispatchThreadID) {
      * texture over (u, v, layer) that surfvol.comp resampled from the bricks
      * cache along the per-vertex surface normals. FrameParams mapping:
      * cam_origin.xy = view center (flattened voxels), cam_right.x/cam_up.y =
-     * half-extents (voxels); slab_x0/y0 = window origin, slab_px = texel
+     * half_res-extents (voxels); slab_x0/y0 = window origin, slab_px = texel
      * pitch (voxels), slab_nx/ny = window texels, slab_wz = layer count,
      * slab_grid = layers behind the surface, max_mip = baked zoff0;
      * slab_z0 = render-time normal offset, slab_depth = marched thickness. */
@@ -526,7 +525,7 @@ void main(uint3 tid_in: SV_DispatchThreadID) {
     float4 bg = float4(0.02, 0.02, 0.03, 1);
     float2 txy = (fu - float2(pc.slab_x0, pc.slab_y0)) / pc.slab_px; /* texel coords */
     if (txy.x < 0.0 || txy.y < 0.0 || txy.x >= pc.slab_nx || txy.y >= pc.slab_ny) {
-      store_px(opix, tid.xy, half, bg);
+      store_px(opix, tid.xy, half_res, bg);
       return;
     }
     float L = float(pc.slab_wz);
@@ -537,7 +536,7 @@ void main(uint3 tid_in: SV_DispatchThreadID) {
     float lo = clamp(center - halfd, 0.0, L);
     float hi = clamp(center + halfd, 0.0, L);
     if (lo >= hi) {
-      store_px(opix, tid.xy, half, bg);
+      store_px(opix, tid.xy, half_res, bg);
       return;
     }
     if ((pc.view_flags & 8u) != 0u) {
@@ -554,7 +553,7 @@ void main(uint3 tid_in: SV_DispatchThreadID) {
       float4 cv0 = surf_coords.Load(int3(gi - int2(0, 1), 0));
       float4 cv1 = surf_coords.Load(int3(gi + int2(0, 1), 0));
       if (min(min(cu0.w, cu1.w), min(cv0.w, cv1.w)) < 0.5) {
-        store_px(opix, tid.xy, half, bg);
+        store_px(opix, tid.xy, half_res, bg);
         return;
       }
       float su = length(cu1.xyz - cu0.xyz) * 0.5 * pc.vol_tx;
@@ -569,7 +568,7 @@ void main(uint3 tid_in: SV_DispatchThreadID) {
                                           float3(1.0 / pc.slab_nx, 1.0 / pc.slab_ny,
                                                  1.0 / L),
                                       0).r;
-      store_px(opix, tid.xy, half, float4(col * (0.5 + 0.5 * ct), 1));
+      store_px(opix, tid.xy, half_res, float4(col * (0.5 + 0.5 * ct), 1));
       return;
     }
     float dt = max(pc.step_voxels, 0.25); /* layers per step (1 layer = 1 texel) */
@@ -637,14 +636,14 @@ void main(uint3 tid_in: SV_DispatchThreadID) {
         else if (mc >= 2u) color = lerp(color, float3(1.0, 0.55, 0.10), 0.55);
       }
     }
-    store_px(opix, tid.xy, half, float4(color, 1));
+    store_px(opix, tid.xy, half_res, float4(color, 1));
     return;
   }
 
   float3 dir = ray_dir(tid.xy);
 
   if (pc.mode == MODE_RAYDIR) {
-    store_px(opix, tid.xy, half, float4(dir * 0.5 + 0.5, 1));
+    store_px(opix, tid.xy, half_res, float4(dir * 0.5 + 0.5, 1));
     return;
   }
 
@@ -659,7 +658,7 @@ void main(uint3 tid_in: SV_DispatchThreadID) {
       voxel = 1.0 / md;
       max_lod = float(page[0] - 1u); // complete on-disk hierarchy
     } else {
-      voxel = 1.0 / float((pc.brick_mode & 0xffu) * 128u);
+      voxel = 1.0 / float((pc.brick_mode & 0xffu) * 16u);
       max_lod = 3.0;
     }
   } else if (is_vslab()) {
@@ -719,7 +718,7 @@ void main(uint3 tid_in: SV_DispatchThreadID) {
   float2 hit = box_hit(ro, dir, box_lo, box_hi);
   float tn = max(hit.x, t_lo), tf_ = min(hit.y, t_hi);
   if (tn >= tf_) {
-    store_px(opix, tid.xy, half, float4(0.02, 0.02, 0.03, 1)); // background
+    store_px(opix, tid.xy, half_res, float4(0.02, 0.02, 0.03, 1)); // background
     return;
   }
 
@@ -753,7 +752,7 @@ void main(uint3 tid_in: SV_DispatchThreadID) {
 
   // bricks mode: page entry cached across steps (rays cross bricks rarely)
   uint b_bpa = pc.brick_mode & 0xffu;
-  float b_N = float(b_bpa * 128u);
+  float b_N = float(b_bpa * 16u);
   uint b_abpa = bricks_is_lod() ? (pc.brick_mode & 0xffu) : ((pc.brick_mode >> 8) & 0xffu);
   float b_inv = 1.0 / (float(b_abpa) * BR_SLOT);
   uint b_last = 0xFFFFFFFFu;
@@ -761,7 +760,7 @@ void main(uint3 tid_in: SV_DispatchThreadID) {
   float b_max = 0.0;
   float3 b_slot = float3(0);
   float b_grad_vox = 1.0;
-  float b_world_brick = 128.0 * voxel;
+  float b_world_brick = 16.0 * voxel;
   LodCache b_lc;
   b_lc.valid = false;
   b_lc.desired = -1;
@@ -809,7 +808,7 @@ void main(uint3 tid_in: SV_DispatchThreadID) {
       } else {
         blod = clamp(lod, 0.0, 3.0);
         float3 vp = saturate(p) * b_N;
-        uint3 bc = min(uint3(vp) >> 7u, uint3(b_bpa - 1u));
+        uint3 bc = min(uint3(vp) >> 4u, uint3(b_bpa - 1u));
         uint bi = (bc.z * b_bpa + bc.y) * b_bpa + bc.x;
         if (bi != b_last) { /* page resolve only on brick crossings */
           b_last = bi;
@@ -821,7 +820,7 @@ void main(uint3 tid_in: SV_DispatchThreadID) {
           b_slot = float3(uint3(slot % abpa, (slot / abpa) % abpa, slot / (abpa * abpa))) *
                        BR_SLOT + BR_AP;
         }
-        b_bl = vp - float3(bc << 7u);
+        b_bl = vp - float3(bc << 4u);
         v = b_ok ? bricks_fetch(b_slot, b_bl, blod, b_inv) : 0.0;
       }
     } else {
@@ -832,7 +831,7 @@ void main(uint3 tid_in: SV_DispatchThreadID) {
 
     // empty-space skip, checked only where the fine sample is already void so
     // dense marching pays nothing. Cube mode: 8^3 occupancy blocks; bricks
-    // mode: whole 128^3 bricks via the page-table max byte.
+    // mode: whole 16^3 blocks via the page-table max byte.
     bool void_blk = false;
     float bsz = bs;
     if (is_bricks()) {
@@ -857,7 +856,7 @@ void main(uint3 tid_in: SV_DispatchThreadID) {
           if (occ.SampleLevel(p, 0) < bgate) void_blk = true;
         } else if (b_max < bgate) { /* whole brick void (cached page entry) */
           void_blk = true;
-          bsz = 128.0 * voxel;
+          bsz = 16.0 * voxel;
         } else if (occ.SampleLevel(p, 0) < bgate) { /* 8^3 block void */
           void_blk = true;
         }
@@ -1039,5 +1038,5 @@ void main(uint3 tid_in: SV_DispatchThreadID) {
     if (overlay2_on()) color = lerp(color, INK3D_RED, saturate(ink2_max * pc.ink3d_gain));
     if (labels_on() && lbl_max > 0.0) color = lerp(color, label_color(lbl_max), LBL_ALPHA);
   }
-  store_px(opix, tid.xy, half, float4(color, 1));
+  store_px(opix, tid.xy, half_res, float4(color, 1));
 }

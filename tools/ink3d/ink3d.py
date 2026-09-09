@@ -390,9 +390,9 @@ def cmd_scene(args):
         levels.append(
             f'    {{"level": {l}, "scale": {1 << l}, "shape": [{s[0]}, {s[1]}, {s[2]}], '
             f'"shards": [{sh[0]}, {sh[1]}, {sh[2]}], "zarr": "zarr/L{l}", '
-            f'"c5d": "c5d/L{l}/{{z}}_{{y}}_{{x}}.c5s", "c5d_quality": {q}}}')
+            f'"volcomp": "volcomp/L{l}/{{z}}_{{y}}_{{x}}.vcs", "volcomp_quality": {q}}}')
     (out / "manifest.json").write_text(
-        '{\n  "format": "render3d.c5d-lod.v1",\n'
+        '{\n  "format": "render3d.volcomp-lod.v1",\n'
         f'  "shape": [{shape[0]}, {shape[1]}, {shape[2]}],\n'
         '  "shard_shape": [1024, 1024, 1024],\n'
         '  "brick_shape": [128, 128, 128],\n'
@@ -401,7 +401,7 @@ def cmd_scene(args):
     lv = ",\n".join(f'    {{"level": {l}, "chunk": 256, "raw": false}}'
                     for l in range(NLEVELS))
     (out / "source.json").write_text(
-        '{\n  "format": "render3d.c5d-source.v1",\n'
+        '{\n  "format": "render3d.volcomp-source.v1",\n'
         f'  "url": "{url}",\n  "quality": 2,\n  "levels": [\n' + lv + "\n  ]\n}\n")
     print(f"ink3d: scene {out} -> {url}")
     print(f"ink3d: view with: ~/render3d-gpu --bricks <ct-lod>/manifest.json "

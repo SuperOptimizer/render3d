@@ -1,30 +1,69 @@
 # render3d
 
 High-performance volumetric renderer for Vesuvius Challenge micro-CT volumes.
-Pure C23 (clang/LLVM), SDL3 + Vulkan compute raycasting (GL 4.6 backend planned),
-Slang shaders → SPIR-V. Consumer of [c5d](https://github.com/SuperOptimizer/c5d) and its
-16³ chunk / 128³ brick / 1024³ shard hierarchy.
+C23 (clang/LLVM), SDL3, and Vulkan compute raycasting through MoltenVK on
+macOS. [volume-compressor](https://github.com/SuperOptimizer/volume-compressor)
+provides CPU-only volume decoding. Both the CPU sampling cache and GPU atlas
+use **16³ blocks (4 KiB of u8 voxels)**; disk chunks remain 128³.
 
-Milestone 1 status: 1024³ real scroll region (PHercParis4) at **225 fps /
-1920×1080** (full gradient shading, ray-cone LOD, release build, Adreno X1-85).
-
-- `spec/volume.md` — data conventions
-- `docs/measured.md` — every design decision with the numbers behind it
-- `docs/performance-review-20260806.md` — implemented performance plan, benchmark matrix,
-  portability work, and prioritized residual bottlenecks
-
-## Quick start
-
-Build dependencies are CMake 3.28+, Ninja, clang, SDL3, Vulkan headers/tools,
-libcurl, and pthreads. CMake fetches c5d at an audited commit; Slang remains a
-one-time pinned tool download.
+## macOS build and run
 
 ```sh
-tools/fetch_slang.sh                    # one-time: vendor pinned slangc
-cmake --preset release && cmake --build --preset release
-./build/release/assemble ~/compressor/corpus/full volume.u8   # 1024³ scroll region
-./build/release/render3d volume.u8 1024 1024 1024 --tf 1
+brew install cmake ninja llvm ccache sdl3 vulkan-headers vulkan-loader molten-vk shaderc c-blosc libtiff
+export PATH="$(brew --prefix llvm)/bin:$PATH"
+./tools/fetch_slang.sh
+cmake --preset macos
+cmake --build --preset macos
+ctest --preset macos -L quick
+./build/macos/render3d --probe
+./build/macos/render3d
 ```
+
+The last command opens the viewer with its synthetic volume. To open data:
+
+```sh
+./build/macos/volcomppack raw volume.u8 256 256 256 volume.vcs 2
+./build/macos/render3d --bricks volume.vcs
+./build/macos/render3d --bricks path/to/tree/manifest.json
+```
+
+CMake fetches pinned volume-compressor and fysics revisions. The Slang fetch
+script selects Linux/macOS and x86-64/ARM64. On macOS use Homebrew LLVM for C23;
+Apple's bundled compiler may be too old. MoltenVK is discovered through
+Homebrew's Vulkan ICD configuration. `--headless --frames 1 --shot out.ppm`
+checks rendering without opening a window.
+
+## Storage and caches
+
+`volcomppack`, `lodpack`, and `zarr2volcomp` write native volume-compressor
+payloads. `.volc` files contain one native 128³ chunk. `.vcs` files use
+render3d's VCS1 indexed container, with CRC32C and explicit missing/zero
+entries; this is not upstream's zarr `sharding_indexed` container.
+LOD trees use `render3d.volcomp-lod.v1` and `volcomp/L*/…vcs`.
+
+A CPU miss reconstructs only the requested 16³ block. The codec may entropy
+read up to 16 blocks within its substream but only runs the inverse transform
+for the requested block. CPU cache sizes count 4 KiB blocks (default 4096,
+16 MiB). The GPU page table and atlas also address 16³ blocks, uploaded after
+CPU decode. Compressed chunks are shared by their block requests in the warm
+cache. Fetch/transcode units remain 128³ chunks or the owning upstream Zarr
+cell; sparse decode does not imply 4 KiB network requests.
+
+`--pool N` now means N³ **16³** atlas slots. Painted class IDs remain exact
+in zlib R3L1 files; surface float coordinates and metadata remain exact in
+zlib R3F1 files. These are distinct from lossy u8 prediction volumes.
+Old c5d shards, brick caches, labels and TFX1 surface files are incompatible;
+rebuild from raw/Zarr/TIFF sources into a fresh output directory. `q` is the
+volume-compressor quantizer, 1–255; the old error-bound/tau knob is removed.
+The headless library ABI is version 2, with `surface_encode`/`surface_decode`
+entry points replacing the old format-specific functions. Historical benchmark
+documents describe the old implementation.
+
+MoltenVK runs cube, block-volume and surface views. The older tiled
+slab/clip/vslab modes require more combined samplers than this Mac exposes
+and are disabled by the capability check. The existing metadata budget still
+limits the number of virtual block pages; excessively large manifests fail
+with an explicit page-budget error.
 
 ## Controls
 
@@ -100,7 +139,7 @@ from the focus. Ctrl+click re-anchors the frames at the new focus; XY stays
 axis-aligned.
 
 **Whole-corpus surfaces**: pack a scroll's tifxyz segments with
-`segpack <store-dir> [-q log2q] <tifxyz-dir>...` (c5d-compressed `.tfx`
+`segpack <store-dir> [-q log2q] <tifxyz-dir>...` (volcomp-compressed `.tfx`
 grids + a manifest with per-tile AABBs), then add `--segments <store-dir>`:
 every surface crossing a plane view draws as a dimmed polyline under the
 active segment's curve. The frame loop only queries the tile index; a
@@ -144,23 +183,23 @@ aws s3 cp --no-sign-request --recursive \
   "s3://vesuvius-challenge-open-data/PHerc0172/segments/<seg>/mesh/<id>.tifxyz/" \
   cache/PHerc0172-segments/w062/
 # mirror coarse levels fully + fine chunks near the surface, then transcode
-./build/release/zarr2c5d cache/PHerc0172-zarr cache/PHerc0172-lod \
+./build/release/zarr2volcomp cache/PHerc0172-zarr cache/PHerc0172-lod \
   --surface cache/PHerc0172-segments/w062 --pad 64 --dry-run   # plan/estimate
-./build/release/zarr2c5d ... --list-missing missing.txt        # chunk list
+./build/release/zarr2volcomp ... --list-missing missing.txt        # chunk list
 tools/fetch_chunks.sh <volume-zarr-url> cache/PHerc0172-zarr missing.txt 24
-./build/release/zarr2c5d cache/PHerc0172-zarr cache/PHerc0172-lod \
+./build/release/zarr2volcomp cache/PHerc0172-zarr cache/PHerc0172-lod \
   --surface cache/PHerc0172-segments/w062 --pad 64 --verify 64
 ./build/release/render3d --bricks cache/PHerc0172-lod/manifest.json \
   --multiview cache/PHerc0172-segments/w062
 ```
 
-### Multiresolution Zarr + c5d bricks
+### Multiresolution Zarr + volcomp bricks
 
 `lodpack` builds the PHerc1218 pyramid without ever expanding the 18 GiB
 mirror into a terabyte-scale raw intermediate. L0 is hard-linked into a
 standard Zarr v3 hierarchy; L1-L7 are rounded isotropic 2x box reductions with
 true array shapes, 1024³ shards and 16³ dct3d chunks. Every completed Zarr
-chunk is decoded again before its 128³ brick is encoded to c5d, so the c5d
+chunk is decoded again before its 128³ brick is encoded to volcomp, so the volcomp
 tree is a closed-loop transcode of the Zarr tree. Output shard pairs are
 atomic and reruns skip completed work.
 
@@ -170,14 +209,14 @@ atomic and reruns skip completed work.
 
 # CPU/container/coordinate/fidelity check for any shard pair
 ./build/native/lodcheck cache/PHerc1218-lod/zarr/L1/c/1/1/1 \
-  cache/PHerc1218-lod/c5d/L1/1_1_1.c5s
+  cache/PHerc1218-lod/volcomp/L1/1_1_1.vcs
 
 # Global multi-shard renderer (use --pool/--warm to size the GPU caches)
 ./build/native/render3d --bricks cache/PHerc1218-lod/manifest.json \
   --pool 8 --warm 512 --tf 1
 ```
 
-The c5d quality ladder is inverted to spend more bits per voxel at coarse
+The volcomp quality ladder is inverted to spend more bits per voxel at coarse
 levels: q2 at L0, q1 at L1, q0.5 at L2 and q0.25 thereafter. The renderer
 opens a multilevel manifest as an 8-slice XY slab at mid-z. Wheel, R/F, and
 PageUp/PageDown move through z; Shift+wheel zooms. `--brick-z Z` selects the
@@ -189,9 +228,8 @@ to the visible slice and view cone, estimates each brick's projected
 base-voxel footprint, and requests the corresponding on-disk LOD. Sampling
 tries the desired level and at most two immediate parents before the pinned
 fallback, so independently arriving LODs compose without holes or arbitrary
-fine/coarse jumps. Manifest c5d decode is asynchronous on four CPU threads by
-default, avoiding contention with raycasting on this GPU's single compute and
-graphics queue; `R3D_BRICKS_GPU_DECODE=1` retains the diagnostic GPU path.
+fine/coarse jumps. Volume-compressor decode runs on a persistent CPU worker pool, leaving the
+graphics queue to upload and render requested 16³ blocks.
 
 Useful flags: `--size W H`, `--cam x y z yaw pitch`, `--tf N`, `--mode N`,
 `--no-vsync`, `--frames N --shot out.ppm` (headless capture), `--probe`
@@ -231,7 +269,7 @@ cached per segment; there is no automatic per-view inference).
 model behind the bucket's `surface-m7-L0` trees — over TCP (run it from villa's
 `ink-detection` env with `nnunetv2` installed: `uv run python
 tools/surf/surfserver.py <model-dir>`; ~3 s per 8-brick cell on an RTX 5080).
-`tools/surf/mkpredtree.py <ct-lod> <out>` creates a *predict tree*: a c5d LOD
+`tools/surf/mkpredtree.py <ct-lod> <out>` creates a *predict tree*: a volcomp LOD
 tree with the CT's geometry and no data whose `source.json` points at the
 server (`predict://127.0.0.1:9744` + `ct_root`). Use it anywhere a prediction
 tree goes — `--overlay <out>` for the tint, `tracecli <out>` / the GUI tracer
@@ -261,10 +299,8 @@ Presets: `dev` (ASan+UBSan RelWithDebInfo) / `release` (portable ThinLTO) /
 the GPU conformance test (renders vs a CPU reference raymarcher, needs the
 real GPU). Warnings are errors.
 
-c5d is fetched at the audited revision recorded by CMake. Codec developers may
-point `R3D_C5D_DIR` at a checkout; non-audited revisions additionally require
-`-DR3D_ALLOW_UNPINNED_C5D=ON` because the GPU glue and kernels share a private
-ABI.
+The codec revision is pinned in CMake. `R3D_VOLCOMP_DIR` can point at a local
+volume-compressor checkout for development; `--probe` reports its revision.
 
 Under the dev preset run with
 `LSAN_OPTIONS=suppressions=lsan.supp` — it silences leak reports from system

@@ -31,7 +31,7 @@ layout(push_constant) uniform Push {
   uint nl;                   /* layers this dispatch bakes per column (from z0) */
 } pc;
 
-const float BR_SLOT = 128.0;
+const float BR_SLOT = 16.0;
 const uint BR_PAGE_HEADER = 64u;
 
 /* Per-column brick cache: consecutive layers of one (u,v) column step one
@@ -51,9 +51,9 @@ vec2 bricks_sample_c(vec3 wp, vec3 shape, inout BCache c) {
   float inv = 1.0 / (float(pc.abpa) * BR_SLOT);
   if (c.valid) {
     vec3 lv = base_v / float(c.scale);
-    uvec3 bc = uvec3(lv) >> 7u;
+    uvec3 bc = uvec3(lv) >> 4u;
     if (all(equal(bc, c.bc))) {
-      vec3 bl = clamp(lv - vec3(bc << 7u), vec3(0.5), vec3(127.5));
+      vec3 bl = clamp(lv - vec3(bc << 4u), vec3(0.5), vec3(15.5));
       vec3 uvw = (c.so + bl) * inv;
       float ct = textureLod(atlas, uvw, 0.0).r;
       float ov = pc.use_ink != 0u ? textureLod(ink, uvw, 0.0).r : 0.0;
@@ -67,9 +67,9 @@ vec2 bricks_sample_c(vec3 wp, vec3 shape, inout BCache c) {
     if (li < 0 || li > last || (stp == 3u && li <= desired + 2)) continue;
     uint h = 4u + uint(li) * 4u;
     uint off = page[h], packed = page[h + 1u], scale = page[h + 2u];
-    uvec3 bd = uvec3(packed & 1023u, (packed >> 10u) & 1023u, packed >> 20u);
+    uvec3 bd = uvec3(packed, page[36u + uint(li) * 2u], page[37u + uint(li) * 2u]);
     vec3 lv = base_v / float(scale);
-    uvec3 bc = min(uvec3(lv) >> 7u, bd - 1u);
+    uvec3 bc = min(uvec3(lv) >> 4u, bd - 1u);
     uint e = page[off + (bc.z * bd.y + bc.y) * bd.x + bc.x];
     if (e == 0xFFFFFFFFu) continue;
     uint slot = e & 0xFFFFFFu;
@@ -79,7 +79,7 @@ vec2 bricks_sample_c(vec3 wp, vec3 shape, inout BCache c) {
     c.scale = scale;
     c.bc = bc;
     c.so = so;
-    vec3 bl = clamp(lv - vec3(bc << 7u), vec3(0.5), vec3(127.5));
+    vec3 bl = clamp(lv - vec3(bc << 4u), vec3(0.5), vec3(15.5));
     vec3 uvw = (so + bl) * inv;
     float ct = textureLod(atlas, uvw, 0.0).r;
     float ov = pc.use_ink != 0u ? textureLod(ink, uvw, 0.0).r : 0.0;

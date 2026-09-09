@@ -1,3 +1,4 @@
+#include "core/thread.h"
 #include "core/cpuvol.h"
 #include "core/surfpred.h"
 
@@ -14,10 +15,12 @@
 #include <time.h>
 #include <unistd.h>
 
-#include <brick.h> /* c5d brick decode */
-#include <shard.h> /* c5d .c5s reader */
+#include <brick.h> /* volcomp brick decode */
+#include <shard.h> /* volcomp .vcs reader */
 
-#define CV_BRICK 128u
+#define CV_BRICK 128u /* storage/fetch chunk */
+#define CV_BLOCK 16u
+#define CV_BLOCK_RAW 4096u
 #define CV_SHARD_BPA 8u /* 1024^3 shards = 8^3 bricks */
 #define CV_RAW ((size_t)CV_BRICK * CV_BRICK * CV_BRICK)
 
@@ -51,7 +54,7 @@ static bool cv_cell_ok(uint32_t chsz) {
   return cellb <= CV_MAX_CELL_BYTES && chb <= CV_MAX_CHUNK_BYTES;
 }
 
-/* Decode cache: a refcounted pool of 128^3 slabs shared by every sampler
+/* Decode cache: a refcounted pool of 16^3 blocks shared by every sampler
  * on one volume. A reader holds a lease that pins its slot, so a pointer
  * handed out under the pool lock stays valid and immutable until that
  * thread leases a different brick; eviction only ever considers unpinned
@@ -66,6 +69,7 @@ typedef struct cv_cache {
   uint32_t *pin;  /* live leases per slot; eviction skips nonzero */
   uint32_t nslots;
   uint64_t tick;
+  _Atomic uint64_t decoded_blocks;
   /* hash index over keys (open addressing, slot+1, 0 = empty) so a hit is
    * O(1) instead of a linear scan of every slot per non-memo lookup */
   uint32_t *hidx;
@@ -92,7 +96,7 @@ static cv_cache *cvc_new(uint32_t nslots) {
   atomic_init(&c->refs, 1u);
   pthread_mutex_init(&c->m, NULL);
   c->nslots = nslots;
-  c->slabs = malloc((size_t)nslots * CV_RAW);
+  c->slabs = malloc((size_t)nslots * CV_BLOCK_RAW);
   c->keys = malloc((size_t)nslots * sizeof *c->keys);
   c->use = calloc(nslots, sizeof *c->use);
   c->pin = calloc(nslots, sizeof *c->pin);
@@ -176,7 +180,7 @@ static void cv_tls_hook(void) {
 }
 
 typedef struct cv_reader {
-  c5d_shard_reader sr;
+  volcomp_shard_reader sr;
   bool open, failed;
 } cv_reader;
 
@@ -189,11 +193,11 @@ static int cv_u64_triplet(const char *p, uint64_t out[3]) {
              : -1;
 }
 
-int r3d_cpuvol_open(r3d_cpuvol *v, const char *root, uint32_t cache_bricks) {
-  return r3d_cpuvol_open_ex(v, root, cache_bricks, true);
+int r3d_cpuvol_open(r3d_cpuvol *v, const char *root, uint32_t cache_blocks) {
+  return r3d_cpuvol_open_ex(v, root, cache_blocks, true);
 }
 
-int r3d_cpuvol_open_ex(r3d_cpuvol *v, const char *root, uint32_t cache_bricks,
+int r3d_cpuvol_open_ex(r3d_cpuvol *v, const char *root, uint32_t cache_blocks,
                        bool allow_predict) {
   memset(v, 0, sizeof *v);
   pthread_mutex_init(&v->mu, NULL);
@@ -207,7 +211,7 @@ int r3d_cpuvol_open_ex(r3d_cpuvol *v, const char *root, uint32_t cache_bricks,
   size_t jn = fread(json, 1, sizeof json - 1, f);
   fclose(f);
   (void)jn;
-  if (!strstr(json, "\"format\": \"render3d.c5d-lod.v1\"")) return -1;
+  if (!strstr(json, "\"format\": \"render3d.volcomp-lod.v1\"")) return -1;
   const char *shape = strstr(json, "\"shape\"");
   uint64_t base[3];
   if (!shape || cv_u64_triplet(shape, base) != 0) return -1;
@@ -242,7 +246,7 @@ int r3d_cpuvol_open_ex(r3d_cpuvol *v, const char *root, uint32_t cache_bricks,
   if (!v->nlev) return -1;
   v->nreaders = nread;
   v->readers = calloc(nread ? nread : 1, sizeof(cv_reader));
-  v->cache = cvc_new(cache_bricks ? cache_bricks : 64);
+  v->cache = cvc_new(cache_blocks ? cache_blocks : 4096);
   v->id = atomic_fetch_add_explicit(&cv_next_id, 1u, memory_order_relaxed);
   v->nneg = 8192;
   v->neg_key = malloc((size_t)v->nneg * sizeof *v->neg_key);
@@ -312,7 +316,7 @@ void r3d_cpuvol_close(r3d_cpuvol *v) {
   cv_reader *rd = v->readers;
   if (rd)
     for (uint32_t i = 0; i < v->nreaders; i++)
-      if (rd[i].open) c5d_shard_close_reader(&rd[i].sr);
+      if (rd[i].open) volcomp_shard_close_reader(&rd[i].sr);
   free(v->readers);
   /* a lease this thread still holds on this pool must go before the volume
    * does; leases held by other threads keep the pool alive on their own */
@@ -334,7 +338,7 @@ void r3d_cpuvol_close(r3d_cpuvol *v) {
 }
 
 /* decode brick (li,bx,by,bz) into a cache slot; NULL when absent on disk */
-/* --- demand fetch: zarr chunks -> .c5b cache (mirrors ni_worker) --------- */
+/* --- demand fetch: zarr chunks -> .volc cache (mirrors ni_worker) --------- */
 
 /* response accumulator: growth is checked and capped at buf.max, so a
  * proxy error page or an endless body aborts the transfer instead of
@@ -393,7 +397,7 @@ static int cv_write_file(const char *path, const void *data, size_t n) {
 }
 
 /* Fetch the cell owning brick (bx,by,bz) at level li and write every brick
- * of the cell to <root>/bricks/L<li> (.c5b; empty file = absent/air). */
+ * of the cell to <root>/bricks/L<li> (.volc; empty file = absent/air). */
 static inline uint32_t cv_hash(uint64_t key) {
   key ^= key >> 33;
   key *= 0xff51afd7ed558ccdull;
@@ -461,7 +465,7 @@ static int cvc_publish(cv_cache *c, uint64_t key, const uint8_t *raw) {
   uint32_t vs = (uint32_t)victim;
   if (c->keys[vs] != UINT64_MAX) cvc_hremove(c, vs);
   c->keys[vs] = key;
-  memcpy(c->slabs + (size_t)vs * CV_RAW, raw, CV_RAW);
+  memcpy(c->slabs + (size_t)vs * CV_BLOCK_RAW, raw, CV_BLOCK_RAW);
   cvc_hinsert(c, vs);
   return victim;
 }
@@ -496,7 +500,7 @@ static CURL *cv_curl_new(void) {
 
 /* fetch the cell owning brick (bx,by,bz) with a caller-owned CURL handle;
  * bricks land in the decode cache directly (no encode->decode round trip
- * for the first use) and in the .c5b disk cache for later sessions */
+ * for the first use) and in the .volc disk cache for later sessions */
 static void cv_net_fetch_h(r3d_cpuvol *v, CURL *curl, uint32_t li, uint32_t bx, uint32_t by,
                            uint32_t bz) {
   if (v->sp) { /* predict source: produce the cell locally (writes the files
@@ -573,7 +577,7 @@ static void cv_net_fetch_h(r3d_cpuvol *v, CURL *curl, uint32_t li, uint32_t bx, 
                blosc_cbuffer_validate(buf.p, buf.n, &nb) == 0 && nb == chunk_bytes &&
                blosc_decompress_ctx(buf.p, chunk, chunk_bytes, 1) == (int)chunk_bytes;
         }
-        if (!ok) { /* fail the whole cell: write no .c5b, no empty marker */
+        if (!ok) { /* fail the whole cell: write no .volc, no empty marker */
           fprintf(stderr, "cpuvol: %s: malformed chunk payload (%zu bytes) - cell abandoned\n",
                   url, buf.n);
           pthread_mutex_lock(&v->mu);
@@ -598,14 +602,14 @@ static void cv_net_fetch_h(r3d_cpuvol *v, CURL *curl, uint32_t li, uint32_t bx, 
     snprintf(dir, sizeof dir, "%s/bricks/L%u", v->root, li);
     mkdir(dir, 0755);
     float q = v->q0 / (float)(1u << (li < 3u ? li : 3u));
-    if (q < 0.25f) q = 0.25f;
+    if (q < 1.0f) q = 1.0f;
     for (uint32_t sz2 = 0; sz2 < cb; sz2++)
       for (uint32_t sy2 = 0; sy2 < cb; sy2++)
         for (uint32_t sx2 = 0; sx2 < cb; sx2++) {
           uint32_t obz = cz * cb + sz2, oby = cy * cb + sy2, obx = cx * cb + sx2;
           if (obx >= l->bx || oby >= l->by || obz >= l->bz) continue;
           char path[1500];
-          snprintf(path, sizeof path, "%s/bricks/L%u/%u_%u_%u.c5b", v->root, li, obz,
+          snprintf(path, sizeof path, "%s/bricks/L%u/%u_%u_%u.volc", v->root, li, obz,
                    oby, obx);
           struct stat st;
           if (stat(path, &st) == 0) continue; /* another fetcher won */
@@ -630,14 +634,11 @@ static void cv_net_fetch_h(r3d_cpuvol *v, CURL *curl, uint32_t li, uint32_t bx, 
             cv_write_file(path, NULL, 0);
             continue;
           }
-          cv_cache_insert(v, ((uint64_t)li << 60) | ((uint64_t)obz << 40) |
-                                 ((uint64_t)oby << 20) | obx,
-                          raw);
-          c5d_brick_params bp = c5d_brick_defaults(1.0f);
+          volcomp_brick_params bp = volcomp_brick_defaults(1.0f);
           bp.q = q;
           uint8_t *enc = NULL;
           size_t en = 0;
-          if (c5d_brick_encode(&bp, raw, CV_BRICK, &enc, &en) == 0) {
+          if (volcomp_brick_encode(&bp, raw, CV_BRICK, &enc, &en) == 0) {
             cv_write_file(path, enc, en);
             free(enc);
           }
@@ -674,8 +675,19 @@ static void cv_cache_insert(r3d_cpuvol *v, uint64_t key, const uint8_t *raw) {
 
 void r3d_cpuvol_cache_put(r3d_cpuvol *v, uint32_t li, uint32_t bx, uint32_t by, uint32_t bz,
                           const uint8_t *raw) {
-  uint64_t key = ((uint64_t)li << 60) | ((uint64_t)bz << 40) | ((uint64_t)by << 20) | bx;
-  cv_cache_insert(v, key, raw);
+  if (!raw || li >= v->nlev) return;
+  uint8_t block[CV_BLOCK_RAW];
+  for (uint32_t z = 0; z < 8; z++)
+    for (uint32_t y = 0; y < 8; y++)
+      for (uint32_t x = 0; x < 8; x++) {
+        for (uint32_t rz = 0; rz < 16; rz++)
+          for (uint32_t ry = 0; ry < 16; ry++)
+            memcpy(block + (rz * 16u + ry) * 16u,
+                   raw + ((z * 16u + rz) * 128u + y * 16u + ry) * 128u + x * 16u, 16);
+        uint64_t key = ((uint64_t)li << 60) | ((uint64_t)(bz * 8u + z) << 40) |
+                       ((uint64_t)(by * 8u + y) << 20) | (bx * 8u + x);
+        cv_cache_insert(v, key, block);
+      }
 }
 
 void r3d_cpuvol_read_block(r3d_cpuvol *v, uint32_t li, int64_t x0, int64_t y0, int64_t z0,
@@ -683,22 +695,22 @@ void r3d_cpuvol_read_block(r3d_cpuvol *v, uint32_t li, int64_t x0, int64_t y0, i
   memset(out, 0, (size_t)nx * ny * nz);
   if (li >= v->nlev) return;
   const r3d_cpuvol_level *l = &v->lev[li];
-  int64_t bx0 = x0 < 0 ? 0 : x0 / CV_BRICK, bx1 = (x0 + nx - 1) / CV_BRICK;
-  int64_t by0 = y0 < 0 ? 0 : y0 / CV_BRICK, by1 = (y0 + ny - 1) / CV_BRICK;
-  int64_t bz0 = z0 < 0 ? 0 : z0 / CV_BRICK, bz1 = (z0 + nz - 1) / CV_BRICK;
-  if (bx1 >= (int64_t)l->bx) bx1 = (int64_t)l->bx - 1;
-  if (by1 >= (int64_t)l->by) by1 = (int64_t)l->by - 1;
-  if (bz1 >= (int64_t)l->bz) bz1 = (int64_t)l->bz - 1;
+  int64_t bx0 = x0 < 0 ? 0 : x0 / CV_BLOCK, bx1 = (x0 + nx - 1) / CV_BLOCK;
+  int64_t by0 = y0 < 0 ? 0 : y0 / CV_BLOCK, by1 = (y0 + ny - 1) / CV_BLOCK;
+  int64_t bz0 = z0 < 0 ? 0 : z0 / CV_BLOCK, bz1 = (z0 + nz - 1) / CV_BLOCK;
+  if (bx1 >= (int64_t)((l->vx + 15u) / 16u)) bx1 = (int64_t)((l->vx + 15u) / 16u) - 1;
+  if (by1 >= (int64_t)((l->vy + 15u) / 16u)) by1 = (int64_t)((l->vy + 15u) / 16u) - 1;
+  if (bz1 >= (int64_t)((l->vz + 15u) / 16u)) bz1 = (int64_t)((l->vz + 15u) / 16u) - 1;
   for (int64_t bz = bz0; bz <= bz1; bz++)
     for (int64_t by = by0; by <= by1; by++)
       for (int64_t bx = bx0; bx <= bx1; bx++) {
         const uint8_t *b = cv_brick(v, li, (uint32_t)bx, (uint32_t)by, (uint32_t)bz);
         if (!b) continue;
         /* overlap of this brick with the block, in block coordinates */
-        int64_t ox0 = bx * CV_BRICK, oy0 = by * CV_BRICK, oz0 = bz * CV_BRICK;
-        int64_t sx0 = ox0 > x0 ? ox0 : x0, sx1 = ox0 + CV_BRICK < x0 + nx ? ox0 + CV_BRICK : x0 + nx;
-        int64_t sy0 = oy0 > y0 ? oy0 : y0, sy1 = oy0 + CV_BRICK < y0 + ny ? oy0 + CV_BRICK : y0 + ny;
-        int64_t sz0 = oz0 > z0 ? oz0 : z0, sz1 = oz0 + CV_BRICK < z0 + nz ? oz0 + CV_BRICK : z0 + nz;
+        int64_t ox0 = bx * CV_BLOCK, oy0 = by * CV_BLOCK, oz0 = bz * CV_BLOCK;
+        int64_t sx0 = ox0 > x0 ? ox0 : x0, sx1 = ox0 + CV_BLOCK < x0 + nx ? ox0 + CV_BLOCK : x0 + nx;
+        int64_t sy0 = oy0 > y0 ? oy0 : y0, sy1 = oy0 + CV_BLOCK < y0 + ny ? oy0 + CV_BLOCK : y0 + ny;
+        int64_t sz0 = oz0 > z0 ? oz0 : z0, sz1 = oz0 + CV_BLOCK < z0 + nz ? oz0 + CV_BLOCK : z0 + nz;
         if (sx1 <= sx0 || sy1 <= sy0 || sz1 <= sz0) continue;
         /* the volume's valid extent (partial edge bricks) */
         int64_t vx1 = (int64_t)l->vx, vy1 = (int64_t)l->vy, vz1 = (int64_t)l->vz;
@@ -708,7 +720,7 @@ void r3d_cpuvol_read_block(r3d_cpuvol *v, uint32_t li, int64_t x0, int64_t y0, i
         for (int64_t z = sz0; z < sz1; z++)
           for (int64_t y = sy0; y < sy1; y++)
             memcpy(out + ((size_t)(z - z0) * ny + (size_t)(y - y0)) * nx + (size_t)(sx0 - x0),
-                   b + ((size_t)(z - oz0) * CV_BRICK + (size_t)(y - oy0)) * CV_BRICK +
+                   b + ((size_t)(z - oz0) * CV_BLOCK + (size_t)(y - oy0)) * CV_BLOCK +
                        (size_t)(sx0 - ox0),
                    (size_t)(sx1 - sx0));
       }
@@ -762,7 +774,7 @@ int r3d_cpuvol_prefetch(r3d_cpuvol *v, uint32_t li, const uint32_t *bxyz, uint32
     }
     if (have) continue;
     char path[1400];
-    snprintf(path, sizeof path, "%s/bricks/L%u/%u_%u_%u.c5b", v->root, li, bz, by, bx);
+    snprintf(path, sizeof path, "%s/bricks/L%u/%u_%u_%u.volc", v->root, li, bz, by, bx);
     struct stat st;
     if (stat(path, &st) == 0) continue; /* on disk: the sampler decodes it */
     uint64_t c = ((uint64_t)(bz / cb) << 40) | ((uint64_t)(by / cb) << 20) | (bx / cb);
@@ -782,7 +794,7 @@ int r3d_cpuvol_prefetch(r3d_cpuvol *v, uint32_t li, const uint32_t *bxyz, uint32
   pthread_t th[16];
   uint32_t spawned = 0;
   for (uint32_t t = 0; t + 1 < threads; t++)
-    if (pthread_create(&th[spawned], NULL, cv_pf_thread, &job) == 0) spawned++;
+    if (r3d_thread_create(&th[spawned], NULL, cv_pf_thread, &job) == 0) spawned++;
   cv_pf_thread(&job);
   for (uint32_t t = 0; t < spawned; t++) pthread_join(th[t], NULL);
   free(cells);
@@ -821,13 +833,15 @@ static const uint8_t *cv_brick(r3d_cpuvol *v, uint32_t li, uint32_t bx, uint32_t
   int hs = cvc_find(c, key);
   if (hs >= 0) {
     c->use[hs] = ++c->tick;
-    const uint8_t *hit = c->slabs + (size_t)hs * CV_RAW;
+    const uint8_t *hit = c->slabs + (size_t)hs * CV_BLOCK_RAW;
     cv_lease_take(c, (uint32_t)hs, key, hit);
     pthread_mutex_unlock(&c->m);
     return hit;
   }
   pthread_mutex_unlock(&c->m);
 
+  uint32_t ox = bx % 8u, oy = by % 8u, oz = bz % 8u;
+  bx /= 8u; by /= 8u; bz /= 8u; /* source chunk containing this 16^3 block */
   uint64_t now_s = (uint64_t)time(NULL);
   pthread_mutex_lock(&v->mu);
   bool absent = cv_neg_hit(v, key, now_s);
@@ -850,8 +864,8 @@ static const uint8_t *cv_brick(r3d_cpuvol *v, uint32_t li, uint32_t bx, uint32_t
         (cv_reader *)v->readers + l->shard_off + (sz * l->sy + sy) * l->sx + sx;
     if (!rd->open && !rd->failed) {
       char path[1400];
-      snprintf(path, sizeof path, "%s/c5d/L%u/%u_%u_%u.c5s", v->root, li, sz, sy, sx);
-      if (c5d_shard_open(path, &rd->sr) == 0 && rd->sr.foot.brick_dim == CV_BRICK &&
+      snprintf(path, sizeof path, "%s/volcomp/L%u/%u_%u_%u.vcs", v->root, li, sz, sy, sx);
+      if (volcomp_shard_open(path, &rd->sr) == 0 && rd->sr.foot.brick_dim == CV_BRICK &&
           rd->sr.foot.shard_dim == 1024u)
         rd->open = true;
       else
@@ -861,20 +875,14 @@ static const uint8_t *cv_brick(r3d_cpuvol *v, uint32_t li, uint32_t bx, uint32_t
       uint32_t bi = ((bz % CV_SHARD_BPA) * CV_SHARD_BPA + (by % CV_SHARD_BPA)) *
                         CV_SHARD_BPA +
                     (bx % CV_SHARD_BPA);
-      const uint8_t *sb = c5d_shard_brick(&rd->sr, bi, &bn);
-      if (sb && bn) { /* copy out: the reader's buffer is not ours to keep
-                       * past the lock */
-        owned = malloc(bn);
-        if (owned) {
-          memcpy(owned, sb, bn);
-          blob = owned;
-        }
-      }
+      const uint8_t *sb = volcomp_shard_brick(&rd->sr, bi, &bn);
+      if (sb && bn) blob = sb;
+
     }
   }
   if (!blob) { /* net-ingest cache file (empty = absent/air) */
     char path[1400];
-    snprintf(path, sizeof path, "%s/bricks/L%u/%u_%u_%u.c5b", v->root, li, bz, by, bx);
+    snprintf(path, sizeof path, "%s/bricks/L%u/%u_%u_%u.volc", v->root, li, bz, by, bx);
     FILE *bf = fopen(path, "rb");
     if (!bf && v->url[0]) { /* never fetched: pull the owning cell now */
       cv_net_fetch(v, li, bx, by, bz);
@@ -907,9 +915,10 @@ static const uint8_t *cv_brick(r3d_cpuvol *v, uint32_t li, uint32_t bx, uint32_t
   }
 
   /* ---- decode outside the locks ---- */
-  if (!cv_scratch) cv_scratch = malloc(CV_RAW);
-  bool ok = cv_scratch && c5d_brick_decode(blob, bn, cv_scratch, CV_BRICK) == 0;
+  if (!cv_scratch) cv_scratch = malloc(CV_BLOCK_RAW);
+  bool ok = cv_scratch && r3d_decode_block(blob, bn, oz, oy, ox, cv_scratch) == 0;
   free(owned);
+  if (ok) atomic_fetch_add(&c->decoded_blocks, 1);
   if (!ok) { /* remember the failure briefly; retry when the TTL lapses */
     pthread_mutex_lock(&v->mu);
     cv_neg_put(v, key, now_s + CV_NEG_TTL_S);
@@ -926,7 +935,7 @@ static const uint8_t *cv_brick(r3d_cpuvol *v, uint32_t li, uint32_t bx, uint32_t
     }
   }
   c->use[hs] = ++c->tick;
-  const uint8_t *got = c->slabs + (size_t)hs * CV_RAW;
+  const uint8_t *got = c->slabs + (size_t)hs * CV_BLOCK_RAW;
   cv_lease_take(c, (uint32_t)hs, key, got);
   pthread_mutex_unlock(&c->m);
   return got;
@@ -938,11 +947,11 @@ static double cv_vox(r3d_cpuvol *v, uint32_t li, int64_t lx, int64_t ly, int64_t
       lz >= (int64_t)l->vz)
     return 0.0;
   const uint8_t *b =
-      cv_brick(v, li, (uint32_t)lx / CV_BRICK, (uint32_t)ly / CV_BRICK, (uint32_t)lz / CV_BRICK);
+      cv_brick(v, li, (uint32_t)lx / CV_BLOCK, (uint32_t)ly / CV_BLOCK, (uint32_t)lz / CV_BLOCK);
   if (!b) return 0.0;
-  uint32_t ox = (uint32_t)lx % CV_BRICK, oy = (uint32_t)ly % CV_BRICK,
-           oz = (uint32_t)lz % CV_BRICK;
-  return (double)b[((size_t)oz * CV_BRICK + oy) * CV_BRICK + ox];
+  uint32_t ox = (uint32_t)lx % CV_BLOCK, oy = (uint32_t)ly % CV_BLOCK,
+           oz = (uint32_t)lz % CV_BLOCK;
+  return (double)b[((size_t)oz * CV_BLOCK + oy) * CV_BLOCK + ox];
 }
 
 double r3d_cpuvol_tri(r3d_cpuvol *v, uint32_t li, const double p[3], double grad[3]) {
@@ -953,6 +962,7 @@ double r3d_cpuvol_tri(r3d_cpuvol *v, uint32_t li, const double p[3], double grad
   double fx = floor(lx), fy = floor(ly), fz = floor(lz);
   double tx = lx - fx, ty = ly - fy, tz = lz - fz;
   int64_t ix = (int64_t)fx, iy = (int64_t)fy, iz = (int64_t)fz;
+  if (!grad && tx == 0 && ty == 0 && tz == 0) return cv_vox(v, li, ix, iy, iz);
   double c[2][2][2];
   for (int dz = 0; dz < 2; dz++)
     for (int dy = 0; dy < 2; dy++)
@@ -980,8 +990,21 @@ uint8_t r3d_cpuvol_at(r3d_cpuvol *v, uint32_t li, double x, double y, double z) 
   uint32_t lx = (uint32_t)(x / l->scale), ly = (uint32_t)(y / l->scale),
            lz = (uint32_t)(z / l->scale);
   if (lx >= l->vx || ly >= l->vy || lz >= l->vz) return 0;
-  const uint8_t *b = cv_brick(v, li, lx / CV_BRICK, ly / CV_BRICK, lz / CV_BRICK);
+  const uint8_t *b = cv_brick(v, li, lx / CV_BLOCK, ly / CV_BLOCK, lz / CV_BLOCK);
   if (!b) return 0;
-  uint32_t ox = lx % CV_BRICK, oy = ly % CV_BRICK, oz = lz % CV_BRICK;
-  return b[((size_t)oz * CV_BRICK + oy) * CV_BRICK + ox];
+  uint32_t ox = lx % CV_BLOCK, oy = ly % CV_BLOCK, oz = lz % CV_BLOCK;
+  return b[((size_t)oz * CV_BLOCK + oy) * CV_BLOCK + ox];
+}
+
+void r3d_cpuvol_get_cache_stats(r3d_cpuvol *v, r3d_cpuvol_cache_stats *out) {
+  memset(out,0,sizeof *out);
+  cv_cache *c=v->cache;
+  if (!c) return;
+  pthread_mutex_lock(&c->m);
+  out->capacity_blocks=c->nslots;
+  for (uint32_t i=0;i<c->nslots;i++) out->resident_blocks+=c->keys[i]!=UINT64_MAX;
+  out->capacity_bytes=(size_t)out->capacity_blocks*CV_BLOCK_RAW;
+  out->resident_bytes=(size_t)out->resident_blocks*CV_BLOCK_RAW;
+  out->decoded_blocks=atomic_load(&c->decoded_blocks);
+  pthread_mutex_unlock(&c->m);
 }

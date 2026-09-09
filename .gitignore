@@ -8,5 +8,5 @@ band/
 cache/
 *.shard
 pyramid/
-*.c5s
+*.vcs
 imgui.ini

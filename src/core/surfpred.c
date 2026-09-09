@@ -12,7 +12,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#include <brick.h> /* c5d brick encode */
+#include <brick.h> /* volcomp brick encode */
 
 #define SP_BRICK 128u
 #define SP_CELL 256u /* 2x2x2 bricks == one P+1 brick */
@@ -137,7 +137,7 @@ static bool sp_cell_on_disk(r3d_surfpred *sp, uint32_t P, uint32_t cx, uint32_t 
         uint32_t bx = cx * 2 + sx, by = cy * 2 + sy, bz = cz * 2 + sz;
         if (bx >= lp->bx || by >= lp->by || bz >= lp->bz) continue;
         char path[1500];
-        snprintf(path, sizeof path, "%s/bricks/L%u/%u_%u_%u.c5b", sp->root, P, bz, by, bx);
+        snprintf(path, sizeof path, "%s/bricks/L%u/%u_%u_%u.volc", sp->root, P, bz, by, bx);
         struct stat st;
         if (stat(path, &st) != 0) return false;
       }
@@ -171,7 +171,7 @@ static bool sp_mkdir(const char *dir) {
  * (sp_write_file only publishes via rename on full success), so a later
  * request that re-checks disk state will retry this brick rather than treat
  * it as complete. */
-static bool sp_write_brick(r3d_surfpred *sp, const c5d_brick_params *bp, uint32_t li,
+static bool sp_write_brick(r3d_surfpred *sp, const volcomp_brick_params *bp, uint32_t li,
                            uint32_t bx, uint32_t by, uint32_t bz, const uint8_t *raw,
                            r3d_cpuvol *cache) {
   char dir[1300], path[1500];
@@ -179,7 +179,7 @@ static bool sp_write_brick(r3d_surfpred *sp, const c5d_brick_params *bp, uint32_
   bool dir_ok = sp_mkdir(dir);
   snprintf(dir, sizeof dir, "%s/bricks/L%u", sp->root, li);
   dir_ok = sp_mkdir(dir) && dir_ok;
-  snprintf(path, sizeof path, "%s/bricks/L%u/%u_%u_%u.c5b", sp->root, li, bz, by, bx);
+  snprintf(path, sizeof path, "%s/bricks/L%u/%u_%u_%u.volc", sp->root, li, bz, by, bx);
   bool zero = true;
   for (size_t i = 0; i < SP_RAW && zero; i++) zero = raw[i] == 0;
   bool ok = true;
@@ -192,7 +192,7 @@ static bool sp_write_brick(r3d_surfpred *sp, const c5d_brick_params *bp, uint32_
     } else {
       uint8_t *enc = NULL;
       size_t en = 0;
-      ok = c5d_brick_encode(bp, raw, SP_BRICK, &enc, &en) == 0 &&
+      ok = volcomp_brick_encode(bp, raw, SP_BRICK, &enc, &en) == 0 &&
            sp_write_file(path, enc, en) == 0;
       free(enc);
     }
@@ -261,7 +261,7 @@ int r3d_surfpred_cell(r3d_surfpred *sp, uint32_t li, uint32_t bx, uint32_t by, u
   uint64_t ckey = ((uint64_t)cz << 40) | ((uint64_t)cy << 20) | cx;
 
   pthread_mutex_lock(&sp->mu);
-  c5d_brick_params bp = c5d_brick_defaults(1.0f);
+  volcomp_brick_params bp = volcomp_brick_defaults(1.0f);
   bp.q = sp->q;
   int rc = 0;
   const uint8_t *cellv = sp_ring_get(sp, ckey); /* thresholded 256^3 level-P */

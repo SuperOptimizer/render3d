@@ -1,4 +1,4 @@
-/* On-demand surface prediction: fills a "predict tree" (a c5d LOD tree with
+/* On-demand surface prediction: fills a "predict tree" (a volcomp LOD tree with
  * the CT's geometry, no data of its own, source.json url predict://host:port
  * + ct_root) by sampling CT blocks, running them through tools/surf/
  * surfserver.py (nnU-Net surface_m7), and writing the resulting bricks into
@@ -27,7 +27,7 @@ typedef struct r3d_surfpred {
   int port;
   uint32_t margin;    /* context voxels around the cell (default 32) */
   float th;           /* probabilities below th read as 0 (default 0.2) */
-  float q;            /* c5d quality for the written bricks */
+  float q;            /* volcomp quality for the written bricks */
   uint32_t pred_level; /* CT level fed to the model (0 = 8-9um scans, 2 = 2.4um) */
   r3d_cpuvol ct;
   bool ct_ok;
@@ -55,7 +55,7 @@ int r3d_surfpred_open(r3d_surfpred *sp, const char *pred_root);
 void r3d_surfpred_close(r3d_surfpred *sp);
 
 /* Serve brick (bx,by,bz) at level li: predicts the owning level-P cell if
- * needed (writing its eight P bricks + the P+1 brick as .c5b, skipping ones
+ * needed (writing its eight P bricks + the P+1 brick as .volc, skipping ones
  * on disk), for li < P writes the requested upsampled brick, optionally
  * inserts produced bricks into `cache` (a cpuvol over the same tree), and if
  * `out` is non-NULL fills it with the requested cell content (li == P: the

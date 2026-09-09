@@ -3,11 +3,11 @@
  * so the renderer's own net-ingest workers must fetch L0 chunks from an
  * in-process HTTP stub. Asserts the fail-closed contract on the vkbackend
  * path (the cpuvol analogue lives in test_ingest):
- *  - captive-portal HTML 200s: the app keeps running, and NO .c5b cache
+ *  - captive-portal HTML 200s: the app keeps running, and NO .volc cache
  *    artifact or empty marker is written (the region can heal)
  *  - a later healthy run fetches, renders content, and persists non-empty
- *    .c5b bricks that serve the next session
- *  - 404s on a fresh cache become permanent empty markers (0-byte .c5b)
+ *    .volc bricks that serve the next session
+ *  - 404s on a fresh cache become permanent empty markers (0-byte .volc)
  * Usage: test_netstream <path-to-render3d> */
 #include <arpa/inet.h>
 #include <dirent.h>
@@ -164,9 +164,9 @@ int main(int argc, char **argv) {
   if (st_make_tree(root, dim, 2, 0) != 0) return 1;
   { /* drop the fine level's shard: L0 must come from the network */
     char p[700];
-    snprintf(p, sizeof p, "%s/c5d/L0/0_0_0.c5s", root);
+    snprintf(p, sizeof p, "%s/volcomp/L0/0_0_0.vcs", root);
     unlink(p);
-    snprintf(p, sizeof p, "%s/c5d/L0", root);
+    snprintf(p, sizeof p, "%s/volcomp/L0", root);
     rmdir(p);
   }
   g_listen = socket(AF_INET, SOCK_STREAM, 0);
@@ -187,7 +187,7 @@ int main(int argc, char **argv) {
     FILE *f = fopen(p, "w");
     if (!f) return 1;
     fprintf(f,
-            "{\n  \"format\": \"render3d.c5d-source.v1\",\n"
+            "{\n  \"format\": \"render3d.volcomp-source.v1\",\n"
             "  \"url\": \"http://127.0.0.1:%u\",\n  \"quality\": 2,\n"
             "  \"levels\": [\n    {\"level\": 0, \"chunk\": 128, \"raw\": true},\n"
             "    {\"level\": 1, \"chunk\": 128, \"raw\": true}\n  ]\n}\n",

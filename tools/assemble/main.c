@@ -1,4 +1,4 @@
-/* assemble — concatenate a contiguous grid of 128^3 raw u8 bricks (c5d corpus
+/* assemble — concatenate a contiguous grid of 128^3 raw u8 bricks (volcomp corpus
  * naming: <sample>_z<Z>_y<Y>_x<X>.u8) into one flat volume.u8 (spec/volume.md).
  *
  *   assemble <corpus_dir> <out.u8> [sample]

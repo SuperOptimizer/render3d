@@ -43,3 +43,18 @@ jobs:
       - name: quick tests
         working-directory: build/${{ matrix.preset }}
         run: ctest -L quick --output-on-failure
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: dependencies
+        run: brew install cmake ninja llvm ccache sdl3 vulkan-headers vulkan-loader molten-vk shaderc c-blosc libtiff
+      - name: configure and build
+        run: |
+          export PATH="$(brew --prefix llvm)/bin:$PATH"
+          tools/fetch_slang.sh
+          cmake --preset macos
+          cmake --build --preset macos
+      - name: CPU tests
+        run: ctest --preset macos -L quick

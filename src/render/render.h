@@ -40,15 +40,12 @@ int r3d_clip_begin(r3d_renderer *r, const char *band_dir, const char *pyramid_di
                    uint32_t band_z, uint32_t depth_max);
 int r3d_clip_frame(r3d_renderer *r, double fx, double fy, uint64_t z0, r3d_frame_params *p);
 
-/* Bricks mode: a c5d .c5s shard decoded ON the GPU (entropy/IDCT/deblock
- * compute kernels) into an R8 atlas image — compressed bytes are all that
- * crosses to the GPU. Two-tier GPU cache: a WARM buffer of compressed bricks
- * (warm_mb MB, LRU) feeds budgeted decodes into the HOT atlas (pool_bpa slots
- * per axis, LRU, page-table indirected). pool_bpa >= the volume's bricks per
- * axis (or 0 when the volume fits the default pool) selects full identity
- * residency up front — the streaming pump is then a no-op. */
-int r3d_bricks_begin(r3d_renderer *r, const char *c5s_path, uint32_t pool_bpa, uint32_t warm_mb);
-/* Overlay volume (e.g. 3D ink predictions): a second c5d LOD tree with the
+/* Volume-compressor storage chunks (128^3) are CPU decoded into requested
+ * 16^3 blocks and uploaded to the R8 atlas. warm_mb budgets shared compressed
+ * chunks; pool_bpa budgets N^3 resident 16^3 GPU blocks. A standalone shard
+ * that fits the pool uses identity residency; manifests stream by LOD. */
+int r3d_bricks_begin(r3d_renderer *r, const char *shard_path, uint32_t pool_bpa, uint32_t warm_mb);
+/* Overlay volume (e.g. 3D ink predictions): a second volcomp LOD tree with the
  * SAME shape/levels as the primary manifest. Its bricks share the page table
  * and slot assignment — whenever a CT brick is decoded, the matching overlay
  * brick lands in the same slot of a parallel atlas (absent = 0). Call after
@@ -75,7 +72,7 @@ void r3d_bricks_refilter(r3d_renderer *r);
 /* 3D labelling display: a slot-parallel class-id atlas (binding 12) the
  * shader tints per class (overlay_flags bit 3). The CPU label volume is the
  * source of truth; gen() is polled per resident slot per frame (must be
- * cheap) and fetch() fills a 128^3 class-id brick only when gen changed. */
+ * cheap) and fetch() fills a 16^3 class-id block only when gen changed. */
 typedef struct r3d_label_src {
   uint32_t (*gen)(void *user, uint32_t level, uint32_t bx, uint32_t by, uint32_t bz);
   void (*fetch)(void *user, uint32_t level, uint32_t bx, uint32_t by, uint32_t bz,
@@ -119,7 +116,7 @@ void r3d_bricks_params(const r3d_renderer *r, r3d_frame_params *p);
  * position/forward in VOLUME space (normalized [0,1] cube coords, model
  * transform already inverted); half_tan = tan(fov_y/2) * frustum diagonal
  * factor; pixel_cone = world-space ray-cone growth per unit distance (two
- * adjacent vertical pixel rays), used to choose the c5d resolution whose
+ * adjacent vertical pixel rays), used to choose the volcomp resolution whose
  * voxel pitch matches apparent magnification; gate = minimum visible voxel
  * value [0,1] (TF-aware, empty bricks below it never occupy slots); budget =
  * max bricks decoded this call. */
@@ -159,6 +156,8 @@ typedef struct r3d_bricks_stats {
 void r3d_bricks_get_stats(r3d_renderer *r, r3d_bricks_stats *st);
 /* Wait for the currently queued streaming batch (benchmark/shutdown boundary). */
 void r3d_bricks_flush(r3d_renderer *r);
+/* Finish pending CPU atlas uploads before a deterministic capture. */
+void r3d_bricks_settle(r3d_renderer *r);
 /* Virtual slab: a W x H x D window positioned anywhere in a sharded Zarr
  * export, streamed from a local cache with remote fetch on miss
  * (R3D_VSLAB_NOFETCH=1 disables). shard_url is the array's `/c` URL; NULL

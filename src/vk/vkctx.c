@@ -64,6 +64,9 @@ int r3d_vkctx_create(r3d_vkctx *c, const char *const *inst_exts, uint32_t n_inst
   uint32_t nexts = 0;
   for (uint32_t i = 0; i < n_inst_exts && nexts < 15; i++) exts[nexts++] = inst_exts[i];
   if (validate) exts[nexts++] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
+#ifdef __APPLE__
+  exts[nexts++] = VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME;
+#endif
 
   VkApplicationInfo app = {
       .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
@@ -73,6 +76,9 @@ int r3d_vkctx_create(r3d_vkctx *c, const char *const *inst_exts, uint32_t n_inst
   const char *layer = "VK_LAYER_KHRONOS_validation";
   VkInstanceCreateInfo ici = {
       .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+#ifdef __APPLE__
+      .flags = VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR,
+#endif
       .pApplicationInfo = &app,
       .enabledExtensionCount = nexts,
       .ppEnabledExtensionNames = exts,
@@ -233,8 +239,10 @@ int r3d_vkctx_create(r3d_vkctx *c, const char *const *inst_exts, uint32_t n_inst
   }
 
   /* --- device --- */
-  const char *dev_exts[6];
+  const char *dev_exts[7];
   uint32_t ndev_exts = 0;
+  if (dev_has_ext(c->phys, "VK_KHR_portability_subset"))
+    dev_exts[ndev_exts++] = "VK_KHR_portability_subset";
   if (dev_has_ext(c->phys, VK_KHR_SWAPCHAIN_EXTENSION_NAME))
     dev_exts[ndev_exts++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
   if (c->caps.host_image_copy) dev_exts[ndev_exts++] = VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME;

@@ -1,4 +1,4 @@
-/* segpack: ingest tifxyz segment dirs into a segment store (c5d-compressed
+/* segpack: ingest tifxyz segment dirs into a segment store (volcomp-compressed
  * .tfx grids + a binary manifest with per-tile AABBs for spatial queries).
  *
  *   segpack <store-dir> [-q <log2q>] [--force] <tifxyz-dir>...

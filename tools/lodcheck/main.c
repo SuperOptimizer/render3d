@@ -1,4 +1,4 @@
-/* Compare c5d bricks against the decoded Zarr shard they were transcoded
+/* Compare volcomp bricks against the decoded Zarr shard they were transcoded
  * from. This validates coordinate mapping, both container CRCs, zero sentinels
  * and codec fidelity without requiring the renderer or a window. */
 #include <math.h>
@@ -42,20 +42,20 @@ static int decode_zarr_brick(const r3d_shard *zs, uint32_t bi, uint8_t *out) {
 
 int main(int argc, char **argv) {
   if (argc < 3 || argc > 4) {
-    fprintf(stderr, "usage: lodcheck <zarr-shard> <c5d-shard> [brick-stride]\n");
+    fprintf(stderr, "usage: lodcheck <zarr-shard> <volcomp-shard> [brick-stride]\n");
     return 2;
   }
   uint32_t stride = argc == 4 ? (uint32_t)strtoul(argv[3], NULL, 10) : 1u;
   if (!stride) return 2;
   r3d_shard zs;
-  c5d_shard_reader cs;
+  volcomp_shard_reader cs;
   if (r3d_shard_open_path(argv[1], &zs) != R3D_SHARD_OK) {
     fprintf(stderr, "lodcheck: invalid Zarr shard %s\n", argv[1]);
     return 1;
   }
-  if (c5d_shard_open(argv[2], &cs) != 0 || cs.foot.shard_dim != 1024u ||
+  if (volcomp_shard_open(argv[2], &cs) != 0 || cs.foot.shard_dim != 1024u ||
       cs.foot.brick_dim != BD || cs.foot.nbricks != BPA * BPA * BPA) {
-    fprintf(stderr, "lodcheck: invalid c5d shard %s\n", argv[2]);
+    fprintf(stderr, "lodcheck: invalid volcomp shard %s\n", argv[2]);
     r3d_shard_close(&zs);
     return 1;
   }
@@ -72,16 +72,16 @@ int main(int argc, char **argv) {
       break;
     }
     size_t bn = 0;
-    const uint8_t *blob = c5d_shard_brick(&cs, b, &bn);
+    const uint8_t *blob = volcomp_shard_brick(&cs, b, &bn);
     if (blob) {
       double started = now_seconds();
-      int decode_rc = c5d_brick_decode_par(blob, bn, got, BD, 4);
+      int decode_rc = volcomp_brick_decode(blob, bn, got, BD);
       decode_seconds += now_seconds() - started;
       if (decode_rc != 0) {
         failed = 1;
         break;
       }
-    } else if (c5d_shard_brick_is_zero(&cs, b)) {
+    } else if (volcomp_shard_brick_is_zero(&cs, b)) {
       memset(got, 0, (size_t)BD * BD * BD);
     } else {
       fprintf(stderr, "lodcheck: brick %u is missing/corrupt\n", b);
@@ -102,11 +102,11 @@ int main(int argc, char **argv) {
   double psnr = mse > 0.0 ? 10.0 * log10(255.0 * 255.0 / mse) : HUGE_VAL;
   printf("lodcheck: L%u %u bricks, %llu voxels: MAE %.3f, PSNR %.2f dB, max %u\n",
          cs.foot.lod_level, checked, (unsigned long long)nvox, mae, psnr, maxerr);
-  printf("lodcheck: c5d CPU decode %.2f ms/checked brick (4 threads)\n",
+  printf("lodcheck: volcomp CPU decode %.2f ms/checked brick (4 threads)\n",
          checked ? decode_seconds * 1000.0 / (double)checked : 0.0);
   free(ref);
   free(got);
-  c5d_shard_close_reader(&cs);
+  volcomp_shard_close_reader(&cs);
   r3d_shard_close(&zs);
   if (failed || !checked || psnr < 30.0) {
     fprintf(stderr, "lodcheck: FAIL\n");

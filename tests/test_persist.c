@@ -1,5 +1,5 @@
 /* Persistence + registration + CPU-cache tests (ctest label: quick).
- * Builds a small synthetic c5d LOD tree (256^3, two levels, textured) in a
+ * Builds a small synthetic volcomp LOD tree (256^3, two levels, textured) in a
  * temp dir so everything runs without scroll data:
  *  - cpuvol: decode correctness, and the pin/lease protocol under
  *    concurrent readers with a 2-slot cache (eviction churn) — exact-match

@@ -1,3 +1,4 @@
+#include "core/thread.h"
 #include "core/bsurf.h"
 
 #include <math.h>
@@ -643,7 +644,7 @@ int r3d_bsurf_start(r3d_bsurf *t, const r3d_bsurf_cfg *cfg, r3d_bsurf_sample_fn 
                     void *ctx) {
   if (bs_init(t, cfg, fn, ctx) != 0) return -1;
   t->running = true;
-  if (pthread_create(&t->th, NULL, bs_thread, t) != 0) {
+  if (r3d_thread_create(&t->th, NULL, bs_thread, t) != 0) {
     t->running = false;
     r3d_bsurf_free(t);
     return -1;

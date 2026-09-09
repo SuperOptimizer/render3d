@@ -49,6 +49,19 @@
         "CMAKE_BUILD_TYPE": "RelWithDebInfo",
         "R3D_SANITIZE": "tsan"
       }
+    },
+    {
+      "name": "macos",
+      "inherits": "base",
+      "binaryDir": "${sourceDir}/build/macos",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
+      },
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
     }
   ],
   "buildPresets": [
@@ -67,6 +80,10 @@
     {
       "name": "tsan",
       "configurePreset": "tsan"
+    },
+    {
+      "name": "macos",
+      "configurePreset": "macos"
     }
   ],
   "testPresets": [
@@ -92,6 +109,13 @@
           "label": "quick"
         }
       },
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "macos",
+      "configurePreset": "macos",
       "output": {
         "outputOnFailure": true
       }

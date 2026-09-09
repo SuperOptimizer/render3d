@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Create a surface "predict tree" for a CT LOD tree that has no published
-surface predictions: a c5d LOD tree with the CT's geometry and no data, whose
+surface predictions: a volcomp LOD tree with the CT's geometry and no data, whose
 source.json points render3d's consumers (renderer overlay ingest, tracer /
 cpuvol) at tools/surf/surfserver.py instead of an HTTP zarr. Bricks are
 predicted on demand and cached under <out>/bricks/L{0,1}.
@@ -47,7 +47,7 @@ if P < 0:
     print(f"inferred pred_level {P} (voxel {um} um)" if um else "no um tag: pred_level 0")
 levels = [{"level": l, "chunk": 256 if l == P else 128, "raw": False} for l in range(nlev)]
 src = {
-    "format": "render3d.c5d-source.v1",
+    "format": "render3d.volcomp-source.v1",
     "url": f"predict://127.0.0.1:{a.port}",
     "quality": a.quality,
     "levels": levels,

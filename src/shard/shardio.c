@@ -1,3 +1,8 @@
+#include "core/thread.h"
+#ifdef __APPLE__
+#define st_mtim st_mtimespec
+#define st_ctim st_ctimespec
+#endif
 #include "shard/shardio.h"
 
 #include <errno.h>
@@ -299,7 +304,7 @@ int r3d_shard_decode_region(const r3d_shard_store *s, uint64_t z0, uint64_t y0, 
   pthread_t tids[16];
   uint32_t made = 0;
   for (; made < nt; made++)
-    if (pthread_create(&tids[made], NULL, region_worker, &j) != 0) break;
+    if (r3d_thread_create(&tids[made], NULL, region_worker, &j) != 0) break;
   if (made == 0) region_worker(&j);
   for (uint32_t t = 0; t < made; t++) pthread_join(tids[t], NULL);
   return atomic_load_explicit(&j.failed, memory_order_relaxed) ? -1 : 0;

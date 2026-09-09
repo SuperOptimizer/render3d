@@ -35,11 +35,11 @@ int main(void) {
 
   const uint8_t metadata[] = "{\"format\":\"tifxyz\",\"scale\":[0.5,0.333333333]}\n";
   r3d_headless_bytes encoded = {0};
-  assert(r3d_headless_tfx1_encode_v1(4, 4, xyz, metadata, sizeof metadata - 1u,
+  assert(r3d_headless_surface_encode_v1(4, 4, xyz, metadata, sizeof metadata - 1u,
                                       -1, NULL, NULL, &encoded) == R3D_HEADLESS_OK);
   assert(encoded.size > 28u);
   r3d_headless_surface decoded = {0};
-  assert(r3d_headless_tfx1_decode_v1(encoded.data, encoded.size, NULL, NULL,
+  assert(r3d_headless_surface_decode_v1(encoded.data, encoded.size, NULL, NULL,
                                      &decoded) == R3D_HEADLESS_OK);
   assert(decoded.width == 4u && decoded.height == 4u);
   assert(memcmp(decoded.xyz, xyz, sizeof xyz) == 0);

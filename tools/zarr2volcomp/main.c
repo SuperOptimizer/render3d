@@ -1,10 +1,10 @@
-/* zarr2c5d -- transcode a raw zarr v2 u8 volume (blosc chunks, 128^3 -- the
- * AWS vesuvius-challenge-open-data layout) into render3d's c5d LOD tree +
+/* zarr2volcomp -- transcode a raw zarr v2 u8 volume (blosc chunks, 128^3 -- the
+ * AWS vesuvius-challenge-open-data layout) into render3d's volcomp LOD tree +
  * manifest.json, without any zarr output tree (the renderer only reads
- * c5d/L* + manifest.json).
+ * volcomp/L* + manifest.json).
  *
  * Source is a LOCAL mirror <mirror>/<L>/<cz>/<cy>/<cx> (+ <L>/.zarray per
- * level).  A zarr chunk is exactly one 128^3 c5d brick, so bricks map 1:1.
+ * level).  A zarr chunk is exactly one 128^3 volcomp brick, so bricks map 1:1.
  * Missing-chunk semantics differ by level class:
  *   - levels >= --full-from were mirrored in full (aws s3 sync): an absent
  *     file IS an absent object = all-fill (zero) chunk;
@@ -71,7 +71,7 @@ static _Atomic uint64_t g_fetched_bytes = 0, g_fetched_n = 0, g_absent_n = 0;
 static level_info g_lv[MAX_LEVELS];
 static uint32_t g_nlev = 0, g_full_from = 3;
 static float g_quality = 2.0f;
-static float g_tau = 0.0f; /* >0: c5d hard max-error bound (sparse corrections) */
+
 static FILE *g_missing_list = NULL;
 static uint64_t g_missing_count = 0;
 static _Atomic uint64_t g_psnr_bricks = 0;
@@ -220,7 +220,7 @@ static int fetch_chunk(uint32_t level, uint64_t cz, uint64_t cy, uint64_t cx,
     }
     if (attempt < 3) sleep((unsigned)(1 << attempt)); /* 1s, 2s, 4s backoff */
   }
-  fprintf(stderr, "zarr2c5d: fetch failed after retries: %s\n", url);
+  fprintf(stderr, "zarr2volcomp: fetch failed after retries: %s\n", url);
   return -1;
 }
 
@@ -256,7 +256,7 @@ static int load_chunk(uint32_t level, uint64_t cz, uint64_t cy, uint64_t cx, uin
     if (rc <= 0) return rc;
     rc = decode_chunk_mem(lv, t_buf.p, t_buf.n, dst);
     if (rc < 0)
-      fprintf(stderr, "zarr2c5d: bad fetched chunk %u/%llu/%llu/%llu (%zu bytes)\n", level,
+      fprintf(stderr, "zarr2volcomp: bad fetched chunk %u/%llu/%llu/%llu (%zu bytes)\n", level,
               (unsigned long long)cz, (unsigned long long)cy, (unsigned long long)cx,
               t_buf.n);
     return rc;
@@ -284,7 +284,7 @@ static int load_chunk(uint32_t level, uint64_t cz, uint64_t cy, uint64_t cx, uin
     size_t got = fread(dst, 1, want, f);
     fclose(f);
     if (got != want) {
-      fprintf(stderr, "zarr2c5d: raw chunk %s is %zu bytes\n", path, got);
+      fprintf(stderr, "zarr2volcomp: raw chunk %s is %zu bytes\n", path, got);
       return -1;
     }
     return 1;
@@ -300,7 +300,7 @@ static int load_chunk(uint32_t level, uint64_t cz, uint64_t cy, uint64_t cx, uin
   blosc_cbuffer_sizes(comp, &nbytes, &cbytes, &blocksize);
   if (nbytes != want || (long)cbytes > fn ||
       blosc_decompress_ctx(comp, dst, want, 1) != (int)want) {
-    fprintf(stderr, "zarr2c5d: bad chunk %s (nbytes %zu)\n", path, nbytes);
+    fprintf(stderr, "zarr2volcomp: bad chunk %s (nbytes %zu)\n", path, nbytes);
     free(comp);
     return -1;
   }
@@ -424,19 +424,19 @@ static void *brick_worker(void *arg) {
             continue;
           }
           float q = g_quality / (float)(1u << (j->level < 3u ? j->level : 3u));
-          if (q < 0.25f) q = 0.25f;
-          c5d_brick_params p = c5d_brick_defaults(1.0f);
+          if (q < 1.0f) q = 1.0f;
+          volcomp_brick_params p = volcomp_brick_defaults(1.0f);
           p.q = q;
-          p.tau = g_tau;
+
           size_t n = 0;
-          if (c5d_brick_encode(&p, raw, BRICK, &j->bricks[b].p, &n) != 0 ||
+          if (volcomp_brick_encode(&p, raw, BRICK, &j->bricks[b].p, &n) != 0 ||
               n > UINT32_MAX) {
             atomic_store(&j->failed, 1);
             break;
           }
           j->bricks[b].n = (uint32_t)n;
           if (g_verify && atomic_fetch_add(&g_psnr_bricks, 1) < g_verify) {
-            if (c5d_brick_decode(j->bricks[b].p, n, rec, BRICK) != 0) {
+            if (volcomp_brick_decode(j->bricks[b].p, n, rec, BRICK) != 0) {
               atomic_store(&j->failed, 1);
               break;
             }
@@ -461,7 +461,7 @@ static void *brick_worker(void *arg) {
 static int process_shard(uint32_t level, uint64_t oz, uint64_t oy, uint64_t ox,
                          uint32_t threads, bool force) {
   char cp[2048];
-  snprintf(cp, sizeof cp, "%s/c5d/L%u/%llu_%llu_%llu.c5s", g_out, level,
+  snprintf(cp, sizeof cp, "%s/volcomp/L%u/%llu_%llu_%llu.vcs", g_out, level,
            (unsigned long long)oz, (unsigned long long)oy, (unsigned long long)ox);
   if (!force && file_exists(cp)) return 1;
 
@@ -538,7 +538,7 @@ static int process_shard(uint32_t level, uint64_t oz, uint64_t oy, uint64_t ox,
   uint64_t miss = atomic_load(&j->missing);
   if (rc == 0 && miss) {
     fprintf(stderr,
-            "zarr2c5d: L%u shard %llu/%llu/%llu: %llu chunks not downloaded "
+            "zarr2volcomp: L%u shard %llu/%llu/%llu: %llu chunks not downloaded "
             "(run --list-missing + tools/fetch_chunks.sh first)\n",
             level, (unsigned long long)oz, (unsigned long long)oy,
             (unsigned long long)ox, (unsigned long long)miss);
@@ -548,12 +548,13 @@ static int process_shard(uint32_t level, uint64_t oz, uint64_t oy, uint64_t ox,
     if (mkdirs(cp, false) != 0) rc = -1;
     char tmp[2112];
     snprintf(tmp, sizeof tmp, "%s.tmp.%ld", cp, (long)getpid());
-    c5d_shard_writer *w = rc == 0 ? c5d_shard_create(tmp, SHARD, BRICK, level, 0.0f) : NULL;
+    volcomp_shard_writer *w = rc == 0 ? volcomp_shard_create(tmp, SHARD, BRICK, level,
+        fmaxf(1.0f, g_quality / (float)(1u << (level < 3u ? level : 3u)))) : NULL;
     if (!w) rc = -1;
     for (uint32_t b = 0; b < NBRICKS && rc == 0; b++)
-      rc = j->zero[b] || !j->bricks[b].p ? c5d_shard_put_zero(w, b)
-                                         : c5d_shard_put(w, b, j->bricks[b].p, j->bricks[b].n);
-    if (w && c5d_shard_close(w) != 0) rc = -1;
+      rc = j->zero[b] || !j->bricks[b].p ? volcomp_shard_put_zero(w, b)
+                                         : volcomp_shard_put(w, b, j->bricks[b].p, j->bricks[b].n);
+    if (w && volcomp_shard_close(w) != 0) rc = -1;
     if (rc == 0 && rename(tmp, cp) != 0) rc = -1;
     if (rc != 0) unlink(tmp);
   }
@@ -569,7 +570,7 @@ static int mark_surface(const char *surf_dir, uint32_t pad, uint32_t min_level,
                         const uint32_t rect[4]) {
   r3d_tifxyz s;
   if (r3d_tifxyz_load(&s, surf_dir) != 0) return -1;
-  printf("zarr2c5d: surface %s: %ux%u grid, %llu valid points\n", surf_dir, s.w, s.h,
+  printf("zarr2volcomp: surface %s: %ux%u grid, %llu valid points\n", surf_dir, s.w, s.h,
          (unsigned long long)s.nvalid);
   for (uint32_t l = min_level; l < g_full_from && l < g_nlev; l++) {
     level_info *lv = &g_lv[l];
@@ -635,7 +636,7 @@ static int write_manifest(void) {
   if (!json) return -1;
   dims3 base = g_lv[0].shape;
   size_t n = (size_t)snprintf(json, 16384,
-                              "{\n  \"format\": \"render3d.c5d-lod.v1\",\n"
+                              "{\n  \"format\": \"render3d.volcomp-lod.v1\",\n"
                               "  \"shape\": [%llu, %llu, %llu],\n"
                               "  \"shard_shape\": [1024, 1024, 1024],\n"
                               "  \"brick_shape\": [128, 128, 128],\n  \"levels\": [\n",
@@ -644,14 +645,14 @@ static int write_manifest(void) {
   for (uint32_t l = 0; l < g_nlev; l++) {
     const level_info *lv = &g_lv[l];
     float q = g_quality / (float)(1u << (l < 3u ? l : 3u));
-    if (q < 0.25f) q = 0.25f;
+    if (q < 1.0f) q = 1.0f;
     n += (size_t)snprintf(json + n, 16384 - n,
                           "    {\"level\": %u, \"scale\": %u, "
                           "\"shape\": [%llu, %llu, %llu], "
                           "\"shards\": [%llu, %llu, %llu], "
                           "\"zarr\": \"zarr/L%u\", "
-                          "\"c5d\": \"c5d/L%u/{z}_{y}_{x}.c5s\", "
-                          "\"c5d_quality\": %.6g}%s\n",
+                          "\"volcomp\": \"volcomp/L%u/{z}_{y}_{x}.vcs\", "
+                          "\"volcomp_quality\": %.6g}%s\n",
                           l, 1u << l, (unsigned long long)lv->shape.z,
                           (unsigned long long)lv->shape.y, (unsigned long long)lv->shape.x,
                           (unsigned long long)lv->shards.z, (unsigned long long)lv->shards.y,
@@ -675,16 +676,16 @@ static double now_seconds(void) {
 int main(int argc, char **argv) {
   if (argc < 3) {
     fprintf(stderr,
-            "usage: zarr2c5d <zarr-mirror-dir> <output-dir> [--url BASE] [--surface DIR] "
+            "usage: zarr2volcomp <zarr-mirror-dir> <output-dir> [--url BASE] [--surface DIR] "
             "[--pad N] [--full-from L] [--min-level L] [--rect i0 j0 i1 j1] [--threads N] "
             "[--mem-budget-mb N] "
-            "[--c5d-quality Q] [--tau T] [--only-level L] "
+            "[--volcomp-quality Q] [--only-level L] "
             "[--list-missing FILE] [--dry-run] [--verify N] [--force]\n"
             "  --mem-budget-mb: cap on phase-1 fill-worker scratch bytes per shard, on top "
             "of the fixed 1024 MiB assembly (default 4096); worker count is derived from "
             "this, not CPU count alone\n"
             "  --url: streaming ingest — chunks are fetched straight into memory and only "
-            "transcoded c5d shards are written (the mirror dir holds .zarray metadata "
+            "transcoded volcomp shards are written (the mirror dir holds .zarray metadata "
             "only); without it, chunks are read from a pre-fetched local mirror\n");
     return 2;
   }
@@ -709,10 +710,9 @@ int main(int argc, char **argv) {
       threads = (uint32_t)strtoul(argv[++i], NULL, 10);
     else if (strcmp(argv[i], "--mem-budget-mb") == 0 && i + 1 < argc)
       g_mem_budget_bytes = strtoull(argv[++i], NULL, 10) * 1024ull * 1024ull;
-    else if (strcmp(argv[i], "--c5d-quality") == 0 && i + 1 < argc)
+    else if (strcmp(argv[i], "--volcomp-quality") == 0 && i + 1 < argc)
       g_quality = strtof(argv[++i], NULL);
-    else if (strcmp(argv[i], "--tau") == 0 && i + 1 < argc)
-      g_tau = strtof(argv[++i], NULL);
+
     else if (strcmp(argv[i], "--only-level") == 0 && i + 1 < argc)
       only_level = (uint32_t)strtoul(argv[++i], NULL, 10);
     else if (strcmp(argv[i], "--min-level") == 0 && i + 1 < argc)
@@ -732,7 +732,7 @@ int main(int argc, char **argv) {
     else if (strcmp(argv[i], "--force") == 0)
       force = true;
     else {
-      fprintf(stderr, "zarr2c5d: unknown/incomplete option %s\n", argv[i]);
+      fprintf(stderr, "zarr2volcomp: unknown/incomplete option %s\n", argv[i]);
       return 2;
     }
   }
@@ -742,7 +742,7 @@ int main(int argc, char **argv) {
   }
   if (g_mem_budget_bytes < (uint64_t)SHARD * SHARD * SHARD)
     fprintf(stderr,
-            "zarr2c5d: --mem-budget-mb is below the fixed 1024 MiB shard assembly; "
+            "zarr2volcomp: --mem-budget-mb is below the fixed 1024 MiB shard assembly; "
             "clamping every shard to 1 fill worker\n");
   if (g_url) { /* streaming ingest: bootstrap per-level .zarray metadata only */
     curl_global_init(CURL_GLOBAL_DEFAULT);
@@ -784,7 +784,7 @@ int main(int argc, char **argv) {
      * transient allocation past 1 GiB. Reject before any buffer is sized. */
     if (chunks.z != chunks.y || chunks.y != chunks.x || chunks.z < 32 ||
         chunks.z > 512) {
-      fprintf(stderr, "zarr2c5d: L%u chunks must be cubic (32..512 edge)\n", l);
+      fprintf(stderr, "zarr2volcomp: L%u chunks must be cubic (32..512 edge)\n", l);
       return 1;
     }
     uint32_t ch = (uint32_t)chunks.z;
@@ -797,7 +797,7 @@ int main(int argc, char **argv) {
     g_nlev = l + 1;
   }
   if (!g_nlev) {
-    fprintf(stderr, "zarr2c5d: no <mirror>/<L>/.zarray found under %s\n", g_mirror);
+    fprintf(stderr, "zarr2volcomp: no <mirror>/<L>/.zarray found under %s\n", g_mirror);
     return 1;
   }
   /* the renderer requires halving levels (scale == 1<<l) */
@@ -806,14 +806,14 @@ int main(int argc, char **argv) {
                   (g_lv[l - 1].shape.x + 1) / 2};
     if (want.z != g_lv[l].shape.z || want.y != g_lv[l].shape.y ||
         want.x != g_lv[l].shape.x) {
-      fprintf(stderr, "zarr2c5d: L%u shape is not the ceil-half of L%u\n", l, l - 1);
+      fprintf(stderr, "zarr2volcomp: L%u shape is not the ceil-half of L%u\n", l, l - 1);
       return 1;
     }
   }
   if (bootstrap) g_full_from = g_nlev ? g_nlev - 1u : 0u;
   if (g_full_from > g_nlev) g_full_from = g_nlev;
   if (g_full_from > 0 && !surf_dir && only_level == UINT32_MAX)
-    printf("zarr2c5d: no --surface: transcoding only levels >= %u (bootstrap; the "
+    printf("zarr2volcomp: no --surface: transcoding only levels >= %u (bootstrap; the "
            "renderer can stream the rest on demand from source.json)\n",
            g_full_from);
   if (surf_dir && mark_surface(surf_dir, pad, min_level, have_rect ? rect : NULL) != 0)
@@ -833,7 +833,7 @@ int main(int argc, char **argv) {
     uint64_t wc = 0, nc = lv->chunks.z * lv->chunks.y * lv->chunks.x;
     if (lv->cwant)
       for (uint64_t i = 0; i < nc; i++) wc += lv->cwant[i];
-    printf("zarr2c5d: L%u %llux%llux%llu -> %llu/%llu shards%s", l,
+    printf("zarr2volcomp: L%u %llux%llux%llu -> %llu/%llu shards%s", l,
            (unsigned long long)lv->shape.z, (unsigned long long)lv->shape.y,
            (unsigned long long)lv->shape.x, (unsigned long long)plan[l],
            (unsigned long long)ns, lv->want ? " (surface" : "");
@@ -843,7 +843,7 @@ int main(int argc, char **argv) {
              (double)wc * (double)lv->chsz * lv->chsz * lv->chsz / 1073741824.0);
     printf("\n");
   }
-  printf("zarr2c5d: %llu shards total, %u levels, threads %u (fill-phase budget %llu MiB)\n",
+  printf("zarr2volcomp: %llu shards total, %u levels, threads %u (fill-phase budget %llu MiB)\n",
          (unsigned long long)total, g_nlev, threads,
          (unsigned long long)(g_mem_budget_bytes / (1024u * 1024u)));
   if (dry) return 0;
@@ -851,11 +851,11 @@ int main(int argc, char **argv) {
   if (missing_path) {
     g_missing_list = fopen(missing_path, "w");
     if (!g_missing_list) {
-      fprintf(stderr, "zarr2c5d: cannot write %s\n", missing_path);
+      fprintf(stderr, "zarr2volcomp: cannot write %s\n", missing_path);
       return 1;
     }
   } else if (mkdirs(g_out, true) != 0 || write_manifest() != 0) {
-    fprintf(stderr, "zarr2c5d: cannot initialise output\n");
+    fprintf(stderr, "zarr2volcomp: cannot initialise output\n");
     return 1;
   }
   if (!missing_path && g_url) {
@@ -863,7 +863,7 @@ int main(int argc, char **argv) {
      * demand into <out>/bricks/L*, downloading each chunk exactly once */
     char sj[4096];
     size_t sn = (size_t)snprintf(sj, sizeof sj,
-                                 "{\n  \"format\": \"render3d.c5d-source.v1\",\n"
+                                 "{\n  \"format\": \"render3d.volcomp-source.v1\",\n"
                                  "  \"url\": \"%s\",\n  \"quality\": %.6g,\n"
                                  "  \"levels\": [\n",
                                  g_url, (double)g_quality);
@@ -876,7 +876,7 @@ int main(int argc, char **argv) {
     char sp2[2048];
     snprintf(sp2, sizeof sp2, "%s/source.json", g_out);
     if (sn >= sizeof sj || write_atomic(sp2, sj, sn) != 0) {
-      fprintf(stderr, "zarr2c5d: cannot write source.json\n");
+      fprintf(stderr, "zarr2volcomp: cannot write source.json\n");
       return 1;
     }
   }
@@ -895,7 +895,7 @@ int main(int argc, char **argv) {
           if (!lv->want && l < g_full_from) continue;
           int rc = process_shard(l, sz, sy, sx, threads, force);
           if (rc < 0) {
-            fprintf(stderr, "zarr2c5d: L%u shard %llu/%llu/%llu failed\n", l,
+            fprintf(stderr, "zarr2volcomp: L%u shard %llu/%llu/%llu failed\n", l,
                     (unsigned long long)sz, (unsigned long long)sy,
                     (unsigned long long)sx);
             return 1;
@@ -903,7 +903,7 @@ int main(int argc, char **argv) {
           skipped += rc > 0;
           done++;
           if (!g_missing_list) {
-            printf("zarr2c5d: L%u %llu/%llu (%s; %.1fs/shard)\n", l,
+            printf("zarr2volcomp: L%u %llu/%llu (%s; %.1fs/shard)\n", l,
                    (unsigned long long)done, (unsigned long long)plan[l],
                    rc > 0 ? "resume-skip" : "written",
                    (now_seconds() - started) / (double)done);
@@ -911,18 +911,18 @@ int main(int argc, char **argv) {
           }
         }
     if (!g_missing_list)
-      printf("zarr2c5d: L%u complete (%llu written, %llu skipped)\n", l,
+      printf("zarr2volcomp: L%u complete (%llu written, %llu skipped)\n", l,
              (unsigned long long)(done - skipped), (unsigned long long)skipped);
   }
 
   if (g_missing_list) {
     fclose(g_missing_list);
-    printf("zarr2c5d: %llu chunks to fetch listed in %s\n",
+    printf("zarr2volcomp: %llu chunks to fetch listed in %s\n",
            (unsigned long long)g_missing_count, missing_path);
     return g_missing_count ? 3 : 0;
   }
   if (g_url)
-    printf("zarr2c5d: fetched %llu chunks (%.1f GB), %llu absent (fill)\n",
+    printf("zarr2volcomp: fetched %llu chunks (%.1f GB), %llu absent (fill)\n",
            (unsigned long long)atomic_load(&g_fetched_n),
            (double)atomic_load(&g_fetched_bytes) / 1073741824.0,
            (unsigned long long)atomic_load(&g_absent_n));
@@ -930,7 +930,7 @@ int main(int argc, char **argv) {
   if (g_verify && vb) {
     uint64_t counted = vb < g_verify ? vb : g_verify;
     double mse = g_sse_sum / (double)counted;
-    printf("zarr2c5d: verify %llu bricks, PSNR %.2f dB\n", (unsigned long long)counted,
+    printf("zarr2volcomp: verify %llu bricks, PSNR %.2f dB\n", (unsigned long long)counted,
            10.0 * log10(255.0 * 255.0 / (mse > 1e-12 ? mse : 1e-12)));
   }
   return 0;

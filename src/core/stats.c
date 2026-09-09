@@ -45,7 +45,7 @@ void r3d_stats_summarize_values(const uint64_t *values, uint32_t count,
   memcpy(sorted, values, (size_t)count * sizeof *sorted);
   qsort(sorted, count, sizeof *sorted, u64_cmp);
   long double sum = 0;
-  for (uint32_t i = 0; i < count; i++) sum += sorted[i];
+  for (uint32_t i = 0; i < count; i++) sum += (long double)sorted[i];
   out->mean_ns = (double)(sum / count);
   out->p50_ns = sorted[((uint64_t)count * 50u + 99u) / 100u - 1u];
   out->p95_ns = sorted[((uint64_t)count * 95u + 99u) / 100u - 1u];

@@ -1,6 +1,6 @@
 /* 3D voxel labelling: a sparse per-brick class-id volume the user paints in
  * the GUI (papyrus / ink / not ink / recto / verso / ...), persisted
- * losslessly as one C5L1 label brick per 128^3 block (c5d label codec).
+ * losslessly as one R3L1 label brick per 128^3 block (zlib label storage).
  * Class 0 is "unlabelled"; painting class 0 erases. */
 #ifndef R3D_LABELVOL_H
 #define R3D_LABELVOL_H
@@ -46,7 +46,7 @@ void r3d_labelvol_fetch(const r3d_labelvol *lv, uint32_t level, uint32_t bx, uin
 
 uint32_t r3d_labelvol_dirty(const r3d_labelvol *lv); /* bricks with unsaved edits */
 
-/* dir holds manifest.json + b_<bx>_<by>_<bz>.c5l label bricks. Save writes
+/* dir holds manifest.json + b_<bx>_<by>_<bz>.r3l label bricks. Save writes
  * only bricks edited since the last save (and unlinks emptied ones) to
  * unique temp files, then publishes manifest.json last; a brick or the
  * manifest that fails to publish stays dirty and is retried on the next
@@ -59,4 +59,5 @@ uint32_t r3d_labelvol_dirty(const r3d_labelvol *lv); /* bricks with unsaved edit
 int r3d_labelvol_save(r3d_labelvol *lv, const char *dir);
 int r3d_labelvol_load(r3d_labelvol *lv, const char *dir);
 
+void r3d_labelvol_fetch_block(const r3d_labelvol *lv, uint32_t level, uint32_t bx, uint32_t by, uint32_t bz, uint8_t *out);
 #endif /* R3D_LABELVOL_H */

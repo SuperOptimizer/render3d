@@ -1,3 +1,4 @@
+#include "core/thread.h"
 #include "core/tracer.h"
 
 #include <curl/curl.h>
@@ -6,7 +7,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #if defined(__GLIBC__) || defined(__linux__)
+#ifdef __GLIBC__
 #include <malloc.h>
+#endif
 #endif
 #include <string.h>
 #include <sys/stat.h>
@@ -406,7 +409,7 @@ static void td_prewarm(td_cache *c, const double *pts3, const uint32_t *cells,
   uint32_t nth = nk < 8 ? nk : 8; /* 16 measured slower (bandwidth-bound) */
   uint32_t started = 0;
   for (uint32_t i = 0; i < nth; i++)
-    if (pthread_create(&th[started], NULL, td_pw_thread, &job) == 0) started++;
+    if (r3d_thread_create(&th[started], NULL, td_pw_thread, &job) == 0) started++;
   if (!started) { /* fall back to serial builds on demand */
     return;
   }
@@ -830,7 +833,7 @@ static void ng_open(ng_vol *v, const char *pred_root) {
       pthread_mutex_init(&v->fmu, NULL);
       pthread_cond_init(&v->fcv, NULL);
       for (uint32_t i = 0; i < 8; i++)
-        if (pthread_create(&v->fth[v->nfth], NULL, ng_prefetch_worker, v) == 0)
+        if (r3d_thread_create(&v->fth[v->nfth], NULL, ng_prefetch_worker, v) == 0)
           v->nfth++;
     }
   }
@@ -907,7 +910,9 @@ static void ng_close(ng_vol *v) {
   if (v->curl) curl_easy_cleanup(v->curl);
   memset(v, 0, sizeof *v);
 #if defined(__GLIBC__)
-  malloc_trim(0); /* see the comment at the top of this function */
+  #ifdef __GLIBC__
+  malloc_trim(0);
+  #endif /* see the comment at the top of this function */
 #endif
 }
 
@@ -5094,7 +5099,7 @@ static void tr_pool_init(tr_pool *pl, r3d_tracer *t, ng_vol *ngv) {
     e->hood = calloc(NG_NHOOD, sizeof *e->hood);
     if (!e->hood) break;
     for (int hi = 0; hi < NG_NHOOD; hi++) e->hood[hi].plane = -1;
-    if (pthread_create(&pl->th[pl->nth], NULL, tr_pool_thread, e) != 0) {
+    if (r3d_thread_create(&pl->th[pl->nth], NULL, tr_pool_thread, e) != 0) {
       free(e->hood);
       break;
     }
@@ -7198,7 +7203,7 @@ int r3d_tracer_start_fused(r3d_tracer *t, const char *pred_root,
   }
   pthread_mutex_init(&t->mu, NULL);
   t->running = true;
-  if (pthread_create(&t->th, NULL, tr_worker, t) != 0) {
+  if (r3d_thread_create(&t->th, NULL, tr_worker, t) != 0) {
     pthread_mutex_destroy(&t->mu);
     r3d_tracer_free(t);
     return -1;
@@ -7808,7 +7813,7 @@ int r3d_tracer_reopt(r3d_tracer *t, const double p[3], int radius) {
   pthread_mutex_unlock(&t->mu);
   printf("tracer: reopened %u cells around (%.0f,%.0f,%.0f), regrowing\n", nreg,
          p[0], p[1], p[2]);
-  if (pthread_create(&t->th, NULL, tr_worker, t) != 0) {
+  if (r3d_thread_create(&t->th, NULL, tr_worker, t) != 0) {
     t->running = false;
     return -1;
   }
@@ -7885,7 +7890,7 @@ int r3d_tracer_grow(r3d_tracer *t, uint32_t extra) {
   t->done = false;
   t->gen++;
   t->running = true;
-  if (pthread_create(&t->th, NULL, tr_worker, t) != 0) {
+  if (r3d_thread_create(&t->th, NULL, tr_worker, t) != 0) {
     t->running = false;
     return -1;
   }
@@ -8025,7 +8030,7 @@ int r3d_tracer_subdivide(r3d_tracer *t) {
   t->done = false;
   t->gen++;
   t->running = true;
-  if (pthread_create(&t->th, NULL, tr_worker, t) != 0) {
+  if (r3d_thread_create(&t->th, NULL, tr_worker, t) != 0) {
     t->running = false;
     t->refine = false;
     t->recalc_conf = false;
@@ -8041,7 +8046,7 @@ int r3d_tracer_refine(r3d_tracer *t) {
   t->done = false;
   t->gen++;
   t->running = true;
-  if (pthread_create(&t->th, NULL, tr_worker, t) != 0) {
+  if (r3d_thread_create(&t->th, NULL, tr_worker, t) != 0) {
     t->running = false;
     t->refine = false;
     return -1;
@@ -8058,7 +8063,7 @@ int r3d_tracer_spiral_fill(r3d_tracer *t) {
   t->done = false;
   t->gen++;
   t->running = true;
-  if (pthread_create(&t->th, NULL, tr_worker, t) != 0) {
+  if (r3d_thread_create(&t->th, NULL, tr_worker, t) != 0) {
     t->running = false;
     t->refine = false;
     t->spiral_fill = false;
@@ -8080,7 +8085,7 @@ int r3d_tracer_ctsnap(r3d_tracer *t, const char *ct_root, double cutoff,
   t->done = false;
   t->gen++;
   t->running = true;
-  if (pthread_create(&t->th, NULL, tr_worker, t) != 0) {
+  if (r3d_thread_create(&t->th, NULL, tr_worker, t) != 0) {
     t->running = false;
     t->ctsnap = false;
     return -1;

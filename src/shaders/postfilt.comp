@@ -24,12 +24,12 @@ layout(push_constant) uniform PC {
 } pc;
 
 float fetch(ivec3 base, ivec3 l, ivec3 d) {
-  return texelFetch(atlas, base + clamp(l + d, ivec3(0), ivec3(127)), 0).r;
+  return texelFetch(atlas, base + clamp(l + d, ivec3(0), ivec3(15)), 0).r;
 }
 
 void main() {
   ivec3 l = ivec3(gl_GlobalInvocationID);
-  if (any(greaterThanEqual(l, ivec3(128)))) return;
+  if (any(greaterThanEqual(l, ivec3(16)))) return;
   ivec3 base = ivec3(int(pc.sx), int(pc.sy), int(pc.sz));
   float outv = 0.0;
   if (pc.mode == 1u) { /* median 27: partial selection up to rank 13 */

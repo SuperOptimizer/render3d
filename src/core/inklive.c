@@ -1,3 +1,4 @@
+#include "core/thread.h"
 #include "core/inklive.h"
 
 #include <arpa/inet.h>
@@ -136,7 +137,7 @@ static uint8_t *il_sample(r3d_inklive *il, const float *xyz, uint32_t rw, uint32
                               .W = W, .H = H, .gen = gen, .tid = t, .nth = nth,
                               .nl = nl, .flip = flip, .abort = &abort_flag};
     if (t + 1 < nth) {
-      if (pthread_create(&th[spawned], NULL, il_sample_rows, &jobs[t]) == 0) spawned++;
+      if (r3d_thread_create(&th[spawned], NULL, il_sample_rows, &jobs[t]) == 0) spawned++;
       else il_sample_rows(&jobs[t]); /* no thread: do this stripe inline */
     }
   }
@@ -341,7 +342,7 @@ int r3d_inklive_start(r3d_inklive *il, const char *vol_root, int port) {
   pthread_mutex_init(&il->mu, NULL);
   pthread_cond_init(&il->cv, NULL);
   snprintf(il->status, sizeof il->status, "idle");
-  if (pthread_create(&il->th, NULL, il_worker, il) != 0) {
+  if (r3d_thread_create(&il->th, NULL, il_worker, il) != 0) {
     r3d_cpuvol_close(&il->vol);
     il->vol_ok = false;
     return -1;

@@ -24,7 +24,7 @@
 extern "C" {
 #endif
 
-#define R3D_HEADLESS_ABI_VERSION 1u
+#define R3D_HEADLESS_ABI_VERSION 2u
 
 typedef enum r3d_headless_status {
   R3D_HEADLESS_OK = 0,
@@ -122,19 +122,19 @@ R3D_HEADLESS_API void r3d_headless_bytes_release_v1(
 R3D_HEADLESS_API void r3d_headless_surface_release_v1(
     r3d_headless_surface *surface, const r3d_headless_allocator *allocator);
 
-/* TFX1 is c5d's compact tifxyz stream. metadata is carried verbatim. */
-R3D_HEADLESS_API r3d_headless_status r3d_headless_tfx1_encode_v1(
+/* R3F1 is volcomp's compact tifxyz stream. metadata is carried verbatim. */
+R3D_HEADLESS_API r3d_headless_status r3d_headless_surface_encode_v1(
     uint32_t width, uint32_t height, const float *xyz, const uint8_t *metadata,
     size_t metadata_size, int32_t log2_quantization,
     const r3d_headless_allocator *allocator,
     const r3d_headless_callbacks *callbacks, r3d_headless_bytes *out_bytes);
-/* Encode and atomically publish a TFX1 file without materializing a second
+/* Encode and atomically publish a R3F1 file without materializing a second
  * caller-language copy. Existing destinations are never overwritten. */
-R3D_HEADLESS_API r3d_headless_status r3d_headless_tfx1_encode_file_v1(
+R3D_HEADLESS_API r3d_headless_status r3d_headless_surface_encode_file_v1(
     const char *path, uint32_t width, uint32_t height, const float *xyz,
     const uint8_t *metadata, size_t metadata_size, int32_t log2_quantization,
     const r3d_headless_callbacks *callbacks);
-R3D_HEADLESS_API r3d_headless_status r3d_headless_tfx1_decode_v1(
+R3D_HEADLESS_API r3d_headless_status r3d_headless_surface_decode_v1(
     const uint8_t *bytes, size_t size, const r3d_headless_allocator *allocator,
     const r3d_headless_callbacks *callbacks, r3d_headless_surface *out_surface);
 
@@ -149,9 +149,10 @@ R3D_HEADLESS_API r3d_headless_status r3d_headless_tifxyz_save_v1(
 
 /* Open a render3d volume manifest. Its source.json may name an upstream local
  * or HTTPS Zarr v2 source; misses are fetched and transcoded lazily by core.
+ * cache_blocks counts 4096-byte decoded blocks.
  * read_roi writes C-order [nz,ny,nx] uint8 values. */
 R3D_HEADLESS_API r3d_headless_status r3d_headless_volume_open_v1(
-    const char *root, uint32_t cache_bricks,
+    const char *root, uint32_t cache_blocks,
     const r3d_headless_allocator *allocator, r3d_headless_volume **out_volume);
 R3D_HEADLESS_API void r3d_headless_volume_close_v1(r3d_headless_volume *volume);
 R3D_HEADLESS_API r3d_headless_status r3d_headless_volume_read_roi_v1(

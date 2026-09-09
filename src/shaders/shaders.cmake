@@ -1,4 +1,4 @@
-# Slang -> SPIR-V at build time (pattern: c5d src/gpu/gpu.cmake).
+# Slang -> SPIR-V at build time.
 # slangc comes from tools/slang/bin (tools/fetch_slang.sh) or PATH.
 
 find_program(R3D_SLANGC NAMES slangc
@@ -46,20 +46,8 @@ foreach(_v ${_variants})
     VERBATIM)
   list(APPEND _spv_outputs "${_out}")
 endforeach()
-# c5d decode kernels (GLSL, from the compressor working tree) + our pack kernel
 find_program(R3D_GLSLC NAMES glslc REQUIRED)
-foreach(_ck entropy dequant_idct deblock corrections)
-  set(_src "${R3D_C5D_DIR}/src/gpu/kernels/${_ck}.comp")
-  set(_out "${_spv_dir}/c5d_${_ck}.spv")
-  add_custom_command(
-    OUTPUT "${_out}"
-    COMMAND "${R3D_GLSLC}" -O --target-env=vulkan1.1 -o "${_out}" "${_src}"
-    DEPENDS "${_src}"
-    COMMENT "glslc c5d ${_ck}.comp"
-    VERBATIM)
-  list(APPEND _spv_outputs "${_out}")
-endforeach()
-foreach(_gk pack occmax occdilate apron surfvol postfilt)
+foreach(_gk occmax occdilate apron surfvol postfilt)
   add_custom_command(
     OUTPUT "${_spv_dir}/${_gk}.spv"
     COMMAND "${R3D_GLSLC}" -O --target-env=vulkan1.1 -o "${_spv_dir}/${_gk}.spv"

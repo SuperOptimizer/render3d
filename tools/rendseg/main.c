@@ -1,6 +1,6 @@
 /* rendseg: flatten a traced tifxyz segment to an image or a layered
  * surface volume. Surface positions are bilinearly upsampled `up`x and
- * sampled from a c5d LOD volume (optionally averaged over +-span along the
+ * sampled from a volcomp LOD volume (optionally averaged over +-span along the
  * surface normal — vc3d's layered flattened view collapsed to one image).
  * Writes 8-bit grayscale PNG (or PGM when the output path ends in .pgm);
  * --layers N writes an N-layer surface volume (vc_render_tifxyz parity):

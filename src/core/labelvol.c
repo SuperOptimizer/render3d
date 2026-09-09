@@ -3,7 +3,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <label.h> /* c5d C5L1 label-brick codec (angle include: c5d src dir) */
+#include <label.h> /* lossless R3L1 label storage (angle include: volcomp src dir) */
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -197,6 +197,37 @@ void r3d_labelvol_fetch(const r3d_labelvol *lv, uint32_t level, uint32_t bx, uin
   }
 }
 
+void r3d_labelvol_fetch_block(const r3d_labelvol *lv, uint32_t level, uint32_t bx, uint32_t by,
+                             uint32_t bz, uint8_t *out) {
+  if (!lv->data) { memset(out, 0, 4096); return; }
+  /* coarse LOD brick: stride-sample the paint grid (thin painted sheets can
+   * drop voxels at coarse zoom; labelling itself happens at level 0) */
+  const uint8_t *cache = NULL;
+  size_t cache_bi = SIZE_MAX;
+  size_t o = 0;
+  for (uint32_t oz = 0; oz < 16u; oz++) {
+    uint64_t wz = ((uint64_t)bz * 16u + oz) << level;
+    for (uint32_t oy = 0; oy < 16u; oy++) {
+      uint64_t wy = ((uint64_t)by * 16u + oy) << level;
+      for (uint32_t ox = 0; ox < 16u; ox++, o++) {
+        uint64_t wx = ((uint64_t)bx * 16u + ox) << level;
+        uint8_t v = 0;
+        if (wx < lv->dim[0] && wy < lv->dim[1] && wz < lv->dim[2]) {
+          size_t bi = lbl_bidx(lv, 0, (uint32_t)(wx >> 7), (uint32_t)(wy >> 7),
+                               (uint32_t)(wz >> 7));
+          if (bi != cache_bi) {
+            cache = lv->data[bi];
+            cache_bi = bi;
+          }
+          if (cache)
+            v = cache[(size_t)(((wz & 127u) * LB + (wy & 127u)) * LB + (wx & 127u))];
+        }
+        out[o] = v;
+      }
+    }
+  }
+}
+
 uint32_t r3d_labelvol_dirty(const r3d_labelvol *lv) {
   if (!lv->data) return 0;
   size_t nb = lbl_nbr(lv);
@@ -208,7 +239,7 @@ uint32_t r3d_labelvol_dirty(const r3d_labelvol *lv) {
 
 static void lbl_brick_path(char *out, size_t cap, const char *dir, uint32_t bx, uint32_t by,
                            uint32_t bz) {
-  snprintf(out, cap, "%s/b_%u_%u_%u.c5l", dir, bx, by, bz);
+  snprintf(out, cap, "%s/b_%u_%u_%u.r3l", dir, bx, by, bz);
 }
 
 /* Best-effort: persist a just-completed rename against a crash. Failure is
@@ -255,7 +286,7 @@ int r3d_labelvol_save(r3d_labelvol *lv, const char *dir) {
     fprintf(stderr, "labels: mkdir %s: %s\n", dir, strerror(errno));
     return -1;
   }
-  c5d_label_params prm = c5d_label_defaults();
+  r3d_label_params prm = r3d_label_defaults();
   prm.nthreads = 0; /* all cores: ~14 ms per brick */
   uint32_t wrote = 0, dropped = 0, failed = 0;
   int rc = 0;
@@ -285,10 +316,10 @@ int r3d_labelvol_save(r3d_labelvol *lv, const char *dir) {
           if (gen_before == lv->gens[0][bi]) lv->saved[bi] = gen_before;
           continue;
         }
-        c5d_label_channel ch = {C5D_LABEL_U8, C5D_LABEL_NO_MASK, d};
+        r3d_label_channel ch = {R3D_LABEL_U8, R3D_LABEL_NO_MASK, d};
         uint8_t *buf = NULL;
         size_t bn = 0;
-        if (c5d_label_encode(&prm, &ch, 1, LB, &buf, &bn) != 0) {
+        if (r3d_label_encode(&prm, &ch, 1, LB, &buf, &bn) != 0) {
           fprintf(stderr, "labels: encode failed for brick %u,%u,%u\n", bx, by, bz);
           rc = -1;
           failed++;
@@ -360,7 +391,7 @@ int r3d_labelvol_load(r3d_labelvol *lv, const char *dir) {
   while ((de = readdir(dp)) != NULL) {
     uint32_t bx, by, bz;
     char tail = 0;
-    if (sscanf(de->d_name, "b_%u_%u_%u.c5%c", &bx, &by, &bz, &tail) != 4 || tail != 'l')
+    if (sscanf(de->d_name, "b_%u_%u_%u.r3%c", &bx, &by, &bz, &tail) != 4 || tail != 'l')
       continue;
     if (bx >= lv->lnb[0][0] || by >= lv->lnb[0][1] || bz >= lv->lnb[0][2]) continue;
     char bp[1408];
@@ -381,14 +412,14 @@ int r3d_labelvol_load(r3d_labelvol *lv, const char *dir) {
     if (!sizeok)
       fprintf(stderr, "labels: %s: bad size or exceeds %u byte cap\n", bp, LBL_MAX_BRICK_FILE);
     uint32_t ddim = 0, nchan = 0;
-    c5d_label_type ty[C5D_LABEL_MAX_CHANNELS];
-    uint32_t mk[C5D_LABEL_MAX_CHANNELS];
+    r3d_label_type ty[R3D_LABEL_MAX_CHANNELS];
+    uint32_t mk[R3D_LABEL_MAX_CHANNELS];
     if (ok)
-      ok = c5d_label_info(buf, (size_t)fn, &ddim, &nchan, ty, mk) == 0 && ddim == LB &&
-           nchan >= 1u && ty[0] == C5D_LABEL_U8;
+      ok = r3d_label_info(buf, (size_t)fn, &ddim, &nchan, ty, mk) == 0 && ddim == LB &&
+           nchan >= 1u && ty[0] == R3D_LABEL_U8;
     if (ok) {
-      c5d_label_channel ch = {C5D_LABEL_U8, mk[0], tmp};
-      ok = c5d_label_decode(buf, (size_t)fn, LB, &ch, 1, 0) == 0;
+      r3d_label_channel ch = {R3D_LABEL_U8, mk[0], tmp};
+      ok = r3d_label_decode(buf, (size_t)fn, LB, &ch, 1, 0) == 0;
     }
     free(buf);
     if (ok) {

@@ -1,3 +1,4 @@
+#include "brick.h"
 /* Net-ingest fault injection (ctest label: quick — offline, localhost only).
  * An in-process HTTP stub plays a zarr chunk server for a manifest with no
  * local shards, so every brick read demand-fetches. Asserts the fail-closed
@@ -5,7 +6,7 @@
  *  - an HTML/proxy 200 or a truncated 200 publishes NO cache artifact and
  *    the region heals on a later healthy retry
  *  - a 404 is a legitimately absent chunk: a permanent empty marker
- *  - a healthy 200 lands the exact bytes, and the .c5b disk cache serves
+ *  - a healthy 200 lands the exact bytes, and the .volc disk cache serves
  *    later sessions without the network
  * Each phase opens a fresh r3d_cpuvol: backoff and negative caches are
  * per-open state, while the disk artifacts under test persist. */
@@ -40,6 +41,21 @@ static int failures = 0;
 
 static uint8_t ipat(uint32_t x, uint32_t y, uint32_t z) {
   return (uint8_t)(31u + ((x * 7u + y * 13u + z * 29u) & 127u)); /* never 0 */
+}
+
+/* Reference reconstruction for this lossy codec, independent of cpuvol's
+ * random-access path. Ingest must agree exactly, including chunk coordinates. */
+static double decoded_pattern(uint32_t x, uint32_t y, uint32_t z) {
+  uint8_t *raw = malloc(CHUNK_BYTES), *enc = NULL;
+  if (!raw) return -1;
+  for (uint32_t zz=0;zz<IB;zz++) for (uint32_t yy=0;yy<IB;yy++) for (uint32_t xx=0;xx<IB;xx++)
+    raw[((size_t)zz*IB+yy)*IB+xx]=ipat(x/IB*IB+xx,y/IB*IB+yy,z/IB*IB+zz);
+  volcomp_brick_params p=volcomp_brick_defaults(2);
+  size_t n=0;
+  int rc=volcomp_brick_encode(&p,raw,IB,&enc,&n);
+  if (!rc) rc=volcomp_brick_decode(enc,n,raw,IB);
+  double value=rc ? -1 : raw[((size_t)(z%IB)*IB+y%IB)*IB+x%IB];
+  free(raw);free(enc);return value;
 }
 
 /* ---- HTTP stub ----------------------------------------------------------- */
@@ -145,21 +161,21 @@ static int make_dataset(const char *root, uint16_t port) {
   FILE *f = fopen(p, "w");
   if (!f) return -1;
   fprintf(f,
-          "{\n  \"format\": \"render3d.c5d-lod.v1\",\n"
+          "{\n  \"format\": \"render3d.volcomp-lod.v1\",\n"
           "  \"shape\": [%u, %u, %u],\n"
           "  \"shard_shape\": [1024, 1024, 1024],\n"
           "  \"brick_shape\": [128, 128, 128],\n  \"levels\": [\n"
           "    {\"level\": 0, \"scale\": 1, \"shape\": [%u, %u, %u], \"shards\": [1, 1, 1],"
-          " \"c5d\": \"c5d/L0/{z}_{y}_{x}.c5s\"},\n"
+          " \"volcomp\": \"volcomp/L0/{z}_{y}_{x}.vcs\"},\n"
           "    {\"level\": 1, \"scale\": 2, \"shape\": [%u, %u, %u], \"shards\": [1, 1, 1],"
-          " \"c5d\": \"c5d/L1/{z}_{y}_{x}.c5s\"}\n  ]\n}\n",
+          " \"volcomp\": \"volcomp/L1/{z}_{y}_{x}.vcs\"}\n  ]\n}\n",
           IDIM, IDIM, IDIM, IDIM, IDIM, IDIM, IDIM / 2, IDIM / 2, IDIM / 2);
   if (fclose(f) != 0) return -1;
   snprintf(p, sizeof p, "%s/source.json", root);
   f = fopen(p, "w");
   if (!f) return -1;
   fprintf(f,
-          "{\n  \"format\": \"render3d.c5d-source.v1\",\n"
+          "{\n  \"format\": \"render3d.volcomp-source.v1\",\n"
           "  \"url\": \"http://127.0.0.1:%u\",\n  \"quality\": 2,\n"
           "  \"levels\": [\n    {\"level\": 0, \"chunk\": 128, \"raw\": true},\n"
           "    {\"level\": 1, \"chunk\": 128, \"raw\": true}\n  ]\n}\n",
@@ -170,7 +186,7 @@ static int make_dataset(const char *root, uint16_t port) {
 static bool brick_file_state(const char *root, uint32_t bx, uint32_t by, uint32_t bz,
                              long *size) {
   char p[700];
-  snprintf(p, sizeof p, "%s/bricks/L0/%u_%u_%u.c5b", root, bz, by, bx);
+  snprintf(p, sizeof p, "%s/bricks/L0/%u_%u_%u.volc", root, bz, by, bx);
   struct stat st;
   if (stat(p, &st) != 0) return false;
   *size = (long)st.st_size;
@@ -223,20 +239,21 @@ int main(void) {
   CHECK(sample_once(root, 60, 200, 60) == 0.0);
   CHECK(brick_file_state(root, 0, 1, 0, &fsz) && fsz == 0);
 
-  /* healthy 200: exact bytes, and a durable .c5b for later sessions */
+  /* healthy 200: codec reconstruction, and a durable .volc for later sessions */
   g_mode = STUB_OK;
   double v = sample_once(root, 200.0, 200.0, 60.0);
-  CHECK(fabs(v - (double)ipat(200, 200, 60)) < 0.01); /* raw cache hit: exact */
+  CHECK(v == decoded_pattern(200, 200, 60)); /* CPU block decode from the durable stream */
   CHECK(brick_file_state(root, 1, 1, 0, &fsz) && fsz > 0);
   /* later session, server unreachable: served from the disk cache (lossy) */
   g_mode = STUB_404;
   double v2 = sample_once(root, 200.0, 200.0, 60.0);
-  CHECK(fabs(v2 - (double)ipat(200, 200, 60)) < 4.0);
+  CHECK(v2 == decoded_pattern(200, 200, 60));
+  CHECK(v2 == v); /* cold and warm paths reconstruct identical voxels */
 
   /* the HTML-poisoned brick HEALS once the server behaves */
   g_mode = STUB_OK;
   double v3 = sample_once(root, 60.0, 60.0, 60.0);
-  CHECK(fabs(v3 - (double)ipat(60, 60, 60)) < 0.01);
+  CHECK(v3 == decoded_pattern(60, 60, 60));
   CHECK(brick_file_state(root, 0, 0, 0, &fsz) && fsz > 0);
 
   g_stop = true;
@@ -248,7 +265,7 @@ int main(void) {
   for (uint32_t bz = 0; bz < 2; bz++)
     for (uint32_t by = 0; by < 2; by++)
       for (uint32_t bx = 0; bx < 2; bx++) {
-        snprintf(p, sizeof p, "%s/bricks/L0/%u_%u_%u.c5b", root, bz, by, bx);
+        snprintf(p, sizeof p, "%s/bricks/L0/%u_%u_%u.volc", root, bz, by, bx);
         unlink(p);
       }
   snprintf(p, sizeof p, "%s/bricks/L0", root);

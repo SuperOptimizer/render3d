@@ -70,7 +70,7 @@ typedef struct r3d_frame_params {
   float vol_r0[3]; float vol_tx;
   float vol_r1[3]; float vol_ty;
   float vol_r2[3]; float vol_tz;
-  /* bricks mode (c5d GPU-decoded atlas): 0 = off; else bpa | atlas_bpa<<8 */
+  /* bricks mode (CPU-decoded 16^3 atlas): 0 = off; else bpa | atlas_bpa<<8 */
   uint32_t brick_mode;
   /* skip gate (0..1): voxels below this are invisible under the CURRENT
    * transfer function + low-cut, so empty-space skipping may leap them.

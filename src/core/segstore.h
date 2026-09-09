@@ -1,5 +1,5 @@
 /* Segment store: a whole scroll's tifxyz surfaces as one directory of
- * c5d-compressed grids (<name>.tfx) plus a binary manifest (segments.r3ds)
+ * volcomp-compressed grids (<name>.tfx) plus a binary manifest (segments.r3ds)
  * that doubles as the spatial index.
  *
  * The index is two-level (inspired by vc3d's SurfacePatchIndex, flattened

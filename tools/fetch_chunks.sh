@@ -1,6 +1,6 @@
 #!/bin/sh
-# Fetch zarr v2 chunks listed by `zarr2c5d --list-missing` into a local mirror.
-# A 404 leaves a "<path>.missing" marker so zarr2c5d can tell "absent object
+# Fetch zarr v2 chunks listed by `zarr2volcomp --list-missing` into a local mirror.
+# A 404 leaves a "<path>.missing" marker so zarr2volcomp can tell "absent object
 # (= zero-fill chunk)" from "not yet downloaded".  Resumable; parallel.
 #
 # usage: fetch_chunks.sh <base-url> <mirror-dir> <list-file> [parallel=16]

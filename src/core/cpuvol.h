@@ -1,8 +1,8 @@
-/* CPU-side sampler over a render3d c5d LOD tree (manifest.json + shard
- * files under c5d/L<l>, plus net-ingested .c5b files under bricks/L<l>)
- * with a brick-granular decode LRU. For worker-thread consumers — the
+/* CPU-side sampler over a render3d volcomp LOD tree (manifest.json + shard
+ * files under volcomp/L<l>, plus net-ingested .volc files under bricks/L<l>)
+ * with a 16^3-block decode LRU. For worker-thread consumers — the
  * surface tracer reads prediction volumes through this; the renderer
- * keeps its own GPU path. Values are u8; no-data voxels read as 0. */
+ * uploads CPU-decoded blocks to its GPU atlas. Values are u8; no-data voxels read as 0. */
 #ifndef R3D_CPUVOL_H
 #define R3D_CPUVOL_H
 
@@ -27,7 +27,7 @@ typedef struct r3d_cpuvol {
   r3d_cpuvol_level lev[R3D_CPUVOL_LEVELS];
   void *readers;   /* lazy shard readers */
   uint32_t nreaders;
-  /* decode cache: refcounted slab pool of 128^3 bricks keyed
+  /* decode cache: refcounted slab pool of 16^3 blocks keyed
    * (level, bx, by, bz), pinned per reader lease. Opaque (cv_cache) and
    * separately refcounted so a lease outlives r3d_cpuvol_close. */
   void *cache;
@@ -56,7 +56,7 @@ typedef struct r3d_cpuvol {
    * tracer must not go data-blind at its frontier just because the
    * viewer never looked there. */
   char url[1400];    /* empty = no net source */
-  float q0;          /* c5d quality ladder base */
+  float q0;          /* volcomp quality ladder base */
   uint32_t chsz[R3D_CPUVOL_LEVELS];
   bool raw[R3D_CPUVOL_LEVELS];
   void *curl;        /* lazy CURL handle */
@@ -66,10 +66,11 @@ typedef struct r3d_cpuvol {
   struct r3d_surfpred *sp;
 } r3d_cpuvol;
 
-int r3d_cpuvol_open(r3d_cpuvol *v, const char *root, uint32_t cache_bricks);
+/* cache_blocks counts 4 KiB decoded 16^3 blocks; zero selects 4096 (16 MiB). */
+int r3d_cpuvol_open(r3d_cpuvol *v, const char *root, uint32_t cache_blocks);
 /* allow_predict=false opens a predict tree as plain files only (no
  * predictor, no recursion) — used by the predictor to read its own output */
-int r3d_cpuvol_open_ex(r3d_cpuvol *v, const char *root, uint32_t cache_bricks,
+int r3d_cpuvol_open_ex(r3d_cpuvol *v, const char *root, uint32_t cache_blocks,
                        bool allow_predict);
 void r3d_cpuvol_close(r3d_cpuvol *v);
 
@@ -92,7 +93,7 @@ int r3d_cpuvol_prefetch(r3d_cpuvol *v, uint32_t li, const uint32_t *bxyz, uint32
 
 /* Copy an axis-aligned block of level-li voxels (base-level index space of
  * that level; may extend outside the volume — those voxels read 0; absent
- * bricks read 0). Bulk brick copies, not per-voxel sampling. */
+ * bricks read 0). Bulk 16^3 block copies, not per-voxel sampling. */
 void r3d_cpuvol_read_block(r3d_cpuvol *v, uint32_t li, int64_t x0, int64_t y0, int64_t z0,
                            uint32_t nx, uint32_t ny, uint32_t nz, uint8_t *out);
 
@@ -100,5 +101,12 @@ void r3d_cpuvol_read_block(r3d_cpuvol *v, uint32_t li, int64_t x0, int64_t y0, i
  * the predictor) so the next sample hits without touching the disk. */
 void r3d_cpuvol_cache_put(r3d_cpuvol *v, uint32_t li, uint32_t bx, uint32_t by, uint32_t bz,
                           const uint8_t *raw);
+
+typedef struct r3d_cpuvol_cache_stats {
+  uint32_t capacity_blocks, resident_blocks;
+  size_t capacity_bytes, resident_bytes;
+  uint64_t decoded_blocks;
+} r3d_cpuvol_cache_stats;
+void r3d_cpuvol_get_cache_stats(r3d_cpuvol *v, r3d_cpuvol_cache_stats *out);
 
 #endif /* R3D_CPUVOL_H */

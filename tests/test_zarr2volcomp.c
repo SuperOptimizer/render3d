@@ -1,10 +1,10 @@
-/* zarr2c5d converter end-to-end (ctest label: quick — offline, local mirror).
+/* zarr2volcomp converter end-to-end (ctest label: quick — offline, local mirror).
  * Builds a local zarr v2 mirror (raw u1 chunks, dimension_separator "/"),
- * runs the actual converter binary, and verifies the produced c5d LOD tree
+ * runs the actual converter binary, and verifies the produced volcomp LOD tree
  * decodes back to the source voxels through cpuvol. Also asserts the
  * amplification guard: a legal-but-pathological 1024^3 chunk edge is
  * rejected instead of allocating gigabytes.
- * Usage: test_zarr2c5d <path-to-zarr2c5d> */
+ * Usage: test_zarr2volcomp <path-to-zarr2volcomp> */
 #include <errno.h>
 #include <math.h>
 #include <stdint.h>
@@ -86,7 +86,7 @@ static void rm_rf(const char *dir) { /* test-owned temp paths only */
 
 int main(int argc, char **argv) {
   if (argc != 2) {
-    fprintf(stderr, "usage: test_zarr2c5d <zarr2c5d-binary>\n");
+    fprintf(stderr, "usage: test_zarr2volcomp <zarr2volcomp-binary>\n");
     return 77;
   }
   char tmp[512];
@@ -100,7 +100,7 @@ int main(int argc, char **argv) {
   CHECK(write_zarray(mirror, ZDIM, ZB) == 0);
   CHECK(write_chunks(mirror) == 0);
   char cmd[2048];
-  snprintf(cmd, sizeof cmd, "%s %s %s --threads 2 --c5d-quality 2 --full-from 0 >%s/z.log 2>&1",
+  snprintf(cmd, sizeof cmd, "%s %s %s --threads 2 --volcomp-quality 2 --full-from 0 >%s/z.log 2>&1",
            argv[1], mirror, out, tmp);
   CHECK(system(cmd) == 0);
   /* the produced tree decodes back to the source voxels */
@@ -134,6 +134,6 @@ int main(int argc, char **argv) {
     fprintf(stderr, "%d failure(s)\n", failures);
     return 1;
   }
-  printf("zarr2c5d converter OK\n");
+  printf("zarr2volcomp converter OK\n");
   return 0;
 }

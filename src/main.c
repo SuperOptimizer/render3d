@@ -1,3 +1,7 @@
+#include "core/thread.h"
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
 /* render3d — volumetric renderer for Vesuvius Challenge micro-CT volumes.
  * M1: SDL3 window + Vulkan compute raycaster (see spec/ and docs/measured.md). */
 #include <SDL3/SDL.h>
@@ -45,8 +49,8 @@ extern char **environ; /* argv-spawned browser jobs inherit the environment */
 #ifndef R3D_SPV_DIR
 #define R3D_SPV_DIR "spv" /* release fallback: exe-relative */
 #endif
-#ifndef R3D_C5D_REV
-#define R3D_C5D_REV "unknown"
+#ifndef R3D_VOLCOMP_REV
+#define R3D_VOLCOMP_REV "unknown"
 #endif
 
 #define MOUSE_SENS 0.0025f
@@ -357,7 +361,7 @@ static uint8_t bsurf_ct_sample(void *ctx, int64_t x, int64_t y, int64_t z) {
 
 /* 3D labelling: paint class ids (papyrus / ink / recto / ...) with the mouse
  * in the plane panes; the renderer mirrors the CPU volume into a slot-
- * parallel atlas (r3d_bricks_labels_sync), and C5L1 label bricks persist it
+ * parallel atlas (r3d_bricks_labels_sync), and R3L1 label bricks persist it
  * losslessly. State is file-scope because the paint gesture (event loop),
  * the panel (GUI), the per-pane routing and the dataset-loop cleanup all
  * touch it. */
@@ -374,11 +378,11 @@ static bool g_lbl_stroke = false; /* a drag is in progress */
 static double g_lbl_prev[3];
 
 static uint32_t lblsrc_gen(void *u, uint32_t level, uint32_t bx, uint32_t by, uint32_t bz) {
-  return r3d_labelvol_gen((const r3d_labelvol *)u, level, bx, by, bz);
+  return r3d_labelvol_gen((const r3d_labelvol *)u, level, bx / 8u, by / 8u, bz / 8u);
 }
 static void lblsrc_fetch(void *u, uint32_t level, uint32_t bx, uint32_t by, uint32_t bz,
                          uint8_t *out) {
-  r3d_labelvol_fetch((const r3d_labelvol *)u, level, bx, by, bz, out);
+  r3d_labelvol_fetch_block((const r3d_labelvol *)u, level, bx, by, bz, out);
 }
 
 /* Volume registration: a second scan of the same scroll overlaid through an
@@ -436,7 +440,7 @@ static bool reg_open_moving(r3d_renderer *renderer, const char *root, const uint
     r3d_regvol_close(&g_reg);
   }
   if (r3d_regvol_open(&g_reg, rr, fd) != 0) return false;
-  r3d_label_src ls = {r3d_regvol_srcgen, r3d_regvol_srcfetch, &g_reg};
+  r3d_label_src ls = {r3d_regvol_blockgen, r3d_regvol_blockfetch, &g_reg};
   if (r3d_bricks_regatlas(renderer, &ls) != 0) {
     r3d_regvol_close(&g_reg); /* atlas never attached: no worker to stop */
     return false;
@@ -1121,7 +1125,7 @@ static int sgc_open(sgcache *c, const char *store_dir, size_t budget) {
   c->budget = budget;
   pthread_mutex_init(&c->mu, NULL);
   pthread_cond_init(&c->cv, NULL);
-  if (pthread_create(&c->th, NULL, sgc_worker, c) != 0) {
+  if (r3d_thread_create(&c->th, NULL, sgc_worker, c) != 0) {
     free(c->ent);
     free(c->queue);
     free(c->ov);
@@ -1310,8 +1314,22 @@ static void od_log(od_state *od, const char *line) {
   snprintf(od->log[od->nlog++], sizeof od->log[0], "%s", line);
 }
 
+/* Child stdout pipes: portable close-on-exec setup. */
+static int r3d_pipe_cloexec(int fd[2]) {
+  if (pipe(fd) != 0) return -1;
+  if (fcntl(fd[0], F_SETFD, FD_CLOEXEC) < 0 || fcntl(fd[1], F_SETFD, FD_CLOEXEC) < 0) {
+    close(fd[0]); close(fd[1]); return -1;
+  }
+  return 0;
+}
+
 static void od_exe_dir(char out[512]) {
+#ifdef __APPLE__
+  uint32_t cap = 512;
+  ssize_t n = _NSGetExecutablePath(out, &cap) == 0 ? (ssize_t)strlen(out) : -1;
+#else
   ssize_t n = readlink("/proc/self/exe", out, 511);
+#endif
   if (n <= 0) {
     snprintf(out, 512, ".");
     return;
@@ -1419,7 +1437,7 @@ static int od_spawn_step(od_state *od) {
   }
   argv[st->nargs] = NULL;
   int fds[2];
-  if (pipe2(fds, O_CLOEXEC) != 0) return -1; /* read end never reaches a child */
+  if (r3d_pipe_cloexec(fds) != 0) return -1; /* read end never reaches a child */
   posix_spawn_file_actions_t fa;
   if (posix_spawn_file_actions_init(&fa) != 0) {
     close(fds[0]);
@@ -1500,10 +1518,10 @@ static int od_pump(od_state *od) {
   return 1;
 }
 
-/* zarr2c5d bootstrap: a single argv-spawned step */
+/* zarr2volcomp bootstrap: a single argv-spawned step */
 static void od_job_bootstrap(od_state *od, const char *exe, const char *url) {
   char prog[600], meta[600];
-  snprintf(prog, sizeof prog, "%s/zarr2c5d", exe);
+  snprintf(prog, sizeof prog, "%s/zarr2volcomp", exe);
   snprintf(meta, sizeof meta, "%s/meta", od->tgt_dir);
   const char *a[] = {prog,        meta,      od->tgt_dir, "--url",
                      url,         "--bootstrap", "--threads", "8"};
@@ -1570,7 +1588,7 @@ static void od_request(od_state *od, int req) {
   if (!od->fth_up) {
     pthread_mutex_init(&od->fmu, NULL);
     pthread_cond_init(&od->fcv, NULL);
-    if (pthread_create(&od->fth, NULL, od_fetch_worker, od) != 0) return;
+    if (r3d_thread_create(&od->fth, NULL, od_fetch_worker, od) != 0) return;
     od->fth_up = true;
   }
   pthread_mutex_lock(&od->fmu);
@@ -1605,7 +1623,7 @@ static int od_poll(od_state *od, r3d_odlist *a, r3d_odlist *b, bool **cached) {
 }
 
 /* The browser is an ordinary ImGui window in the frame loop. Opening a
- * dataset runs background jobs (zarr2c5d --bootstrap, tifxyz download);
+ * dataset runs background jobs (zarr2volcomp --bootstrap, tifxyz download);
  * when everything is local it writes the chosen paths and requests a
  * dataset swap — plain mutable state, reopened in the same session. */
 static void od_browser_window(od_state *od, bool *open, char *next_bricks, size_t nb_cap,
@@ -1965,7 +1983,7 @@ static int i3_spawn(const char *const *args, int n, pid_t *pid_out, int *fd_out)
   for (int i = 0; i < n; i++) argv[i] = (char *)args[i];
   argv[n] = NULL;
   int fds[2];
-  if (pipe2(fds, O_CLOEXEC) != 0) return -1;
+  if (r3d_pipe_cloexec(fds) != 0) return -1;
   posix_spawn_file_actions_t fa;
   if (posix_spawn_file_actions_init(&fa) != 0) {
     close(fds[0]);
@@ -2037,7 +2055,7 @@ static uint32_t i3_footprint(const r3d_tifxyz *s, double pad, const char *path) 
 }
 
 /* drop the overlay cache's negative knowledge so freshly computed chunks
- * re-stream: zero-size .c5b absent markers plus the coarse seed cache */
+ * re-stream: zero-size .volc absent markers plus the coarse seed cache */
 static void i3_clear_absent(const char *root) {
   char p[1400];
   snprintf(p, sizeof p, "%s/seed.raw", root);
@@ -2050,7 +2068,7 @@ static void i3_clear_absent(const char *root) {
     struct dirent *e;
     while ((e = readdir(dir))) {
       size_t bn = strlen(e->d_name);
-      if (bn < 4 || strcmp(e->d_name + bn - 4, ".c5b") != 0) continue;
+      if (bn < 4 || strcmp(e->d_name + bn - 4, ".volc") != 0) continue;
       snprintf(p, sizeof p, "%s/%s", d, e->d_name);
       struct stat st;
       if (stat(p, &st) == 0 && st.st_size == 0) unlink(p);
@@ -2124,9 +2142,9 @@ static int write_bench_json(const char *path, const char *scenario, int width, i
   json_string(f, quality);
   fprintf(f, ",\n  \"width\": %d,\n  \"height\": %d,\n  \"warmup_frames\": %u,\n"
              "  \"measured_frames\": %llu,\n  \"retained_frame_samples\": %u,\n"
-             "  \"c5d_revision\": ",
+             "  \"volcomp_revision\": ",
           width, height, warmup, (unsigned long long)nsamples, stats->count);
-  json_string(f, R3D_C5D_REV);
+  json_string(f, R3D_VOLCOMP_REV);
   fprintf(f, ",\n  \"pending_cell_frames\": %llu,\n"
              "  \"brick_stream\": {\"decoded\": %llu, \"jobs\": %llu, "
              "\"failures\": %u, \"mean_job_ms\": %.6f,\n"
@@ -2166,8 +2184,7 @@ int main(int argc, char **argv) {
     r3d_vkctx vk;
     if (r3d_vkctx_create(&vk, NULL, 0, false) != 0) return EXIT_FAILURE;
     r3d_vkctx_print_caps(&vk);
-    printf("c5d revision       : %s (GPU ABI %u)\n", R3D_C5D_REV,
-           (unsigned)R3D_C5D_GPU_ABI);
+    printf("volume-compressor revision: %s (CPU decode)\n", R3D_VOLCOMP_REV);
     r3d_vkctx_destroy(&vk);
     return EXIT_SUCCESS;
   }
@@ -2193,7 +2210,7 @@ int main(int argc, char **argv) {
   int depth0 = 0;           /* initial visible depth; explicit 0 = full volume */
   bool depth_given = false;
   bool clip_mode = false;   /* clipmap over the shard band */
-  const char *bricks_path = NULL; /* c5d shard for GPU-decoded bricks mode */
+  const char *bricks_path = NULL; /* volcomp shard for GPU-decoded bricks mode */
   int pool_bpa = 0, warm_mb = 0;  /* bricks hot-atlas slots/axis, warm-tier MB */
   int brick_z = -1, brick_depth = 0; /* global manifest XY slice; depth 0 = full volume */
   uint32_t brick_shape[3] = {0, 0, 0};
@@ -2243,7 +2260,7 @@ int main(int argc, char **argv) {
   bool im_req_out = false;
   char inkmap_path[1200] = "";
   const char *seg_store_path = NULL; /* segpack store: draw ALL surfaces */
-  const char *overlay_path = NULL;   /* active overlay c5d LOD root */
+  const char *overlay_path = NULL;   /* active overlay volcomp LOD root */
   const char *overlay_paths[8];      /* all --overlay trees (ink, surface preds...) */
   uint32_t n_overlays = 0;
   int overlay_sel = 0;
@@ -2336,7 +2353,8 @@ int main(int argc, char **argv) {
   bool slab_view = false;
   for (int i = 1; i < argc; i++)
     if (strcmp(argv[i], "--slab-view") == 0) slab_view = true;
-  if (bricks_path && !multiview_path && !slab_view && !umbilicus_path) multiview_path = "(none)";
+  bool auto_multiview = bricks_path && !multiview_path && !slab_view && !umbilicus_path;
+  if (auto_multiview) multiview_path = "(none)";
   if (umbilicus_path && !multiview_path) { /* multiview annotates in-place;
                                             * standalone uses the vslab rig */
     vslab_mode = true;
@@ -2591,6 +2609,7 @@ int main(int argc, char **argv) {
     r3d_bricks_stats initial_bst;
     r3d_bricks_get_stats(renderer, &initial_bst);
     brick_is_lod = initial_bst.nlevels > 1u;
+    if (auto_multiview && !brick_is_lod) multiview_path = NULL;
     brick_depth = depth_given ? depth0 : (brick_is_lod ? 8 : 0);
     if (brick_depth < 0) brick_depth = 0;
     if (getenv("R3D_LBLTEST")) { /* headless/bench: enable 3D labelling and
@@ -5138,7 +5157,7 @@ int main(int argc, char **argv) {
               g_flat_th_up = false;
             }
             atomic_store(&g_flat_state, 1);
-            if (pthread_create(&g_flat_th, NULL, flat_worker, NULL) == 0)
+            if (r3d_thread_create(&g_flat_th, NULL, flat_worker, NULL) == 0)
               g_flat_th_up = true;
             else {
               atomic_store(&g_flat_state, 0);
@@ -5570,7 +5589,7 @@ int main(int argc, char **argv) {
     if (bricks_path && igCollapsingHeader_TreeNodeFlags("labels", 0)) {
       if (!g_lbl_init) {
         igTextWrapped("paint 3D class labels (papyrus, ink, recto/verso, ...) into "
-                      "the volume; saved losslessly as C5L1 label bricks");
+                      "the volume; saved losslessly as R3L1 label bricks");
         if (igButton("enable 3D labelling##lblen", (ImVec2){0, 0})) {
           uint32_t ld[3] = {brick_shape[0], brick_shape[1], brick_shape[2]};
           if (r3d_labelvol_init(&g_lblv, ld) == 0) {
@@ -7252,6 +7271,9 @@ int main(int argc, char **argv) {
       }
       r3d_surfvol_regtap(renderer, g_reg_open && g_reg_flat);
       r3d_bricks_regatlas_sync(renderer, 16u);
+      if (in.screenshot || (total_frames && shot_path && frame_index + 1 >= total_frames)) {
+        r3d_bricks_settle(renderer);
+      }
       { /* SLIM flatten completion: save + add to the store on this thread */
         int fst2 = atomic_load(&g_flat_state);
         if (fst2 == 2 || fst2 == 3) {

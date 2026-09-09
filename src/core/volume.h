@@ -1,5 +1,5 @@
 /* Raw u8 volume access: mmap'd flat file, x-fastest ([z][y][x], spec/volume.md).
- * Carries the c5d spatial-hierarchy metadata from day 1 so later brick/LOD
+ * Carries the volcomp spatial-hierarchy metadata from day 1 so later brick/LOD
  * streaming does not change this interface. */
 #ifndef R3D_VOLUME_H
 #define R3D_VOLUME_H
