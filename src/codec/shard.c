@@ -9,6 +9,11 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#if defined(__aarch64__) && defined(__ARM_FEATURE_CRC32)
+#include <arm_acle.h>
+#elif defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+#include <nmmintrin.h>
+#endif
 struct volcomp_shard_writer {
   FILE *f;
   uint8_t footer[32], *index;
@@ -16,6 +21,7 @@ struct volcomp_shard_writer {
   uint64_t cursor;
   int failed;
 };
+#if !defined(__aarch64__) || !defined(__ARM_FEATURE_CRC32)
 static uint32_t crc_table[256];
 static pthread_once_t crc_once = PTHREAD_ONCE_INIT;
 static void crc_init(void) {
@@ -26,13 +32,45 @@ static void crc_init(void) {
     crc_table[j] = c;
   }
 }
+#endif
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+__attribute__((target("sse4.2")))
+static uint32_t crc_x86(const uint8_t *p, size_t n) {
+  uint64_t c = UINT32_MAX;
+  while (n >= 8) {
+    uint64_t word;
+    memcpy(&word, p, 8);
+    c = _mm_crc32_u64(c, word);
+    p += 8; n -= 8;
+  }
+  while (n--) c = _mm_crc32_u8((uint32_t)c, *p++);
+  return ~(uint32_t)c;
+}
+#endif
 uint32_t volcomp_crc32c(const void *data, size_t n) {
-  pthread_once(&crc_once, crc_init);
   const uint8_t *p = data;
+#if defined(__aarch64__) && defined(__ARM_FEATURE_CRC32)
   uint32_t c = UINT32_MAX;
-  while (n--)
-    c = (c >> 8) ^ crc_table[(c ^ *p++) & 255u];
+  while (n >= 8) {
+    uint64_t word;
+    memcpy(&word, p, 8);
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+    word = __builtin_bswap64(word);
+#endif
+    c = __crc32cd(c, word);
+    p += 8; n -= 8;
+  }
+  while (n--) c = __crc32cb(c, *p++);
   return ~c;
+#else
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+  if (__builtin_cpu_supports("sse4.2")) return crc_x86(p, n);
+#endif
+  pthread_once(&crc_once, crc_init);
+  uint32_t c = UINT32_MAX;
+  while (n--) c = (c >> 8) ^ crc_table[(c ^ *p++) & 255u];
+  return ~c;
+#endif
 }
 static uint32_t brick_count(uint32_t sd, uint32_t bd) {
   if (bd != 128 || sd < bd || sd % bd)

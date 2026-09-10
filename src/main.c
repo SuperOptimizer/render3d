@@ -1,4 +1,6 @@
 #include "core/thread.h"
+#include "app/viewcache.h"
+#include "app/benchmark.h"
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
 #endif
@@ -61,6 +63,27 @@ extern char **environ; /* argv-spawned browser jobs inherit the environment */
 #define BASE_SPEED 0.4f /* volume units per second */
 
 enum { CAM_ORBIT = 0, CAM_FLY = 1 };
+
+static uint64_t app_surface_revision = 1;
+static int app_surf_swap(r3d_renderer *r, uint32_t w, uint32_t h,
+                         const float *coords, const float *normals, float sx, float sy) {
+  int rc = r3d_surf_swap(r, w, h, coords, normals, sx, sy);
+  if (rc == 0) app_surface_revision++;
+  return rc;
+}
+typedef struct app_surface_request {
+  r3d_renderer *renderer;
+  float maxdim, vpp, gate;
+} app_surface_request;
+static void app_surface_box(void *ud, const float world_lo[3], const float world_hi[3]) {
+  app_surface_request *r = ud;
+  float lo[3], hi[3];
+  for (int a = 0; a < 3; a++) {
+    lo[a] = world_lo[a] / r->maxdim;
+    hi[a] = world_hi[a] / r->maxdim;
+  }
+  r3d_bricks_stream_box(r->renderer, lo, hi, r->vpp, r->gate);
+}
 
 static const char PHERC1218_SOURCE[] =
     "https://dl.ash2txt.org/community-uploads/forrest/exports/PHerc1218/"
@@ -383,6 +406,11 @@ static double g_lbl_prev[3];
 static uint32_t lblsrc_gen(void *u, uint32_t level, uint32_t bx, uint32_t by, uint32_t bz) {
   return r3d_labelvol_gen((const r3d_labelvol *)u, level, bx / 8u, by / 8u, bz / 8u);
 }
+static uint64_t lblsrc_revision(void *u) { return r3d_labelvol_revision(u); }
+static uint64_t regsrc_revision(void *u) {
+  return atomic_load(&((r3d_regvol *)u)->gen);
+}
+
 static void lblsrc_fetch(void *u, uint32_t level, uint32_t bx, uint32_t by, uint32_t bz,
                          uint8_t *out) {
   r3d_labelvol_fetch_block((const r3d_labelvol *)u, level, bx, by, bz, out);
@@ -443,7 +471,7 @@ static bool reg_open_moving(r3d_renderer *renderer, const char *root, const uint
     r3d_regvol_close(&g_reg);
   }
   if (r3d_regvol_open(&g_reg, rr, fd) != 0) return false;
-  r3d_label_src ls = {r3d_regvol_blockgen, r3d_regvol_blockfetch, &g_reg};
+  r3d_label_src ls = {r3d_regvol_blockgen, r3d_regvol_blockfetch, &g_reg, regsrc_revision, r3d_regvol_blockfetch_complete};
   if (r3d_bricks_regatlas(renderer, &ls) != 0) {
     r3d_regvol_close(&g_reg); /* atlas never attached: no worker to stop */
     return false;
@@ -973,6 +1001,7 @@ typedef struct sgc_ent {
   r3d_segrows rows;  /* trace-skipping bounds for it */
   int state;         /* SGC_*; all access under mu */
   uint64_t last_use; /* LRU tick */
+  uint32_t pins; /* short GUI leases; eviction skips pinned immutable grids */
 } sgc_ent;
 
 #define SGC_STRIDE 4u
@@ -983,8 +1012,8 @@ typedef struct sgcache {
   pthread_t th;
   pthread_mutex_t mu;
   pthread_cond_t cv;
-  uint32_t *queue;
-  uint32_t qn, qcap;
+  uint32_t *queue, *order;
+  uint32_t qn, qcap, ready;
   bool quit, open;
   size_t bytes, budget;
   uint64_t tick;
@@ -1011,7 +1040,7 @@ static void sgc_evict_lru(sgcache *c, uint32_t keep) { /* mu held */
     uint32_t victim = UINT32_MAX;
     uint64_t oldest = UINT64_MAX;
     for (uint32_t i = 0; i < c->st.n; i++)
-      if (c->ent[i].state == SGC_READY && i != keep && c->ent[i].last_use < oldest) {
+      if (c->ent[i].state == SGC_READY && !c->ent[i].pins && i != keep && c->ent[i].last_use < oldest) {
         oldest = c->ent[i].last_use;
         victim = i;
       }
@@ -1020,6 +1049,7 @@ static void sgc_evict_lru(sgcache *c, uint32_t keep) { /* mu held */
     r3d_tifxyz_free(&c->ent[victim].s);
     r3d_segrows_free(&c->ent[victim].rows);
     c->ent[victim].state = SGC_EMPTY;
+    c->ready--;
   }
 }
 
@@ -1089,6 +1119,7 @@ static void *sgc_worker(void *ud) {
       c->ent[i].s = s;
       c->ent[i].rows = rows;
       c->ent[i].state = SGC_READY;
+      c->ready++;
       c->ent[i].last_use = ++c->tick;
       c->bytes += sgc_ent_bytes(&c->ent[i]);
       sgc_evict_lru(c, i);
@@ -1098,6 +1129,21 @@ static void *sgc_worker(void *ud) {
   }
   pthread_mutex_unlock(&c->mu);
   return NULL;
+}
+
+typedef struct sgc_sort_entry { const char *name; uint32_t index; } sgc_sort_entry;
+static int sgc_sort_compare(const void *a, const void *b) {
+  const sgc_sort_entry *x = a, *y = b;
+  int order = strcmp(x->name, y->name);
+  return order ? order : (x->index > y->index) - (x->index < y->index);
+}
+static void sgc_activate(sgcache *c, uint32_t index) {
+  pthread_mutex_lock(&c->mu);
+  if (c->act_req == UINT32_MAX && !c->act_busy && c->act_ready == UINT32_MAX) {
+    c->act_req = index;
+    pthread_cond_signal(&c->cv);
+  }
+  pthread_mutex_unlock(&c->mu);
 }
 
 static int sgc_open(sgcache *c, const char *store_dir, size_t budget) {
@@ -1124,6 +1170,14 @@ static int sgc_open(sgcache *c, const char *store_dir, size_t budget) {
     r3d_segstore_close(&c->st);
     return -1;
   }
+  c->order = malloc((c->st.n ? c->st.n : 1) * sizeof *c->order);
+  sgc_sort_entry *sort = malloc((c->st.n ? c->st.n : 1) * sizeof *sort);
+  if (c->order && sort) {
+    for (uint32_t i = 0; i < c->st.n; i++) sort[i] = (sgc_sort_entry){c->st.segs[i].name, i};
+    qsort(sort, c->st.n, sizeof *sort, sgc_sort_compare);
+    for (uint32_t i = 0; i < c->st.n; i++) c->order[i] = sort[i].index;
+  } else { free(c->order); c->order = NULL; }
+  free(sort);
   c->qcap = c->st.n;
   c->budget = budget;
   pthread_mutex_init(&c->mu, NULL);
@@ -1132,6 +1186,7 @@ static int sgc_open(sgcache *c, const char *store_dir, size_t budget) {
     free(c->ent);
     free(c->queue);
     free(c->ov);
+    free(c->order);
     r3d_segstore_close(&c->st);
     return -1;
   }
@@ -1160,6 +1215,7 @@ static void sgc_close(sgcache *c) {
   free(c->ent);
   free(c->queue);
   free(c->ov);
+  free(c->order);
   pthread_mutex_destroy(&c->mu);
   pthread_cond_destroy(&c->cv);
   r3d_segstore_close(&c->st);
@@ -1252,6 +1308,8 @@ static float tf_min_visible(const uint8_t lut[256][4]) {
 
 static const char OD_BUCKET[] = "https://vesuvius-challenge-open-data.s3.amazonaws.com";
 
+static const char OD_VOLCOMP[] = "https://dl.ash2txt.org/community-uploads/forrest/volcomp";
+
 #define OD_MAX_STEPS 6
 #define OD_MAX_ARGS 12
 #define OD_ARGBUF 8192
@@ -1262,6 +1320,10 @@ typedef struct {
 } od_step;
 
 typedef struct od_state {
+  char error[512];
+  int source; /* 0 S3 open data, 1 native compressed volumes */
+  int fsource;
+  bool ferror, list_error;
   r3d_odlist scrolls, vols, segs, variants;
   int sel_scroll, sel_vol, sel_seg, sel_variant;
   bool scrolls_ok, vols_ok, segs_ok, variants_ok;
@@ -1524,6 +1586,13 @@ static int od_pump(od_state *od) {
 /* zarr2volcomp bootstrap: a single argv-spawned step */
 static void od_job_bootstrap(od_state *od, const char *exe, const char *url) {
   char prog[600], meta[600];
+  if (od->source == 1) {
+    char script[600];
+    snprintf(script,sizeof script,"%s/bootstrap_volcomp.py",exe);
+    snprintf(prog,sizeof prog,"%s/volcomppack",exe);
+    const char *args[]={"python3",script,url,od->tgt_dir,"--packer",prog};
+    od_job_reset(od);od_job_step(od,args,6);return;
+  }
   snprintf(prog, sizeof prog, "%s/zarr2volcomp", exe);
   snprintf(meta, sizeof meta, "%s/meta", od->tgt_dir);
   const char *a[] = {prog,        meta,      od->tgt_dir, "--url",
@@ -1542,6 +1611,7 @@ static void *od_fetch_worker(void *ud) {
       return NULL;
     }
     int req = od->freq;
+    int source = od->fsource;
     char scroll[300], seg[300];
     snprintf(scroll, sizeof scroll, "%s", od->fscroll);
     snprintf(seg, sizeof seg, "%s", od->fseg);
@@ -1549,14 +1619,26 @@ static void *od_fetch_worker(void *ud) {
 
     r3d_odlist a = {0}, b = {0};
     bool *cached = NULL;
+    bool fetch_error = false;
     char pfx[700];
-    if (req == 1) {
-      r3d_odlist_fetch(OD_BUCKET, "", &a);
+    if (source == 1) {
+      if (req == 1) fetch_error = r3d_odlist_fetch_http(OD_VOLCOMP,"",&a) != 0;
+      else if (req == 2) {
+        snprintf(pfx,sizeof pfx,"%s/volumes/",scroll);
+        fetch_error = r3d_odlist_fetch_http(OD_VOLCOMP,pfx,&a) != 0;
+        cached=calloc(a.ndirs?a.ndirs:1,sizeof *cached);
+        for(uint32_t i=0;cached && i<a.ndirs;i++) {
+          char mp[900];snprintf(mp,sizeof mp,"cache/volcomp/%s/%s/manifest.json",scroll,a.dirs[i]);
+          cached[i]=od_file_exists(mp);
+        }
+      }
+    } else if (req == 1) {
+      fetch_error = r3d_odlist_fetch(OD_BUCKET, "", &a) != 0;
     } else if (req == 2) {
       snprintf(pfx, sizeof pfx, "%s/volumes/", scroll);
-      r3d_odlist_fetch(OD_BUCKET, pfx, &a);
+      fetch_error |= r3d_odlist_fetch(OD_BUCKET, pfx, &a) != 0;
       snprintf(pfx, sizeof pfx, "%s/segments/", scroll);
-      r3d_odlist_fetch(OD_BUCKET, pfx, &b);
+      fetch_error |= r3d_odlist_fetch(OD_BUCKET, pfx, &b) != 0;
       cached = calloc(a.ndirs ? a.ndirs : 1, sizeof *cached);
       for (uint32_t i = 0; cached && i < a.ndirs; i++) {
         char mp[900];
@@ -1565,13 +1647,13 @@ static void *od_fetch_worker(void *ud) {
       }
     } else if (req == 3) {
       snprintf(pfx, sizeof pfx, "%s/segments/%s/mesh/", scroll, seg);
-      r3d_odlist_fetch(OD_BUCKET, pfx, &a);
+      fetch_error |= r3d_odlist_fetch(OD_BUCKET, pfx, &a) != 0;
     } else if (req == 4) {
       snprintf(pfx, sizeof pfx, "%s/representations/predictions/surfaces/", scroll);
-      r3d_odlist_fetch(OD_BUCKET, pfx, &a);
+      fetch_error |= r3d_odlist_fetch(OD_BUCKET, pfx, &a) != 0;
     } else if (req == 5) {
       snprintf(pfx, sizeof pfx, "%s/representations/predictions/ink-3d/", scroll);
-      r3d_odlist_fetch(OD_BUCKET, pfx, &a);
+      fetch_error |= r3d_odlist_fetch(OD_BUCKET, pfx, &a) != 0;
     }
     pthread_mutex_lock(&od->fmu);
     r3d_odlist_free(&od->fres_a);
@@ -1580,6 +1662,7 @@ static void *od_fetch_worker(void *ud) {
     od->fres_a = a;
     od->fres_b = b;
     od->fcached = cached;
+    od->ferror = fetch_error;
     od->fdone = req;
     od->freq = 0;
     od->fbusy = false;
@@ -1597,6 +1680,7 @@ static void od_request(od_state *od, int req) {
   pthread_mutex_lock(&od->fmu);
   if (!od->fbusy) {
     od->freq = req;
+    od->fsource = od->source;
     od->fbusy = true;
     if (od->sel_scroll >= 0)
       snprintf(od->fscroll, sizeof od->fscroll, "%s", od->scrolls.dirs[od->sel_scroll]);
@@ -1613,6 +1697,7 @@ static int od_poll(od_state *od, r3d_odlist *a, r3d_odlist *b, bool **cached) {
   pthread_mutex_lock(&od->fmu);
   int done = od->fdone;
   if (done) {
+    od->list_error = od->ferror;
     *a = od->fres_a;
     *b = od->fres_b;
     *cached = od->fcached;
@@ -1735,11 +1820,41 @@ static void od_browser_window(od_state *od, bool *open, char *next_bricks, size_
     igEnd();
     return;
   }
+  bool listing_busy=false;
+  if(od->fth_up) {
+    pthread_mutex_lock(&od->fmu);listing_busy=od->fbusy;pthread_mutex_unlock(&od->fmu);
+  }
+  igBeginDisabled(listing_busy || od->act != 0);
+  int selected_source=od->source;
+  const char *source_names[]={"S3 open data","Compressed volumes (Forrest)"};
+  bool source_changed=false;
+  if(igBeginCombo("source",source_names[od->source],0)) {
+    for(int i=0;i<2;i++)if(igSelectable_Bool(source_names[i],od->source==i,0,(ImVec2){0,0})) {
+      selected_source=i;source_changed=i!=od->source;
+    }
+    igEndCombo();
+  }
+  igSameLine(0,8);
+  if(igButton("refresh",(ImVec2){0,0}))source_changed=true;
+  if(source_changed) {
+    od->source=selected_source;
+    od->list_error=false;
+    r3d_odlist_free(&od->scrolls);r3d_odlist_free(&od->vols);r3d_odlist_free(&od->segs);
+    r3d_odlist_free(&od->variants);r3d_odlist_free(&od->ovls);r3d_odlist_free(&od->inks);
+    free(od->vol_cached);od->vol_cached=NULL;
+    od->scrolls_ok=od->vols_ok=od->segs_ok=od->variants_ok=od->ovls_ok=od->inks_ok=false;
+    od->sel_scroll=od->sel_vol=od->sel_seg=od->sel_variant=od->sel_ovl=od->sel_ink=-1;
+  }
+  igEndDisabled();
+  igTextDisabled("%s",od->source?OD_VOLCOMP:OD_BUCKET);
+  if(od->error[0])igTextWrapped("%s",od->error);
+  if(od->list_error)igTextWrapped("Could not list this source. Check the connection and click refresh.");
   if (!od->scrolls_ok) {
     od_request(od, 1);
-    igTextDisabled("listing bucket...");
+    igTextDisabled("listing source...");
   }
   const char *cur = od->sel_scroll >= 0 ? od->scrolls.dirs[od->sel_scroll] : "<pick a scroll>";
+  igBeginDisabled(listing_busy || od->act != 0);
   if (igBeginCombo("scroll", cur, 0)) {
     for (uint32_t i = 0; i < od->scrolls.ndirs; i++)
       if (igSelectable_Bool(od->scrolls.dirs[i], (int)i == od->sel_scroll, 0,
@@ -1755,6 +1870,7 @@ static void od_browser_window(od_state *od, bool *open, char *next_bricks, size_
       }
     igEndCombo();
   }
+  igEndDisabled();
   if (od->sel_scroll >= 0 && !od->vols_ok) {
     od_request(od, 2);
     igTextDisabled("listing scroll...");
@@ -1787,8 +1903,8 @@ static void od_browser_window(od_state *od, bool *open, char *next_bricks, size_
       const char *nm[2] = {od->scrolls.dirs[od->sel_scroll], od->vols.dirs[od->sel_vol]};
       if (od_names_ok(od, nm, 2)) {
         char url[1200];
-        snprintf(od->tgt_dir, sizeof od->tgt_dir, "cache/od/%s/%s", nm[0], nm[1]);
-        snprintf(url, sizeof url, "%s/%s/volumes/%s", OD_BUCKET, nm[0], nm[1]);
+        snprintf(od->tgt_dir, sizeof od->tgt_dir, "cache/%s/%s/%s", od->source?"volcomp":"od", nm[0], nm[1]);
+        snprintf(url, sizeof url, "%s/%s/volumes/%s", od->source?OD_VOLCOMP:OD_BUCKET, nm[0], nm[1]);
         od_job_bootstrap(od, exe, url);
         if (!od->job_ovf) {
           od->spawned = false;
@@ -1808,8 +1924,8 @@ static void od_browser_window(od_state *od, bool *open, char *next_bricks, size_
       const char *nm[2] = {od->scrolls.dirs[od->sel_scroll], od->vols.dirs[od->sel_vol]};
       if (od_names_ok(od, nm, 2)) {
         char url[1200];
-        snprintf(od->tgt_dir, sizeof od->tgt_dir, "cache/od/%s/%s", nm[0], nm[1]);
-        snprintf(url, sizeof url, "%s/%s/volumes/%s", OD_BUCKET, nm[0], nm[1]);
+        snprintf(od->tgt_dir, sizeof od->tgt_dir, "cache/%s/%s/%s", od->source?"volcomp":"od", nm[0], nm[1]);
+        snprintf(url, sizeof url, "%s/%s/volumes/%s", od->source?OD_VOLCOMP:OD_BUCKET, nm[0], nm[1]);
         od_job_bootstrap(od, exe, url);
         if (!od->job_ovf) {
           od->spawned = false;
@@ -1895,7 +2011,7 @@ static void od_browser_window(od_state *od, bool *open, char *next_bricks, size_
       igSetTooltip("open a volume first");
   }
   /* ---- surface predictions: attach live as the blue overlay slot */
-  if (od->sel_scroll >= 0 && od->vols_ok && !od->ovls_ok) od_request(od, 4);
+  if (!od->source && od->sel_scroll >= 0 && od->vols_ok && !od->ovls_ok) od_request(od, 4);
   if (od->ovls_ok && od->ovls.ndirs) {
     igText("surface predictions");
     igBeginChild_Str("odovls", (ImVec2){0, 70}, ImGuiChildFlags_Borders, 0);
@@ -1932,7 +2048,7 @@ static void od_browser_window(od_state *od, bool *open, char *next_bricks, size_
     igEndDisabled();
   }
   /* ---- 3D ink: attach live as the red overlay slot */
-  if (od->sel_scroll >= 0 && od->vols_ok && !od->inks_ok) od_request(od, 5);
+  if (!od->source && od->sel_scroll >= 0 && od->vols_ok && !od->inks_ok) od_request(od, 5);
   if (od->inks_ok && od->inks.ndirs) {
     igText("3D ink");
     igBeginChild_Str("odinks", (ImVec2){0, 70}, ImGuiChildFlags_Borders, 0);
@@ -2098,13 +2214,14 @@ static void take_screenshot(r3d_renderer *renderer, uint64_t frame) {
   free(rgba);
 }
 
-static void profile_summary(const r3d_frame_stats *samples, uint64_t n, size_t field,
+static void profile_summary(const app_frame_sample *samples, uint64_t n, size_t field,
                             r3d_stats_summary *out) {
   memset(out, 0, sizeof *out);
   if (!samples || n == 0 || n > UINT32_MAX) return;
   uint64_t *v = malloc((size_t)n * sizeof *v);
   if (!v) return;
-  for (uint64_t i = 0; i < n; i++) v[i] = ((const uint64_t *)&samples[i])[field];
+  for (uint64_t i = 0; i < n; i++)
+    v[i] = app_sample_timing(&samples[i], field);
   r3d_stats_summarize_values(v, (uint32_t)n, out);
   free(v);
 }
@@ -2129,25 +2246,61 @@ static void json_timing(FILE *f, const char *name, const r3d_stats_summary *s, b
 
 static int write_bench_json(const char *path, const char *scenario, int width, int height,
                             const char *quality, uint32_t warmup, const r3d_stats *stats,
-                            const r3d_frame_stats *samples, uint64_t nsamples,
-                            uint64_t pending_cell_frames, const r3d_bricks_stats *bricks) {
+                            const app_frame_sample *samples, uint64_t nsamples,
+                            uint64_t pending_cell_frames, const r3d_bricks_stats *bricks,
+                            const app_bench_intervals *intervals) {
   FILE *f = fopen(path, "w");
   if (!f) {
     fprintf(stderr, "benchmark: cannot write %s\n", path);
     return -1;
   }
   r3d_stats_summary timing[10];
-  r3d_stats_summarize(stats, &timing[0], &timing[1]);
+  profile_summary(samples, nsamples, APP_CPU_FRAME, &timing[0]);
+  profile_summary(samples, nsamples, APP_GPU_TOTAL, &timing[1]);
   for (size_t i = 0; i < 8; i++) profile_summary(samples, nsamples, i, &timing[i + 2]);
-  fputs("{\n  \"schema\": \"render3d-benchmark-v1\",\n  \"scenario\": ", f);
+  fputs("{\n  \"schema\": \"render3d-benchmark-v2\",\n  \"scenario\": ", f);
   json_string(f, scenario ? scenario : "static");
   fputs(",\n  \"quality\": ", f);
   json_string(f, quality);
+  fputs(",\n  \"gpu_timestamp_lag_frames\": 2,\n"
+        "  \"gpu_timing_window\": \"queries returned during measured CPU frames; "
+        "GPU submissions lag by two frames\"", f);
   fprintf(f, ",\n  \"width\": %d,\n  \"height\": %d,\n  \"warmup_frames\": %u,\n"
              "  \"measured_frames\": %llu,\n  \"retained_frame_samples\": %u,\n"
              "  \"volcomp_revision\": ",
-          width, height, warmup, (unsigned long long)nsamples, stats->count);
+          width, height, warmup, (unsigned long long)nsamples, (uint32_t)nsamples);
+  (void)stats; /* interactive display keeps a ring; JSON covers every measured frame */
   json_string(f, R3D_VOLCOMP_REV);
+  fputs(",\n  \"intervals\": {\n", f);
+  const char *interval_names[] = {"startup", "warmup", "measured", "final_flush"};
+  const r3d_bricks_stats *interval_stats[] = {&intervals->startup, &intervals->warmup,
+                                            &intervals->measured, &intervals->final_flush};
+  uint64_t interval_ns[] = {intervals->startup_ns, intervals->warmup_ns,
+                            intervals->measured_ns, intervals->final_flush_ns};
+  for (int i = 0; i < 4; i++) {
+    const r3d_bricks_stats *b = interval_stats[i];
+    fprintf(f, "    \"%s\": {\"wall_ms\": %.6f, \"decoded\": %llu, "
+               "\"jobs\": %llu, \"worker_ms\": %.6f, \"failures\": %u}%s\n",
+            interval_names[i], (double)interval_ns[i] / 1e6,
+            (unsigned long long)b->decoded, (unsigned long long)b->jobs,
+            (double)b->stream_ns / 1e6, b->failures, i == 3 ? "" : ",");
+  }
+  fputs("  }", f);
+  /* app_bricks_delta preserves these gauges and cumulative telemetry from
+   * the measured-end snapshot; only interval counters above are subtracted. */
+  fprintf(f, ",\n  \"brick_state_measured_end\": {\n"
+             "    \"gauges\": {\"hot\": %u, \"hot_cap\": %u, "
+             "\"page_entries\": %u, \"page_capacity\": %u, "
+             "\"page_probe_max\": %u, \"metadata_bytes\": %llu},\n"
+             "    \"cumulative_totals\": {\"slot_probes\": %llu, "
+             "\"compressed_reads\": %llu, \"compressed_bytes\": %llu}\n  }",
+          bricks ? bricks->hot : 0, bricks ? bricks->hot_cap : 0,
+          bricks ? bricks->page_entries : 0, bricks ? bricks->page_capacity : 0,
+          bricks ? bricks->page_probe_max : 0,
+          (unsigned long long)(bricks ? bricks->metadata_bytes : 0),
+          (unsigned long long)(bricks ? bricks->slot_probes : 0),
+          (unsigned long long)(bricks ? bricks->compressed_reads : 0),
+          (unsigned long long)(bricks ? bricks->compressed_bytes : 0));
   fprintf(f, ",\n  \"pending_cell_frames\": %llu,\n"
              "  \"brick_stream\": {\"decoded\": %llu, \"jobs\": %llu, "
              "\"failures\": %u, \"mean_job_ms\": %.6f,\n"
@@ -2177,9 +2330,64 @@ static int write_bench_json(const char *path, const char *scenario, int width, i
                                   "cpu_record", "cpu_submit"};
   for (size_t i = 0; i < 10; i++) json_timing(f, names[i], &timing[i], i + 1 < 10);
   fputs("  }\n}\n", f);
-  int rc = ferror(f) || fclose(f) != 0 ? -1 : 0;
+  int rc = ferror(f) ? -1 : 0;
+  if (fclose(f) != 0) rc = -1;
   if (rc == 0) printf("benchmark json: %s\n", path);
   return rc;
+}
+
+/* Availability changes interaction, never the sidebar's section inventory. */
+static bool gui_section(const char *title,bool available,const char *reason,ImGuiTreeNodeFlags flags) {
+  igBeginDisabled(!available);
+  bool open=igCollapsingHeader_TreeNodeFlags(title,flags);
+  igEndDisabled();
+  if(!available && igIsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+    igSetTooltip("%s",reason);
+  return available && open;
+}
+
+/* Bundle handoff is local and atomic; never attach another CT's results. */
+static int inference_request_volume(const char *bundle,const char *manifest) {
+  char path[1200],tmp[1208];
+  snprintf(path,sizeof path,"%s/requested-ct.txt",bundle);
+  snprintf(tmp,sizeof tmp,"%s.tmp",path);
+  char *canonical=manifest && *manifest ? realpath(manifest,NULL) : NULL;
+  if(manifest && *manifest && !canonical)return -1;
+  FILE *f=fopen(tmp,"w");
+  if(!f) { free(canonical);return -1; }
+  bool ok=fprintf(f,"%s\n",canonical?canonical:"")>=0;
+  free(canonical);
+  if(fclose(f))ok=false;
+  if(!ok || rename(tmp,path)) { unlink(tmp);return -1; }
+  return 0;
+}
+
+static int inference_bound_heads(const char *bundle,const char *manifest,
+                                  char paths[32][640]) {
+  char binding[1024],path[1200],line[256];
+  snprintf(path,sizeof path,"%s/ct-manifest.txt",bundle);
+  FILE *f=fopen(path,"r");
+  if(!f)return 0;
+  bool read=fgets(binding,sizeof binding,f)!=NULL;fclose(f);
+  if(!read)return 0;
+  binding[strcspn(binding,"\r\n")]=0;
+  char *current=realpath(manifest,NULL);
+  bool match=current && !strcmp(current,binding);free(current);
+  if(!match)return 0;
+  snprintf(path,sizeof path,"%s/heads.txt",bundle);
+  f=fopen(path,"r");if(!f)return 0;
+  unsigned count=0;
+  while(fgets(line,sizeof line,f)) {
+    line[strcspn(line,"\r\n")]=0;
+    if(!line[0])continue;
+    if(count==32 || strstr(line,"..") || line[0]=='/' ||
+        strspn(line,"abcdefghijklmnopqrstuvwxyz0123456789_/")!=strlen(line)) { count=0;break; }
+    int n=snprintf(paths[count],640,"%s/%s",bundle,line);
+    if(n<0 || n>=640) { count=0;break; }
+    count++;
+  }
+  fclose(f);
+  return (int)count;
 }
 
 int main(int argc, char **argv) {
@@ -2269,6 +2477,8 @@ int main(int argc, char **argv) {
     return r3d_annot_run(&ao);
   }
 
+  uint64_t app_start_ns = r3d_now_ns();
+  int app_exit_status = EXIT_SUCCESS;
   if (argc > 1 && strcmp(argv[1], "--probe") == 0) {
     r3d_vkctx vk;
     if (r3d_vkctx_create(&vk, NULL, 0, false) != 0) return EXIT_FAILURE;
@@ -2350,7 +2560,14 @@ int main(int argc, char **argv) {
   char inkmap_path[1200] = "";
   const char *seg_store_path = NULL; /* segpack store: draw ALL surfaces */
   const char *overlay_path = NULL;   /* active overlay volcomp LOD root */
-  const char *overlay_paths[8];      /* all --overlay trees (ink, surface preds...) */
+  const char *overlay_paths[32];      /* all --overlay trees (ink, surface preds...) */
+  const char *inference_root=NULL;
+  char inference_paths[32][640],inference_ct[1024];
+  char inference_status[1024]="";
+  uint64_t inference_status_next=0;
+  int inference_red=1;
+  bool inference_pending=false;
+  uint64_t inference_poll_next=0;
   uint32_t n_overlays = 0;
   int overlay_sel = 0;
   char ink3d_root[640] = ""; /* --ink3d / browser: 3D-ink overlay (red, second
@@ -2414,6 +2631,7 @@ int main(int argc, char **argv) {
       if (i < argc - 1 && argv[i + 1][0] >= '1' && argv[i + 1][0] <= '9')
         inklive_port = atoi(argv[i + 1]);
     }
+    if (i < argc - 1 && strcmp(argv[i], "--inference") == 0)inference_root=argv[i+1];
     if (i < argc - 1 && strcmp(argv[i], "--ink3d") == 0)
       snprintf(ink3d_root, sizeof ink3d_root, "%s", argv[i + 1]);
     if (i < argc - 1 && strcmp(argv[i], "--overlay") == 0 &&
@@ -2469,7 +2687,7 @@ int main(int argc, char **argv) {
   if (bench && exit_frames == 0) exit_frames = 300;
   if (headless && !exit_frames && run_seconds <= 0.0)
     exit_frames = 1000; /* never run unattended forever */
-  if (run_seconds > 0.0 && !exit_frames) exit_frames = 2000000u; /* time decides (cap keeps the per-frame sample buffer sane) */
+  if (run_seconds > 0.0 && !exit_frames) exit_frames = 2000000u; /* time decides; samples grow with actual measured frames */
   if (!exit_frames) warmup_frames = 0;
   if (exit_frames > UINT32_MAX - warmup_frames) {
     fprintf(stderr, "--frames + --warmup is too large\n");
@@ -2487,6 +2705,50 @@ int main(int argc, char **argv) {
 
   r3d_umbilicus umbilicus;
   r3d_umbilicus_init(&umbilicus);
+  if(inference_root) {
+    char listpath[1024],line[256];
+    snprintf(listpath,sizeof listpath,"%s/ct-manifest.txt",inference_root);
+    FILE *binding=fopen(listpath,"r");
+    if(!binding || !fgets(inference_ct,sizeof inference_ct,binding)) {
+      if(binding)fclose(binding);fprintf(stderr,"inference: missing CT binding\n");return EXIT_FAILURE;
+    }
+    fclose(binding);inference_ct[strcspn(inference_ct,"\r\n")]=0;
+    if(!bricks_path) {
+      bricks_path=inference_ct;
+      if(!multiview_path && !slab_view && !umbilicus_path) {
+        auto_multiview=true;multiview_path="(none)";
+      }
+    }
+    char *given=realpath(bricks_path,NULL),*expected=realpath(inference_ct,NULL);
+    bool match=given && expected && !strcmp(given,expected);free(given);free(expected);
+    if(!match) {
+      inference_pending=true;
+      snprintf(inference_status,sizeof inference_status,"TSM: connecting the selected volume...");
+    }
+    if(match) {
+    snprintf(listpath,sizeof listpath,"%s/heads.txt",inference_root);
+    FILE *heads=fopen(listpath,"r");
+    if(!heads) { fprintf(stderr,"inference: cannot open %s; start tools/tsm/serve.py first\n",listpath); return EXIT_FAILURE; }
+    n_overlays=0;
+    while(fgets(line,sizeof line,heads)) {
+      line[strcspn(line,"\r\n")]=0;
+      if(!line[0])continue;
+      if(n_overlays>=32 || strstr(line,"..") || line[0]=='/' || strspn(line,"abcdefghijklmnopqrstuvwxyz0123456789_/")!=strlen(line)) {
+        fclose(heads);fprintf(stderr,"inference: invalid head list\n");return EXIT_FAILURE;
+      }
+      int written=snprintf(inference_paths[n_overlays],sizeof inference_paths[0],"%s/%s",inference_root,line);
+      if(written<0 || (size_t)written>=sizeof inference_paths[0]) { fclose(heads);return EXIT_FAILURE; }
+      overlay_paths[n_overlays]=inference_paths[n_overlays];
+      const char *name=strrchr(line,'/');name=name?name+1:line;
+      if(!strcmp(name,"ink"))inference_red=(int)n_overlays;
+      n_overlays++;
+    }
+    fclose(heads);
+    if(!n_overlays) { fprintf(stderr,"inference: empty head list\n");return EXIT_FAILURE; }
+    if(inference_red>=(int)n_overlays)inference_red=0;
+    if(!ink3d_root[0])snprintf(ink3d_root,sizeof ink3d_root,"%s",overlay_paths[inference_red]);
+    }
+  }
   if (!umbilicus_path && bricks_path) {
     /* auto-discover: <bricks-root>/umbilicus.json (mkumb's output). The
      * winding frame powers the spiral prior, wrap gates, signed spacing
@@ -2560,12 +2822,15 @@ int main(int argc, char **argv) {
                     .headless_w = (uint32_t)win_w,
                     .headless_h = (uint32_t)win_h};
   r3d_renderer *renderer = NULL;
+  bool trace_startup=getenv("R3D_TRACE_STARTUP")!=NULL;
+  uint64_t renderer_start_ns=trace_startup?r3d_now_ns():0;
   if (r3d_create(win, &cfg, &renderer) != 0) {
     fprintf(stderr, "renderer init failed\n");
     if (win) SDL_DestroyWindow(win);
     SDL_Quit();
     return EXIT_FAILURE;
   }
+  if(trace_startup)fprintf(stderr,"startup: renderer=%.3f ms\n",(double)(r3d_now_ns()-renderer_start_ns)/1e6);
   r3d_set_quality(renderer, quality_policy == 2 ? R3D_QUALITY_FAST : R3D_QUALITY_FULL);
 
   /* the dataset (volume + segment + overlay) is ordinary mutable state: the
@@ -2578,10 +2843,19 @@ int main(int argc, char **argv) {
        od_next_ink[640] = "", od_next_reg[640] = "";
   bool od_swap = false, od_attach_ovl = false, od_attach_ink = false,
        od_attach_reg = false;
+  bool swap_test_done=false;
+  char active_bricks[2048]="",active_seg[2048]="";
+  char previous_bricks[2048]="",previous_seg[2048]="";
+  if(bricks_path)snprintf(active_bricks,sizeof active_bricks,"%s",bricks_path);
+  if(multiview_path)snprintf(active_seg,sizeof active_seg,"%s",multiview_path);
+  if(bricks_path)bricks_path=active_bricks;
+  if(multiview_path)multiview_path=active_seg;
   for (;;) {
   if (od_swap) {
     od_swap = false;
-    bricks_path = od_next_bricks[0] ? od_next_bricks : NULL;
+    snprintf(active_bricks,sizeof active_bricks,"%s",od_next_bricks);
+    snprintf(active_seg,sizeof active_seg,"%s",od_next_seg[0]?od_next_seg:(od_next_bricks[0]?"(none)":""));
+    bricks_path = active_bricks[0] ? active_bricks : NULL;
     /* keep the 2x2 layout across a volume-only swap: with no segment the
      * multiview starts in its empty state (blank flattened pane, planes
      * centered on the volume, tracer ready) instead of dropping to the
@@ -2590,8 +2864,11 @@ int main(int argc, char **argv) {
      * drops to the plain empty view with the browser open instead of
      * exiting through the multiview-needs-bricks check */
     multiview_path =
-        od_next_seg[0] ? od_next_seg : (od_next_bricks[0] ? "(none)" : NULL);
+        active_seg[0] ? active_seg : NULL;
     if (!od_next_bricks[0]) od_window = true;
+    inference_pending=inference_root!=NULL;
+    inference_poll_next=0;inference_status_next=0;
+    snprintf(inference_status,sizeof inference_status,"TSM: connecting the selected volume...");
     overlay_path = NULL; /* else the old tree is reopened against the new
                           * volume: shape mismatch -> silent EXIT_FAILURE */
     if (od_next_ovl[0]) { /* browser-picked surface predictions */
@@ -2643,14 +2920,30 @@ int main(int argc, char **argv) {
     return EXIT_FAILURE;
   }
 
+  if(inference_root && inference_pending && !bricks_path)
+    inference_request_volume(inference_root,NULL);
   double vox_um = 0.0; /* physical voxel pitch; 0 = unknown */
   float gt_step_default = 0.0f; /* 48-um-pitch step (approved-GT norm) */
   if (bricks_path) {
     const char *pfe = getenv("R3D_POSTFILT"); /* headless/bench: force the
                                                * display filter (mode bits) */
     if (pfe) r3d_bricks_postfilter(renderer, (uint32_t)strtoul(pfe, NULL, 0), 1.0f, 1u);
-    if (r3d_bricks_begin(renderer, bricks_path, (uint32_t)pool_bpa, (uint32_t)warm_mb) != 0)
-      return EXIT_FAILURE;
+    uint64_t dataset_start_ns=trace_startup?r3d_now_ns():0;
+    if (r3d_bricks_begin(renderer, bricks_path, (uint32_t)pool_bpa, (uint32_t)warm_mb) != 0) {
+      snprintf(od.error,sizeof od.error,"Could not load volume. %s",previous_bricks[0]?"Restoring the previous volume.":"Choose another volume in the data browser.");
+      od_log(&od,od.error);od_window=true;
+      r3d_bricks_end(renderer);
+      snprintf(od_next_bricks,sizeof od_next_bricks,"%s",previous_bricks);
+      snprintf(od_next_seg,sizeof od_next_seg,"%s",previous_seg);
+      previous_bricks[0]=previous_seg[0]=0;
+      od_next_ovl[0]=od_next_ink[0]=0;
+      od_swap=true;
+      if(headless && !od_next_bricks[0]) { app_exit_status=EXIT_FAILURE; break; }
+      continue;
+    }
+    if(trace_startup)fprintf(stderr,"startup: dataset=%.3f ms\n",(double)(r3d_now_ns()-dataset_start_ns)/1e6);
+    if(inference_root && inference_pending && inference_request_volume(inference_root,bricks_path))
+      snprintf(inference_status,sizeof inference_status,"TSM: could not request this volume");
     { /* voxel pitch: scroll volumes carry "...um" in the source URL
        * (e.g. 8.640um); fall back to a token in the local path. Feeds
        * the physical-size readouts (trace area etc). */
@@ -2705,7 +2998,7 @@ int main(int argc, char **argv) {
                                   * stamp test blobs at the volume center */
       uint32_t ld[3] = {brick_shape[0], brick_shape[1], brick_shape[2]};
       if (r3d_labelvol_init(&g_lblv, ld) == 0) {
-        r3d_label_src ls = {lblsrc_gen, lblsrc_fetch, &g_lblv};
+        r3d_label_src ls = {lblsrc_gen, lblsrc_fetch, &g_lblv, lblsrc_revision, NULL};
         if (r3d_bricks_labels(renderer, &ls) == 0) {
           g_lbl_init = true;
           double c[3] = {(double)ld[0] * 0.5, (double)ld[1] * 0.5, (double)ld[2] * 0.5};
@@ -2762,6 +3055,7 @@ int main(int argc, char **argv) {
   /* vc3d-style 2x2 multi-view: flattened segment (TL, milestone C — an XY
    * overview until then) + XY/XZ/YZ ortho plane views, shared focus POI */
   r3d_tifxyz mv_seg = {0};
+  bool sv_ready = false;
   r3d_mview mv[4] = {0};
   double mv_focus[3] = {0, 0, 0}; /* world voxels x,y,z */
   int mv_thick = 1;               /* plane-view slab thickness (voxels) */
@@ -2872,11 +3166,12 @@ int main(int argc, char **argv) {
     if (sv_w > dim3d) sv_w = dim3d;
     if (sv_h > dim3d) sv_h = dim3d;
     if (sv_l > dim3d) sv_l = dim3d;
-    if (r3d_surfvol_begin(renderer, (uint32_t)sv_w, (uint32_t)sv_h, (uint32_t)sv_l,
+    if (mv_seg.nvalid && r3d_surfvol_begin(renderer, (uint32_t)sv_w, (uint32_t)sv_h, (uint32_t)sv_l,
                           (uint32_t)sv_l / 2, mv_seg.sx, mv_seg.sy) != 0) {
       fprintf(stderr, "multiview: surface-volume window init failed\n");
       return EXIT_FAILURE;
     }
+    sv_ready = mv_seg.nvalid != 0;
     if (inklive_up) { /* dataset swap: the sampler must follow the new CT tree */
       r3d_inklive_stop(&inklive);
       inklive_up = false;
@@ -2985,6 +3280,8 @@ int main(int argc, char **argv) {
   bool mv_tr_spiral = true;
   bool mv_tr_fill = true;
   float mv_corpus_vis = 0.55f; /* corpus polyline alpha in the plane views */
+  if (getenv("R3D_CORPUS_VIS"))
+    mv_corpus_vis = fmaxf(0.0f, fminf(1.0f, strtof(getenv("R3D_CORPUS_VIS"), NULL)));
   bool mv_tr_live = true;      /* render the growing grid in the seg pane */
   bool mv_tr_view = false; /* the flattened pane FOLLOWS the selected live
                             * trace; cleared when a store segment is
@@ -3137,22 +3434,37 @@ int main(int argc, char **argv) {
   static const char *mt_name[MT_N] = {"poll", "nav", "gui", "stream", "frame"};
   uint64_t mt_sum[MT_N] = {0}, mt_max[MT_N] = {0}, mt_frames = 0;
   double mt_ema[MT_N] = {0};
+  ImGuiListClipper *surface_clipper = ImGuiListClipper_ImGuiListClipper();
+  r3d_surface_bounds surface_bounds = {0};
+  r3d_trace_slice trace_slices[4] = {0};
+  uint64_t trace_display_revision = 0;
   r3d_frame_stats prof = {0};   /* EMA-smoothed for display */
   r3d_frame_stats prof_sum = {0}; /* running sums for the exit report */
   uint64_t prof_frames = 0;
-  r3d_frame_stats *prof_samples = exit_frames ? calloc(exit_frames, sizeof *prof_samples) : NULL;
-  if (exit_frames && !prof_samples) return EXIT_FAILURE;
+  app_samples prof_samples = {0};
+  app_bench_intervals intervals = {0};
+  r3d_bricks_stats measure_begin = {0}, measure_end = {0};
+  if (bricks_path) r3d_bricks_get_stats(renderer, &intervals.startup);
+  intervals.startup_ns = r3d_now_ns() - app_start_ns;
+  if(trace_startup)fprintf(stderr,"startup: total=%.3f ms\n",(double)intervals.startup_ns/1e6);
+  measure_begin = intervals.startup;
+  uint64_t measure_begin_ns = 0;
   uint64_t prev_ns = r3d_now_ns();
 
   bool running = true;
   uint32_t frame_fail = 0;
   uint64_t run_start_ns = r3d_now_ns();
+  measure_begin_ns = run_start_ns;
   while (running) {
     uint64_t t0 = r3d_now_ns();
     if (run_seconds > 0.0 && (double)(t0 - run_start_ns) * 1e-9 >= run_seconds &&
         frame_index > warmup_frames)
       total_frames = frame_index; /* time is up: this frame is the last */
     if (exit_frames && frame_index == warmup_frames) {
+      if (bricks_path) r3d_bricks_get_stats(renderer, &measure_begin);
+      intervals.warmup = app_bricks_delta(&measure_begin, &intervals.startup);
+      measure_begin_ns = r3d_now_ns();
+      intervals.warmup_ns = measure_begin_ns - run_start_ns;
       r3d_stats_init(&stats);
       memset(&prof_sum, 0, sizeof prof_sum);
       prof_frames = 0;
@@ -3312,6 +3624,12 @@ int main(int argc, char **argv) {
       SDL_Delay(50);
       continue;
     }
+    /* Occluded/minimized windows can lose presentation backpressure on
+     * macOS. Keep ingest and event handling alive without busy-looping an
+     * invisible view. Visible windows and headless benchmarks stay uncapped. */
+    if (win && (SDL_GetWindowFlags(win) &
+                (SDL_WINDOW_OCCLUDED | SDL_WINDOW_MINIMIZED | SDL_WINDOW_HIDDEN)))
+      SDL_Delay(33);
 
     if (sgc.open && getenv("R3D_ACTIVATE_TEST") &&
         frame_index == (uint32_t)atoi(getenv("R3D_ACTIVATE_TEST")) && sgc.st.n) {
@@ -3336,7 +3654,7 @@ int main(int argc, char **argv) {
         sgc.act_busy = false;
         sgc.act_coords = sgc.act_normals = NULL;
         pthread_mutex_unlock(&sgc.mu);
-        if (r3d_surf_swap(renderer, ns.w, ns.h, co, no, ns.sx, ns.sy) == 0) {
+        if (app_surf_swap(renderer, ns.w, ns.h, co, no, ns.sx, ns.sy) == 0) {
           smask_drop(renderer, sgc_active); /* mask belongs to the old segment */
           r3d_tifxyz_free(&mv_seg);
           r3d_segrows_free(&mv_rows);
@@ -3485,7 +3803,7 @@ int main(int argc, char **argv) {
         double fx2 = (double)mv[R3D_MV_SEG].pw / (double)(mv_seg.w ? mv_seg.w : 1);
         mv[R3D_MV_SEG].zoom = fy2 < fx2 ? fy2 : fx2;
         double fitv = getenv("R3D_MV_FIT") ? strtod(getenv("R3D_MV_FIT"), NULL) : 0.0;
-        if (!(fitv >= 64.0)) fitv = 2048.0; /* headless: voxels shown vertically */
+        if (!(fitv >= 64.0)) fitv = inference_root ? 512.0 : 2048.0;
         for (int i = 1; i < 4; i++) mv[i].zoom = (double)mv[i].ph / fitv;
       }
       int hover = r3d_mv_hit(mv, in.mouse_xy[0], in.mouse_xy[1]);
@@ -3885,7 +4203,17 @@ int main(int argc, char **argv) {
         }
       }
 
-      if (mv_mask & 1u) { /* keep the flattened surface-volume window under the
+      if (!mv_seg.nvalid && sv_ready) {
+        r3d_surfvol_end(renderer);
+        sv_ready = false;
+      }
+      if (mv_seg.nvalid && (mv_mask & 1u) && !sv_ready) {
+        if (r3d_surfvol_begin(renderer, (uint32_t)sv_w, (uint32_t)sv_h,
+                              (uint32_t)sv_l, (uint32_t)sv_l / 2,
+                              mv_seg.sx, mv_seg.sy) != 0) return EXIT_FAILURE;
+        sv_ready = true;
+      }
+      if (sv_ready && (mv_mask & 1u)) { /* keep the flattened surface-volume window under the
          * view (snapped for hysteresis) and rebuild on residency arrivals;
          * a collapsed segment view skips baking entirely */
         const r3d_mview *sv = &mv[R3D_MV_SEG];
@@ -4345,6 +4673,24 @@ int main(int argc, char **argv) {
     uint32_t rvw = half_res ? (uint32_t)w / 2 : (uint32_t)w;
     uint32_t rvh = half_res ? (uint32_t)h / 2 : (uint32_t)h;
 
+    if(inference_root && inference_pending && bricks_path && r3d_now_ns()>=inference_poll_next) {
+      inference_poll_next=r3d_now_ns()+1000000000ull;
+      int count=inference_bound_heads(inference_root,bricks_path,inference_paths);
+      if(count>0) {
+        if(overlay_sel<0 || overlay_sel>=count)overlay_sel=0;
+        if(inference_red<0 || inference_red>=count)inference_red=count>1?1:0;
+        if(!r3d_bricks_overlay_switch(renderer,inference_paths[overlay_sel]) &&
+           !r3d_bricks_ink3d_switch(renderer,inference_paths[inference_red])) {
+          n_overlays=(uint32_t)count;
+          for(int k=0;k<count;k++)overlay_paths[k]=inference_paths[k];
+          overlay_path=overlay_paths[overlay_sel];overlay_show=true;
+          snprintf(ink3d_root,sizeof ink3d_root,"%s",overlay_paths[inference_red]);
+          ink3d_ok=true;ink3d_show=true;inference_pending=false;
+          inference_status_next=0;
+          printf("inference: attached current volume %s\n",bricks_path);
+        }
+      }
+    }
     mt_t[2] = r3d_now_ns();
     /* control panel: floating window normally; in multiview a docked left
      * side panel that collapses to a slim bar (views reflow to fill) */
@@ -4373,6 +4719,87 @@ int main(int argc, char **argv) {
     if (panel_content) {
     if (!multiview_path)
       igText("%.0f fps   gpu %.2f ms", (double)fps_smooth, (double)last_gpu_ns / 1e6);
+    if (igCollapsingHeader_TreeNodeFlags("TSM overlays", ImGuiTreeNodeFlags_DefaultOpen)) {
+        {
+          {
+            bool ready=inference_root && !inference_pending && n_overlays>0;
+            for(int slot=0;slot<2;slot++) {
+              int selected=slot?inference_red:overlay_sel;
+              const char *selected_name=ready && selected>=0 && selected<(int)n_overlays ? overlay_paths[selected] : "Not connected";
+              const char *preview=strrchr(selected_name,'/');
+              igTextUnformatted(slot ? "Red head" : "Blue head",NULL);
+              igBeginDisabled(!ready);
+              igSetNextItemWidth(-1);
+              if(igBeginCombo(slot?"##tsm_red_head":"##tsm_blue_head",preview?preview+1:selected_name,0)) {
+                for(uint32_t k=0;k<n_overlays;k++) {
+                  const char *name=strrchr(overlay_paths[k],'/');name=name?name+1:overlay_paths[k];
+                  if(igSelectable_Bool(name,selected==(int)k,0,(ImVec2){0,0})) {
+                    int rc=slot?r3d_bricks_ink3d_switch(renderer,overlay_paths[k]):r3d_bricks_overlay_switch(renderer,overlay_paths[k]);
+                    if(!rc) {
+                      if(slot) { inference_red=(int)k;ink3d_ok=true;snprintf(ink3d_root,sizeof ink3d_root,"%s",overlay_paths[k]); }
+                      else { overlay_sel=(int)k;overlay_path=overlay_paths[k]; }
+                    }
+                  }
+                }
+                igEndCombo();
+              }
+              igEndDisabled();
+            }
+            if(!ready)igTextWrapped(inference_root ? "Connecting TSM to the current volume. Predictions will appear automatically." : "No inference service connected.");
+          }
+          if (overlay_path) igCheckbox(inference_root ? "Blue head##ovshow" : "show##ovshow", &overlay_show);
+          if (ink3d_ok) {
+            if (overlay_path) igSameLine(0, 10);
+            igCheckbox(inference_root?"Red head##i3dshow":"3D ink (red)##i3dshow", &ink3d_show);
+          }
+          igBeginDisabled(!overlay_path);
+          igSetNextItemWidth(140);
+          igSliderFloat("gain", &overlay_gain, 0.25f, 8.0f, "%.2f",
+                        ImGuiSliderFlags_Logarithmic);
+          igEndDisabled();
+          if (ink3d_ok) {
+            igSetNextItemWidth(140);
+            igSliderFloat(inference_root?"Red head gain":"3D ink gain", &ink3d_gain, 0.25f, 8.0f, "%.2f",
+                          ImGuiSliderFlags_Logarithmic);
+            if (igIsItemHovered(0))
+              igSetTooltip(inference_root ? "Scale the selected head's encoded intensity before red tinting" : "the model's smooth 0..1 ink probability is scaled\n"
+                           "by this before it drives the red tint");
+          }
+          if (multiview_path) {
+            igText("show in:");
+            static const char *ov_pane[4] = {"seg##ovp", "XY##ovp", "XZ##ovp", "YZ##ovp"};
+            for (int op = 0; op < 4; op++) {
+              igSameLine(0, 8);
+              bool on = (mv_ov_mask >> op) & 1u;
+              if (igCheckbox(ov_pane[op], &on))
+                mv_ov_mask = on ? mv_ov_mask | (1u << op) : mv_ov_mask & ~(1u << op);
+            }
+          }
+          if(inference_root) {
+            uint64_t now=r3d_now_ns();
+            if(now>=inference_status_next) {
+              char path[1024];snprintf(path,sizeof path,"%s/status.txt",inference_root);
+              FILE *status=fopen(path,"r");
+              if(status) { size_t bytes=fread(inference_status,1,sizeof inference_status-1,status);inference_status[bytes]=0;fclose(status); }
+              inference_status_next=now+1000000000ull;
+            }
+            igTextWrapped("%s",inference_status);
+            igTextWrapped("Distance heads show -20 to +20 model voxels. surface_in1 / surface_out1 show the zero-crossing sheets. Winding components show -1 to +1.");
+          } else if (n_overlays > 1) {
+            for (uint32_t k = 0; k < n_overlays; k++) {
+              const char *sl_ = strrchr(overlay_paths[k], '/');
+              char lbl[96];
+              snprintf(lbl, sizeof lbl, "%.80s##ov%u", sl_ ? sl_ + 1 : overlay_paths[k], k);
+              bool cur = (int)k == overlay_sel;
+              if (igRadioButton_Bool(lbl, cur) && !cur &&
+                  r3d_bricks_overlay_switch(renderer, overlay_paths[k]) == 0) {
+                overlay_sel = (int)k;
+                overlay_path = overlay_paths[k];
+              }
+            }
+          }
+        }
+    }
     if (igButton("data browser", (ImVec2){0, 0})) od_window = true;
     igSameLine(0, 8);
     if (igButton("open segment", (ImVec2){0, 0})) igOpenPopup_Str("r3d_open_seg", 0);
@@ -4391,7 +4818,7 @@ int main(int argc, char **argv) {
       }
       if (es.xyz && r3d_segrows_build(&es, &er) == 0 &&
           mv_build_grids(&es, &eco, &eno) == 0 &&
-          r3d_surf_swap(renderer, es.w, es.h, eco, eno, es.sx, es.sy) == 0) {
+          app_surf_swap(renderer, es.w, es.h, eco, eno, es.sx, es.sy) == 0) {
         smask_drop(renderer, sgc_active); /* mask belongs to the old segment */
         r3d_tifxyz_free(&mv_seg);
         r3d_segrows_free(&mv_rows);
@@ -4632,9 +5059,9 @@ int main(int argc, char **argv) {
             brick_z = (int)brick_shape[2] - brick_depth;
         }
       }
-      if (multiview_path) {
+      {
         igSeparator();
-    if (igCollapsingHeader_TreeNodeFlags("views", ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (gui_section("views",multiview_path!=NULL,"Open a CT volume for slice views",ImGuiTreeNodeFlags_DefaultOpen)) {
           static const char *mv_name[4] = {"segment", "XY", "XZ", "YZ"};
           for (int i = 0; i < 4; i++) {
             bool vis = (mv_visible >> i) & 1u;
@@ -4733,8 +5160,7 @@ int main(int argc, char **argv) {
             mv[R3D_MV_SEG].slice = (double)zo;
           igCheckbox("stretch heatmap", &mv_stretch);
     }
-        if (umbilicus_path &&
-            igCollapsingHeader_TreeNodeFlags("umbilicus", ImGuiTreeNodeFlags_DefaultOpen)) {
+        if (gui_section("umbilicus",multiview_path && umbilicus_path,"Open a volume with an umbilicus",ImGuiTreeNodeFlags_DefaultOpen)) {
           igText("%zu point%s", umbilicus.count, umbilicus.count == 1 ? "" : "s");
           igCheckbox("edit (U places; Ctrl+Z / Ctrl+Shift+Z)", &mv_umb_edit);
           igText("recenter on place:");
@@ -4796,7 +5222,7 @@ int main(int argc, char **argv) {
         }
         igTextDisabled("segment %ux%u  %llu valid points", mv_seg.w, mv_seg.h,
                        (unsigned long long)mv_seg.nvalid);
-    if (multiview_path && igCollapsingHeader_TreeNodeFlags("manual surface", 0)) {
+    if (gui_section("manual surface",multiview_path!=NULL,"Open a CT volume for surface placement",0)) {
       igTextDisabled("P over a plane view: place points on one sheet, in\n"
                      "any order, any pane - rough outline first, densify\n"
                      "inside later. Create fits a surface through them all;\n"
@@ -4819,8 +5245,7 @@ int main(int argc, char **argv) {
           msurf_create = true;
       }
     }
-    if (multiview_path && bricks_path &&
-        igCollapsingHeader_TreeNodeFlags("boundary surface", 0)) {
+    if (gui_section("boundary surface",multiview_path && bricks_path,"Open a CT volume for surface growth",0)) {
       igTextDisabled("Set the render low cut so papyrus stands hard against\n"
                      "air, then B over a plane view on/near that edge. Grow\n"
                      "follows the papyrus/void interface outward from the\n"
@@ -4857,8 +5282,7 @@ int main(int argc, char **argv) {
         bsurf_go = true;
       }
     }
-    if (multiview_path && n_overlays &&
-        igCollapsingHeader_TreeNodeFlags("tracer", 0)) {
+    if (gui_section("tracer",multiview_path && n_overlays,"Load surface predictions to trace",0)) {
       const char *pr = overlay_paths[overlay_sel];
       const char *prb = strrchr(pr, '/');
       igTextDisabled("predictions: %s", prb ? prb + 1 : pr);
@@ -5227,7 +5651,7 @@ int main(int argc, char **argv) {
         }
       }
     }
-    if (sgc.open && igCollapsingHeader_TreeNodeFlags("surfaces", 0)) {
+    if (gui_section("surfaces",multiview_path && sgc.open,"Open a segment store",0)) {
       { /* SLIM re-flattening of the active segment */
         int fst = atomic_load(&g_flat_state);
         igBeginDisabled(fst == 1 || mv_seg.w <= 2 || sgc_active[0] == 0);
@@ -5275,11 +5699,13 @@ int main(int argc, char **argv) {
           igSliderFloat("corpus lines", &mv_corpus_vis, 0.0f, 1.0f, "%.2f", 0);
           {
             pthread_mutex_lock(&sgc.mu);
-            uint32_t ready = 0;
-            for (uint32_t si = 0; si < sgc.st.n; si++)
-              if (sgc.ent[si].state == SGC_READY) ready++;
+            uint32_t ready = sgc.ready;
+            size_t cache_bytes = sgc.bytes;
+            bool act_pending = sgc.act_req != UINT32_MAX || sgc.act_busy ||
+                               sgc.act_ready != UINT32_MAX;
+            pthread_mutex_unlock(&sgc.mu);
             igText("segment store: %u surfaces  %u cached (%zu MB)", sgc.st.n, ready,
-                   sgc.bytes >> 20);
+                   cache_bytes >> 20);
             igText("plane hits  XY %u  XZ %u  YZ %u", sgc_nhits[R3D_MV_XY],
                    sgc_nhits[R3D_MV_XZ], sgc_nhits[R3D_MV_YZ]);
             if (sgc_near_focus[0] != mv_focus[0] || sgc_near_focus[1] != mv_focus[1] ||
@@ -5288,14 +5714,15 @@ int main(int argc, char **argv) {
               sgc_nnear = r3d_segstore_near_query(&sgc.st, mv_focus, 300.0, sgc_near, 6);
               if (sgc_nnear > 6) sgc_nnear = 6;
             }
-            bool act_pending = sgc.act_req != UINT32_MAX || sgc.act_busy;
             if (act_pending) igTextDisabled("activating...");
             else igTextDisabled("near focus (click to activate):");
             for (uint32_t k = 0; k < sgc_nnear; k++) {
               uint32_t si = sgc_near[k];
               bool cur = strcmp(sgc.st.segs[si].name, sgc_active) == 0;
               char lbl[112];
+              pthread_mutex_lock(&sgc.mu);
               float ovf = sgc.ov_active != UINT32_MAX ? sgc.ov[si] : 0.0f;
+              pthread_mutex_unlock(&sgc.mu);
               if (cur)
                 snprintf(lbl, sizeof lbl, "  %.64s (active)", sgc.st.segs[si].name);
               else if (ovf > 0.02f)
@@ -5303,54 +5730,32 @@ int main(int argc, char **argv) {
                          (double)ovf * 100.0);
               else
                 snprintf(lbl, sizeof lbl, "  %.64s", sgc.st.segs[si].name);
-              if (igSelectable_Bool(lbl, cur, 0, (ImVec2){0, 0}) && !cur && !act_pending &&
-                  sgc.act_ready == UINT32_MAX) {
-                sgc.act_req = si;
-                pthread_cond_signal(&sgc.cv);
-              }
+              if (igSelectable_Bool(lbl, cur, 0, (ImVec2){0, 0}) && !cur && !act_pending)
+                sgc_activate(&sgc, si);
             }
             if (igCollapsingHeader_TreeNodeFlags("all surfaces", 0)) {
-              /* alphabetical view (timestamp names sort chronologically);
-               * the order array rebuilds when the store size changes */
-              static uint32_t *surf_ord = NULL;
-              static uint32_t surf_ord_n = 0;
-              if (surf_ord_n != sgc.st.n) {
-                free(surf_ord);
-                surf_ord = malloc(sgc.st.n * sizeof *surf_ord);
-                surf_ord_n = surf_ord ? sgc.st.n : 0;
-                if (surf_ord) {
-                  for (uint32_t si = 0; si < sgc.st.n; si++) surf_ord[si] = si;
-                  for (uint32_t a = 1; a < sgc.st.n; a++) { /* insertion sort */
-                    uint32_t v = surf_ord[a], b = a;
-                    while (b > 0 && strcmp(sgc.st.segs[surf_ord[b - 1]].name,
-                                           sgc.st.segs[v].name) > 0) {
-                      surf_ord[b] = surf_ord[b - 1];
-                      b--;
-                    }
-                    surf_ord[b] = v;
-                  }
-                }
-              }
-              for (uint32_t oi3 = 0; oi3 < sgc.st.n; oi3++) {
-                uint32_t si = surf_ord ? surf_ord[oi3] : oi3;
+              /* Order is built with the immutable corpus manifest. Only
+               * visible ImGui rows are formatted and submitted. */
+              ImGuiListClipper_Begin(surface_clipper, (int)sgc.st.n, -1.0f);
+              while (ImGuiListClipper_Step(surface_clipper))
+                for (int row = surface_clipper->DisplayStart;
+                     row < surface_clipper->DisplayEnd; row++) {
+                uint32_t si = sgc.order ? sgc.order[row] : (uint32_t)row;
                 bool cur = strcmp(sgc.st.segs[si].name, sgc_active) == 0;
                 char lbl[96];
                 snprintf(lbl, sizeof lbl, "%.64s##s%u", sgc.st.segs[si].name, si);
-                if (igSelectable_Bool(lbl, cur, 0, (ImVec2){0, 0}) && !cur && !act_pending &&
-                    sgc.act_ready == UINT32_MAX) {
-                  sgc.act_req = si;
-                  pthread_cond_signal(&sgc.cv);
-                }
+                if (igSelectable_Bool(lbl, cur, 0, (ImVec2){0, 0}) && !cur && !act_pending)
+                  sgc_activate(&sgc, si);
               }
+              ImGuiListClipper_End(surface_clipper);
             }
-            pthread_mutex_unlock(&sgc.mu);
           }
     }
       }
     /* ---- 3D ink (volume): detect directly on CT chunks the surface passes
      * through; cached once into a local zarr, shown as the red overlay */
-    if (bricks_path) {
-      if (i3_pid) { /* pump the worker pipe; keep the last ink3d: line */
+    {
+      if (bricks_path && i3_pid) { /* pump the worker pipe; keep the last ink3d: line */
         char pb[512];
         for (;;) {
           ssize_t rn = read(i3_fd, pb, sizeof pb);
@@ -5400,7 +5805,7 @@ int main(int argc, char **argv) {
           break;
         }
       }
-      if (igCollapsingHeader_TreeNodeFlags("3D ink (volume)", 0)) {
+      if (gui_section("3D ink (volume)",bricks_path!=NULL,"Open a CT volume for ink detection",0)) {
         bool have_surf = mv_seg.xyz && mv_seg.nvalid > 0;
         igBeginDisabled(!have_surf || !ct_src_url[0] || i3_pid != 0);
         if (igButton("detect 3D ink on this surface", (ImVec2){0, 0})) {
@@ -5460,7 +5865,7 @@ int main(int argc, char **argv) {
         if (i3_line[0]) igTextDisabled("%s", i3_line);
       }
     }
-    if (inklive_up && igCollapsingHeader_TreeNodeFlags("live ink (2.5D surface)", 0)) {
+    if (gui_section("live ink (2.5D surface)",inklive_up,"Connect a surface ink service",0)) {
       igCheckbox("show ink on flattened view", &inklive_show);
       igBeginDisabled(inkmap_job);
       if (igCheckbox("verso (reverse side)##inkverso", &ink_verso)) {
@@ -5632,7 +6037,7 @@ int main(int argc, char **argv) {
       igTextDisabled("server 127.0.0.1:%d", inklive_port);
       igTextDisabled("%s", inklive.status);
     }
-    if (bricks_path && igCollapsingHeader_TreeNodeFlags("post process", 0)) {
+    if (gui_section("post process",bricks_path!=NULL,"Open a CT volume to apply filters",0)) {
       /* GPU post-decode display filter: runs once per streamed brick, so
        * pane rendering stays free; applying flushes the resident bricks so
        * they re-stream through the filter IN PLACE — no reload, and no
@@ -5675,14 +6080,14 @@ int main(int argc, char **argv) {
                      "the view falls back to the coarse level for a moment\n"
                      "while they refill — nothing else changes");
     }
-    if (bricks_path && igCollapsingHeader_TreeNodeFlags("labels", 0)) {
+    if (gui_section("labels",bricks_path!=NULL,"Open a CT volume to label",0)) {
       if (!g_lbl_init) {
         igTextWrapped("paint 3D class labels (papyrus, ink, recto/verso, ...) into "
                       "the volume; saved losslessly as R3L1 label bricks");
         if (igButton("enable 3D labelling##lblen", (ImVec2){0, 0})) {
           uint32_t ld[3] = {brick_shape[0], brick_shape[1], brick_shape[2]};
           if (r3d_labelvol_init(&g_lblv, ld) == 0) {
-            r3d_label_src ls = {lblsrc_gen, lblsrc_fetch, &g_lblv};
+            r3d_label_src ls = {lblsrc_gen, lblsrc_fetch, &g_lblv, lblsrc_revision, NULL};
             if (r3d_bricks_labels(renderer, &ls) == 0) {
               g_lbl_init = true;
               g_lbl_paint = true;
@@ -5766,7 +6171,14 @@ int main(int argc, char **argv) {
         }
       }
     }
-    if (bricks_path && igCollapsingHeader_TreeNodeFlags("registration", 0)) {
+    if (gui_section("registration",bricks_path!=NULL,"Open a fixed CT volume",0)) {
+      igBeginDisabled(!g_reg_open || g_reg_busy);
+      igSetNextItemWidth(150);
+      igCombo_Str("alignment method##regmode", &g_reg_refmode,
+                  "measure NCC\0refine rigid\0refine affine\0",3);
+      igEndDisabled();
+      if(!g_reg_open && igIsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        igSetTooltip("Open a moving volume to align it with this CT");
       if (!g_reg_open) {
         igTextWrapped("overlay a second scan of the same scroll and line it up "
                       "(green = this volume, magenta = the other scan)");
@@ -5837,10 +6249,6 @@ int main(int argc, char **argv) {
         if (igButton("save transform##regjs", (ImVec2){0, 0}) && g_reg_json[0])
           r3d_regvol_save_json(&g_reg, g_reg_json);
         igSeparator();
-        igSetNextItemWidth(150);
-        igCombo_Str("##regmode", &g_reg_refmode, "measure NCC\0refine rigid\0refine affine\0",
-                    3);
-        igSameLine(0, 8);
         igSetNextItemWidth(90);
         igSliderInt("level##reglvl", &g_reg_reflevel, 0, 4, "L%d", 0);
         igSameLine(0, 8);
@@ -5877,50 +6285,6 @@ int main(int argc, char **argv) {
           r3d_regvol_close(&g_reg);
         }
       }
-    }
-    if ((overlay_path || ink3d_ok) && igCollapsingHeader_TreeNodeFlags("overlay", 0)) {
-        {
-          if (overlay_path) igCheckbox("show##ovshow", &overlay_show);
-          if (ink3d_ok) {
-            if (overlay_path) igSameLine(0, 10);
-            igCheckbox("3D ink (red)##i3dshow", &ink3d_show);
-          }
-          igSameLine(0, 10);
-          igSetNextItemWidth(140);
-          igSliderFloat("gain", &overlay_gain, 0.25f, 8.0f, "%.2f",
-                        ImGuiSliderFlags_Logarithmic);
-          if (ink3d_ok) {
-            igSetNextItemWidth(140);
-            igSliderFloat("3D ink gain", &ink3d_gain, 0.25f, 8.0f, "%.2f",
-                          ImGuiSliderFlags_Logarithmic);
-            if (igIsItemHovered(0))
-              igSetTooltip("the model's smooth 0..1 ink probability is scaled\n"
-                           "by this before it drives the red tint");
-          }
-          if (multiview_path) {
-            igText("show in:");
-            static const char *ov_pane[4] = {"seg##ovp", "XY##ovp", "XZ##ovp", "YZ##ovp"};
-            for (int op = 0; op < 4; op++) {
-              igSameLine(0, 8);
-              bool on = (mv_ov_mask >> op) & 1u;
-              if (igCheckbox(ov_pane[op], &on))
-                mv_ov_mask = on ? mv_ov_mask | (1u << op) : mv_ov_mask & ~(1u << op);
-            }
-          }
-          if (n_overlays > 1) {
-            for (uint32_t k = 0; k < n_overlays; k++) {
-              const char *sl_ = strrchr(overlay_paths[k], '/');
-              char lbl[96];
-              snprintf(lbl, sizeof lbl, "%.80s##ov%u", sl_ ? sl_ + 1 : overlay_paths[k], k);
-              bool cur = (int)k == overlay_sel;
-              if (igRadioButton_Bool(lbl, cur) && !cur &&
-                  r3d_bricks_overlay_switch(renderer, overlay_paths[k]) == 0) {
-                overlay_sel = (int)k;
-                overlay_path = overlay_paths[k];
-              }
-            }
-          }
-        }
     }
     if (igCollapsingHeader_TreeNodeFlags("streaming", 0)) {
         igText("bricks: hot %u/%u slots  warm %u (%.0f/%llu MB)%s", bst.hot, bst.hot_cap,
@@ -6044,15 +6408,24 @@ int main(int argc, char **argv) {
         }
       }
     }
-    if (getenv("R3D_SWAP_TEST") && frame_index == 300 && !od_swap) {
+    if (getenv("R3D_SWAP_TEST") && frame_index == 300 && !od_swap && !swap_test_done) {
       /* headless repro of a browser dataset swap: R3D_SWAP_TEST=<manifest.json>
        * (volume-only swap; the segment store and --inklive stay) */
       snprintf(od_next_bricks, sizeof od_next_bricks, "%s", getenv("R3D_SWAP_TEST"));
       od_next_seg[0] = 0;
       od_swap = true;
-      frame_index = 0; /* so later frame-keyed test hooks fire again */
+      swap_test_done=true;
     }
-    if (od_swap) running = false; /* teardown + reopen in the dataset loop */
+    if (od_swap && od_next_bricks[0] && r3d_bricks_validate(od_next_bricks)!=0) {
+      snprintf(od.error,sizeof od.error,"Cannot open selected volume: invalid, unreadable, or unsupported metadata. The current volume is still open.");
+      od_log(&od,od.error);fprintf(stderr,"odbrowse: %s\n",od.error);od_window=true;od_swap=false;
+    }
+    if (od_swap) {
+      od.error[0]=0;
+      snprintf(previous_bricks,sizeof previous_bricks,"%s",bricks_path?bricks_path:"");
+      snprintf(previous_seg,sizeof previous_seg,"%s",multiview_path?multiview_path:"");
+      running=false;
+    }
 
     if (umbilicus_path) {
       if (annotation_z < 0) annotation_z = 0;
@@ -6265,7 +6638,7 @@ int main(int argc, char **argv) {
           r3d_segrows trr = {0};
           if (nv > 4 && r3d_segrows_build(&ts, &trr) == 0 &&
               mv_build_grids(&ts, &tco, &tno) == 0 &&
-              r3d_surf_swap(renderer, ts.w, ts.h, tco, tno, ts.sx, ts.sy) == 0) {
+              app_surf_swap(renderer, ts.w, ts.h, tco, tno, ts.sx, ts.sy) == 0) {
             smask_drop(renderer, sgc_active); /* mask belongs to the old segment */
             r3d_tifxyz_free(&mv_seg);
             r3d_segrows_free(&mv_rows);
@@ -6554,6 +6927,7 @@ int main(int argc, char **argv) {
       if (g != GT->gen && GT->pos) {
         r3d_tracer_snapshot(&GT->tr, GT->pos, GT->st, GT->cf, NULL, NULL, NULL);
         GT->gen = g;
+        trace_display_revision++;
         uint64_t now2 = r3d_now_ns();
         if (mv_tr_live && mv_tr_view && GT->nset > 8 &&
             (now2 - mv_tr_live_ns > 400000000ull || GT->done)) {
@@ -6614,7 +6988,7 @@ int main(int argc, char **argv) {
             r3d_segrows trr = {0};
             if (nv > 8 && r3d_segrows_build(&ts, &trr) == 0 &&
                 mv_build_grids(&ts, &tco, &tno) == 0 &&
-                r3d_surf_swap(renderer, ts.w, ts.h, tco, tno, ts.sx, ts.sy) == 0) {
+                app_surf_swap(renderer, ts.w, ts.h, tco, tno, ts.sx, ts.sy) == 0) {
               r3d_tifxyz_free(&mv_seg);
               r3d_segrows_free(&mv_rows);
               free(mv_normals);
@@ -6687,7 +7061,7 @@ int main(int argc, char **argv) {
       /* plane trace colors on the segment view (vc3d): XY orange, XZ red,
        * YZ yellow */
       const ImU32 trace_col[4] = {0, 0xff008cffu, 0xff0000ffu, 0xff00ffffu};
-      if (sgc.open) { /* corpus surfaces: dimmed intersection polylines under
+      if (sgc.open && mv_corpus_vis > 0.0f) { /* corpus surfaces: dimmed intersection polylines under
          * the active segment's curve. Queries hit only the tile index;
          * grids come from the worker's cache (missing ones get queued) and
          * at most a few re-traces run per frame to amortize slice scrubs. */
@@ -6697,7 +7071,6 @@ int main(int argc, char **argv) {
         const ImU32 dim_col = (ca8 << 24) | 0x00c8b478u;
         const ImU32 ov_hi = 0x783c8ce6u; /* heavy overlap with active: orange */
         const ImU32 ov_lo = 0x5864b4d2u; /* light overlap: sand */
-        pthread_mutex_lock(&sgc.mu);
         int traces = 0;
         for (int i = 1; i < 4; i++) {
           if (!(mv_mask & (1u << i)) || MV_IS3D(i)) continue;
@@ -6741,27 +7114,40 @@ int main(int argc, char **argv) {
           for (uint32_t k = 0; k < draw_n; k++) {
             uint32_t si = sgc_hits[i][k];
             if (strcmp(sgc.st.segs[si].name, sgc_active) == 0) continue;
+            pthread_mutex_lock(&sgc.mu);
             sgc_ent *e = &sgc.ent[si];
-            if (e->state == SGC_EMPTY) {
-              sgc_request(&sgc, si);
-              continue;
+            if (e->state == SGC_EMPTY) sgc_request(&sgc, si);
+            bool ready = e->state == SGC_READY;
+            r3d_tifxyz surface = {0};
+            r3d_segrows rows = {0};
+            if (ready) {
+              e->pins++;
+              e->last_use = ++sgc.tick;
+              surface = e->s;
+              rows = e->rows;
             }
+            float ovf = sgc.ov_active != UINT32_MAX ? sgc.ov[si] : 0.0f;
+            pthread_mutex_unlock(&sgc.mu);
             sgc_line *ln = &sgc_ln[i][si];
-            if (e->state == SGC_READY &&
+            if (ready &&
                 (!ln->valid || ln->slice != mv[i].slice || ln->gen != mv_basis_gen) &&
                 traces < 2) {
               traces++;
               ln->l.n = 0;
-              r3d_segtrace_basis(&e->s, &e->rows, NULL, 0.0f, mv_po[i], mv_pb[i][0],
+              r3d_segtrace_basis(&surface, &rows, NULL, 0.0f, mv_po[i], mv_pb[i][0],
                                  mv_pb[i][1], mv_pb[i][2], mv[i].slice, mv_lines_emit,
                                  &ln->l);
               ln->slice = mv[i].slice;
               ln->gen = mv_basis_gen;
               ln->valid = true;
-              e->last_use = ++sgc.tick;
+            }
+            if (ready) {
+              pthread_mutex_lock(&sgc.mu);
+              e->pins--;
+              sgc_evict_lru(&sgc, UINT32_MAX);
+              pthread_mutex_unlock(&sgc.mu);
             }
             if (ln->valid && ln->slice == mv[i].slice && ln->gen == mv_basis_gen) {
-              float ovf = sgc.ov_active != UINT32_MAX ? sgc.ov[si] : 0.0f;
               ImU32 col = ovf > 0.15f ? ov_hi : (ovf > 0.02f ? ov_lo : dim_col);
               /* corpus lines tolerate a 3 px collapse: half the tessellation */
               mv_draw_lines(draw, &mv[i], ln->l.w, ln->l.n, col, 1.0f, 9.0f);
@@ -6769,7 +7155,6 @@ int main(int argc, char **argv) {
           }
           ImDrawList_PopClipRect(draw);
         }
-        pthread_mutex_unlock(&sgc.mu);
       }
       for (int i = 1; i < 4; i++) { /* segment curve on each plane view */
         if (!(mv_mask & (1u << i)) || MV_IS3D(i)) continue;
@@ -7058,6 +7443,11 @@ int main(int argc, char **argv) {
                   errno ? strerror(errno) : "write error");
       }
       if (GT->active && GT->pos) { /* growing trace: orange points */
+        static int trace_slice_selection = -1;
+        if (trace_slice_selection != gt_sel) {
+          trace_slice_selection = gt_sel;
+          trace_display_revision++;
+        }
         const ImU32 tc_ = 0xff2896ffu, tb_ = 0xff000000u;
         uint32_t TW = GT->tr.W, TH = GT->tr.H;
         for (int i = 1; i < 4; i++) {
@@ -7110,21 +7500,17 @@ int main(int argc, char **argv) {
                 }
             }
           } else {
-            double lo = mv[i].slice - 1.0, hi = mv[i].slice + (double)mv_thick + 1.0;
-            for (uint32_t j = 0; j < TH; j++)
-              for (uint32_t ii = 0; ii < TW; ii++) {
-                size_t k = (size_t)j * TW + ii;
-                if (GT->st[k] != R3D_TR_SET) continue;
-                const double *P = GT->pos + k * 3;
-                double fu, fv, fs;
-                r3d_mv_w2b(mv_pb[i], mv_po[i], P, &fu, &fv, &fs);
-                if (fs < lo || fs > hi) continue;
+            r3d_trace_slice *ts = &trace_slices[i];
+            if (r3d_trace_slice_update(ts, trace_display_revision, GT->pos, GT->st,
+                                      (size_t)TW * TH, mv_po[i], mv_pb[i],
+                                      mv[i].slice, (double)mv_thick) >= 0)
+              for (size_t j = 0; j < ts->n; j++) {
+                const r3d_trace_point *point = &ts->points[j];
                 float sx_, sy_;
-                r3d_mv_project(&mv[i], fu, fv, &sx_, &sy_);
-                float cf2 = GT->cf[k];
-                bool weak = cf2 < mv_tr_thresh;
-                ImU32 pc_ = weak ? 0x907070e0u /* weak: translucent red */
-                                 : tc_;
+                r3d_mv_project(&mv[i], point->u, point->v, &sx_, &sy_);
+                if (sx_ < cmin.x - 3.0f || sx_ > cmax.x + 3.0f ||
+                    sy_ < cmin.y - 3.0f || sy_ > cmax.y + 3.0f) continue;
+                ImU32 pc_ = GT->cf[point->index] < mv_tr_thresh ? 0x907070e0u : tc_;
                 ImDrawList_AddCircleFilled(draw, (ImVec2){sx_, sy_}, 2.6f, tb_, 6);
                 ImDrawList_AddCircleFilled(draw, (ImVec2){sx_, sy_}, 1.8f, pc_, 6);
               }
@@ -7174,7 +7560,7 @@ int main(int argc, char **argv) {
             (g_reg_open && g_reg_show
                  ? (16u | ((uint32_t)(g_reg_alpha * 255.0f + 0.5f) << 16))
                  : 0u) |
-            (overlay_path && !strstr(overlay_path, "ink") ? 256u : 0u),
+            (overlay_path && (inference_root || !strstr(overlay_path, "ink")) ? 256u : 0u),
     };
     memcpy(p.vol_r0, &vm.r0, 12);
     memcpy(p.vol_r1, &vm.r1, 12);
@@ -7248,7 +7634,8 @@ int main(int argc, char **argv) {
       p.slab_depth = (uint32_t)brick_depth;
       /* streaming pump: camera in VOLUME space (model transform inverted, like
        * the clip focus); smaller decode budget while moving so the pump's GPU
-       * time shares the frame with half-res rendering */
+       * time shares the frame with half-res rendering. Budgets count 4 KiB
+       * blocks: 64/128 uploads are only 256/512 KiB, not old 128^3 chunks. */
       float bext[3];
       r3d_bricks_extent(renderer, bext);
       r3d_v3 vc = v3(bext[0] * 0.5f, bext[1] * 0.5f, bext[2] * 0.5f);
@@ -7275,23 +7662,24 @@ int main(int argc, char **argv) {
             if (j0 < 0) j0 = 0;
             if (g1 > (int64_t)mv_seg.w) g1 = mv_seg.w;
             if (j1 > (int64_t)mv_seg.h) j1 = mv_seg.h;
-            double span = (double)((g1 - g0) * (j1 - j0));
-            int64_t step = span > 0 ? (int64_t)(sqrt(span / 384.0) + 1.0) : 1;
-            /* voxels per pixel: (grid units per px) / (grid units per voxel) */
-            float vf = (float)(1.0 / (sv->zoom * (double)mv_seg.sx)) * exp2f(lod_bias);
-            uint32_t lvl = 0;
-            while (vf >= 2.0f && lvl < 7u) {
-              vf *= 0.5f;
-              lvl++;
-            }
-            for (int64_t gj = j0; gj < j1; gj += step)
-              for (int64_t gi = g0; gi < g1; gi += step) {
-                const float *sp = r3d_tifxyz_at(&mv_seg, (uint32_t)gi, (uint32_t)gj);
-                if (!r3d_tifxyz_valid(sp)) continue;
-                float pp[3] = {sp[0] / (float)mdim, sp[1] / (float)mdim,
-                               sp[2] / (float)mdim};
-                r3d_bricks_stream_point(renderer, pp, lvl, p.skip_gate);
-              }
+            /* Cover every visible surface cell, including the displayed
+             * normal offset/slab. Cached tile bounds make this independent
+             * of the number of surface vertices and avoid sparse holes at
+             * 16^3 residency granularity. */
+            if (surface_bounds.revision != app_surface_revision && mv_seg.nvalid)
+              r3d_surface_bounds_build(&surface_bounds, &mv_seg, &mv_rows,
+                                       mv_normals, app_surface_revision);
+            float vpp = (float)(1.0 / (sv->zoom * (double)mv_seg.sx * mdim)) *
+                        exp2f(lod_bias);
+            app_surface_request request = {renderer, (float)mdim, vpp, p.skip_gate};
+            if (g0 < g1 && j0 < j1 && mv_seg.nvalid)
+              r3d_surface_cover(&mv_rows,
+                                surface_bounds.revision == app_surface_revision
+                                    ? &surface_bounds : NULL,
+                                (uint32_t)g0, (uint32_t)j0, (uint32_t)g1, (uint32_t)j1,
+                                (float)sv->slice - 0.5f * fmaxf((float)mv_thick, 1.0f),
+                                (float)sv->slice + 0.5f * fmaxf((float)mv_thick, 1.0f),
+                                1.0f, app_surface_box, &request);
           }
           for (int i = 1; i < 4; i++) {
             if (!(mv_mask & (1u << i))) continue; /* collapsed: no streaming */
@@ -7333,14 +7721,14 @@ int main(int argc, char **argv) {
             float vpp = (float)(1.0 / (mv[i].zoom * (double)mdim)) * exp2f(lod_bias);
             r3d_bricks_stream_box(renderer, lo, hi, vpp, p.skip_gate);
           }
-          r3d_bricks_stream_submit(renderer, moving ? 3u : 8u);
+          r3d_bricks_stream_submit(renderer, r3d_bricks_stream_budget(renderer, moving));
         }
       } else {
         r3d_bricks_stream(renderer, be, bf, ht, pixel_cone, (uint32_t)brick_z,
-                          (uint32_t)brick_depth, p.skip_gate, moving ? 2u : 6u);
+                          (uint32_t)brick_depth, p.skip_gate, r3d_bricks_stream_budget(renderer, moving));
       }
       if (g_lbl_init) /* mirror paint edits / slot churn into the label atlas */
-        r3d_bricks_labels_sync(renderer, 8u);
+        r3d_bricks_labels_sync(renderer, 0u);
       if (g_smask && g_smask_gpu_dirty && (frame_index & 7u) == 0) {
         /* throttled: strokes re-upload the whole mask image at ~1/8 frames */
         if (r3d_surfmask(renderer, g_smask, g_smask_w, g_smask_h) == 0)
@@ -7602,13 +7990,22 @@ int main(int argc, char **argv) {
     bool measuring = !exit_frames || frame_index > warmup_frames;
     if (frc == 0 && measuring) {
       last_gpu_ns = st.gpu_ns;
-      const uint64_t *sv = (const uint64_t *)&st;
-      uint64_t *pv = (uint64_t *)&prof, *qv = (uint64_t *)&prof_sum;
-      for (size_t k = 0; k < sizeof st / sizeof(uint64_t); k++) {
-        pv[k] = (uint64_t)((double)pv[k] * 0.95 + (double)sv[k] * 0.05);
-        qv[k] += sv[k];
-      }
-      if (prof_samples && prof_frames < exit_frames) prof_samples[prof_frames] = st;
+#define APP_PROFILE_ACCUMULATE(field) \
+      do { \
+        prof.field = (uint64_t)((double)prof.field * 0.95 + (double)st.field * 0.05); \
+        prof_sum.field += st.field; \
+      } while (0)
+      APP_PROFILE_ACCUMULATE(gpu_ns);
+      APP_PROFILE_ACCUMULATE(gpu_raycast_ns);
+      APP_PROFILE_ACCUMULATE(gpu_blit_ns);
+      APP_PROFILE_ACCUMULATE(gpu_gui_ns);
+      APP_PROFILE_ACCUMULATE(cpu_wait_ns);
+      APP_PROFILE_ACCUMULATE(cpu_acquire_ns);
+      APP_PROFILE_ACCUMULATE(cpu_record_ns);
+      APP_PROFILE_ACCUMULATE(cpu_submit_ns);
+#undef APP_PROFILE_ACCUMULATE
+      prof.panes_drawn = st.panes_drawn;
+      prof_sum.panes_drawn += st.panes_drawn;
       prof_frames++;
     }
     mt_t[5] = r3d_now_ns();
@@ -7636,12 +8033,29 @@ int main(int argc, char **argv) {
       running = false;
     }
 
-    if (measuring) {
-      r3d_stats_push(&stats, r3d_now_ns() - t0, st.gpu_ns);
+    if (measuring && frc == 0) {
+      uint64_t frame_ns = r3d_now_ns() - t0;
+      if ((exit_frames || bench_json) && !app_samples_push(&prof_samples, &st, frame_ns)) {
+        fprintf(stderr, "benchmark: sample allocation failed; stopping incomplete run\n");
+        app_exit_status = EXIT_FAILURE;
+        running = false;
+      }
+      r3d_stats_push(&stats, frame_ns, st.gpu_ns);
       r3d_stats_report(&stats);
     }
   }
 
+  intervals.measured_ns = r3d_now_ns() - measure_begin_ns;
+  if (bricks_path) r3d_bricks_get_stats(renderer, &measure_end);
+  intervals.measured = app_bricks_delta(&measure_end, &measure_begin);
+  r3d_bricks_stats final_bst = measure_end;
+  if (bricks_path) {
+    uint64_t flush_begin_ns = r3d_now_ns();
+    r3d_bricks_flush(renderer);
+    r3d_bricks_get_stats(renderer, &final_bst);
+    intervals.final_flush_ns = r3d_now_ns() - flush_begin_ns;
+    intervals.final_flush = app_bricks_delta(&final_bst, &measure_end);
+  }
   r3d_stats_report_now(&stats);
   if (slab_src.voxels) r3d_volume_close(&slab_src);
   if (mt_frames > 2) {
@@ -7676,10 +8090,7 @@ int main(int argc, char **argv) {
     printf("vslab decoded cache: %u ready, %llu hits, %llu misses, last %.0f ms\n", pcs.ready,
            (unsigned long long)pcs.hits, (unsigned long long)pcs.misses, pcs.last_decode_ms);
   }
-  r3d_bricks_stats final_bst = {0};
   if (bricks_path) {
-    r3d_bricks_flush(renderer);
-    r3d_bricks_get_stats(renderer, &final_bst);
     printf("bricks bench: decoded %llu in %llu jobs, %.2f ms/job, %u failure(s), hot %u/%u\n",
            (unsigned long long)final_bst.decoded, (unsigned long long)final_bst.jobs,
            final_bst.jobs ? (double)final_bst.stream_ns / (double)final_bst.jobs / 1e6 : 0.0,
@@ -7700,9 +8111,11 @@ int main(int argc, char **argv) {
              (unsigned long long)final_bst.lod_requests[6],
              (unsigned long long)final_bst.lod_requests[7]);
   }
-  if (bench_json)
+  if (bench_json && !prof_samples.failed &&
     write_bench_json(bench_json, bench_name ? bench_name : bench, win_w, win_h, quality_arg,
-                     warmup_frames, &stats, prof_samples, prof_frames, vs_pend_acc, &final_bst);
+                     warmup_frames, &stats, prof_samples.data, prof_samples.n, vs_pend_acc,
+                     &intervals.measured, &intervals) != 0)
+    app_exit_status = EXIT_FAILURE;
   if (umbilicus_path && umbilicus.dirty &&
       save_umbilicus(&umbilicus, umbilicus_path, annotation_status) != 0)
     fprintf(stderr, "umbilicus: FINAL SAVE FAILED for %s (%s) - %zu point(s) unsaved\n",
@@ -7768,7 +8181,10 @@ int main(int argc, char **argv) {
       free(mv_ol_off[i].g);
     }
   }
-  free(prof_samples);
+  ImGuiListClipper_destroy(surface_clipper);
+  r3d_surface_bounds_free(&surface_bounds);
+  for (int i = 0; i < 4; i++) r3d_trace_slice_free(&trace_slices[i]);
+  free(prof_samples.data);
   if (g_lbl_init) { /* labels are per volume: save unsaved edits, then drop */
     bool lbl_lost = false;
     if (g_lbl_dir[0] && r3d_labelvol_dirty(&g_lblv)) {
@@ -7822,5 +8238,5 @@ int main(int argc, char **argv) {
   r3d_destroy(renderer);
   if (win) SDL_DestroyWindow(win);
   SDL_Quit();
-  return EXIT_SUCCESS;
+  return app_exit_status;
 }

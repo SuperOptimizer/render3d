@@ -102,6 +102,8 @@ int r3d_odlist_fetch(const char *bucket_url, const char *prefix, r3d_odlist *out
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, sbuf_write);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 20L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 45L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     long code = 0;
     if (curl_easy_perform(curl) != CURLE_OK ||
@@ -179,4 +181,38 @@ void r3d_odlist_free(r3d_odlist *l) {
   free(l->files);
   free(l->file_sizes);
   memset(l, 0, sizeof *l);
+}
+
+/* nginx-style directory indexes: accept only direct relative child dirs.
+ * Display labels are not trusted; derive names exclusively from hrefs. */
+int r3d_odlist_fetch_http(const char *base, const char *prefix, r3d_odlist *out) {
+  memset(out,0,sizeof *out);
+  char url[2048];
+  if(snprintf(url,sizeof url,"%s/%s",base,prefix)>=(int)sizeof url)return -1;
+  CURL *c=curl_easy_init();if(!c)return -1;
+  sbuf b={0};int rc=-1;long code=0;
+  curl_easy_setopt(c,CURLOPT_URL,url);
+  curl_easy_setopt(c,CURLOPT_WRITEFUNCTION,sbuf_write);curl_easy_setopt(c,CURLOPT_WRITEDATA,&b);
+  curl_easy_setopt(c,CURLOPT_FOLLOWLOCATION,1L);curl_easy_setopt(c,CURLOPT_CONNECTTIMEOUT,15L);
+  curl_easy_setopt(c,CURLOPT_TIMEOUT,45L);curl_easy_setopt(c,CURLOPT_NOSIGNAL,1L);
+  if(curl_easy_perform(c)!=CURLE_OK)goto done;
+  curl_easy_getinfo(c,CURLINFO_RESPONSE_CODE,&code);
+  if(code!=200 || !b.p)goto done;
+  const char *p=b.p;
+  while((p=strstr(p,"href="))) {
+    p+=5;char quote=*p++;if(quote!='\'' && quote!='"')continue;
+    const char *end=strchr(p,quote);if(!end)break;
+    size_t n=(size_t)(end-p);
+    if(n>1 && p[n-1]=='/' && name_is_safe(p,n-1)) {
+      bool duplicate=false;
+      for(uint32_t i=0;i<out->ndirs;i++)
+        if(strlen(out->dirs[i])==n-1 && !memcmp(out->dirs[i],p,n-1))duplicate=true;
+      if(!duplicate && push_str(&out->dirs,&out->ndirs,p,n-1))goto done;
+    }
+    p=end+1;
+  }
+  rc=0;
+done:
+  if(rc)r3d_odlist_free(out);
+  free(b.p);curl_easy_cleanup(c);return rc;
 }

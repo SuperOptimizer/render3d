@@ -6,6 +6,7 @@
 #ifndef R3D_CPUVOL_H
 #define R3D_CPUVOL_H
 
+#include "block_region.h"
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -17,6 +18,8 @@ typedef struct r3d_cpuvol_level {
   uint32_t vx, vy, vz;     /* level shape, voxels */
   uint32_t bx, by, bz;     /* brick grid dims */
   uint32_t sx, sy, sz;     /* shard grid dims */
+  uint32_t gx, gy, gz; /* 16^3 decode-block grid */
+  uint64_t block_off; /* wide logical decode-block offset */
   uint32_t shard_off;      /* first reader index */
 } r3d_cpuvol_level;
 
@@ -25,6 +28,7 @@ typedef struct r3d_cpuvol {
   uint32_t nlev;
   uint64_t nx, ny, nz; /* base shape, voxels */
   r3d_cpuvol_level lev[R3D_CPUVOL_LEVELS];
+  void *files; /* bounded compressed-file cache and source-cell fetch locks */
   void *readers;   /* lazy shard readers */
   uint32_t nreaders;
   /* decode cache: refcounted slab pool of 16^3 blocks keyed
@@ -41,15 +45,16 @@ typedef struct r3d_cpuvol {
   uint64_t *neg_exp;  /* expiry, seconds since epoch; UINT64_MAX = permanent */
   uint32_t nneg;      /* power of two */
   /* thread safety: the decode cache carries its own lock and per-slot pin
-   * counts; mu guards the negative cache and the net backoff; io_mu
-   * serializes shard reads + demand fetches. Decodes run outside all of
-   * them. Concurrent r3d_cpuvol_tri/at/read_block callers on one volume are
+   * counts; mu guards the negative cache and net backoff. Reader-local
+   * locks initialize shard mappings. Compressed files are leased per cache
+   * entry and demand fetches deduplicated by source cell. Concurrent
+   * r3d_cpuvol_tri/at/read_block callers on one volume are
    * supported and never observe a slot that eviction may rewrite: every
    * returned brick pointer is pinned until that thread asks for another
    * brick. The volume object itself is NOT concurrently closable — callers
    * must join their samplers before r3d_cpuvol_close (leases outstanding at
    * that point stay valid, but the r3d_cpuvol is gone). */
-  pthread_mutex_t mu, io_mu;
+  pthread_mutex_t mu;
   /* demand fetch (source.json): brick misses pull the owning zarr cell,
    * transcode, and land in <root>/bricks/L* — the same cache the
    * renderer's net ingest fills, so either side feeds the other. The
@@ -59,20 +64,29 @@ typedef struct r3d_cpuvol {
   float q0;          /* volcomp quality ladder base */
   uint32_t chsz[R3D_CPUVOL_LEVELS];
   bool raw[R3D_CPUVOL_LEVELS];
-  void *curl;        /* lazy CURL handle */
+  bool native_source;
   uint64_t net_cool; /* backoff: no fetches until this tick-time (s) */
   /* predict source (url predict://): misses are produced by the surface
    * predictor instead of fetched (see core/surfpred.h) */
   struct r3d_surfpred *sp;
 } r3d_cpuvol;
 
-/* cache_blocks counts 4 KiB decoded 16^3 blocks; zero selects 4096 (16 MiB). */
+/* root may be a directory or the selected manifest file. cache_blocks counts
+ * 4 KiB decoded 16^3 blocks; zero selects 4096 (16 MiB). */
 int r3d_cpuvol_open(r3d_cpuvol *v, const char *root, uint32_t cache_blocks);
 /* allow_predict=false opens a predict tree as plain files only (no
  * predictor, no recursion) — used by the predictor to read its own output */
 int r3d_cpuvol_open_ex(r3d_cpuvol *v, const char *root, uint32_t cache_blocks,
                        bool allow_predict);
 void r3d_cpuvol_close(r3d_cpuvol *v);
+/* Release this thread's last decoded-block lease when a worker batch ends. */
+void r3d_cpuvol_release_thread(r3d_cpuvol *v);
+
+/* Batch small raw rectangles. Resident regions contained in one 16^3 block
+ * share a cache lock; misses and larger reads use the ordinary status path.
+ * Output regions must not overlap each other. */
+void r3d_cpuvol_read_regions(r3d_cpuvol *v, uint32_t li,
+                            r3d_block_region *regions, uint32_t count);
 
 /* Nearest-neighbor value at base-resolution voxel coords, sampled from
  * pyramid level li. Out-of-bounds or no-data reads 0. */
@@ -85,8 +99,8 @@ uint8_t r3d_cpuvol_at(r3d_cpuvol *v, uint32_t li, double x, double y, double z);
 double r3d_cpuvol_tri(r3d_cpuvol *v, uint32_t li, const double p[3], double grad[3]);
 
 /* Demand-fetch (in parallel, `threads` connections) the cells owning the
- * listed level-li bricks (x,y,z triples) that are neither cached nor on
- * disk. Fetched bricks land in the decode cache directly. Returns the
+ * listed level-li 128^3 source chunks (x,y,z triples) that are neither cached nor on
+ * disk. Fetched chunks are persisted for subsequent 16^3 block decoding. Returns the
  * number of cells fetched, or -1. */
 int r3d_cpuvol_prefetch(r3d_cpuvol *v, uint32_t li, const uint32_t *bxyz, uint32_t n,
                         uint32_t threads);
@@ -97,6 +111,13 @@ int r3d_cpuvol_prefetch(r3d_cpuvol *v, uint32_t li, const uint32_t *bxyz, uint32
 void r3d_cpuvol_read_block(r3d_cpuvol *v, uint32_t li, int64_t x0, int64_t y0, int64_t z0,
                            uint32_t nx, uint32_t ny, uint32_t nz, uint8_t *out);
 
+/* Same zero-filled output, but false when any in-volume block is unavailable
+ * or corrupt. Genuine zero chunks/empty markers/out-of-volume voxels are
+ * complete. Reprobes local arrivals despite transient negative-cache entries;
+ * repeated network fetches retain their retry backoff. */
+bool r3d_cpuvol_read_block_status(r3d_cpuvol *v, uint32_t li, int64_t x0, int64_t y0, int64_t z0,
+                                  uint32_t nx, uint32_t ny, uint32_t nz, uint8_t *out);
+
 /* Insert a raw 128^3 brick into the decode cache (e.g. one just produced by
  * the predictor) so the next sample hits without touching the disk. */
 void r3d_cpuvol_cache_put(r3d_cpuvol *v, uint32_t li, uint32_t bx, uint32_t by, uint32_t bz,
@@ -106,6 +127,7 @@ typedef struct r3d_cpuvol_cache_stats {
   uint32_t capacity_blocks, resident_blocks;
   size_t capacity_bytes, resident_bytes;
   uint64_t decoded_blocks;
+  uint64_t compressed_reads, compressed_bytes, compressed_hits;
 } r3d_cpuvol_cache_stats;
 void r3d_cpuvol_get_cache_stats(r3d_cpuvol *v, r3d_cpuvol_cache_stats *out);
 

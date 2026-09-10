@@ -23,11 +23,13 @@ typedef struct r3d_labelvol {
   uint32_t *gens[R3D_LBL_MAXLEV]; /* per-level edit counters (0 = untouched) */
   uint32_t *saved; /* level-0 gen at the last save */
   uint64_t nvox[R3D_LBL_NCLASS]; /* labelled voxel count per class */
+  uint64_t revision; /* monotonic content change counter, including loads */
   uint64_t edits;  /* total paint ops that changed something */
 } r3d_labelvol;
 
 int r3d_labelvol_init(r3d_labelvol *lv, const uint32_t dim[3]);
 void r3d_labelvol_free(r3d_labelvol *lv);
+uint64_t r3d_labelvol_revision(const r3d_labelvol *lv);
 
 /* Sphere brush: set class cls (0 erases) within `radius` voxels of p (world
  * voxel coordinates). Returns the number of voxels that changed. */

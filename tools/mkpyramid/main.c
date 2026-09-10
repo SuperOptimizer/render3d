@@ -16,11 +16,16 @@
 #include <unistd.h>
 
 #include "shard/shardio.h"
+#include "../common/workers.h"
+#include <stdatomic.h>
 
+#ifndef NX
 #define NX 43008ull
 #define NY 43008ull
 #define NZ 68608ull
+#endif
 #define SD 1024u
+#define TILE 128u
 #define L_FIRST 2
 #define L_LAST 5
 
@@ -68,6 +73,59 @@ static void down2(const uint8_t *src, uint32_t d, uint8_t *dst) {
     }
 }
 
+typedef struct pyramid_job {
+  const r3d_shard *source;
+  level_file *levels;
+  uint32_t sy, sx;
+  _Atomic uint32_t next;
+  _Atomic int failed;
+} pyramid_job;
+static void *pyramid_worker(void *arg) {
+  pyramid_job *j = arg;
+  uint8_t *full = malloc((size_t)TILE * TILE * TILE);
+  uint8_t *half = malloc((size_t)64 * 64 * 64);
+  uint8_t *q[8] = {0};
+  for (int l = 2; l <= 5; l++) q[l] = malloc((size_t)(TILE >> l) * (TILE >> l) * (TILE >> l));
+  if (!full || !half || !q[2] || !q[3] || !q[4] || !q[5]) atomic_store(&j->failed, 1);
+  uint8_t chunk[4096];
+  for (;;) {
+    uint32_t tile = atomic_fetch_add(&j->next, 1);
+    if (tile >= 512u || atomic_load(&j->failed)) break;
+    uint32_t tz = tile / 64u * TILE, ty = tile / 8u % 8u * TILE, tx = tile % 8u * TILE;
+    for (uint32_t z = 0; z < TILE; z += 16)
+      for (uint32_t y = 0; y < TILE; y += 16)
+        for (uint32_t x = 0; x < TILE; x += 16) {
+          if (r3d_shard_chunk_decode(j->source, (tz + z) / 16u, (ty + y) / 16u,
+                                     (tx + x) / 16u, chunk) != 0) {
+            atomic_store(&j->failed, 1);
+            goto done;
+          }
+          for (uint32_t zz = 0; zz < 16; zz++)
+            for (uint32_t yy = 0; yy < 16; yy++)
+              memcpy(full + (((size_t)z + zz) * TILE + y + yy) * TILE + x,
+                     chunk + (zz * 16u + yy) * 16u, 16u);
+        }
+    down2(full, TILE, half);
+    down2(half, TILE / 2u, q[2]);
+    down2(q[2], TILE / 4u, q[3]);
+    down2(q[3], TILE / 8u, q[4]);
+    down2(q[4], TILE / 16u, q[5]);
+    for (int l = L_FIRST; l <= L_LAST; l++) {
+      uint32_t d = TILE >> l;
+      uint64_t Z0 = tz >> l, Y0 = ((uint64_t)j->sy * SD + ty) >> l,
+               X0 = ((uint64_t)j->sx * SD + tx) >> l;
+      for (uint32_t z = 0; z < d; z++)
+        for (uint32_t yy = 0; yy < d; yy++)
+          memcpy(j->levels[l].map + ((Z0 + z) * j->levels[l].ly + Y0 + yy) * j->levels[l].lx + X0,
+                 q[l] + ((size_t)z * d + yy) * d, d);
+    }
+  }
+done:
+  free(full); free(half);
+  for (int l = 2; l <= 5; l++) free(q[l]);
+  return NULL;
+}
+
 int main(int argc, char **argv) {
   if (argc != 4) {
     fprintf(stderr, "usage: mkpyramid <band_dir> <band_Z> <out_dir>\n");
@@ -90,31 +148,33 @@ int main(int argc, char **argv) {
   /* resumability */
   char done_path[600];
   snprintf(done_path, sizeof done_path, "%s/.done", out);
-  char done[42][42];
+  enum { GRID_Y = (NY + SD - 1u) / SD, GRID_X = (NX + SD - 1u) / SD };
+  char done[GRID_Y][GRID_X];
   memset(done, 0, sizeof done);
   FILE *df = fopen(done_path, "r");
   if (df) {
     uint32_t y, x;
     while (fscanf(df, "%u %u", &y, &x) == 2)
-      if (y < 42 && x < 42) done[y][x] = 1;
+      if (y < GRID_Y && x < GRID_X) done[y][x] = 1;
     fclose(df);
   }
   df = fopen(done_path, "a");
 
-  uint8_t *full = malloc((size_t)SD * SD * SD); /* 1 GiB decode buffer */
-  uint8_t *half = malloc((size_t)512 * 512 * 512);
-  uint8_t *q[8];
-  for (int l = 2; l <= 5; l++) q[l] = malloc((size_t)(SD >> l) * (SD >> l) * (SD >> l));
-  if (!full || !half) return EXIT_FAILURE;
+  if (!df) return EXIT_FAILURE;
+  long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+  uint32_t workers = ncpu > 0 ? (uint32_t)ncpu : 1u;
+  if (workers > 16u) workers = 16u;
+  r3d_tool_workers pool;
+  if (r3d_tool_workers_init(&pool, workers) != 0) { fclose(df); return EXIT_FAILURE; }
 
   uint32_t todo = 0, processed = 0, absent = 0;
-  for (uint32_t y = 0; y < 42; y++)
-    for (uint32_t x = 0; x < 42; x++)
+  for (uint32_t y = 0; y < GRID_Y; y++)
+    for (uint32_t x = 0; x < GRID_X; x++)
       if (!done[y][x]) todo++;
   uint64_t t_start = now_ms();
 
-  for (uint32_t sy = 0; sy < 42; sy++) {
-    for (uint32_t sx = 0; sx < 42; sx++) {
+  for (uint32_t sy = 0; sy < GRID_Y; sy++) {
+    for (uint32_t sx = 0; sx < GRID_X; sx++) {
       if (done[sy][sx]) continue;
       r3d_shard sh;
       if (r3d_shard_open(&store, bz, sy, sx, &sh) != 0) {
@@ -122,23 +182,16 @@ int main(int argc, char **argv) {
         processed++;
         continue; /* not downloaded (yet) or masked-out: leave zeros, no .done */
       }
+      /* Independent aligned128³ tiles preserve every integer reduction
+       * boundary while retaining multicore DCT decoding. */
+      pyramid_job job = {.source=&sh, .levels=lf, .sy=sy, .sx=sx};
+      r3d_tool_workers_run(&pool, pyramid_worker, &job);
       r3d_shard_close(&sh);
-
-      r3d_shard_decode_region(&store, (uint64_t)bz * SD, (uint64_t)sy * SD, (uint64_t)sx * SD,
-                              SD, SD, SD, full, 0);
-      down2(full, SD, half);
-      down2(half, 512, q[2]);
-      down2(q[2], 256, q[3]);
-      down2(q[3], 128, q[4]);
-      down2(q[4], 64, q[5]);
-
-      for (int l = L_FIRST; l <= L_LAST; l++) {
-        uint32_t d = SD >> l;
-        uint64_t Y0 = ((uint64_t)sy * SD) >> l, X0 = ((uint64_t)sx * SD) >> l;
-        for (uint32_t z = 0; z < d; z++)
-          for (uint32_t yy = 0; yy < d; yy++)
-            memcpy(lf[l].map + ((uint64_t)z * lf[l].ly + Y0 + yy) * lf[l].lx + X0,
-                   q[l] + ((size_t)z * d + yy) * d, d);
+      if (atomic_load(&job.failed)) {
+        fprintf(stderr, "mkpyramid: corrupt source shard %u/%u/%u\n", bz, sy, sx);
+        r3d_tool_workers_destroy(&pool);
+        fclose(df);
+        return EXIT_FAILURE;
       }
       fprintf(df, "%u %u\n", sy, sx);
       fflush(df);
@@ -151,6 +204,7 @@ int main(int argc, char **argv) {
       }
     }
   }
+  r3d_tool_workers_destroy(&pool);
   fclose(df);
   for (int l = L_FIRST; l <= L_LAST; l++) {
     msync(lf[l].map, lf[l].n, MS_SYNC);

@@ -148,7 +148,7 @@ struct BrickCtx {
   float3 slot_org; /* atlas mip0 texel origin of the slot */
   float atlas_lod; /* residual filtering after choosing an on-disk LOD */
   float grad_vox;  /* one base-space gradient radius in chosen-level voxels */
-  float world_brick; /* chosen brick edge in renderer/world units */
+  float world_brick; /* safe empty-skip edge in renderer/world units */
 };
 
 // Slot geometry: 16^3 payload, no padding. Filtering clamps within a slot.
@@ -157,16 +157,29 @@ static const float BR_AP = 0.0;
 static const uint BR_LOD_FLAG = 0x20000u;
 static const uint BR_PAGE_HEADER = 64u;
 
-bool bricks_is_lod() { return (pc.brick_mode & BR_LOD_FLAG) != 0u; }
+/* Resident hash table shares the stable64-word level header. Probing is
+ * bounded by capacity, with empty-key termination and no tombstones. */
+#include "pagehash.h"
+uint brick_page(uint index) {
+  return (pc.brick_mode & 0x40000u) != 0u ? resident_page(index) : page[index];
+}
+
+bool bricks_is_lod() {
+#ifdef R3D_BRICKS_LOD
+  return true;
+#else
+  return (pc.brick_mode & BR_LOD_FLAG) != 0u;
+#endif
+}
 
 BrickCtx bricks_locate(float3 p) {
   uint bpa = pc.brick_mode & 0xffu;
   uint abpa = (pc.brick_mode >> 8) & 0xffu;
   float3 vp = saturate(p) * float(bpa * 16u);
   uint3 bc = min(uint3(vp) >> 4u, uint3(bpa - 1u));
-  uint e = page[(bc.z * bpa + bc.y) * bpa + bc.x];
+  uint e = brick_page(((pc.brick_mode & 0x40000u) != 0u ? BR_PAGE_HEADER : 0u) + (bc.z * bpa + bc.y) * bpa + bc.x);
   BrickCtx c;
-  c.ok = e != 0xFFFFFFFFu;
+  c.ok = e < 0xFFFFFFFEu;
   c.maxv = c.ok ? float(e >> 24u) / 255.0 : 0.0;
   uint slot = e & 0xFFFFFFu;
   uint3 sc = uint3(slot % abpa, (slot / abpa) % abpa, slot / (abpa * abpa));
@@ -189,6 +202,7 @@ BrickCtx bricks_locate(float3 p) {
 struct LodCache {
   bool valid;
   int desired;
+  uint3 desired_bc;
   uint scale;
   uint3 bc;
   BrickCtx c;
@@ -207,12 +221,11 @@ BrickCtx bricks_lod_locate_ex(float3 p, float lod, out uint scale_out, out uint3
   uint nlev = page[0];
   float3 base_shape = float3(page[1], page[2], page[3]);
   float maxdim = max(base_shape.x, max(base_shape.y, base_shape.z));
-  /* failed locate = air at every probed level: the void-skip granularity is
-   * ONE COARSEST brick. (The old 1.0 init made rays entering through air
-   * leap a whole box unit — past the entire volume in full-volume views.) */
-  c.world_brick = BR_SLOT * float(1u << (nlev - 1u)) / maxdim;
   float3 base_v = clamp(p * maxdim, float3(0), max(base_shape - 0.001, float3(0)));
   int desired = int(clamp(floor(lod), 0.0, float(nlev - 1u)));
+  /* A coarse fallback/empty page says nothing about the residency of the
+   * next desired cell. Never skip across a finer block that was not probed. */
+  c.world_brick = BR_SLOT * float(1u << uint(desired)) / maxdim;
   uint abpa = pc.brick_mode & 0xffu;
   int last = int(nlev) - 1;
   for (uint step = 0; step < 4u; step++) {
@@ -223,9 +236,11 @@ BrickCtx bricks_lod_locate_ex(float3 p, float lod, out uint scale_out, out uint3
       uint3 bd = uint3(packed, page[36u + uint(li) * 2u], page[37u + uint(li) * 2u]);
       float3 lv = base_v / float(scale);
       uint3 bc = min(uint3(lv) >> 4u, bd - 1u);
-      uint bi = off + (bc.z * bd.y + bc.y) * bd.x + bc.x;
-      uint e = page[bi];
+      uint e = resident_page_xyz(h,bc.x,bc.y,bc.z,bd.x,bd.y);
       if (e == 0xFFFFFFFFu) continue;
+      if (e == 0xFFFFFFFEu) {
+        scale_out=scale;bc_out=bc;return c; // known fine air, never coarse fallback
+      }
       uint slot = e & 0xFFFFFFu;
       uint3 sc = uint3(slot % abpa, (slot / abpa) % abpa, slot / (abpa * abpa));
       c.ok = true;
@@ -237,7 +252,6 @@ BrickCtx bricks_lod_locate_ex(float3 p, float lod, out uint scale_out, out uint3
        * globally continuous mip image. */
       c.atlas_lod = 0.0;
       c.grad_vox = exp2(lod) / float(scale);
-      c.world_brick = BR_SLOT * float(scale) / maxdim;
       scale_out = scale;
       bc_out = bc;
       return c;
@@ -254,23 +268,29 @@ BrickCtx bricks_lod_locate(float3 p, float lod) {
 BrickCtx bricks_lod_locate_cached(float3 p, float lod, inout LodCache lc) {
   uint nlev = page[0];
   int desired = int(clamp(floor(lod), 0.0, float(nlev - 1u)));
-  if (lc.valid && lc.desired == desired) {
-    float3 base_shape = float3(page[1], page[2], page[3]);
-    float maxdim = max(base_shape.x, max(base_shape.y, base_shape.z));
-    float3 base_v = clamp(p * maxdim, float3(0), max(base_shape - 0.001, float3(0)));
+  float3 base_shape = float3(page[1], page[2], page[3]);
+  float maxdim = max(base_shape.x, max(base_shape.y, base_shape.z));
+  float3 base_v = clamp(p * maxdim, float3(0), max(base_shape - 0.001, float3(0)));
+  uint3 desired_bc = uint3(base_v / float(1u << uint(desired))) >> 4u;
+  /* The chosen fallback can span several desired cells. Crossing one of
+   * those cells must probe again: its finer page may already be resident. */
+#ifndef R3D_DISABLE_LOD_CACHE
+  if (lc.valid && lc.desired == desired && all(lc.desired_bc == desired_bc)) {
     float3 lv = base_v / float(lc.scale);
-    uint3 bc = uint3(lv) >> 4u;
-    if (all(bc == lc.bc)) {
-      BrickCtx c = lc.c;
-      c.bl = lv - float3(bc << 4u);
-      return c;
-    }
+    BrickCtx c = lc.c;
+    c.bl = lv - float3(lc.bc << 4u);
+    /* Perspective footprint changes even while the integer LOD/cell stays
+     * the same. Only residency is cached, not the gradient radius. */
+    c.grad_vox = exp2(lod) / float(lc.scale);
+    return c;
   }
+#endif
   uint scale;
   uint3 bc;
   BrickCtx c = bricks_lod_locate_ex(p, lod, scale, bc);
   lc.valid = c.ok;
   lc.desired = desired;
+  lc.desired_bc = desired_bc;
   lc.scale = scale;
   lc.bc = bc;
   lc.c = c;
@@ -524,7 +544,7 @@ void main(uint3 tid_in: SV_DispatchThreadID) {
     float2 fu = pc.cam_origin.xy + ndc.x * pc.cam_right.xy + ndc.y * pc.cam_up.xy;
     float4 bg = float4(0.02, 0.02, 0.03, 1);
     float2 txy = (fu - float2(pc.slab_x0, pc.slab_y0)) / pc.slab_px; /* texel coords */
-    if (txy.x < 0.0 || txy.y < 0.0 || txy.x >= pc.slab_nx || txy.y >= pc.slab_ny) {
+    if (pc.slab_nx <= 0.0 || pc.slab_ny <= 0.0 || txy.x < 0.0 || txy.y < 0.0 || txy.x >= pc.slab_nx || txy.y >= pc.slab_ny) {
       store_px(opix, tid.xy, half_res, bg);
       return;
     }
@@ -764,6 +784,7 @@ void main(uint3 tid_in: SV_DispatchThreadID) {
   LodCache b_lc;
   b_lc.valid = false;
   b_lc.desired = -1;
+  b_lc.desired_bc = uint3(0);
   b_lc.scale = 1u;
   b_lc.bc = uint3(0);
 
@@ -812,8 +833,8 @@ void main(uint3 tid_in: SV_DispatchThreadID) {
         uint bi = (bc.z * b_bpa + bc.y) * b_bpa + bc.x;
         if (bi != b_last) { /* page resolve only on brick crossings */
           b_last = bi;
-          uint e = page[bi];
-          b_ok = e != 0xFFFFFFFFu;
+          uint e = brick_page(((pc.brick_mode & 0x40000u) != 0u ? BR_PAGE_HEADER : 0u) + bi);
+          b_ok = e < 0xFFFFFFFEu;
           b_max = b_ok ? float(e >> 24u) / 255.0 : 0.0;
           uint abpa = (pc.brick_mode >> 8) & 0xffu;
           uint slot = e & 0xFFFFFFu;

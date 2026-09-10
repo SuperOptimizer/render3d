@@ -159,6 +159,12 @@ R3D_HEADLESS_API r3d_headless_status r3d_headless_volume_read_roi_v1(
     r3d_headless_volume *volume, uint32_t level, int64_t x0, int64_t y0,
     int64_t z0, uint32_t nx, uint32_t ny, uint32_t nz,
     const r3d_headless_callbacks *callbacks, uint8_t *out_zyx);
+/* Inference input: unavailable in-bounds data returns E_IO and leaves output
+ * untouched. Known air and out-of-volume padding remain valid zeros. */
+R3D_HEADLESS_API r3d_headless_status r3d_headless_volume_read_roi_strict_v1(
+    r3d_headless_volume *volume, uint32_t level, int64_t x0, int64_t y0,
+    int64_t z0, uint32_t nx, uint32_t ny, uint32_t nz,
+    const r3d_headless_callbacks *callbacks, uint8_t *out_zyx);
 
 /* Deterministic evidence trace on a structured tangent lattice. Each vertex
  * searches the supplied scalar field along the lattice normal. */

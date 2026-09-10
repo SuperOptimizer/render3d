@@ -14,6 +14,7 @@
 #include <math.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -233,7 +234,7 @@ typedef struct fake_server {
   int fd;
   int port;
   pthread_t th;
-  volatile bool stop;
+  _Atomic bool stop;
 } fake_server;
 
 static bool srv_io(int fd, void *buf, size_t n, bool wr) {
@@ -274,8 +275,11 @@ static const char k_reply_meta[] =
 static void *srv_main(void *arg) {
   fake_server *s = arg;
   while (!s->stop) {
+    struct pollfd listener = {.fd = s->fd, .events = POLLIN};
+    if (poll(&listener, 1, 100) <= 0) continue;
+    if (s->stop) break;
     int c = accept(s->fd, NULL, NULL);
-    if (c < 0) continue; /* the 1 s accept timeout: re-check stop */
+    if (c < 0) continue;
     uint8_t hdr[8];
     if (srv_io(c, hdr, 8, false) && memcmp(hdr, "TSV1", 4) == 0) {
       uint32_t n = srv_get32(hdr + 4);
@@ -333,6 +337,7 @@ static int srv_start(fake_server *s) {
 
 static void srv_stop(fake_server *s) {
   s->stop = true;
+  /* poll() bounds the join on macOS too; SO_RCVTIMEO does not bound accept. */
   pthread_join(s->th, NULL);
   close(s->fd);
 }

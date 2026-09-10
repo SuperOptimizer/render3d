@@ -28,7 +28,7 @@ static int failures = 0;
     }                                                                 \
   } while (0)
 
-enum lmode { L_OK, L_TRUNC_FOREVER, L_500, L_HTML };
+enum lmode { L_OK, L_TRUNC_FOREVER, L_500, L_HTML, L_INDEX };
 static _Atomic int g_mode = L_OK;
 static _Atomic bool g_stop = false;
 static int g_listen = -1;
@@ -81,6 +81,13 @@ static void serve_one(int fd) {
     body = "boom";
     ctype = "text/plain";
     break;
+  case L_INDEX:
+    body="<html><a href=\"../\">parent</a><a href=\"PHerc1218/\">wrong label</a>"
+         "<a href='volume.zarr/'>volume</a><a href=\"PHerc1218/\">duplicate</a>"
+         "<a href=\"/escape/\">absolute</a><a href=\"https://evil/\">external</a>"
+         "<a href=\"%2e%2e/\">encoded</a><a href=\"nested/path/\">nested</a>"
+         "<a href=\"file.json\">file</a></html>";
+    ctype="text/html";break;
   case L_HTML:
     body = "<html><body>login required</body></html>";
     ctype = "text/html";
@@ -164,6 +171,13 @@ int main(void) {
   CHECK(rc != 0 || (l.ndirs == 0 && l.nfiles == 0));
   r3d_odlist_free(&l);
 
+  g_mode=L_INDEX;
+  CHECK(r3d_odlist_fetch_http(url,"",&l)==0);
+  CHECK(l.ndirs==2 && !strcmp(l.dirs[0],"PHerc1218") && !strcmp(l.dirs[1],"volume.zarr"));
+  r3d_odlist_free(&l);
+  g_mode=L_500;
+  CHECK(r3d_odlist_fetch_http(url,"",&l)!=0 && l.ndirs==0);
+  r3d_odlist_free(&l);
   g_stop = true;
   shutdown(g_listen, SHUT_RDWR);
   close(g_listen);

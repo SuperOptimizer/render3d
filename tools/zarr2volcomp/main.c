@@ -19,6 +19,7 @@
 #include <errno.h>
 #include <math.h>
 #include <pthread.h>
+#include "../common/workers.h"
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -56,16 +57,9 @@ typedef struct level_info {
   uint32_t chsz;  /* zarr chunk edge (128 or 256; a chunk is (chsz/128)^3 bricks) */
 } level_info;
 
-typedef struct blob {
-  uint8_t *p;
-  uint32_t n;
-} blob;
-
 static const char *g_mirror, *g_out;
 static const char *g_url = NULL; /* streaming ingest: fetch chunks, keep no mirror */
-/* Total bytes a shard's phase-1 fill workers may hold in scratch buffers at
- * once (on top of the fixed 1024^3 assembly); worker count is derived from
- * this, not from CPU count alone -- overridable with --mem-budget-mb. */
+/* Bound rolling assembly plus active decode/encode workers. */
 static uint64_t g_mem_budget_bytes = 4ull * 1024 * 1024 * 1024;
 static _Atomic uint64_t g_fetched_bytes = 0, g_fetched_n = 0, g_absent_n = 0;
 static level_info g_lv[MAX_LEVELS];
@@ -165,15 +159,19 @@ static void chunk_path(char path[2048], uint32_t level, uint64_t cz, uint64_t cy
 
 typedef struct fetch_buf {
   uint8_t *p;
-  size_t n, cap;
+  size_t n, cap, limit;
 } fetch_buf;
 
 static size_t fetch_write(const void *data, size_t sz, size_t nm, void *ud) {
   fetch_buf *b = ud;
+  if (sz && nm > SIZE_MAX / sz) return 0;
   size_t n = sz * nm;
+  size_t limit = b->limit ? b->limit : (16u << 20);
+  if (b->n > limit || n > limit - b->n) return 0;
   if (b->n + n > b->cap) {
     size_t nc = b->cap ? b->cap * 2 : (4u << 20);
     while (nc < b->n + n) nc *= 2;
+    if (nc > limit) nc = limit;
     uint8_t *np = realloc(b->p, nc);
     if (!np) return 0;
     b->p = np;
@@ -252,6 +250,7 @@ static int load_chunk(uint32_t level, uint64_t cz, uint64_t cy, uint64_t cx, uin
   if (cz >= lv->chunks.z || cy >= lv->chunks.y || cx >= lv->chunks.x) return 0;
   if (!chunk_wanted(lv, cz, cy, cx)) return 0; /* far from surface: air */
   if (g_url) { /* streaming ingest: network -> memory -> brick, no mirror */
+    t_buf.limit = (size_t)lv->chsz * lv->chsz * lv->chsz + (16u << 20);
     int rc = fetch_chunk(level, cz, cy, cx, &t_buf);
     if (rc <= 0) return rc;
     rc = decode_chunk_mem(lv, t_buf.p, t_buf.n, dst);
@@ -313,9 +312,11 @@ static int load_chunk(uint32_t level, uint64_t cz, uint64_t cy, uint64_t cx, uin
 typedef struct shard_job {
   uint32_t level;
   uint64_t oz, oy, ox; /* shard coords */
-  uint8_t *assem;      /* SHARD^3 assembly (phase 1 fills, phase 2 cuts) */
-  blob bricks[NBRICKS];
-  uint8_t zero[NBRICKS];
+  uint8_t *assem; /* rolling source-Z slab; completed128-slice bands drain */
+  uint32_t sx, sy, depth, brick_begin, brick_end;
+  uint64_t fill_z;
+  volcomp_shard_writer *writer;
+  pthread_mutex_t write_mu;
   _Atomic uint32_t next;
   _Atomic int failed;
   _Atomic uint64_t missing; /* chunks not yet downloaded */
@@ -335,16 +336,8 @@ static void shard_fill_range(uint32_t level, uint64_t oz, uint64_t oy, uint64_t 
   }
 }
 
-static uint64_t shard_fill_ncells(uint32_t level, uint64_t oz, uint64_t oy, uint64_t ox) {
-  uint64_t c0[3], c1[3];
-  shard_fill_range(level, oz, oy, ox, c0, c1);
-  return (c1[0] - c0[0] + 1) * (c1[1] - c0[1] + 1) * (c1[2] - c0[2] + 1);
-}
-
-/* Phase 1: decode every zarr chunk overlapping the shard into a shared
- * SHARD^3 assembly (disjoint copy regions — no locking). Handles any cubic
- * chunk size, including ones that don't divide 1024 (e.g. the 192^3
- * surface-prediction trees): a brick may straddle chunk boundaries. */
+/* Load each overlapping source chunk once per shard. The ring retains the
+ * incomplete output band across source planes, including192³ chunks. */
 static void *fill_worker(void *arg) {
   shard_job *j = arg;
   const level_info *lv = &g_lv[j->level];
@@ -352,18 +345,18 @@ static void *fill_worker(void *arg) {
   uint64_t c0[3], c1[3];
   shard_fill_range(j->level, j->oz, j->oy, j->ox, c0, c1);
   uint64_t O[3] = {j->oz * SHARD, j->oy * SHARD, j->ox * SHARD};
-  uint64_t nz = c1[0] - c0[0] + 1, ny = c1[1] - c0[1] + 1, nx = c1[2] - c0[2] + 1;
+  uint64_t ny = c1[1] - c0[1] + 1, nx = c1[2] - c0[2] + 1;
   size_t chunk_bytes = (size_t)chsz * chsz * chsz;
   uint8_t *chunk = malloc(chunk_bytes);
   if (!chunk) {
     atomic_store(&j->failed, 1);
     return NULL;
   }
-  uint64_t ncells = nz * ny * nx;
+  uint64_t ncells = ny * nx;
   for (;;) {
     uint32_t cell = atomic_fetch_add(&j->next, 1);
     if (cell >= ncells || atomic_load(&j->failed)) break;
-    uint64_t cz = c0[0] + cell / (ny * nx);
+    uint64_t cz = j->fill_z;
     uint64_t cy = c0[1] + (cell / nx) % ny;
     uint64_t cx = c0[2] + cell % nx;
     int rc = load_chunk(j->level, cz, cy, cx, chunk);
@@ -375,23 +368,31 @@ static void *fill_worker(void *arg) {
       atomic_store(&j->failed, 1);
       break;
     }
-    if (rc == 0) continue; /* absent = fill; assembly is pre-zeroed */
+    if (rc == 0) continue; /* new source-plane ring region was zeroed */
     /* copy chunk ∩ shard into the assembly */
     uint64_t G[3] = {cz * chsz, cy * chsz, cx * chsz};
     uint64_t s[3], e[3];
     for (int a = 0; a < 3; a++) {
       s[a] = G[a] > O[a] ? G[a] : O[a];
-      uint64_t ge = G[a] + chsz, oe = O[a] + SHARD;
+      uint64_t ge = G[a] + chsz, oe = O[a] + (a == 1 ? j->sy : a == 2 ? j->sx : SHARD);
       e[a] = ge < oe ? ge : oe;
     }
     for (uint64_t z2 = s[0]; z2 < e[0]; z2++)
       for (uint64_t y2 = s[1]; y2 < e[1]; y2++)
-        memcpy(j->assem + (((z2 - O[0]) * SHARD + (y2 - O[1])) * SHARD + (s[2] - O[2])),
+        memcpy(j->assem + ((((z2 - O[0]) % j->depth) * j->sy + (y2 - O[1])) * j->sx + (s[2] - O[2])),
                chunk + (((z2 - G[0]) * chsz + (y2 - G[1])) * chsz + (s[2] - G[2])),
                e[2] - s[2]);
   }
   free(chunk);
+  free(t_buf.p); t_buf = (fetch_buf){0};
   return NULL;
+}
+
+static void zarr_worker_cleanup(void) {
+  free(t_buf.p);
+  t_buf = (fetch_buf){0};
+  if (t_curl) curl_easy_cleanup(t_curl);
+  t_curl = NULL;
 }
 
 /* Phase 2: cut 128^3 bricks out of the assembly and encode them. */
@@ -406,52 +407,64 @@ static void *brick_worker(void *arg) {
     return NULL;
   }
   for (;;) {
-    uint32_t b = atomic_fetch_add(&j->next, 1);
-    if (b >= NBRICKS || atomic_load(&j->failed)) break;
+    uint32_t b = j->brick_begin + atomic_fetch_add(&j->next, 1);
+    if (b >= j->brick_end || atomic_load(&j->failed)) break;
     uint32_t bz = b / (SHARD_BPA * SHARD_BPA), by = (b / SHARD_BPA) % SHARD_BPA,
              bx = b % SHARD_BPA;
-    {
-          for (uint32_t r = 0; r < BRICK; r++) /* gather the 128^3 sub-cube */
-            for (uint32_t q_ = 0; q_ < BRICK; q_++)
-              memcpy(raw + ((size_t)r * BRICK + q_) * BRICK,
-                     j->assem + (((size_t)(bz * BRICK + r) * SHARD +
-                                  ((size_t)by * BRICK + q_)) *
-                                     SHARD +
-                                 (size_t)bx * BRICK),
-                     BRICK);
-          if (all_zero(raw, BRICK_BYTES)) {
-            j->zero[b] = 1;
-            continue;
-          }
-          float q = g_quality / (float)(1u << (j->level < 3u ? j->level : 3u));
-          if (q < 1.0f) q = 1.0f;
-          volcomp_brick_params p = volcomp_brick_defaults(1.0f);
-          p.q = q;
+    if (bx * BRICK >= j->sx || by * BRICK >= j->sy) {
+      pthread_mutex_lock(&j->write_mu);
+      int rc = volcomp_shard_put_zero(j->writer, b);
+      pthread_mutex_unlock(&j->write_mu);
+      if (rc) atomic_store(&j->failed, 1);
+      continue;
+    }
+    for (uint32_t r = 0; r < BRICK; r++)
+      for (uint32_t y = 0; y < BRICK; y++)
+        memcpy(raw + ((size_t)r * BRICK + y) * BRICK,
+               j->assem + ((((size_t)bz * BRICK + r) % j->depth * j->sy +
+                            by * BRICK + y) * j->sx + bx * BRICK), BRICK);
+    if (all_zero(raw, BRICK_BYTES)) {
+      pthread_mutex_lock(&j->write_mu);
+      int rc = volcomp_shard_put_zero(j->writer, b);
+      pthread_mutex_unlock(&j->write_mu);
+      if (rc) atomic_store(&j->failed, 1);
+      continue;
+    }
+    float q = g_quality / (float)(1u << (j->level < 3u ? j->level : 3u));
+    if (q < 1.0f) q = 1.0f;
+    volcomp_brick_params p = volcomp_brick_defaults(1.0f);
+    p.q = q;
 
-          size_t n = 0;
-          if (volcomp_brick_encode(&p, raw, BRICK, &j->bricks[b].p, &n) != 0 ||
-              n > UINT32_MAX) {
-            atomic_store(&j->failed, 1);
-            break;
-          }
-          j->bricks[b].n = (uint32_t)n;
-          if (g_verify && atomic_fetch_add(&g_psnr_bricks, 1) < g_verify) {
-            if (volcomp_brick_decode(j->bricks[b].p, n, rec, BRICK) != 0) {
-              atomic_store(&j->failed, 1);
-              break;
-            }
-            double sse = 0;
-            for (size_t i = 0; i < BRICK_BYTES; i++) {
-              double d = (double)raw[i] - (double)rec[i];
-              sse += d * d;
-            }
-            pthread_mutex_lock(&g_verify_mu);
-            g_sse_sum += sse / (double)BRICK_BYTES;
-            pthread_mutex_unlock(&g_verify_mu);
-          } else if (g_verify) {
-            atomic_fetch_sub(&g_psnr_bricks, 1);
-          }
-        }
+    size_t n = 0;
+    uint8_t *encoded = NULL;
+    if (volcomp_brick_encode(&p, raw, BRICK, &encoded, &n) != 0 ||
+        n > UINT32_MAX) {
+      free(encoded);
+      atomic_store(&j->failed, 1);
+      break;
+    }
+    if (g_verify && atomic_fetch_add(&g_psnr_bricks, 1) < g_verify) {
+      if (volcomp_brick_decode(encoded, n, rec, BRICK) != 0) {
+        free(encoded);
+        atomic_store(&j->failed, 1);
+        break;
+      }
+      double sse = 0;
+      for (size_t i = 0; i < BRICK_BYTES; i++) {
+        double d = (double)raw[i] - (double)rec[i];
+        sse += d * d;
+      }
+      pthread_mutex_lock(&g_verify_mu);
+      g_sse_sum += sse / (double)BRICK_BYTES;
+      pthread_mutex_unlock(&g_verify_mu);
+    } else if (g_verify) {
+      atomic_fetch_sub(&g_psnr_bricks, 1);
+    }
+    pthread_mutex_lock(&j->write_mu);
+    int rc = volcomp_shard_put(j->writer, b, encoded, n);
+    pthread_mutex_unlock(&j->write_mu);
+    free(encoded);
+    if (rc) atomic_store(&j->failed, 1);
   }
   free(raw);
   free(rec);
@@ -496,44 +509,67 @@ static int process_shard(uint32_t level, uint64_t oz, uint64_t oy, uint64_t ox,
   j->oz = oz;
   j->oy = oy;
   j->ox = ox;
-  j->assem = calloc(1, (size_t)SHARD * SHARD * SHARD);
-  if (!j->assem) {
-    free(j);
-    return -1;
+  const level_info *lv = &g_lv[level];
+  uint32_t gcd = lv->chsz, rem = BRICK;
+  while (rem) { uint32_t t = gcd % rem; gcd = rem; rem = t; }
+  j->depth = lv->chsz + BRICK - gcd;
+  uint64_t wx = lv->chunks.x * lv->chsz - ox * SHARD;
+  uint64_t wy = lv->chunks.y * lv->chsz - oy * SHARD;
+  j->sx = wx >= SHARD ? SHARD : (uint32_t)((wx + BRICK - 1) / BRICK * BRICK);
+  j->sy = wy >= SHARD ? SHARD : (uint32_t)((wy + BRICK - 1) / BRICK * BRICK);
+  uint64_t assembly_bytes = (uint64_t)j->depth * j->sx * j->sy;
+  uint64_t chunk_bytes = (uint64_t)lv->chsz * lv->chsz * lv->chsz;
+  /* Raw decode + compressed input, including bounded CURL growth; native
+   * encoder working storage/output/raw/reconstruction fits64MiB/worker. */
+  uint64_t fill_bytes = chunk_bytes * 3 + (32u << 20);
+  uint64_t encode_bytes = 64u << 20;
+  uint64_t worker_bytes = fill_bytes > encode_bytes ? fill_bytes : encode_bytes;
+  if (g_mem_budget_bytes < assembly_bytes + worker_bytes) {
+    fprintf(stderr, "zarr2volcomp: memory budget needs at least%llu MiB for chunk edge%u\n",
+            (unsigned long long)((assembly_bytes + worker_bytes + (1u<<20)-1) >> 20), lv->chsz);
+    free(j); return -1;
   }
-  pthread_t tids[32];
+  uint64_t budget_nt = (g_mem_budget_bytes - assembly_bytes) / worker_bytes;
   uint32_t nt = threads > 32u ? 32u : threads;
   if (nt < 1u) nt = 1u;
-  /* Phase 1 (fill) holds one chsz^3 scratch buffer per worker alongside the
-   * fixed SHARD^3 assembly; bound worker count by a global byte budget
-   * instead of trusting CPU count alone (a 512-edge chunk is 128 MiB/worker,
-   * so an unbudgeted 32-way fan-out could still approach the assembly plus
-   * several GiB of scratch). Also never start more fill workers than there
-   * are source chunks to claim. */
-  const level_info *lv0 = &g_lv[level];
-  uint64_t assem_bytes = (uint64_t)SHARD * SHARD * SHARD;
-  uint64_t worker_bytes = (uint64_t)lv0->chsz * lv0->chsz * lv0->chsz;
-  uint64_t avail = g_mem_budget_bytes > assem_bytes ? g_mem_budget_bytes - assem_bytes : 0;
-  uint32_t budget_nt = worker_bytes ? (uint32_t)(avail / worker_bytes) : nt;
-  if (budget_nt < 1u) budget_nt = 1u;
-  uint64_t fill_ncells = shard_fill_ncells(level, oz, oy, ox);
-  uint32_t fill_nt = nt < budget_nt ? nt : budget_nt;
-  if (fill_ncells < (uint64_t)fill_nt) fill_nt = (uint32_t)fill_ncells;
-  if (fill_nt < 1u) fill_nt = 1u;
-  for (int phase = 0; phase < 2 && !atomic_load(&j->failed); phase++) {
-    atomic_store(&j->next, 0);
-    uint32_t phase_nt = phase == 0 ? fill_nt : nt;
-    uint32_t created = 0;
-    for (; created < phase_nt; created++)
-      if (pthread_create(&tids[created], NULL, phase == 0 ? fill_worker : brick_worker,
-                         j) != 0) {
-        atomic_store(&j->failed, 1);
-        break;
+  if (budget_nt < nt) nt = (uint32_t)budget_nt;
+  j->assem = malloc((size_t)assembly_bytes);
+  if (!j->assem || mkdirs(cp, false) != 0) { free(j->assem); free(j); return -1; }
+  char tmp[2112];
+  snprintf(tmp, sizeof tmp, "%s.tmp.%ld", cp, (long)getpid());
+  j->writer = volcomp_shard_create(tmp, SHARD, BRICK, level,
+      fmaxf(1.0f, g_quality / (float)(1u << (level < 3u ? level : 3u))));
+  if (!j->writer) { free(j->assem); free(j); return -1; }
+  pthread_mutex_init(&j->write_mu, NULL);
+  uint64_t c0[3], c1[3];
+  shard_fill_range(level, oz, oy, ox, c0, c1);
+  uint32_t completed = 0;
+  r3d_tool_workers pool;
+  bool pool_ready = r3d_tool_workers_init(&pool, nt) == 0;
+  if (!pool_ready) atomic_store(&j->failed, 1);
+  else pool.cleanup = zarr_worker_cleanup;
+  for (uint64_t cz = c0[0]; cz <= c1[0] && !atomic_load(&j->failed); cz++) {
+    uint64_t z0 = cz * lv->chsz > oz * SHARD ? cz * lv->chsz - oz * SHARD : 0;
+    uint64_t z1 = (cz + 1) * lv->chsz - oz * SHARD;
+    if (z1 > SHARD) z1 = SHARD;
+    for (uint64_t z = z0; z < z1; z++)
+      memset(j->assem + z % j->depth * j->sx * j->sy, 0, (size_t)j->sx * j->sy);
+    j->fill_z = cz;
+    for (int phase = 0; phase < 2 && !atomic_load(&j->failed); phase++) {
+      if (phase == 1) {
+        if (atomic_load(&j->missing)) break;
+        j->brick_begin = completed * SHARD_BPA * SHARD_BPA;
+        j->brick_end = (uint32_t)(z1 / BRICK) * SHARD_BPA * SHARD_BPA;
+        completed = (uint32_t)(z1 / BRICK);
+        if (j->brick_begin == j->brick_end) continue;
       }
-    for (uint32_t t = 0; t < created; t++) pthread_join(tids[t], NULL);
-    if (phase == 0 && atomic_load(&j->missing)) break; /* incomplete: no encode */
+      atomic_store(&j->next, 0);
+      r3d_tool_workers_run(&pool, phase == 0 ? fill_worker : brick_worker, j);
+    }
+    if (atomic_load(&j->missing)) break;
   }
 
+  if (pool_ready) r3d_tool_workers_destroy(&pool);
   int rc = atomic_load(&j->failed) ? -1 : 0;
   uint64_t miss = atomic_load(&j->missing);
   if (rc == 0 && miss) {
@@ -544,21 +580,10 @@ static int process_shard(uint32_t level, uint64_t oz, uint64_t oy, uint64_t ox,
             (unsigned long long)ox, (unsigned long long)miss);
     rc = -1;
   }
-  if (rc == 0) {
-    if (mkdirs(cp, false) != 0) rc = -1;
-    char tmp[2112];
-    snprintf(tmp, sizeof tmp, "%s.tmp.%ld", cp, (long)getpid());
-    volcomp_shard_writer *w = rc == 0 ? volcomp_shard_create(tmp, SHARD, BRICK, level,
-        fmaxf(1.0f, g_quality / (float)(1u << (level < 3u ? level : 3u)))) : NULL;
-    if (!w) rc = -1;
-    for (uint32_t b = 0; b < NBRICKS && rc == 0; b++)
-      rc = j->zero[b] || !j->bricks[b].p ? volcomp_shard_put_zero(w, b)
-                                         : volcomp_shard_put(w, b, j->bricks[b].p, j->bricks[b].n);
-    if (w && volcomp_shard_close(w) != 0) rc = -1;
-    if (rc == 0 && rename(tmp, cp) != 0) rc = -1;
-    if (rc != 0) unlink(tmp);
-  }
-  for (uint32_t b = 0; b < NBRICKS; b++) free(j->bricks[b].p);
+  if (volcomp_shard_close(j->writer) != 0) rc = -1;
+  pthread_mutex_destroy(&j->write_mu);
+  if (rc == 0 && rename(tmp, cp) != 0) rc = -1;
+  if (rc != 0) unlink(tmp);
   free(j->assem);
   free(j);
   return rc;
@@ -681,9 +706,8 @@ int main(int argc, char **argv) {
             "[--mem-budget-mb N] "
             "[--volcomp-quality Q] [--only-level L] "
             "[--list-missing FILE] [--dry-run] [--verify N] [--force]\n"
-            "  --mem-budget-mb: cap on phase-1 fill-worker scratch bytes per shard, on top "
-            "of the fixed 1024 MiB assembly (default 4096); worker count is derived from "
-            "this, not CPU count alone\n"
+            "  --mem-budget-mb: bound rolling assembly plus active workers (default4096); "
+            "too-small budgets fail before allocation\n"
             "  --url: streaming ingest — chunks are fetched straight into memory and only "
             "transcoded volcomp shards are written (the mirror dir holds .zarray metadata "
             "only); without it, chunks are read from a pre-fetched local mirror\n");
@@ -740,10 +764,6 @@ int main(int argc, char **argv) {
     long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
     threads = ncpu > 0 ? (uint32_t)ncpu : 1u;
   }
-  if (g_mem_budget_bytes < (uint64_t)SHARD * SHARD * SHARD)
-    fprintf(stderr,
-            "zarr2volcomp: --mem-budget-mb is below the fixed 1024 MiB shard assembly; "
-            "clamping every shard to 1 fill worker\n");
   if (g_url) { /* streaming ingest: bootstrap per-level .zarray metadata only */
     curl_global_init(CURL_GLOBAL_DEFAULT);
     for (uint32_t l = 0; l < MAX_LEVELS; l++) {

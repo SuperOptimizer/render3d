@@ -63,6 +63,7 @@ add_library(r3d_core STATIC
   src/core/segtrace.c
   src/core/segstore.c
   src/core/cpuvol.c
+  src/core/deblock.c
   src/core/pngw.c
   src/core/tracer.c
   src/core/bsurf.c
@@ -128,11 +129,11 @@ target_include_directories(r3d_fysics SYSTEM PUBLIC ${R3D_FYSICS_DIR})
 target_compile_options(r3d_fysics PRIVATE -ffast-math -fno-math-errno -O3)
 target_link_libraries(r3d_fysics PUBLIC m PRIVATE r3d_sanitize)
 add_library(r3d_volcomp STATIC src/codec/brick.c src/codec/shard.c
-  src/codec/label.c src/codec/tifxyz.c)
+  src/codec/label.c src/codec/tifxyz.c src/codec/native_source.c)
 target_include_directories(r3d_volcomp PUBLIC src/codec)
 target_include_directories(r3d_volcomp SYSTEM PRIVATE ${R3D_VOLCOMP_DIR})
 target_compile_definitions(r3d_volcomp PUBLIC R3D_VOLCOMP_REV="${R3D_VOLCOMP_REV}")
-target_link_libraries(r3d_volcomp PUBLIC m ZLIB::ZLIB TIFF::TIFF Threads::Threads PRIVATE r3d_warnings r3d_sanitize)
+target_link_libraries(r3d_volcomp PUBLIC m ZLIB::ZLIB TIFF::TIFF Threads::Threads CURL::libcurl PRIVATE r3d_warnings r3d_sanitize)
 target_link_libraries(r3d_core PUBLIC r3d_volcomp r3d_fysics)
 
 # --- stable headless ABI (no viewer/Vulkan dependency) ---
@@ -197,7 +198,7 @@ add_library(r3d_vk STATIC
   src/vk/vkclip.c
   src/vk/vkgui.c)
 target_include_directories(r3d_vk PUBLIC src)
-target_link_libraries(r3d_vk PUBLIC Vulkan::Vulkan SDL3::SDL3 CURL::libcurl r3d_imgui r3d_shard r3d_volcomp
+target_link_libraries(r3d_vk PUBLIC Vulkan::Vulkan SDL3::SDL3 CURL::libcurl r3d_imgui r3d_shard r3d_volcomp r3d_core
                              PRIVATE ${BLOSC_LIB} r3d_warnings r3d_sanitize)
 
 # --- shaders (Slang -> SPIR-V) ---
@@ -242,6 +243,12 @@ target_link_libraries(zarr2volcomp PRIVATE r3d_core r3d_volcomp ${BLOSC_LIB} CUR
 
 # --- tests ---
 enable_testing()
+add_executable(test_blockmap tests/test_blockmap.c)
+target_include_directories(test_blockmap PRIVATE src)
+target_link_libraries(test_blockmap PRIVATE r3d_warnings r3d_sanitize)
+add_test(NAME blockmap COMMAND test_blockmap)
+set_tests_properties(blockmap PROPERTIES LABELS quick TIMEOUT 60)
+
 add_executable(test_headless tests/test_headless.c)
 target_link_libraries(test_headless PRIVATE render3d_headless m r3d_warnings r3d_sanitize)
 add_test(NAME headless COMMAND test_headless)
@@ -260,6 +267,45 @@ add_test(NAME view COMMAND test_view $<TARGET_FILE:render3d>)
 set_tests_properties(view PROPERTIES LABELS quick TIMEOUT 120)
 add_test(NAME view_gui COMMAND test_view $<TARGET_FILE:render3d> gui)
 set_tests_properties(view_gui PROPERTIES LABELS gpu TIMEOUT 300)
+add_executable(test_surface_stream tests/test_surface_stream.c)
+target_link_libraries(test_surface_stream PRIVATE render3d_headless r3d_volcomp r3d_warnings r3d_sanitize)
+add_test(NAME surface_stream COMMAND test_surface_stream)
+set_tests_properties(surface_stream PROPERTIES LABELS quick TIMEOUT 30)
+
+add_executable(test_lodpack tests/test_lodpack.c)
+target_link_libraries(test_lodpack PRIVATE r3d_volcomp r3d_shard r3d_warnings r3d_sanitize)
+add_test(NAME lodpack COMMAND test_lodpack)
+set_tests_properties(lodpack PROPERTIES LABELS quick TIMEOUT 60)
+
+add_executable(test_headless_roi tests/test_headless_roi.c)
+target_include_directories(test_headless_roi PRIVATE include src)
+target_link_libraries(test_headless_roi PRIVATE r3d_core r3d_warnings r3d_sanitize)
+add_test(NAME headless_roi COMMAND test_headless_roi)
+set_tests_properties(headless_roi PROPERTIES LABELS quick TIMEOUT 30)
+
+add_executable(test_reg_retry tests/test_reg_retry.c)
+target_link_libraries(test_reg_retry PRIVATE r3d_core r3d_warnings r3d_sanitize)
+add_test(NAME reg_retry COMMAND test_reg_retry)
+set_tests_properties(reg_retry PROPERTIES LABELS quick TIMEOUT 30)
+
+add_executable(test_app_perf tests/test_app_perf.c)
+target_link_libraries(test_app_perf PRIVATE r3d_core r3d_warnings r3d_sanitize)
+add_test(NAME app_perf COMMAND test_app_perf)
+set_tests_properties(app_perf PROPERTIES LABELS quick TIMEOUT 60)
+
+add_executable(test_app_ui tests/test_app_ui.c src/annotui.c src/viewui.c)
+target_compile_definitions(test_app_ui PRIVATE R3D_SPV_DIR="${R3D_SPV_DIR}")
+add_dependencies(test_app_ui r3d_shaders)
+target_link_libraries(test_app_ui PRIVATE r3d_core r3d_vk r3d_warnings r3d_sanitize)
+add_test(NAME app_ui COMMAND test_app_ui)
+set_tests_properties(app_ui PROPERTIES LABELS quick TIMEOUT 60)
+
+foreach(tool_test packtools mkpyramid)
+  add_executable(test_${tool_test} tests/test_${tool_test}.c)
+  target_link_libraries(test_${tool_test} PRIVATE r3d_volcomp r3d_shard r3d_warnings r3d_sanitize)
+  add_test(NAME ${tool_test} COMMAND test_${tool_test})
+  set_tests_properties(${tool_test} PROPERTIES LABELS quick TIMEOUT 60)
+endforeach()
 
 add_executable(test_quick tests/test_quick.c)
 target_link_libraries(test_quick PRIVATE r3d_core r3d_warnings r3d_sanitize)
@@ -272,6 +318,7 @@ add_test(NAME persist COMMAND test_persist)
 set_tests_properties(persist PROPERTIES LABELS quick TIMEOUT 300)
 
 add_executable(test_stack tests/test_stack.c)
+add_dependencies(test_stack rendseg)
 target_link_libraries(test_stack PRIVATE r3d_core r3d_volcomp r3d_warnings r3d_sanitize)
 add_test(NAME stack COMMAND test_stack $<TARGET_FILE:rendseg>)
 set_tests_properties(stack PROPERTIES LABELS quick TIMEOUT 120)
@@ -287,6 +334,7 @@ add_test(NAME odlist COMMAND test_odlist)
 set_tests_properties(odlist PROPERTIES LABELS quick TIMEOUT 60)
 
 add_executable(test_zarr2volcomp tests/test_zarr2volcomp.c)
+add_dependencies(test_zarr2volcomp zarr2volcomp)
 target_link_libraries(test_zarr2volcomp PRIVATE r3d_core r3d_warnings r3d_sanitize)
 add_test(NAME zarr2volcomp COMMAND test_zarr2volcomp $<TARGET_FILE:zarr2volcomp>)
 set_tests_properties(zarr2volcomp PROPERTIES LABELS quick TIMEOUT 180)
@@ -343,6 +391,11 @@ add_test(NAME gpu COMMAND test_gpu $<TARGET_FILE:render3d>)
 set_tests_properties(gpu PROPERTIES LABELS gpu TIMEOUT 120 SKIP_RETURN_CODE 77
   ENVIRONMENT "LSAN_OPTIONS=suppressions=${CMAKE_SOURCE_DIR}/lsan.supp")
 
+add_executable(bench_blocks tools/bench_blocks/main.c)
+target_include_directories(bench_blocks PRIVATE tests)
+target_include_directories(bench_blocks SYSTEM PRIVATE ${R3D_VOLCOMP_DIR})
+target_link_libraries(bench_blocks PRIVATE r3d_volcomp r3d_warnings r3d_sanitize)
+
 add_executable(test_blocks tests/test_blocks.c)
 target_include_directories(test_blocks SYSTEM PRIVATE ${R3D_VOLCOMP_DIR})
 target_link_libraries(test_blocks PRIVATE r3d_core r3d_warnings r3d_sanitize)
@@ -354,4 +407,137 @@ target_link_libraries(test_block_atlas PRIVATE r3d_vk r3d_core r3d_warnings r3d_
 target_compile_definitions(test_block_atlas PRIVATE R3D_SPV_DIR="${R3D_SPV_DIR}")
 add_dependencies(test_block_atlas r3d_shaders)
 add_test(NAME block_atlas COMMAND test_block_atlas)
+
+add_executable(test_viewcache tests/test_viewcache.c)
+target_link_libraries(test_viewcache PRIVATE r3d_core r3d_vk r3d_warnings r3d_sanitize)
+target_compile_definitions(test_viewcache PRIVATE R3D_SPV_DIR="${R3D_SPV_DIR}")
+add_dependencies(test_viewcache r3d_shaders)
+add_test(NAME viewcache COMMAND test_viewcache)
+set_tests_properties(viewcache PROPERTIES LABELS gpu TIMEOUT 120 SKIP_RETURN_CODE 77)
+
+add_executable(test_pagehash_gpu tests/test_pagehash_gpu.c)
+target_link_libraries(test_pagehash_gpu PRIVATE r3d_vk r3d_warnings r3d_sanitize)
+target_compile_definitions(test_pagehash_gpu PRIVATE R3D_SPV_DIR="${R3D_SPV_DIR}")
+add_dependencies(test_pagehash_gpu r3d_shaders)
+add_test(NAME pagehash_gpu COMMAND test_pagehash_gpu)
+set_tests_properties(pagehash_gpu PROPERTIES LABELS gpu TIMEOUT 60 SKIP_RETURN_CODE 77)
+
+add_executable(test_sparse_zero tests/test_sparse_zero.c)
+target_link_libraries(test_sparse_zero PRIVATE r3d_core r3d_vk r3d_warnings r3d_sanitize)
+target_compile_definitions(test_sparse_zero PRIVATE R3D_SPV_DIR="${R3D_SPV_DIR}")
+add_dependencies(test_sparse_zero r3d_shaders)
+add_test(NAME sparse_zero COMMAND test_sparse_zero)
+set_tests_properties(sparse_zero PROPERTIES LABELS gpu TIMEOUT 120 SKIP_RETURN_CODE 77)
+
+add_executable(test_gpu_updates tests/test_gpu_updates.c)
+target_link_libraries(test_gpu_updates PRIVATE r3d_core r3d_vk r3d_warnings r3d_sanitize)
+target_compile_definitions(test_gpu_updates PRIVATE R3D_SPV_DIR="${R3D_SPV_DIR}")
+add_dependencies(test_gpu_updates r3d_shaders)
+add_test(NAME gpu_updates COMMAND test_gpu_updates)
+set_tests_properties(gpu_updates PROPERTIES LABELS gpu TIMEOUT 120 SKIP_RETURN_CODE 77)
 set_tests_properties(block_atlas PROPERTIES LABELS gpu TIMEOUT 60 SKIP_RETURN_CODE 77)
+
+add_executable(test_blockpost tests/test_blockpost.c)
+target_link_libraries(test_blockpost PRIVATE r3d_vk r3d_warnings r3d_sanitize)
+target_compile_definitions(test_blockpost PRIVATE R3D_SPV_DIR="${R3D_SPV_DIR}")
+add_dependencies(test_blockpost r3d_shaders)
+add_test(NAME blockpost COMMAND test_blockpost)
+set_tests_properties(blockpost PROPERTIES LABELS gpu TIMEOUT 60 SKIP_RETURN_CODE 77)
+
+# Browser native-volume bootstrap lives beside the renderer and packer.
+configure_file(tools/bootstrap_volcomp.py bootstrap_volcomp.py COPYONLY)
+configure_file(tools/fetch_volcomp.py fetch_volcomp.py COPYONLY)
+add_dependencies(render3d volcomppack zarr2volcomp)
+
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+  add_executable(native_source_probe tests/native_source_probe.c)
+  target_link_libraries(native_source_probe PRIVATE r3d_core r3d_warnings r3d_sanitize)
+  add_test(NAME native_source COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_SOURCE_DIR}/tests/test_native_source.py $<TARGET_FILE:native_source_probe>
+    $<TARGET_FILE:volcomppack>)
+  add_dependencies(native_source_probe volcomppack)
+  set_tests_properties(native_source PROPERTIES LABELS quick TIMEOUT 60)
+endif()
+
+add_executable(test_dataset_swap tests/test_dataset_swap.c)
+target_link_libraries(test_dataset_swap PRIVATE r3d_volcomp r3d_warnings r3d_sanitize)
+add_dependencies(test_dataset_swap render3d)
+add_test(NAME dataset_swap COMMAND test_dataset_swap $<TARGET_FILE:render3d>)
+set_tests_properties(dataset_swap PROPERTIES LABELS gpu TIMEOUT 120 SKIP_RETURN_CODE 77)
+target_link_libraries(test_blockmap PRIVATE Threads::Threads)
+
+add_executable(test_deblock tests/test_deblock.c)
+target_include_directories(test_deblock SYSTEM PRIVATE ${R3D_VOLCOMP_DIR})
+target_link_libraries(test_deblock PRIVATE r3d_core r3d_warnings r3d_sanitize)
+add_test(NAME deblock COMMAND test_deblock)
+set_tests_properties(deblock PROPERTIES LABELS quick TIMEOUT 60)
+add_executable(test_deblock_render tests/test_deblock_render.c)
+target_link_libraries(test_deblock_render PRIVATE r3d_volcomp r3d_warnings r3d_sanitize)
+add_dependencies(test_deblock_render render3d)
+add_test(NAME deblock_render COMMAND test_deblock_render $<TARGET_FILE:render3d>)
+set_tests_properties(deblock_render PROPERTIES LABELS gpu TIMEOUT 120 SKIP_RETURN_CODE 77)
+
+add_executable(test_coarse_pin tests/test_coarse_pin.c)
+target_link_libraries(test_coarse_pin PRIVATE r3d_vk r3d_warnings r3d_sanitize)
+target_compile_definitions(test_coarse_pin PRIVATE R3D_SPV_DIR="${R3D_SPV_DIR}")
+add_dependencies(test_coarse_pin r3d_shaders)
+add_test(NAME coarse_pin COMMAND test_coarse_pin)
+set_tests_properties(coarse_pin PROPERTIES LABELS gpu TIMEOUT 60 SKIP_RETURN_CODE 77)
+
+add_executable(test_lod_pipeline tests/test_lod_pipeline.c)
+target_link_libraries(test_lod_pipeline PRIVATE r3d_volcomp r3d_warnings r3d_sanitize)
+add_dependencies(test_lod_pipeline render3d)
+add_test(NAME lod_pipeline COMMAND test_lod_pipeline $<TARGET_FILE:render3d>)
+set_tests_properties(lod_pipeline PROPERTIES LABELS gpu TIMEOUT 120 SKIP_RETURN_CODE 77)
+
+add_executable(test_lod_cache tests/test_lod_cache.c)
+target_link_libraries(test_lod_cache PRIVATE r3d_vk r3d_warnings r3d_sanitize)
+target_compile_definitions(test_lod_cache PRIVATE R3D_SPV_DIR="${R3D_SPV_DIR}")
+add_dependencies(test_lod_cache r3d_shaders)
+add_test(NAME lod_cache COMMAND test_lod_cache)
+set_tests_properties(lod_cache PROPERTIES LABELS gpu TIMEOUT 60 SKIP_RETURN_CODE 77)
+add_test(NAME lod_cache_air COMMAND test_lod_cache)
+set_tests_properties(lod_cache_air PROPERTIES LABELS gpu TIMEOUT 60 SKIP_RETURN_CODE 77
+  ENVIRONMENT "R3D_TEST_COARSE_AIR=1")
+
+add_executable(test_lod_gradient tests/test_lod_gradient.c)
+target_link_libraries(test_lod_gradient PRIVATE r3d_vk r3d_warnings r3d_sanitize)
+target_compile_definitions(test_lod_gradient PRIVATE R3D_SPV_DIR="${R3D_SPV_DIR}")
+add_dependencies(test_lod_gradient r3d_shaders)
+add_test(NAME lod_gradient COMMAND test_lod_gradient)
+set_tests_properties(lod_gradient PROPERTIES LABELS gpu TIMEOUT 60)
+
+add_executable(test_stream_teardown tests/test_stream_teardown.c)
+target_link_libraries(test_stream_teardown PRIVATE r3d_vk r3d_warnings r3d_sanitize)
+target_compile_definitions(test_stream_teardown PRIVATE R3D_SPV_DIR="${R3D_SPV_DIR}")
+add_dependencies(test_stream_teardown r3d_shaders)
+add_test(NAME stream_teardown COMMAND test_stream_teardown)
+set_tests_properties(stream_teardown PROPERTIES LABELS gpu TIMEOUT 60)
+
+if(Python3_Interpreter_FOUND)
+  add_executable(native_renderer_probe tests/native_renderer_probe.c)
+  target_link_libraries(native_renderer_probe PRIVATE r3d_vk r3d_warnings r3d_sanitize)
+  target_compile_definitions(native_renderer_probe PRIVATE R3D_SPV_DIR="${R3D_SPV_DIR}")
+  add_dependencies(native_renderer_probe r3d_shaders)
+  add_test(NAME native_renderer COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_SOURCE_DIR}/tests/test_native_source.py $<TARGET_FILE:native_source_probe>
+    $<TARGET_FILE:volcomppack> $<TARGET_FILE:native_renderer_probe>)
+  set_tests_properties(native_renderer PROPERTIES LABELS gpu TIMEOUT 60)
+endif()
+
+add_executable(test_decode_restart tests/test_decode_restart.c)
+target_include_directories(test_decode_restart SYSTEM PRIVATE ${R3D_VOLCOMP_DIR})
+target_link_libraries(test_decode_restart PRIVATE r3d_core r3d_warnings r3d_sanitize)
+add_test(NAME decode_restart COMMAND test_decode_restart)
+set_tests_properties(decode_restart PROPERTIES LABELS quick TIMEOUT 120)
+
+if(Python3_Interpreter_FOUND)
+  add_executable(inference_renderer_probe tests/inference_renderer_probe.c)
+  target_link_libraries(inference_renderer_probe PRIVATE r3d_vk r3d_warnings r3d_sanitize)
+  target_compile_definitions(inference_renderer_probe PRIVATE R3D_SPV_DIR="${R3D_SPV_DIR}")
+  add_dependencies(inference_renderer_probe r3d_shaders)
+  add_test(NAME inference_stream COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_SOURCE_DIR}/tests/test_inference_stream.py $<TARGET_FILE:inference_renderer_probe>)
+  set_tests_properties(inference_stream PROPERTIES LABELS gpu TIMEOUT 30)
+endif()

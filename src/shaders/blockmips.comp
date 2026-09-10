@@ -1,0 +1,48 @@
+#version 450
+/* One workgroup builds all three mip levels of a 16^3 atlas slot. */
+layout(local_size_x=64) in;
+layout(binding=0,r8) uniform readonly image3D base_image;
+layout(binding=1,r8) uniform writeonly image3D mip1;
+layout(binding=2,r8) uniform writeonly image3D mip2;
+layout(binding=3,r8) uniform writeonly image3D mip3;
+layout(std430,binding=4) readonly buffer Slots { uint data[]; } slots;
+layout(push_constant) uniform PC { uint abpa, bpa, offset; } pc;
+shared uint values[512];
+shared uint coarse[64];
+uint average(uint sum) {
+  uint q=sum/8u, rem=sum%8u;
+  return q+uint(rem>4u || (rem==4u && (q&1u)!=0u));
+}
+void main() {
+  uint tid=gl_LocalInvocationID.x;
+  uint s=slots.data[pc.offset+gl_WorkGroupID.x*2];
+  ivec3 origin=ivec3(s%pc.abpa,(s/pc.abpa)%pc.abpa,s/(pc.abpa*pc.abpa));
+  for(uint i=tid;i<512;i+=64) {
+    ivec3 p=ivec3(i%8,(i/8)%8,i/64);
+    uint sum=0u;
+    for(int z=0;z<2;z++)for(int y=0;y<2;y++)for(int x=0;x<2;x++)
+      sum+=uint(roundEven(imageLoad(base_image,origin*16+p*2+ivec3(x,y,z)).r*255.0));
+    uint v=average(sum);
+    values[i]=v;
+    imageStore(mip1,origin*8+p,vec4(float(v)/255.0));
+  }
+  barrier();
+  ivec3 p=ivec3(tid%4,(tid/4)%4,tid/16);
+  uint sum=0u;
+  for(int z=0;z<2;z++)for(int y=0;y<2;y++)for(int x=0;x<2;x++) {
+    ivec3 q=p*2+ivec3(x,y,z);
+    sum+=values[(q.z*8+q.y)*8+q.x];
+  }
+  coarse[tid]=average(sum);
+  imageStore(mip2,origin*4+p,vec4(float(coarse[tid])/255.0));
+  barrier();
+  if(tid<8) {
+    p=ivec3(tid%2,(tid/2)%2,tid/4);
+    sum=0u;
+    for(int z=0;z<2;z++)for(int y=0;y<2;y++)for(int x=0;x<2;x++) {
+      ivec3 q=p*2+ivec3(x,y,z);
+      sum+=coarse[(q.z*4+q.y)*4+q.x];
+    }
+    imageStore(mip3,origin*2+p,vec4(float(average(sum))/255.0));
+  }
+}

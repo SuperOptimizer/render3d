@@ -201,7 +201,6 @@ static int tr_pred_repair_on(void) {
 static void td_build_raw(r3d_cpuvol *vol, uint32_t level, int64_t cx, int64_t cy,
                          int64_t cz, float *sq, uint8_t *out) {
   /* occupancy of the extended block, squared-EDT seeds */
-  const double sc = (double)vol->lev[level].scale;
   const size_t NE = (size_t)TD_EXT * TD_EXT * TD_EXT;
   uint8_t *occ = tr_pred_repair_on() ? malloc(NE) : NULL;
   uint32_t *bq = occ ? malloc(NE * sizeof *bq) : NULL;
@@ -209,19 +208,20 @@ static void td_build_raw(r3d_cpuvol *vol, uint32_t level, int64_t cx, int64_t cy
     free(occ);
     occ = NULL;
   }
-  for (int64_t lz = 0; lz < TD_EXT; lz++)
-    for (int64_t ly = 0; ly < TD_EXT; ly++)
-      for (int64_t lx = 0; lx < TD_EXT; lx++) {
-        double bx = ((double)(cx * TD_CORE - TD_BORD + lx) + 0.5) * sc;
-        double by = ((double)(cy * TD_CORE - TD_BORD + ly) + 0.5) * sc;
-        double bz = ((double)(cz * TD_CORE - TD_BORD + lz) + 0.5) * sc;
-        uint8_t v = r3d_cpuvol_at(vol, level, bx, by, bz);
-        size_t k = ((size_t)lz * TD_EXT + (size_t)ly) * TD_EXT + (size_t)lx;
-        if (occ)
-          occ[k] = (double)v >= TR_DT_TH ? 2 : ((double)v >= 0.6 * TR_DT_TH ? 1 : 0);
-        else
-          sq[k] = (double)v >= TR_DT_TH ? 0.0f : 1e30f;
-      }
+  /* Use the tail of existing float scratch for the u8 input. Forward
+   * thresholding is overlap-safe: each source byte is consumed before its
+   * four-byte destination reaches it. No extra per-worker allocation. */
+  uint8_t *voxels = (uint8_t *)sq + NE * (sizeof *sq - 1u);
+  r3d_cpuvol_read_block(vol, level, cx * TD_CORE - TD_BORD,
+                         cy * TD_CORE - TD_BORD, cz * TD_CORE - TD_BORD,
+                         TD_EXT, TD_EXT, TD_EXT, voxels);
+  for (size_t k = 0; k < NE; k++) {
+    uint8_t v = voxels[k];
+    if (occ)
+      occ[k] = (double)v >= TR_DT_TH ? 2 : ((double)v >= 0.6 * TR_DT_TH ? 1 : 0);
+    else
+      sq[k] = (double)v >= TR_DT_TH ? 0.0f : 1e30f;
+  }
   if (occ) {
     /* hysteresis: flood from cores (2) through weak (1); survivors are
      * foreground (3) */

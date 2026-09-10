@@ -16,6 +16,7 @@
 #include <errno.h>
 #include <math.h>
 #include <pthread.h>
+#include "../common/workers.h"
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -62,7 +63,7 @@ typedef struct shard_job {
   float zq, ztau, vcquality;
   _Atomic uint32_t next;
   _Atomic int failed;
-  uint32_t level;
+  uint32_t level, end;
   bool downsample;
 } shard_job;
 
@@ -253,7 +254,7 @@ static void *brick_worker(void *arg) {
   }
   for (;;) {
     uint32_t b = atomic_fetch_add(&j->next, 1);
-    if (b >= NBRICKS || atomic_load(&j->failed)) break;
+    if (b >= j->end || atomic_load(&j->failed)) break;
     uint32_t bz = b / (SHARD_BPA * SHARD_BPA), by = (b / SHARD_BPA) % SHARD_BPA,
              bx = b % SHARD_BPA;
     memset(raw, 0, (size_t)BRICK * BRICK * BRICK);
@@ -307,62 +308,6 @@ worker_done:
   return NULL;
 }
 
-static int write_zarr_shard(const char *path, blob *chunks) {
-  if (mkdirs(path, false) != 0) return -1;
-  char tmp[2112];
-  snprintf(tmp, sizeof tmp, "%s.tmp.%ld", path, (long)getpid());
-  FILE *f = fopen(tmp, "wb");
-  uint8_t *idx = malloc(ZARR_INDEX_BYTES + 4u);
-  if (!f || !idx) {
-    if (f) fclose(f);
-    free(idx);
-    unlink(tmp);
-    return -1;
-  }
-  uint64_t off = 0;
-  int rc = 0;
-  for (size_t ci = 0; ci < NCHUNKS; ci++) {
-    if (!chunks[ci].p) {
-      memset(idx + ci * 16u, 0xff, 16u);
-      continue;
-    }
-    if (fwrite(chunks[ci].p, 1, chunks[ci].n, f) != chunks[ci].n) {
-      rc = -1;
-      break;
-    }
-    put_u64le(idx + ci * 16u, off);
-    put_u64le(idx + ci * 16u + 8u, chunks[ci].n);
-    off += chunks[ci].n;
-  }
-  if (rc == 0) {
-    put_u32le(idx + ZARR_INDEX_BYTES, volcomp_crc32c(idx, ZARR_INDEX_BYTES));
-    if (fwrite(idx, 1, ZARR_INDEX_BYTES + 4u, f) != ZARR_INDEX_BYTES + 4u || fflush(f) != 0 ||
-        fsync(fileno(f)) != 0)
-      rc = -1;
-  }
-  free(idx);
-  if (fclose(f) != 0) rc = -1;
-  if (rc == 0 && rename(tmp, path) != 0) rc = -1;
-  if (rc != 0) unlink(tmp);
-  return rc;
-}
-
-static int write_volcomp_shard(const char *path, uint32_t level, blob *bricks, uint8_t *zero) {
-  if (mkdirs(path, false) != 0) return -1;
-  char tmp[2112];
-  snprintf(tmp, sizeof tmp, "%s.tmp.%ld", path, (long)getpid());
-  volcomp_shard_writer *w = volcomp_shard_create(tmp, SHARD, BRICK, level, 0.0f);
-  if (!w) return -1;
-  int rc = 0;
-  for (uint32_t b = 0; b < NBRICKS && rc == 0; b++)
-    rc = zero[b] ? volcomp_shard_put_zero(w, b)
-                 : volcomp_shard_put(w, b, bricks[b].p, bricks[b].n);
-  if (volcomp_shard_close(w) != 0) rc = -1;
-  if (rc == 0 && rename(tmp, path) != 0) rc = -1;
-  if (rc != 0) unlink(tmp);
-  return rc;
-}
-
 static int process_shard(const char *source, const char *out, dims3 base, uint32_t level,
                          uint64_t oz, uint64_t oy, uint64_t ox, uint32_t threads,
                          float vcq0, bool volcomp_only, bool force) {
@@ -404,18 +349,63 @@ static int process_shard(const char *source, const char *out, dims3 base, uint32
                    .downsample = downsample};
   uint32_t nt = threads ? threads : 1u;
   if (nt > 32u) nt = 32u;
-  pthread_t tids[32];
-  uint32_t created = 0;
-  for (; created < nt; created++)
-    if (pthread_create(&tids[created], NULL, brick_worker, &job) != 0) {
-      atomic_store(&job.failed, 1);
-      break;
+  /* Keep at most one worker batch of encoded payloads. Payload order is
+   * deterministic brick-major; the Zarr index retains logical chunk order. */
+  char ct[2112], zt[2112];
+  snprintf(ct, sizeof ct, "%s.tmp.%ld", cp, (long)getpid());
+  snprintf(zt, sizeof zt, "%s.tmp.%ld", zp, (long)getpid());
+  int rc = mkdirs(cp, false);
+  if (downsample && mkdirs(zp, false) != 0) rc = -1;
+  volcomp_shard_writer *writer = rc == 0
+      ? volcomp_shard_create(ct, SHARD, BRICK, level, quality) : NULL;
+  FILE *zf = downsample && rc == 0 ? fopen(zt, "wb") : NULL;
+  uint8_t *index = downsample ? malloc(ZARR_INDEX_BYTES + 4u) : NULL;
+  if (!writer || (downsample && (!zf || !index))) rc = -1;
+  if (index) memset(index, 0xff, ZARR_INDEX_BYTES);
+  r3d_tool_workers pool;
+  bool pool_ready = rc == 0 && r3d_tool_workers_init(&pool, nt) == 0;
+  if (!pool_ready) rc = -1;
+  uint64_t offset = 0;
+  for (uint32_t first = 0; first < NBRICKS && rc == 0; first += nt) {
+    job.end = first + nt < NBRICKS ? first + nt : NBRICKS;
+    atomic_store(&job.next, first);
+    r3d_tool_workers_run(&pool, brick_worker, &job);
+    if (atomic_load(&job.failed)) { rc = -1; break; }
+    for (uint32_t b = first; b < job.end && rc == 0; b++) {
+      rc = czero[b] ? volcomp_shard_put_zero(writer, b)
+                   : volcomp_shard_put(writer, b, cbricks[b].p, cbricks[b].n);
+      free_blob(&cbricks[b]);
+      if (!downsample) continue;
+      uint32_t bz = b / 64u, by = (b / 8u) % 8u, bx = b % 8u;
+      for (uint32_t z = 0; z < 8; z++)
+        for (uint32_t y = 0; y < 8; y++)
+          for (uint32_t x = 0; x < 8; x++) {
+            size_t ci = ((size_t)(bz * 8u + z) * 64u + by * 8u + y) * 64u + bx * 8u + x;
+            blob *c = &zchunks[ci];
+            if (c->p) {
+              if (fwrite(c->p, 1, c->n, zf) != c->n) rc = -1;
+              put_u64le(index + ci * 16u, offset);
+              put_u64le(index + ci * 16u + 8u, c->n);
+              offset += c->n;
+              free_blob(c);
+            }
+          }
     }
-  for (uint32_t t = 0; t < created; t++) pthread_join(tids[t], NULL);
-
-  int rc = atomic_load(&job.failed) ? -1 : 0;
-  if (rc == 0 && downsample) rc = write_zarr_shard(zp, zchunks);
-  if (rc == 0) rc = write_volcomp_shard(cp, level, cbricks, czero);
+  }
+  if (pool_ready) r3d_tool_workers_destroy(&pool);
+  if (writer && volcomp_shard_close(writer) != 0) rc = -1;
+  if (zf) {
+    if (rc == 0) {
+      put_u32le(index + ZARR_INDEX_BYTES, volcomp_crc32c(index, ZARR_INDEX_BYTES));
+      if (fwrite(index, 1, ZARR_INDEX_BYTES + 4u, zf) != ZARR_INDEX_BYTES + 4u ||
+          fflush(zf) != 0 || fsync(fileno(zf)) != 0) rc = -1;
+    }
+    if (fclose(zf) != 0) rc = -1;
+  }
+  if (rc == 0 && downsample && rename(zt, zp) != 0) rc = -1;
+  if (rc == 0 && rename(ct, cp) != 0) rc = -1;
+  if (rc != 0) { unlink(ct); if (downsample) unlink(zt); }
+  free(index);
   for (size_t i = 0; i < NCHUNKS; i++)
     if (zchunks) free_blob(&zchunks[i]);
   for (uint32_t i = 0; i < NBRICKS; i++) free_blob(&cbricks[i]);
@@ -578,7 +568,7 @@ int main(int argc, char **argv) {
       return 2;
     }
   }
-  if (!base.z || !base.y || !base.x || max_level >= MAX_LEVELS || vcq0 <= 0.0f) return 2;
+  if (!base.z || !base.y || !base.x || max_level >= MAX_LEVELS || !(vcq0 >= 1.0f && vcq0 <= 255.0f)) return 2;
   if (!threads) {
     long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
     threads = ncpu > 0 ? (uint32_t)ncpu : 1u;

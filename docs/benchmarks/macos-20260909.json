@@ -1,0 +1,92 @@
+[
+  {
+    "scenario": "static",
+    "variant": "before",
+    "repeats": 3,
+    "frame_ms": 2.12647,
+    "p99_ms": 2.75,
+    "gpu_ms": 2.038017,
+    "decoded": 9138,
+    "peak_mib": 431.3287658691406
+  },
+  {
+    "scenario": "static",
+    "variant": "tables",
+    "repeats": 3,
+    "frame_ms": 2.121271,
+    "p99_ms": 2.738,
+    "gpu_ms": 2.032747,
+    "decoded": 9294,
+    "peak_mib": 431.5943908691406
+  },
+  {
+    "scenario": "static",
+    "variant": "after",
+    "repeats": 3,
+    "frame_ms": 2.095492,
+    "p99_ms": 2.665,
+    "gpu_ms": 2.06294,
+    "decoded": 32768,
+    "peak_mib": 432.7037658691406
+  },
+  {
+    "scenario": "fly",
+    "variant": "before",
+    "repeats": 3,
+    "frame_ms": 5.866548,
+    "p99_ms": 18.375,
+    "gpu_ms": 5.748729,
+    "decoded": 5844,
+    "peak_mib": 431.4693908691406
+  },
+  {
+    "scenario": "fly",
+    "variant": "tables",
+    "repeats": 3,
+    "frame_ms": 5.863249,
+    "p99_ms": 18.438,
+    "gpu_ms": 5.735776,
+    "decoded": 5896,
+    "peak_mib": 431.50061798095703
+  },
+  {
+    "scenario": "fly",
+    "variant": "after",
+    "repeats": 3,
+    "frame_ms": 5.933223,
+    "p99_ms": 20.75,
+    "gpu_ms": 5.059219,
+    "decoded": 30044,
+    "peak_mib": 432.26624298095703
+  },
+  {
+    "scenario": "exercise",
+    "variant": "before",
+    "repeats": 3,
+    "frame_ms": 5.63187,
+    "p99_ms": 23.419,
+    "gpu_ms": 5.588445,
+    "decoded": 2934,
+    "peak_mib": 1456.5318908691406
+  },
+  {
+    "scenario": "exercise",
+    "variant": "tables",
+    "repeats": 3,
+    "frame_ms": 5.612079,
+    "p99_ms": 23.511,
+    "gpu_ms": 5.564381,
+    "decoded": 2907,
+    "peak_mib": 1456.9693908691406
+  },
+  {
+    "scenario": "exercise",
+    "variant": "after",
+    "repeats": 3,
+    "frame_ms": 5.314452,
+    "p99_ms": 23.351,
+    "gpu_ms": 5.260003,
+    "decoded": 6690,
+    "peak_mib": 1457.047492980957
+  }
+]

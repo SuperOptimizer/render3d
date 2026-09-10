@@ -7,6 +7,7 @@
  * Layer spacing equals the xy texel pitch so the window is an isotropic
  * volume at the view's LOD, rendered afterwards by the surf raycast path. */
 #version 450
+#extension GL_GOOGLE_include_directive : require
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
@@ -34,13 +35,18 @@ layout(push_constant) uniform Push {
 const float BR_SLOT = 16.0;
 const uint BR_PAGE_HEADER = 64u;
 
+#include "pagehash.h"
+uint brick_page(uint index) { return resident_page(index); }
+
 /* Per-column brick cache: consecutive layers of one (u,v) column step one
  * voxel along the normal, so they almost always stay inside the brick the
  * previous layer resolved. Reuse it (level, brick coord, slot origin) and
- * only re-walk the page table on a brick change. */
+ * only re-walk the page table on a requested-cell change. A coarse fallback
+ * must not hide a resident finer neighbor within the same coarse brick. */
 struct BCache {
   bool valid;
   uint scale;
+  uvec3 desired_bc;
   uvec3 bc;
   vec3 so;
 };
@@ -49,10 +55,12 @@ vec2 bricks_sample_c(vec3 wp, vec3 shape, inout BCache c) {
   uint nlev = page[0];
   vec3 base_v = clamp(wp, vec3(0.0), max(shape - 0.001, vec3(0.0)));
   float inv = 1.0 / (float(pc.abpa) * BR_SLOT);
+  uint desired_scale=1u<<min(pc.lod,nlev-1u);
+  uvec3 desired_bc=uvec3(base_v/float(desired_scale))>>4u;
   if (c.valid) {
     vec3 lv = base_v / float(c.scale);
-    uvec3 bc = uvec3(lv) >> 4u;
-    if (all(equal(bc, c.bc))) {
+    uvec3 bc = c.bc;
+    if (all(equal(desired_bc, c.desired_bc))) {
       vec3 bl = clamp(lv - vec3(bc << 4u), vec3(0.5), vec3(15.5));
       vec3 uvw = (c.so + bl) * inv;
       float ct = textureLod(atlas, uvw, 0.0).r;
@@ -70,13 +78,15 @@ vec2 bricks_sample_c(vec3 wp, vec3 shape, inout BCache c) {
     uvec3 bd = uvec3(packed, page[36u + uint(li) * 2u], page[37u + uint(li) * 2u]);
     vec3 lv = base_v / float(scale);
     uvec3 bc = min(uvec3(lv) >> 4u, bd - 1u);
-    uint e = page[off + (bc.z * bd.y + bc.y) * bd.x + bc.x];
+    uint e = resident_page_xyz(h,bc.x,bc.y,bc.z,bd.x,bd.y);
     if (e == 0xFFFFFFFFu) continue;
+    if (e == 0xFFFFFFFEu) { c.valid=false; return vec2(0.0); }
     uint slot = e & 0xFFFFFFu;
     vec3 so = vec3(uvec3(slot % pc.abpa, (slot / pc.abpa) % pc.abpa,
                          slot / (pc.abpa * pc.abpa))) * BR_SLOT;
     c.valid = true;
     c.scale = scale;
+    c.desired_bc = desired_bc;
     c.bc = bc;
     c.so = so;
     vec3 bl = clamp(lv - vec3(bc << 4u), vec3(0.5), vec3(15.5));
@@ -138,6 +148,7 @@ void main() {
   BCache bc;
   bc.valid = false;
   bc.scale = 1u;
+  bc.desired_bc = uvec3(0u);
   bc.bc = uvec3(0u);
   bc.so = vec3(0.0);
   for (uint z = pc.z0; z < z1; z++) {

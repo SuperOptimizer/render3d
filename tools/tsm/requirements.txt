@@ -1,0 +1,3 @@
+# Architecture, input normalization and output encodings used by the bridge.
+tsm @ git+https://github.com/SuperOptimizer/tsm.git@9a92eaef5e6ee3d043bc402e23dd64583cbe437e
+pytest>=8

@@ -154,21 +154,13 @@ r3d_headless_status r3d_headless_surface_encode_v1(
     return R3D_HEADLESS_E_INVALID_ARGUMENT;
   (void)xyz_size;
   if (hl_cancelled(callbacks)) return R3D_HEADLESS_E_CANCELLED;
-  const size_t n = (size_t)width * height;
-  size_t plane_bytes = 0u;
-  if (!hl_mul(n, sizeof(float), &plane_bytes)) return R3D_HEADLESS_E_INVALID_ARGUMENT;
-  float *planes = malloc(plane_bytes * 3u);
-  if (planes == NULL) return R3D_HEADLESS_E_OUT_OF_MEMORY;
   r3d_surface_data source = {.w = width, .h = height,
-                       .meta = (uint8_t *)metadata, .meta_len = metadata_size};
-  for (size_t c = 0u; c < 3u; ++c) source.plane[c] = planes + c * n;
-  for (size_t k = 0u; k < n; ++k)
-    for (size_t c = 0u; c < 3u; ++c) source.plane[c][k] = xyz[k * 3u + c];
+      .plane = {(float *)xyz, (float *)xyz + 1, (float *)xyz + 2},
+      .meta = (uint8_t *)metadata, .meta_len = metadata_size};
   uint8_t *encoded = NULL;
   size_t encoded_size = 0u;
   hl_progress(callbacks, "surface-encode", 0u, 1u);
-  const int rc = r3d_surface_encode(&source, (int)log2_quantization, &encoded, &encoded_size);
-  free(planes);
+  const int rc = r3d_surface_encode_strided(&source, 3, &encoded, &encoded_size);
   if (rc != 0 || encoded == NULL) {
     free(encoded);
     return R3D_HEADLESS_E_FORMAT;
@@ -254,15 +246,30 @@ r3d_headless_status r3d_headless_surface_decode_v1(
   if (bytes == NULL || size == 0u || out_surface == NULL)
     return R3D_HEADLESS_E_INVALID_ARGUMENT;
   if (hl_cancelled(callbacks)) return R3D_HEADLESS_E_CANCELLED;
-  r3d_surface_data decoded = {0};
-  hl_progress(callbacks, "surface-decode", 0u, 1u);
-  if (r3d_surface_decode(bytes, size, &decoded) != 0) return R3D_HEADLESS_E_FORMAT;
-  r3d_headless_status status = hl_cancelled(callbacks)
-      ? R3D_HEADLESS_E_CANCELLED
-      : hl_surface_from_volcomp(&decoded, allocator, out_surface);
-  r3d_surface_free(&decoded);
-  if (status == R3D_HEADLESS_OK) hl_progress(callbacks, "surface-decode", 1u, 1u);
-  return status;
+  r3d_headless_allocator a;
+  if (!hl_allocator(allocator, &a)) return R3D_HEADLESS_E_INVALID_ARGUMENT;
+  r3d_surface_data view = {0};
+  if (r3d_surface_info(bytes, size, &view.w, &view.h, &view.meta_len) != 0)
+    return R3D_HEADLESS_E_FORMAT;
+  float *xyz = a.allocate(a.user, (size_t)view.w * view.h * 3u * sizeof(float));
+  view.meta = view.meta_len ? a.allocate(a.user, view.meta_len) : NULL;
+  r3d_headless_status status = R3D_HEADLESS_OK;
+  if (!xyz || (view.meta_len && !view.meta)) status = R3D_HEADLESS_E_OUT_OF_MEMORY;
+  else {
+    for (size_t c = 0; c < 3; c++) view.plane[c] = xyz + c;
+    hl_progress(callbacks, "surface-decode", 0u, 1u);
+    if (r3d_surface_decode_strided(bytes, size, &view, 3) != 0)
+      status = R3D_HEADLESS_E_FORMAT;
+    else if (hl_cancelled(callbacks)) status = R3D_HEADLESS_E_CANCELLED;
+  }
+  if (status != R3D_HEADLESS_OK) {
+    a.release(a.user, xyz);
+    a.release(a.user, view.meta);
+    return status;
+  }
+  *out_surface = (r3d_headless_surface){view.w, view.h, xyz, view.meta, view.meta_len};
+  hl_progress(callbacks, "surface-decode", 1u, 1u);
+  return R3D_HEADLESS_OK;
 }
 
 r3d_headless_status r3d_headless_tifxyz_load_v1(
@@ -369,29 +376,53 @@ void r3d_headless_volume_close_v1(r3d_headless_volume *volume) {
   a.release(a.user, volume);
 }
 
-r3d_headless_status r3d_headless_volume_read_roi_v1(
+static r3d_headless_status hl_volume_read_roi(
     r3d_headless_volume *volume, uint32_t level, int64_t x0, int64_t y0,
     int64_t z0, uint32_t nx, uint32_t ny, uint32_t nz,
-    const r3d_headless_callbacks *callbacks, uint8_t *out_zyx) {
+    const r3d_headless_callbacks *callbacks, uint8_t *out_zyx, bool strict) {
   size_t plane = 0u, total = 0u;
   if (volume == NULL || out_zyx == NULL || nx == 0u || ny == 0u || nz == 0u ||
       level >= volume->core.nlev || !hl_mul((size_t)nx, ny, &plane) ||
-      !hl_mul(plane, nz, &total))
+      !hl_mul(plane, nz, &total) ||
+      x0 > INT64_MAX - (int64_t)nx || y0 > INT64_MAX - (int64_t)ny ||
+      z0 > INT64_MAX - (int64_t)nz)
     return R3D_HEADLESS_E_INVALID_ARGUMENT;
   uint8_t *temporary = malloc(total);
   if (temporary == NULL) return R3D_HEADLESS_E_OUT_OF_MEMORY;
-  for (uint32_t z = 0u; z < nz; ++z) {
+  for (uint32_t z = 0u; z < nz;) {
+    /* Stop at source block boundaries so a wide XY footprint cannot evict
+     * blocks before their remaining Z slices are copied. */
+    uint32_t depth = 16u - (uint32_t)((uint64_t)(z0 + (int64_t)z) & 15u);
+    if (depth > nz - z) depth = nz - z;
     if (hl_cancelled(callbacks)) {
       free(temporary);
       return R3D_HEADLESS_E_CANCELLED;
     }
-    r3d_cpuvol_read_block(&volume->core, level, x0, y0, z0 + (int64_t)z,
-                          nx, ny, 1u, temporary + (size_t)z * plane);
-    hl_progress(callbacks, "volume-read-roi", (uint64_t)z + 1u, nz);
+    if(strict) {
+      if(!r3d_cpuvol_read_block_status(&volume->core,level,x0,y0,z0+(int64_t)z,
+                                      nx,ny,depth,temporary+(size_t)z*plane)) {
+        free(temporary);
+        return R3D_HEADLESS_E_IO;
+      }
+    } else r3d_cpuvol_read_block(&volume->core, level, x0, y0, z0 + (int64_t)z,
+                                 nx, ny, depth, temporary + (size_t)z * plane);
+    z += depth;
+    hl_progress(callbacks, "volume-read-roi", z, nz);
   }
   memcpy(out_zyx, temporary, total);
   free(temporary);
   return R3D_HEADLESS_OK;
+}
+
+r3d_headless_status r3d_headless_volume_read_roi_v1(
+    r3d_headless_volume *volume,uint32_t level,int64_t x0,int64_t y0,int64_t z0,
+    uint32_t nx,uint32_t ny,uint32_t nz,const r3d_headless_callbacks *callbacks,uint8_t *out_zyx) {
+  return hl_volume_read_roi(volume,level,x0,y0,z0,nx,ny,nz,callbacks,out_zyx,false);
+}
+r3d_headless_status r3d_headless_volume_read_roi_strict_v1(
+    r3d_headless_volume *volume,uint32_t level,int64_t x0,int64_t y0,int64_t z0,
+    uint32_t nx,uint32_t ny,uint32_t nz,const r3d_headless_callbacks *callbacks,uint8_t *out_zyx) {
+  return hl_volume_read_roi(volume,level,x0,y0,z0,nx,ny,nz,callbacks,out_zyx,true);
 }
 
 static bool hl_normalize3(double v[3]) {

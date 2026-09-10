@@ -81,7 +81,10 @@ void r3d_labelvol_free(r3d_labelvol *lv) {
   memset(lv, 0, sizeof *lv);
 }
 
+uint64_t r3d_labelvol_revision(const r3d_labelvol *lv) { return lv->revision; }
+
 static void lbl_bump(r3d_labelvol *lv, uint32_t bx, uint32_t by, uint32_t bz) {
+  lv->revision++;
   for (uint32_t l = 0; l < lv->nlev; l++)
     lv->gens[l][lbl_bidx(lv, l, bx >> l, by >> l, bz >> l)]++;
 }

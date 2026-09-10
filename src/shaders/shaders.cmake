@@ -19,6 +19,10 @@ set(_variants
   "raycast_slab:raycast:-DR3D_MODE=1 -DWG_X=16 -DWG_Y=8"
   "raycast_clip:raycast:-DR3D_MODE=2 -DWG_X=16 -DWG_Y=8"
   "raycast_bricks:raycast:-DR3D_MODE=3 -DWG_X=16 -DWG_Y=8"
+  "raycast_lod:raycast:-DR3D_MODE=3 -DR3D_BRICKS_LOD=1 -DWG_X=16 -DWG_Y=8"
+  "raycast_fast_lod:raycast:-DR3D_MODE=3 -DR3D_BRICKS_LOD=1 -DR3D_FAST_GRADIENT=1 -DWG_X=16 -DWG_Y=8"
+  "raycast_lod_uncached:raycast:-DR3D_MODE=3 -DR3D_BRICKS_LOD=1 -DR3D_DISABLE_LOD_CACHE=1 -DWG_X=16 -DWG_Y=8"
+  "raycast_fast_lod_uncached:raycast:-DR3D_MODE=3 -DR3D_BRICKS_LOD=1 -DR3D_FAST_GRADIENT=1 -DR3D_DISABLE_LOD_CACHE=1 -DWG_X=16 -DWG_Y=8"
   "raycast_vslab:raycast:-DR3D_MODE=4 -DWG_X=16 -DWG_Y=8"
   "raycast_surf:raycast:-DR3D_MODE=5 -DWG_X=16 -DWG_Y=8"
   "raycast_fast_cube:raycast:-DR3D_MODE=0 -DR3D_FAST_GRADIENT=1 -DWG_X=16 -DWG_Y=8"
@@ -41,18 +45,18 @@ foreach(_v ${_variants})
     COMMAND "${R3D_SLANGC}" "${_src}" -target spirv -profile spirv_1_5 -O2
             -fvk-use-c-layout
             -entry main ${_defs} -o "${_out}"
-    DEPENDS "${_src}" "${_shader_dir}/common.slang"
+    DEPENDS "${_src}" "${_shader_dir}/common.slang" "${_shader_dir}/pagehash.h"
     COMMENT "slangc ${_shader}.slang -> ${_name}.spv"
     VERBATIM)
   list(APPEND _spv_outputs "${_out}")
 endforeach()
 find_program(R3D_GLSLC NAMES glslc REQUIRED)
-foreach(_gk occmax occdilate apron surfvol postfilt)
+foreach(_gk pageprobe blockmips occmax occdilate apron surfvol postfilt)
   add_custom_command(
     OUTPUT "${_spv_dir}/${_gk}.spv"
     COMMAND "${R3D_GLSLC}" -O --target-env=vulkan1.1 -o "${_spv_dir}/${_gk}.spv"
             "${_shader_dir}/${_gk}.comp"
-    DEPENDS "${_shader_dir}/${_gk}.comp"
+    DEPENDS "${_shader_dir}/${_gk}.comp" "${_shader_dir}/pagehash.h"
     COMMENT "glslc ${_gk}.comp"
     VERBATIM)
   list(APPEND _spv_outputs "${_spv_dir}/${_gk}.spv")

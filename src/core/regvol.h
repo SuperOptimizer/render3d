@@ -29,10 +29,11 @@ typedef struct r3d_regvol {
   /* base pull map: fixed base voxel (xyz) -> moving base voxel (xyz) */
   double M[12];
   /* interactive deltas: move the MOVING volume within the fixed frame */
-  double d_tr[3];  /* translation, fixed voxels (x, y, z) */
-  double d_rot[3]; /* rotation about x/y/z axes, radians */
-  double d_lscale; /* log isotropic scale */
-  uint32_t gen;    /* display generation; bumps on any transform change */
+  double d_tr[3];       /* translation, fixed voxels (x, y, z) */
+  double d_rot[3];      /* rotation about x/y/z axes, radians */
+  double d_lscale;      /* log isotropic scale */
+  _Atomic uint32_t gen; /* display generation; bumps on any transform change */
+  void *retry; /* bounded incomplete-block cooldown table (mu protected) */
   pthread_mutex_t mu;
   /* resample scratch (render-thread fetch only) */
   uint8_t *scratch;
@@ -46,21 +47,24 @@ typedef struct r3d_regvol {
   double job_ctr[3]; /* ROI center, fixed base voxels (xyz) */
   uint32_t job_half; /* ROI half-extent in level voxels */
   uint32_t job_level;
-  double job_P[12];   /* pull map snapshot the job ran with */
+  double job_P[12];    /* pull map snapshot the job ran with */
   double job_Mnew[12]; /* refined pull map (job result) */
-  double ncc0, ncc1;  /* before / after (measure: ncc1 == ncc0) */
+  double ncc0, ncc1;   /* before / after (measure: ncc1 == ncc0) */
 } r3d_regvol;
 
-int r3d_regvol_open(r3d_regvol *rv, const char *moving_root, const uint32_t fixed_dim[3]);
+int r3d_regvol_open(r3d_regvol *rv, const char *moving_root,
+                    const uint32_t fixed_dim[3]);
 void r3d_regvol_close(r3d_regvol *rv);
 
 /* effective pull map: deltas composed onto M */
 void r3d_regvol_pull(r3d_regvol *rv, double P[12]);
-void r3d_regvol_bump(r3d_regvol *rv); /* display generation++ (call after edits) */
+void r3d_regvol_bump(
+    r3d_regvol *rv); /* display generation++ (call after edits) */
 void r3d_regvol_bake(r3d_regvol *rv); /* fold deltas into M, zero them */
 void r3d_regvol_reset_deltas(r3d_regvol *rv);
 void r3d_regvol_set_scale(r3d_regvol *rv, double s); /* M = diag(s) (seed) */
-double r3d_regvol_scale(r3d_regvol *rv); /* effective isotropic scale cbrt|det P| */
+double
+r3d_regvol_scale(r3d_regvol *rv); /* effective isotropic scale cbrt|det P| */
 /* voxel pitch parsed from a path (bucket volume names embed "...-1.129um-...");
  * 0 when the path carries none */
 double r3d_regvol_parse_um(const char *path);
@@ -72,9 +76,10 @@ int r3d_regvol_load_json(r3d_regvol *rv, const char *path);
 int r3d_regvol_save_json(r3d_regvol *rv, const char *path);
 
 /* renderer source callbacks (r3d_label_src signature) */
-uint32_t r3d_regvol_srcgen(void *rv, uint32_t level, uint32_t bx, uint32_t by, uint32_t bz);
-void r3d_regvol_srcfetch(void *rv, uint32_t level, uint32_t bx, uint32_t by, uint32_t bz,
-                         uint8_t *out);
+uint32_t r3d_regvol_srcgen(void *rv, uint32_t level, uint32_t bx, uint32_t by,
+                           uint32_t bz);
+void r3d_regvol_srcfetch(void *rv, uint32_t level, uint32_t bx, uint32_t by,
+                         uint32_t bz, uint8_t *out);
 
 /* worker job: measure NCC over an ROI (mode 0) or refine the transform there
  * (mode 1 rigid / 2 affine; result auto-applies on poll). ctr in fixed base
@@ -86,6 +91,12 @@ int r3d_regvol_job_start(r3d_regvol *rv, const char *fixed_root, int mode,
 int r3d_regvol_job_poll(r3d_regvol *rv, bool *ok);
 
 /* Renderer callbacks use 16^3 block coordinates and a 4096-byte output. */
-uint32_t r3d_regvol_blockgen(void *v, uint32_t l, uint32_t x, uint32_t y, uint32_t z);
-void r3d_regvol_blockfetch(void *v, uint32_t l, uint32_t x, uint32_t y, uint32_t z, uint8_t *out);
+uint32_t r3d_regvol_blockgen(void *v, uint32_t l, uint32_t x, uint32_t y,
+                             uint32_t z);
+void r3d_regvol_blockfetch(void *v, uint32_t l, uint32_t x, uint32_t y,
+                           uint32_t z, uint8_t *out);
+/* False means some source data is unavailable; the renderer must keep that
+ * output retryable. blockgen returns 0 during a short per-block cooldown. */
+bool r3d_regvol_blockfetch_complete(void *v, uint32_t l, uint32_t x, uint32_t y,
+                                    uint32_t z, uint8_t *out);
 #endif /* R3D_REGVOL_H */

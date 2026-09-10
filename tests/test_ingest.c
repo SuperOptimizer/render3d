@@ -16,6 +16,7 @@
 #include <netinet/in.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -64,6 +65,8 @@ enum stub_mode { STUB_HTML, STUB_TRUNC, STUB_404, STUB_OK };
 static _Atomic int g_mode = STUB_HTML;
 static _Atomic bool g_stop = false;
 static int g_listen = -1;
+static _Atomic bool g_delay = false, g_entered = false, g_release = false;
+static _Atomic uint32_t g_requests = 0;
 
 static void send_all(int fd, const void *p, size_t n) {
   const uint8_t *b = p;
@@ -89,6 +92,11 @@ static void serve_one(int fd) {
   if (sscanf(req, "GET /%u/%u/%u/%u ", &li, &cz, &cy, &cx) != 4) {
     send_all(fd, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n", 47);
     return;
+  }
+  atomic_fetch_add(&g_requests, 1);
+  if (g_delay) {
+    g_entered = true;
+    while (!g_release && !g_stop) usleep(1000);
   }
   int mode = g_mode;
   char hdr[256];
@@ -203,6 +211,151 @@ static double sample_once(const char *root, double x, double y, double z) {
   return val;
 }
 
+typedef struct sample_job {
+  r3d_cpuvol *v;
+  double x, y, z, value;
+  _Atomic bool done;
+} sample_job;
+static void *sample_worker(void *arg) {
+  sample_job *j = arg;
+  j->value = r3d_cpuvol_at(j->v, 0, j->x, j->y, j->z);
+  j->done = true;
+  return NULL;
+}
+static void status_tests(const char *root) {
+  r3d_cpuvol v;
+  CHECK(r3d_cpuvol_open(&v, root, 8) == 0);
+  v.url[0] = 0; /* local-arrival checks must not invoke the stub */
+  uint8_t data[4096];
+  CHECK(r3d_cpuvol_read_block_status(&v, 0, -32, -32, -32, 16, 16, 16, data));
+  /* Existing404 marker is legitimate air, including negative/TLS hits. */
+  (void)r3d_cpuvol_at(&v, 0, 0, 128, 0);
+  CHECK(r3d_cpuvol_read_block_status(&v, 0, 0, 128, 0, 16, 16, 16, data));
+  CHECK(r3d_cpuvol_read_block_status(&v, 0, 0, 128, 0, 16, 16, 16, data));
+  for (size_t i = 0; i < sizeof data; i++) CHECK(data[i] == 0);
+  /* Same output bytes, different completeness for an unavailable chunk. */
+  (void)r3d_cpuvol_at(&v, 0, 128, 0, 0);
+  CHECK(!r3d_cpuvol_read_block_status(&v, 0, 128, 0, 0, 16, 16, 16, data));
+  CHECK(!r3d_cpuvol_read_block_status(&v, 0, 128, 0, 0, 16, 16, 16, data));
+  char from[720], to[720];
+  snprintf(from, sizeof from, "%s/bricks/L0/0_0_0.volc", root);
+  snprintf(to, sizeof to, "%s/bricks/L0/0_0_1.volc", root);
+  FILE *in = fopen(from, "rb"), *out = fopen(to, "wb");
+  CHECK(in && out);
+  if (in && out) {
+    size_t n;
+    while ((n = fread(data, 1, sizeof data, in)) != 0) CHECK(fwrite(data, 1, n, out) == n);
+  }
+  if (in) CHECK(fclose(in) == 0);
+  if (out) CHECK(fclose(out) == 0);
+  CHECK(r3d_cpuvol_read_block_status(&v, 0, 128, 0, 0, 16, 16, 16, data));
+  CHECK(data[0] != 0); /* noticed before the30-second negative TTL expired */
+  r3d_cpuvol_close(&v);
+  CHECK(unlink(to) == 0);
+  CHECK(r3d_cpuvol_open(&v, root, 8) == 0); v.url[0] = 0;
+  out = fopen(to, "wb"); CHECK(out != NULL);
+  if (out) { CHECK(fwrite("bad!", 1, 4, out) == 4); CHECK(fclose(out) == 0); }
+  CHECK(!r3d_cpuvol_read_block_status(&v, 0, 128, 0, 0, 16, 16, 16, data));
+  CHECK(!r3d_cpuvol_read_block_status(&v, 0, 128, 0, 0, 16, 16, 16, data));
+  out = fopen(to, "wb"); CHECK(out != NULL); if (out) CHECK(fclose(out) == 0);
+  CHECK(r3d_cpuvol_read_block_status(&v, 0, 128, 0, 0, 16, 16, 16, data));
+  r3d_cpuvol_close(&v); CHECK(unlink(to) == 0);
+  puts("CPU completeness: unavailable/corrupt versus air; local arrival bypasses transientmemo OK");
+}
+static void locality_tests(const char *root) {
+  r3d_cpuvol v;
+  CHECK(r3d_cpuvol_open(&v, root, 8) == 0);
+  /* Reading each16³ block reloads the compressed128³ file only once. */
+  for (uint32_t z = 0; z < 8; z++)
+    for (uint32_t y = 0; y < 8; y++)
+      for (uint32_t x = 0; x < 8; x++) (void)r3d_cpuvol_at(&v, 0, x * 16, y * 16, z * 16);
+  r3d_cpuvol_cache_stats stats;
+  r3d_cpuvol_get_cache_stats(&v, &stats);
+  CHECK(stats.compressed_reads == 1 && stats.compressed_hits == 511);
+  /* Block(1,0,0) in chunk0 must not suppress source chunk(1,0,0). */
+  (void)r3d_cpuvol_at(&v, 0, 16, 0, 0);
+  uint32_t list[12] = {1,0,0, 1,0,0, 1,0,0, 1,0,0};
+  CHECK(r3d_cpuvol_prefetch(&v, 0, list, 4, 4) == 1);
+  long size = 0;
+  CHECK(brick_file_state(root, 1, 0, 0, &size) && size > 0);
+  /* A blocked network miss cannot stall an unrelated local compressed miss.
+   * Two demanders of the same source cell cause only one HTTP request. */
+  sample_job remote = {.v=&v, .x=10, .y=10, .z=140};
+  sample_job remote2 = {.v=&v, .x=30, .y=10, .z=140};
+  sample_job local = {.v=&v, .x=50, .y=10, .z=10};
+  uint32_t requests = g_requests;
+  g_delay = true; g_entered = false; g_release = false;
+  pthread_t rt, rt2, lt;
+  CHECK(pthread_create(&rt, NULL, sample_worker, &remote) == 0);
+  for (int i = 0; i < 2000 && !g_entered; i++) usleep(1000);
+  CHECK(g_entered);
+  CHECK(pthread_create(&rt2, NULL, sample_worker, &remote2) == 0);
+  CHECK(pthread_create(&lt, NULL, sample_worker, &local) == 0);
+  for (int i = 0; i < 1000 && !local.done; i++) usleep(1000);
+  CHECK(local.done && !remote.done);
+  g_release = true;
+  pthread_join(rt, NULL); pthread_join(rt2, NULL); pthread_join(lt, NULL);
+  g_delay = false;
+  CHECK(g_requests == requests + 1);
+  CHECK(remote.value == decoded_pattern(10,10,140));
+  CHECK(remote2.value == decoded_pattern(30,10,140));
+  CHECK(local.value == decoded_pattern(50,10,10));
+  /* Atomic file replacement invalidates the compressed cache identity.
+   * This decoded block was evicted during the earlier512-block traversal. */
+  uint8_t *constant = malloc(CHUNK_BYTES), *encoded = NULL;
+  size_t encoded_n = 0;
+  CHECK(constant != NULL);
+  if (constant) {
+    memset(constant, 200, CHUNK_BYTES);
+    volcomp_brick_params params = volcomp_brick_defaults(2);
+    CHECK(volcomp_brick_encode(&params, constant, IB, &encoded, &encoded_n) == 0);
+    if (encoded) {
+      char path[720], temporary[740];
+      snprintf(path, sizeof path, "%s/bricks/L0/0_0_0.volc", root);
+      snprintf(temporary, sizeof temporary, "%s.replace", path);
+      FILE *file = fopen(temporary, "wb");
+      CHECK(file != NULL);
+      if (file) {
+        CHECK(fwrite(encoded, 1, encoded_n, file) == encoded_n);
+        CHECK(fclose(file) == 0);
+        CHECK(rename(temporary, path) == 0);
+        CHECK(volcomp_brick_decode(encoded, encoded_n, constant, IB) == 0);
+        CHECK(r3d_cpuvol_at(&v, 0, 112, 112, 0) == constant[112 * IB + 112]);
+      }
+    }
+    free(encoded); encoded = NULL;
+    uint32_t noise = 1234567;
+    for (size_t i = 0; i < CHUNK_BYTES; i++) {
+      noise ^= noise << 13; noise ^= noise >> 17; noise ^= noise << 5;
+      constant[i] = (uint8_t)noise;
+    }
+    CHECK(volcomp_brick_encode(&params, constant, IB, &encoded, &encoded_n) == 0);
+    CHECK(encoded_n > (1u << 20)); /* larger than the former cache cutoff */
+    if (encoded) {
+      char path[720], temporary[740];
+      snprintf(path, sizeof path, "%s/bricks/L0/0_0_0.volc", root);
+      snprintf(temporary, sizeof temporary, "%s.replace", path);
+      FILE *file = fopen(temporary, "wb");
+      CHECK(file != NULL);
+      if (file) {
+        CHECK(fwrite(encoded, 1, encoded_n, file) == encoded_n);
+        CHECK(fclose(file) == 0);
+        CHECK(rename(temporary, path) == 0);
+        CHECK(volcomp_brick_decode(encoded, encoded_n, constant, IB) == 0);
+        r3d_cpuvol_get_cache_stats(&v, &stats);
+        uint64_t reads = stats.compressed_reads;
+        CHECK(r3d_cpuvol_at(&v, 0, 64, 64, 64) == constant[(64 * IB + 64) * IB + 64]);
+        CHECK(r3d_cpuvol_at(&v, 0, 80, 64, 64) == constant[(64 * IB + 64) * IB + 80]);
+        r3d_cpuvol_get_cache_stats(&v, &stats);
+        CHECK(stats.compressed_reads == reads + 1);
+      }
+    }
+    free(encoded); free(constant);
+  }
+  r3d_cpuvol_close(&v);
+  printf("compressed chunk:1 read/512 blocks; source prefetch, dedup and independent local reads OK\n");
+}
+
 int main(void) {
   signal(SIGPIPE, SIG_IGN); /* aborted client writes must not kill the stub */
   char tmp[512];
@@ -255,6 +408,9 @@ int main(void) {
   double v3 = sample_once(root, 60.0, 60.0, 60.0);
   CHECK(v3 == decoded_pattern(60, 60, 60));
   CHECK(brick_file_state(root, 0, 0, 0, &fsz) && fsz > 0);
+
+  status_tests(root);
+  locality_tests(root);
 
   g_stop = true;
   shutdown(g_listen, SHUT_RDWR);

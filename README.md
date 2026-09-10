@@ -33,6 +33,28 @@ Apple's bundled compiler may be too old. MoltenVK is discovered through
 Homebrew's Vulkan ICD configuration. `--headless --frames 1 --shot out.ppm`
 checks rendering without opening a window.
 
+## Real volume download
+
+Download PHerc1218's complete 8×/16×/32× overview pyramid and one 1024³
+full-resolution region (about 186 MiB downloaded; about twice that on disk
+with both source and renderer containers):
+
+```sh
+python3 tools/fetch_volcomp.py \
+  https://dl.ash2txt.org/community-uploads/forrest/volcomp/PHerc1218/volumes/20250521120456-8.640um-1.2m-116keV-masked.zarr \
+  cache/PHerc1218-volcomp
+./build/macos/render3d --bricks cache/PHerc1218-volcomp/overview/manifest.json
+```
+
+The source is Zarr v3 `sharding_indexed` with native volume-compressor chunks.
+`volcomppack zarr-shard` validates the index CRC and bounds and repackages
+chunks as VCS1; the fetcher verifies every compressed payload is unchanged.
+Missing Zarr chunks become zero-fill entries. Overview levels are rebased
+so renderer L0 is source level 3 (69.12 µm voxels). The interior region is
+`cache/PHerc1218-volcomp/interior-1024.vcs`, at original Z/Y/X origin
+`11264/3072/3072`, with 8.64 µm voxels. The full-resolution scan is not fully
+mirrored. Download metadata and original shards remain under `source/`.
+
 ## Storage and caches
 
 `volcomppack`, `lodpack`, and `zarr2volcomp` write native volume-compressor
@@ -42,12 +64,27 @@ entries; this is not upstream's zarr `sharding_indexed` container.
 LOD trees use `render3d.volcomp-lod.v1` and `volcomp/L*/…vcs`.
 
 A CPU miss reconstructs only the requested 16³ block. The codec may entropy
-read up to 16 blocks within its substream but only runs the inverse transform
-for the requested block. CPU cache sizes count 4 KiB blocks (default 4096,
+read up to 16 blocks within its substream but only dequantizes and transforms
+the requested block. Bounded entropy checkpoints avoid repeating earlier reads
+for nearby requests, using about 263 KiB per decoder thread for compressed bytes
+and restart state. CPU cache sizes count 4 KiB blocks (default 4096,
 16 MiB). The GPU page table and atlas also address 16³ blocks, uploaded after
-CPU decode. Compressed chunks are shared by their block requests in the warm
-cache. Fetch/transcode units remain 128³ chunks or the owning upstream Zarr
+CPU decode. Compressed chunks are shared by block requests through immutable
+file mappings or a bounded CPU cache. `--warm` defaults to zero; a positive
+value enables an optional CPU compressed-data cache in MiB. Fetch/transcode
+units remain 128³ chunks or the owning upstream Zarr
 cell; sparse decode does not imply 4 KiB network requests.
+
+CT display volumes are deblocked on the CPU before upload by default. The filter
+uses volume-compressor's gated four-tap kernel at every 16³ block face, including
+128³ chunk seams, with the encoded block's quantizer. A bounded 32 MiB raw-block
+cache supplies the two-voxel neighborhood. Missing local neighbors are skipped
+and seams are retried from raw data as files arrive; filtering never initiates
+extra downloads. Fully filtered coarsest levels are cached in `seed-deblock.raw`.
+Set `R3D_DEBLOCK=0` before launching to disable it. This is a CT display filter:
+raw CPU sampling, registration inputs, labels, and prediction overlays retain
+their original values. Use the disabled setting for raw registration comparisons.
+Upstream parity assumes a consistent quantizer within each pyramid level.
 
 `--pool N` now means N³ **16³** atlas slots. Painted class IDs remain exact
 in zlib R3L1 files; surface float coordinates and metadata remain exact in
@@ -61,9 +98,37 @@ documents describe the old implementation.
 
 MoltenVK runs cube, block-volume and surface views. The older tiled
 slab/clip/vslab modes require more combined samplers than this Mac exposes
-and are disabled by the capability check. The existing metadata budget still
-limits the number of virtual block pages; excessively large manifests fail
-with an explicit page-budget error.
+and are disabled by the capability check. GPU page tables and resident-block
+metadata are sparse and sized to the atlas. Logical block IDs are 64-bit;
+shaders use paired 32-bit words without requiring GPU 64-bit integer support.
+Source availability uses a bounded cache, and CPU decode remains 16³-granular.
+Pyramid draws use dedicated shaders to eliminate unused sampling paths while
+preserving the selected quality. The full-resolution PHerc1667 volume
+(5.29 billion virtual blocks) is tested,
+including rendering blocks beyond the 32-bit ID range. Dimensions remain
+32-bit per axis, shard-reader metadata is limited to 4 million entries, and
+large volumes need a pyramid with a manageable coarsest level. Invalid browser
+selections leave the current volume open.
+
+## Data browser
+
+Click **data browser** and choose a **source**:
+
+- **S3 open data** lists the existing Vesuvius open-data bucket.
+- **Compressed volumes (Forrest)** lists
+  [the native compressed-volume collection](https://dl.ash2txt.org/community-uploads/forrest/volcomp/).
+
+Choose a scroll, select a volume, and click **open volume**. You can switch
+sources in the same window; opening another volume replaces the current dataset.
+**Open as registration volume** also works with compressed volumes.
+
+Compressed volumes download the coarsest level for the initial preview, then
+fetch native 128³ payloads using HTTP ranges as you navigate. Payloads are
+preserved without re-encoding; CPU decoding and decoded residency remain 16³.
+Caches live under `cache/volcomp/`, separately from S3's `cache/od/`.
+The compressed source currently supplies volumes; segment and prediction
+browsing remains available from S3. Use **refresh** to reload a listing.
+Bootstrap requires `python3`; CMake places its scripts beside the viewer.
 
 ## Controls
 
@@ -311,13 +376,13 @@ atomic and reruns skip completed work.
 ./build/native/lodcheck cache/PHerc1218-lod/zarr/L1/c/1/1/1 \
   cache/PHerc1218-lod/volcomp/L1/1_1_1.vcs
 
-# Global multi-shard renderer (use --pool/--warm to size the GPU caches)
+# Global multi-shard renderer (--pool sizes the GPU atlas; --warm is CPU MiB)
 ./build/native/render3d --bricks cache/PHerc1218-lod/manifest.json \
   --pool 8 --warm 512 --tf 1
 ```
 
-The volcomp quality ladder is inverted to spend more bits per voxel at coarse
-levels: q2 at L0, q1 at L1, q0.5 at L2 and q0.25 thereafter. The renderer
+The volcomp quality ladder spends more bits per voxel at coarse
+levels: q8 at L0, q4 at L1, q2 at L2 and q1 thereafter. The renderer
 opens a multilevel manifest as an 8-slice XY slab at mid-z. Wheel, R/F, and
 PageUp/PageDown move through z; Shift+wheel zooms. `--brick-z Z` selects the
 initial slice, `--depth N` changes its thickness, and explicit `--depth 0`
@@ -337,6 +402,14 @@ Useful flags: `--size W H`, `--cam x y z yaw pitch`, `--tf N`, `--mode N`,
 derived renderer allocation budget). Reproducible runs use `--warmup N`
 (same process, excluded from metrics) and `--bench-json out.json`; `tools/perf.sh`
 runs the standard suite and writes mean/p50/p95/p99/max timing files.
+For a local synthetic macOS streaming suite, run `python3 tools/bench_macos.py`.
+Benchmark JSON v2 separates startup, warmup, measured and final-flush counters,
+and includes measured-end cache/page-table state. GPU timestamps returned in
+the measured window describe submissions two frames earlier.
+See [the macOS performance measurements](docs/performance-macos-20260909.md)
+for decode costs, detail arrival, memory use, and remaining bottlenecks.
+The [performance review fixes](docs/performance-review-fixes-20260909.md)
+describe sparse residency, CPU caching, queued updates and bounded conversion.
 `--quality full|interactive|fast` selects fixed full-resolution six-tap shading,
 the default six-tap shading with half-resolution motion, or the measured
 four-tap tetrahedral gradient plus half-resolution motion.
@@ -391,6 +464,12 @@ offscreen is still captured by `--shot`); `--seconds S` ends a run by wall
 time. `tools/perf_headless.sh <manifest> <tifxyz> [overlay] [segstore]` runs
 the multiview scenario matrix unattended and diffs against a baseline dir.
 
+`R3D_TRACE_STARTUP=1` logs renderer creation, dataset setup, cached seed
+upload/wait versus read/metadata, and total startup times.
+
+`R3D_TRACE_WAITS=1` logs frame waits above 20 ms, separating semaphore wait
+time from timestamp-query retrieval and including the completed slot's GPU time.
+
 ## Development
 
 Presets: `dev` (ASan+UBSan RelWithDebInfo) / `release` (portable ThinLTO) /
@@ -417,3 +496,24 @@ the asynchronous vslab worker always uses queue-ordered staging).
 Vulkan validation: `R3D_VALIDATE=1` (needs vulkan-validationlayers installed).
 `R3D_NO_HOST_COPY=1` forces the portable staged streaming-upload fallback for
 slab/clip/vslab testing.
+
+### Atlas startup and GPU update performance
+
+Standalone `.vcs` volumes now start with an empty atlas and stream visible
+16³ blocks. LOD manifests immediately show their coarsest fallback while
+finer data arrives. For bulk-load throughput validation only, set
+`R3D_BRICKS_EAGER=1` with a pool large enough to hold the standalone volume.
+Mips and occupancy update in batched GPU compute work after CPU decoding.
+The flattened-surface window is allocated on demand and released when no
+segment remains open.
+
+See [the full-codebase review](docs/performance-review-20260909.md) for the
+confirmed follow-up ledger and required measurements.
+The [optimization measurements](docs/performance-optimized-20260909.md)
+compare real-data startup, navigation and memory before and after this pass.
+
+### TSM inference overlays
+
+Run multi-head 3D inference on visible CT regions with the Paris4 TSM checkpoint.
+The GUI supports independent blue/red head selection, including ink, surfaces,
+fibres and signed-distance fields. See [setup, controls and validation](docs/tsm-inference.md).

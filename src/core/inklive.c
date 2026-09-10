@@ -1,5 +1,6 @@
 #include "core/thread.h"
 #include "core/inklive.h"
+#include "core/cellset.h"
 
 #include <arpa/inet.h>
 #include <math.h>
@@ -161,11 +162,7 @@ static void il_prefetch(r3d_inklive *il, const float *xyz, uint32_t rw, uint32_t
                         uint32_t nl) {
   if (!il->vol.url[0]) return;
   uint32_t cw = rw + 1, ch = rh + 1;
-  size_t cap = (size_t)cw * ch * 8u;
-  if (cap > 4000000u) cap = 4000000u;
-  uint32_t *list = malloc(cap * 3u * sizeof *list);
-  if (!list) return;
-  uint32_t n = 0;
+  r3d_cellset cells = {0};
   const double span = (double)(nl - 1) / 2.0 + 1.0; /* slab half-depth */
   for (uint32_t j = 0; j < ch; j++)
     for (uint32_t i = 0; i < cw; i++) {
@@ -203,28 +200,25 @@ static void il_prefetch(r3d_inklive *il, const float *xyz, uint32_t rw, uint32_t
       for (int64_t bz = lo[2]; bz <= hi[2]; bz++)
         for (int64_t by = lo[1]; by <= hi[1]; by++)
           for (int64_t bx = lo[0]; bx <= hi[0]; bx++) {
-            bool dup = false; /* neighbours repeat: check the recent tail
-                               * (the prefetch dedupes by cell anyway) */
-            for (uint32_t k = n > 64 ? n - 64 : 0; k < n; k++)
-              if (list[k * 3] == (uint32_t)bx && list[k * 3 + 1] == (uint32_t)by &&
-                  list[k * 3 + 2] == (uint32_t)bz) {
-                dup = true;
-                break;
-              }
-            if (dup || n >= cap) continue;
-            list[n * 3] = (uint32_t)bx;
-            list[n * 3 + 1] = (uint32_t)by;
-            list[n * 3 + 2] = (uint32_t)bz;
-            n++;
+            int added = r3d_cellset_add(&cells, (uint32_t)bx, (uint32_t)by,
+                                        (uint32_t)bz, 4000000u);
+            if (added == -2) {
+              r3d_cpuvol_prefetch(&il->vol, 0, &cells.cells[0][0], cells.n, 12);
+              r3d_cellset_clear(&cells);
+              added = r3d_cellset_add(&cells, (uint32_t)bx, (uint32_t)by,
+                                      (uint32_t)bz, 4000000u);
+            }
+            if (added < 0) goto finish; /* prefetch is optional on OOM */
           }
     }
-  if (n) {
+finish:
+  if (cells.n) {
     pthread_mutex_lock(&il->mu);
-    snprintf(il->status, sizeof il->status, "prefetching %u bricks...", n);
+    snprintf(il->status, sizeof il->status, "prefetching %u bricks...", cells.n);
     pthread_mutex_unlock(&il->mu);
-    r3d_cpuvol_prefetch(&il->vol, 0, list, n, 12);
+    r3d_cpuvol_prefetch(&il->vol, 0, &cells.cells[0][0], cells.n, 12);
   }
-  free(list);
+  r3d_cellset_free(&cells);
 }
 
 static void *il_worker(void *ud) {

@@ -1,0 +1,1390 @@
+{
+  "pack": {
+    "fixture_kind": "dense",
+    "baseline_description": "Original HEAD converter source.",
+    "after_description": "Final 16-chunk, 32 MiB raw preparation batch, automatic CPU decode pool with 64 DCT chunks/claim, and requested 4 encoder workers.",
+    "before": {
+      "wall_seconds": 2.55,
+      "user_seconds": 17.87,
+      "system_seconds": 0.14,
+      "maximum_resident_set_size_bytes": 1297104896,
+      "peak_memory_footprint_bytes": 1297237360,
+      "log": "build/bench-review-fixes/volcomppack-dense-original-head.log"
+    },
+    "after": {
+      "wall_seconds": 2.82,
+      "user_seconds": 17.77,
+      "system_seconds": 0.08,
+      "maximum_resident_set_size_bytes": 61472768,
+      "peak_memory_footprint_bytes": 56787448,
+      "log": "build/bench-review-fixes/volcomppack-dense-decoder-pool-final.log"
+    },
+    "command_arguments": "band SOURCE 0 0 0 OUTPUT.vcs 2 4",
+    "interpretation": "Dense conversion is about 11% slower in this single-run comparison, with about 95% lower peak RSS. Earlier 42% slowdown from capping decoder concurrency at encoder concurrency was removed."
+  },
+  "surface": {
+    "before": {
+      "maximum_resident_set_size_bytes": 211402752,
+      "peak_memory_footprint_bytes": 205177408,
+      "wall_seconds": 0.38,
+      "user_seconds": 0.2,
+      "system_seconds": 0.01,
+      "runs": [
+        {
+          "encode_ms": 62.236,
+          "decode_ms": 12.583,
+          "encoded_bytes": 1369389
+        },
+        {
+          "encode_ms": 54.592,
+          "decode_ms": 9.839,
+          "encoded_bytes": 1369389
+        },
+        {
+          "encode_ms": 53.58,
+          "decode_ms": 9.665,
+          "encoded_bytes": 1369389
+        }
+      ]
+    },
+    "after": {
+      "maximum_resident_set_size_bytes": 110739456,
+      "peak_memory_footprint_bytes": 104432120,
+      "wall_seconds": 0.38,
+      "user_seconds": 0.2,
+      "system_seconds": 0.0,
+      "runs": [
+        {
+          "encode_ms": 61.476,
+          "decode_ms": 12.396,
+          "encoded_bytes": 1369389
+        },
+        {
+          "encode_ms": 52.987,
+          "decode_ms": 9.829,
+          "encoded_bytes": 1369389
+        },
+        {
+          "encode_ms": 54.177,
+          "decode_ms": 9.87,
+          "encoded_bytes": 1369389
+        }
+      ]
+    }
+  },
+  "zarr384": {
+    "before": {
+      "maximum_resident_set_size_bytes": 1119961088,
+      "peak_memory_footprint_bytes": 1114260728,
+      "wall_seconds": 0.38,
+      "user_seconds": 0.51,
+      "system_seconds": 0.38,
+      "log": "build/bench-review-fixes/zarr384-before.log"
+    },
+    "after": {
+      "maximum_resident_set_size_bytes": 85639168,
+      "peak_memory_footprint_bytes": 79430184,
+      "wall_seconds": 0.05,
+      "user_seconds": 0.13,
+      "system_seconds": 0.01,
+      "log": "build/bench-review-fixes/zarr384-after.log"
+    },
+    "baseline_description": "Original HEAD full-shard-assembly converter source, linked against current common libraries.",
+    "after_description": "Rolling-band implementation before persistent-worker follow-up; recorded runtime is an intermediate measurement, not a timing of the final binary. Payload/working-memory strategy remains the same."
+  },
+  "crc_real": {
+    "bytes_per_pass": 56849291,
+    "passes": 8,
+    "before_MBps": 566.6,
+    "after_MBps": 7025.9,
+    "checksum_hex": "d7ecf8f8"
+  },
+  "notes": [
+    "Apple M4 16GiB, macOS; local synthetic conversion inputs except CRC real native shard.",
+    "surface2048x2048 smooth XYZ; three encode/decode repetitions in each process.",
+    "zarr384 input has192cube source chunks.",
+    "pack/pack_sparse/mkpyramid_* now contain final converter-versus-original HEAD source comparisons; pack_intermediate_sparse and zarr384 after are explicitly historical/intermediate measurements."
+  ],
+  "pack_intermediate_sparse": {
+    "before": {
+      "maximum_resident_set_size_bytes": 1115471872,
+      "peak_memory_footprint_bytes": 1080607896,
+      "wall_seconds": 0.37,
+      "user_seconds": 0.5,
+      "system_seconds": 0.06
+    },
+    "after": {
+      "maximum_resident_set_size_bytes": 10518528,
+      "peak_memory_footprint_bytes": 5734760,
+      "wall_seconds": 0.37,
+      "user_seconds": 0.37,
+      "system_seconds": 0.01
+    },
+    "status": "Historical pre-worker follow-up measurement of a different sparse fixture; not the final pack comparison."
+  },
+  "conversion_comparison": {
+    "fixture": "Logical 1024^3 DCT shard: 262144 16^3 entries. Dense entries reference one identical encoded pattern payload; sparse entries all absent.",
+    "comparison_scope": "Converter source comparison only; baseline and final link current common codec/shard libraries. This measures compute and residency, not distinct-payload storage bandwidth.",
+    "measurement_method": "One /usr/bin/time -l invocation per original HEAD/final comparison. Wall-time differences are single-run observations, not statistically established speedups.",
+    "reproduction_notes": "build/bench-review-fixes/tool-worker-benchmark-notes.txt"
+  },
+  "pack_sparse": {
+    "fixture_kind": "sparse",
+    "baseline_description": "Original HEAD converter source.",
+    "after_description": "Final 16-chunk, 32 MiB raw preparation batch, automatic CPU decode pool with 64 DCT chunks/claim, and requested 4 encoder workers.",
+    "before": {
+      "wall_seconds": 0.51,
+      "user_seconds": 0.61,
+      "system_seconds": 0.08,
+      "maximum_resident_set_size_bytes": 1115308032,
+      "peak_memory_footprint_bytes": 1085359280,
+      "log": "build/bench-review-fixes/volcomppack-sparse-original-head.log"
+    },
+    "after": {
+      "wall_seconds": 0.1,
+      "user_seconds": 0.47,
+      "system_seconds": 0.03,
+      "maximum_resident_set_size_bytes": 39796736,
+      "peak_memory_footprint_bytes": 35062144,
+      "log": "build/bench-review-fixes/volcomppack-sparse-decoder-pool-final.log"
+    },
+    "command_arguments": "band SOURCE 0 0 0 OUTPUT.vcs 2 4"
+  },
+  "mkpyramid_dense": {
+    "fixture_kind": "dense",
+    "baseline_description": "Original HEAD converter source with only NX/NY/NZ and scan-grid normalized to one 1024^3 shard; original parallel regiondecode/full-shard reductions preserved.",
+    "after_description": "Final parallel 128^3 tile decoding/reduction with automatic CPU worker count capped at 16.",
+    "before": {
+      "wall_seconds": 1.59,
+      "user_seconds": 14.29,
+      "system_seconds": 0.1,
+      "maximum_resident_set_size_bytes": 1248034816,
+      "peak_memory_footprint_bytes": 1228965088,
+      "log": "build/bench-review-fixes/mkpyramid-dense-original-head.log"
+    },
+    "after": {
+      "wall_seconds": 1.81,
+      "user_seconds": 14.26,
+      "system_seconds": 0.13,
+      "maximum_resident_set_size_bytes": 50692096,
+      "peak_memory_footprint_bytes": 26837400,
+      "log": "build/bench-review-fixes/mkpyramid-dense-after.log"
+    },
+    "command_arguments": "SOURCE 0 OUTPUT",
+    "interpretation": "About 14% runtime increase in this single-run comparison, with about 96% lower peak RSS. The 9.76\u21921.81s serial-to-parallel intermediate result is not an overall original HEAD speedup."
+  },
+  "mkpyramid_sparse": {
+    "fixture_kind": "sparse",
+    "baseline_description": "Original HEAD converter source with only NX/NY/NZ and scan-grid normalized to one 1024^3 shard; original parallel regiondecode/full-shard reductions preserved.",
+    "after_description": "Final parallel 128^3 tile decoding/reduction with automatic CPU worker count capped at 16.",
+    "before": {
+      "wall_seconds": 0.35,
+      "user_seconds": 0.35,
+      "system_seconds": 0.08,
+      "maximum_resident_set_size_bytes": 1248034816,
+      "peak_memory_footprint_bytes": 1228965088,
+      "log": "build/bench-review-fixes/mkpyramid-sparse-original-head.log"
+    },
+    "after": {
+      "wall_seconds": 0.2,
+      "user_seconds": 0.24,
+      "system_seconds": 0.01,
+      "maximum_resident_set_size_bytes": 49381376,
+      "peak_memory_footprint_bytes": 25641368,
+      "log": "build/bench-review-fixes/mkpyramid-sparse-after.log"
+    },
+    "command_arguments": "SOURCE 0 OUTPUT"
+  },
+  "lodpack_baseline_limit": "Unmodified original HEAD lodpack passes invalid q=0 to the shard writer and cannot publish successful output; no successful comparable original HEAD timing is reported. Pool-only intermediate benchmarks are saved separately.",
+  "renderer": {
+    "hardware": "Apple M4, 16 GiB, macOS 26.3, MoltenVK",
+    "workload": "Local PHerc1218 overview; R3D_MV_EXERCISE=1 R3D_MV_FIT=512; full1920x1080, tf1, pool32, warmup400, frames1200, headless no-vsync; no segment",
+    "binary_sha256": "c246c0960d231f9228caf8843a5171b1ef3fb131cb6026fc5bfff2df68205b22",
+    "runs": [
+      {
+        "repeat": 0,
+        "warm_mib": 128,
+        "benchmark": {
+          "schema": "render3d-benchmark-v2",
+          "scenario": "static",
+          "quality": "full",
+          "gpu_timestamp_lag_frames": 2,
+          "gpu_timing_window": "queries returned during measured CPU frames; GPU submissions lag by two frames",
+          "width": 1920,
+          "height": 1080,
+          "warmup_frames": 400,
+          "measured_frames": 1200,
+          "retained_frame_samples": 1200,
+          "volcomp_revision": "70320c58c922c6c3bcd62f9c209eeb3fa3a332b8",
+          "intervals": {
+            "startup": {
+              "wall_ms": 163.952,
+              "decoded": 0,
+              "jobs": 0,
+              "worker_ms": 0.0,
+              "failures": 0
+            },
+            "warmup": {
+              "wall_ms": 1546.119,
+              "decoded": 4190,
+              "jobs": 100,
+              "worker_ms": 367.566,
+              "failures": 0
+            },
+            "measured": {
+              "wall_ms": 3887.15,
+              "decoded": 1636,
+              "jobs": 94,
+              "worker_ms": 339.447,
+              "failures": 0
+            },
+            "final_flush": {
+              "wall_ms": 0.0,
+              "decoded": 0,
+              "jobs": 0,
+              "worker_ms": 0.0,
+              "failures": 0
+            }
+          },
+          "brick_state_measured_end": {
+            "gauges": {
+              "hot": 7305,
+              "hot_cap": 32768,
+              "page_entries": 10656,
+              "page_capacity": 131072,
+              "page_probe_max": 4,
+              "metadata_bytes": 3485984
+            },
+            "cumulative_totals": {
+              "slot_probes": 7949,
+              "compressed_reads": 0,
+              "compressed_bytes": 0
+            }
+          },
+          "pending_cell_frames": 0,
+          "brick_stream": {
+            "decoded": 1636,
+            "jobs": 94,
+            "failures": 0,
+            "mean_job_ms": 3.611138,
+            "levels": 3,
+            "lod_wanted": [
+              1,
+              1840,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "lod_requests": [
+              419085,
+              1068505,
+              100680,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "timings": {
+            "cpu_frame": {
+              "mean_ms": 3.238523,
+              "p50_ms": 3.134,
+              "p95_ms": 5.572,
+              "p99_ms": 6.5,
+              "max_ms": 15.489
+            },
+            "gpu_frame": {
+              "mean_ms": 2.910524,
+              "p50_ms": 2.692083,
+              "p95_ms": 5.363916,
+              "p99_ms": 5.696,
+              "max_ms": 8.010875
+            },
+            "gpu_total": {
+              "mean_ms": 2.910524,
+              "p50_ms": 2.692083,
+              "p95_ms": 5.363916,
+              "p99_ms": 5.696,
+              "max_ms": 8.010875
+            },
+            "gpu_raycast": {
+              "mean_ms": 2.677491,
+              "p50_ms": 2.421209,
+              "p95_ms": 5.258208,
+              "p99_ms": 5.62125,
+              "max_ms": 6.096875
+            },
+            "gpu_blit": {
+              "mean_ms": 0.152921,
+              "p50_ms": 0.001458,
+              "p95_ms": 1.301708,
+              "p99_ms": 2.2055,
+              "max_ms": 2.70275
+            },
+            "gpu_gui": {
+              "mean_ms": 0.080111,
+              "p50_ms": 0.077166,
+              "p95_ms": 0.095416,
+              "p99_ms": 0.918916,
+              "max_ms": 2.6325
+            },
+            "cpu_wait": {
+              "mean_ms": 2.723804,
+              "p50_ms": 2.634,
+              "p95_ms": 5.014,
+              "p99_ms": 6.002,
+              "max_ms": 14.866
+            },
+            "cpu_acquire": {
+              "mean_ms": 0.000127,
+              "p50_ms": 0.0,
+              "p95_ms": 0.001,
+              "p99_ms": 0.001,
+              "max_ms": 0.001
+            },
+            "cpu_record": {
+              "mean_ms": 0.014946,
+              "p50_ms": 0.015,
+              "p95_ms": 0.023,
+              "p99_ms": 0.034,
+              "max_ms": 0.073
+            },
+            "cpu_submit": {
+              "mean_ms": 0.123872,
+              "p50_ms": 0.112,
+              "p95_ms": 0.195,
+              "p99_ms": 0.375,
+              "max_ms": 0.812
+            }
+          }
+        },
+        "peak_memory_footprint_bytes": 311067344,
+        "maximum_resident_set_size_bytes": 66895872
+      },
+      {
+        "repeat": 0,
+        "warm_mib": 0,
+        "benchmark": {
+          "schema": "render3d-benchmark-v2",
+          "scenario": "static",
+          "quality": "full",
+          "gpu_timestamp_lag_frames": 2,
+          "gpu_timing_window": "queries returned during measured CPU frames; GPU submissions lag by two frames",
+          "width": 1920,
+          "height": 1080,
+          "warmup_frames": 400,
+          "measured_frames": 1200,
+          "retained_frame_samples": 1200,
+          "volcomp_revision": "70320c58c922c6c3bcd62f9c209eeb3fa3a332b8",
+          "intervals": {
+            "startup": {
+              "wall_ms": 153.645,
+              "decoded": 0,
+              "jobs": 0,
+              "worker_ms": 0.0,
+              "failures": 0
+            },
+            "warmup": {
+              "wall_ms": 1552.179,
+              "decoded": 4210,
+              "jobs": 119,
+              "worker_ms": 461.123,
+              "failures": 0
+            },
+            "measured": {
+              "wall_ms": 3903.004,
+              "decoded": 1616,
+              "jobs": 92,
+              "worker_ms": 355.594,
+              "failures": 0
+            },
+            "final_flush": {
+              "wall_ms": 0.0,
+              "decoded": 0,
+              "jobs": 0,
+              "worker_ms": 0.0,
+              "failures": 0
+            }
+          },
+          "brick_state_measured_end": {
+            "gauges": {
+              "hot": 7305,
+              "hot_cap": 32768,
+              "page_entries": 10666,
+              "page_capacity": 131072,
+              "page_probe_max": 4,
+              "metadata_bytes": 3465728
+            },
+            "cumulative_totals": {
+              "slot_probes": 7949,
+              "compressed_reads": 0,
+              "compressed_bytes": 0
+            }
+          },
+          "pending_cell_frames": 0,
+          "brick_stream": {
+            "decoded": 1616,
+            "jobs": 92,
+            "failures": 0,
+            "mean_job_ms": 3.865152,
+            "levels": 3,
+            "lod_wanted": [
+              1,
+              1840,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "lod_requests": [
+              426137,
+              1075825,
+              100680,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "timings": {
+            "cpu_frame": {
+              "mean_ms": 3.251591,
+              "p50_ms": 3.3,
+              "p95_ms": 5.395,
+              "p99_ms": 5.823,
+              "max_ms": 6.349
+            },
+            "gpu_frame": {
+              "mean_ms": 3.23002,
+              "p50_ms": 3.26675,
+              "p95_ms": 5.326333,
+              "p99_ms": 5.689209,
+              "max_ms": 6.215125
+            },
+            "gpu_total": {
+              "mean_ms": 3.23002,
+              "p50_ms": 3.26675,
+              "p95_ms": 5.326333,
+              "p99_ms": 5.689209,
+              "max_ms": 6.215125
+            },
+            "gpu_raycast": {
+              "mean_ms": 3.167073,
+              "p50_ms": 3.218,
+              "p95_ms": 5.27825,
+              "p99_ms": 5.684042,
+              "max_ms": 6.157083
+            },
+            "gpu_blit": {
+              "mean_ms": 0.003708,
+              "p50_ms": 0.001459,
+              "p95_ms": 0.003042,
+              "p99_ms": 0.023958,
+              "max_ms": 0.236166
+            },
+            "gpu_gui": {
+              "mean_ms": 0.059239,
+              "p50_ms": 0.0635,
+              "p95_ms": 0.073958,
+              "p99_ms": 0.082375,
+              "max_ms": 0.235625
+            },
+            "cpu_wait": {
+              "mean_ms": 2.76147,
+              "p50_ms": 2.801,
+              "p95_ms": 4.794,
+              "p99_ms": 5.249,
+              "max_ms": 5.686
+            },
+            "cpu_acquire": {
+              "mean_ms": 8.2e-05,
+              "p50_ms": 0.0,
+              "p95_ms": 0.001,
+              "p99_ms": 0.001,
+              "max_ms": 0.001
+            },
+            "cpu_record": {
+              "mean_ms": 0.014299,
+              "p50_ms": 0.015,
+              "p95_ms": 0.024,
+              "p99_ms": 0.032,
+              "max_ms": 0.097
+            },
+            "cpu_submit": {
+              "mean_ms": 0.121726,
+              "p50_ms": 0.112,
+              "p95_ms": 0.211,
+              "p99_ms": 0.412,
+              "max_ms": 0.943
+            }
+          }
+        },
+        "peak_memory_footprint_bytes": 305808032,
+        "maximum_resident_set_size_bytes": 53493760
+      },
+      {
+        "repeat": 1,
+        "warm_mib": 0,
+        "benchmark": {
+          "schema": "render3d-benchmark-v2",
+          "scenario": "static",
+          "quality": "full",
+          "gpu_timestamp_lag_frames": 2,
+          "gpu_timing_window": "queries returned during measured CPU frames; GPU submissions lag by two frames",
+          "width": 1920,
+          "height": 1080,
+          "warmup_frames": 400,
+          "measured_frames": 1200,
+          "retained_frame_samples": 1200,
+          "volcomp_revision": "70320c58c922c6c3bcd62f9c209eeb3fa3a332b8",
+          "intervals": {
+            "startup": {
+              "wall_ms": 143.795,
+              "decoded": 0,
+              "jobs": 0,
+              "worker_ms": 0.0,
+              "failures": 0
+            },
+            "warmup": {
+              "wall_ms": 1541.269,
+              "decoded": 4148,
+              "jobs": 132,
+              "worker_ms": 508.87,
+              "failures": 0
+            },
+            "measured": {
+              "wall_ms": 3889.227,
+              "decoded": 1653,
+              "jobs": 102,
+              "worker_ms": 374.098,
+              "failures": 0
+            },
+            "final_flush": {
+              "wall_ms": 0.0,
+              "decoded": 0,
+              "jobs": 0,
+              "worker_ms": 0.0,
+              "failures": 0
+            }
+          },
+          "brick_state_measured_end": {
+            "gauges": {
+              "hot": 7301,
+              "hot_cap": 32768,
+              "page_entries": 10628,
+              "page_capacity": 131072,
+              "page_probe_max": 4,
+              "metadata_bytes": 3465728
+            },
+            "cumulative_totals": {
+              "slot_probes": 7919,
+              "compressed_reads": 0,
+              "compressed_bytes": 0
+            }
+          },
+          "pending_cell_frames": 0,
+          "brick_stream": {
+            "decoded": 1653,
+            "jobs": 102,
+            "failures": 0,
+            "mean_job_ms": 3.667627,
+            "levels": 3,
+            "lod_wanted": [
+              1,
+              1840,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "lod_requests": [
+              420315,
+              1067441,
+              100680,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "timings": {
+            "cpu_frame": {
+              "mean_ms": 3.240196,
+              "p50_ms": 3.194,
+              "p95_ms": 5.41,
+              "p99_ms": 6.112,
+              "max_ms": 8.29
+            },
+            "gpu_frame": {
+              "mean_ms": 3.077587,
+              "p50_ms": 2.931167,
+              "p95_ms": 5.268083,
+              "p99_ms": 5.894583,
+              "max_ms": 6.141041
+            },
+            "gpu_total": {
+              "mean_ms": 3.077587,
+              "p50_ms": 2.931167,
+              "p95_ms": 5.268083,
+              "p99_ms": 5.894583,
+              "max_ms": 6.141041
+            },
+            "gpu_raycast": {
+              "mean_ms": 2.927032,
+              "p50_ms": 2.655291,
+              "p95_ms": 5.15575,
+              "p99_ms": 5.810125,
+              "max_ms": 6.053291
+            },
+            "gpu_blit": {
+              "mean_ms": 0.082493,
+              "p50_ms": 0.001417,
+              "p95_ms": 0.103584,
+              "p99_ms": 2.273875,
+              "max_ms": 2.696125
+            },
+            "gpu_gui": {
+              "mean_ms": 0.068061,
+              "p50_ms": 0.079417,
+              "p95_ms": 0.091792,
+              "p99_ms": 0.103292,
+              "max_ms": 2.5875
+            },
+            "cpu_wait": {
+              "mean_ms": 2.769929,
+              "p50_ms": 2.67,
+              "p95_ms": 4.836,
+              "p99_ms": 5.588,
+              "max_ms": 7.722
+            },
+            "cpu_acquire": {
+              "mean_ms": 0.000116,
+              "p50_ms": 0.0,
+              "p95_ms": 0.001,
+              "p99_ms": 0.001,
+              "max_ms": 0.001
+            },
+            "cpu_record": {
+              "mean_ms": 0.014201,
+              "p50_ms": 0.014,
+              "p95_ms": 0.024,
+              "p99_ms": 0.034,
+              "max_ms": 0.35
+            },
+            "cpu_submit": {
+              "mean_ms": 0.116663,
+              "p50_ms": 0.108,
+              "p95_ms": 0.194,
+              "p99_ms": 0.368,
+              "max_ms": 0.657
+            }
+          }
+        },
+        "peak_memory_footprint_bytes": 306037504,
+        "maximum_resident_set_size_bytes": 53444608
+      },
+      {
+        "repeat": 1,
+        "warm_mib": 128,
+        "benchmark": {
+          "schema": "render3d-benchmark-v2",
+          "scenario": "static",
+          "quality": "full",
+          "gpu_timestamp_lag_frames": 2,
+          "gpu_timing_window": "queries returned during measured CPU frames; GPU submissions lag by two frames",
+          "width": 1920,
+          "height": 1080,
+          "warmup_frames": 400,
+          "measured_frames": 1200,
+          "retained_frame_samples": 1200,
+          "volcomp_revision": "70320c58c922c6c3bcd62f9c209eeb3fa3a332b8",
+          "intervals": {
+            "startup": {
+              "wall_ms": 149.836,
+              "decoded": 0,
+              "jobs": 0,
+              "worker_ms": 0.0,
+              "failures": 0
+            },
+            "warmup": {
+              "wall_ms": 1552.637,
+              "decoded": 4185,
+              "jobs": 117,
+              "worker_ms": 448.87,
+              "failures": 0
+            },
+            "measured": {
+              "wall_ms": 3902.209,
+              "decoded": 1645,
+              "jobs": 101,
+              "worker_ms": 355.281,
+              "failures": 0
+            },
+            "final_flush": {
+              "wall_ms": 0.0,
+              "decoded": 0,
+              "jobs": 0,
+              "worker_ms": 0.0,
+              "failures": 0
+            }
+          },
+          "brick_state_measured_end": {
+            "gauges": {
+              "hot": 7305,
+              "hot_cap": 32768,
+              "page_entries": 10656,
+              "page_capacity": 131072,
+              "page_probe_max": 4,
+              "metadata_bytes": 3485984
+            },
+            "cumulative_totals": {
+              "slot_probes": 7953,
+              "compressed_reads": 0,
+              "compressed_bytes": 0
+            }
+          },
+          "pending_cell_frames": 0,
+          "brick_stream": {
+            "decoded": 1645,
+            "jobs": 101,
+            "failures": 0,
+            "mean_job_ms": 3.517634,
+            "levels": 3,
+            "lod_wanted": [
+              1,
+              1840,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "lod_requests": [
+              412098,
+              1064517,
+              100680,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "timings": {
+            "cpu_frame": {
+              "mean_ms": 3.251032,
+              "p50_ms": 3.256,
+              "p95_ms": 5.458,
+              "p99_ms": 6.218,
+              "max_ms": 21.008
+            },
+            "gpu_frame": {
+              "mean_ms": 3.059613,
+              "p50_ms": 3.046084,
+              "p95_ms": 5.268125,
+              "p99_ms": 5.821542,
+              "max_ms": 6.337667
+            },
+            "gpu_total": {
+              "mean_ms": 3.059613,
+              "p50_ms": 3.046084,
+              "p95_ms": 5.268125,
+              "p99_ms": 5.821542,
+              "max_ms": 6.337667
+            },
+            "gpu_raycast": {
+              "mean_ms": 2.917494,
+              "p50_ms": 2.72125,
+              "p95_ms": 5.20325,
+              "p99_ms": 5.806458,
+              "max_ms": 6.29375
+            },
+            "gpu_blit": {
+              "mean_ms": 0.072109,
+              "p50_ms": 0.001458,
+              "p95_ms": 0.477833,
+              "p99_ms": 1.609167,
+              "max_ms": 2.614375
+            },
+            "gpu_gui": {
+              "mean_ms": 0.070011,
+              "p50_ms": 0.067958,
+              "p95_ms": 0.092833,
+              "p99_ms": 0.497041,
+              "max_ms": 2.134
+            },
+            "cpu_wait": {
+              "mean_ms": 2.755676,
+              "p50_ms": 2.747,
+              "p95_ms": 4.883,
+              "p99_ms": 5.714,
+              "max_ms": 20.068
+            },
+            "cpu_acquire": {
+              "mean_ms": 0.000112,
+              "p50_ms": 0.0,
+              "p95_ms": 0.001,
+              "p99_ms": 0.001,
+              "max_ms": 0.017
+            },
+            "cpu_record": {
+              "mean_ms": 0.014746,
+              "p50_ms": 0.015,
+              "p95_ms": 0.024,
+              "p99_ms": 0.036,
+              "max_ms": 0.071
+            },
+            "cpu_submit": {
+              "mean_ms": 0.119236,
+              "p50_ms": 0.112,
+              "p95_ms": 0.189,
+              "p99_ms": 0.358,
+              "max_ms": 0.599
+            }
+          }
+        },
+        "peak_memory_footprint_bytes": 312083200,
+        "maximum_resident_set_size_bytes": 66977792
+      },
+      {
+        "repeat": 2,
+        "warm_mib": 128,
+        "benchmark": {
+          "schema": "render3d-benchmark-v2",
+          "scenario": "static",
+          "quality": "full",
+          "gpu_timestamp_lag_frames": 2,
+          "gpu_timing_window": "queries returned during measured CPU frames; GPU submissions lag by two frames",
+          "width": 1920,
+          "height": 1080,
+          "warmup_frames": 400,
+          "measured_frames": 1200,
+          "retained_frame_samples": 1200,
+          "volcomp_revision": "70320c58c922c6c3bcd62f9c209eeb3fa3a332b8",
+          "intervals": {
+            "startup": {
+              "wall_ms": 149.745,
+              "decoded": 0,
+              "jobs": 0,
+              "worker_ms": 0.0,
+              "failures": 0
+            },
+            "warmup": {
+              "wall_ms": 1551.959,
+              "decoded": 4177,
+              "jobs": 114,
+              "worker_ms": 440.838,
+              "failures": 0
+            },
+            "measured": {
+              "wall_ms": 3886.077,
+              "decoded": 1649,
+              "jobs": 97,
+              "worker_ms": 366.519,
+              "failures": 0
+            },
+            "final_flush": {
+              "wall_ms": 0.0,
+              "decoded": 0,
+              "jobs": 0,
+              "worker_ms": 0.0,
+              "failures": 0
+            }
+          },
+          "brick_state_measured_end": {
+            "gauges": {
+              "hot": 7305,
+              "hot_cap": 32768,
+              "page_entries": 10666,
+              "page_capacity": 131072,
+              "page_probe_max": 4,
+              "metadata_bytes": 3485984
+            },
+            "cumulative_totals": {
+              "slot_probes": 7949,
+              "compressed_reads": 0,
+              "compressed_bytes": 0
+            }
+          },
+          "pending_cell_frames": 0,
+          "brick_stream": {
+            "decoded": 1649,
+            "jobs": 97,
+            "failures": 0,
+            "mean_job_ms": 3.778546,
+            "levels": 3,
+            "lod_wanted": [
+              1,
+              1840,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "lod_requests": [
+              427978,
+              1077025,
+              100680,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "timings": {
+            "cpu_frame": {
+              "mean_ms": 3.237584,
+              "p50_ms": 3.267,
+              "p95_ms": 5.404,
+              "p99_ms": 5.996,
+              "max_ms": 7.684
+            },
+            "gpu_frame": {
+              "mean_ms": 3.017776,
+              "p50_ms": 2.891958,
+              "p95_ms": 5.286208,
+              "p99_ms": 5.803458,
+              "max_ms": 6.103708
+            },
+            "gpu_total": {
+              "mean_ms": 3.017776,
+              "p50_ms": 2.891958,
+              "p95_ms": 5.286208,
+              "p99_ms": 5.803458,
+              "max_ms": 6.103708
+            },
+            "gpu_raycast": {
+              "mean_ms": 2.831167,
+              "p50_ms": 2.628125,
+              "p95_ms": 5.204334,
+              "p99_ms": 5.722291,
+              "max_ms": 6.034125
+            },
+            "gpu_blit": {
+              "mean_ms": 0.098182,
+              "p50_ms": 0.001417,
+              "p95_ms": 0.701083,
+              "p99_ms": 1.590041,
+              "max_ms": 2.69575
+            },
+            "gpu_gui": {
+              "mean_ms": 0.088428,
+              "p50_ms": 0.07775,
+              "p95_ms": 0.095042,
+              "p99_ms": 1.159208,
+              "max_ms": 1.839708
+            },
+            "cpu_wait": {
+              "mean_ms": 2.804578,
+              "p50_ms": 2.815,
+              "p95_ms": 4.835,
+              "p99_ms": 5.57,
+              "max_ms": 7.255
+            },
+            "cpu_acquire": {
+              "mean_ms": 0.000108,
+              "p50_ms": 0.0,
+              "p95_ms": 0.001,
+              "p99_ms": 0.001,
+              "max_ms": 0.001
+            },
+            "cpu_record": {
+              "mean_ms": 0.012634,
+              "p50_ms": 0.013,
+              "p95_ms": 0.023,
+              "p99_ms": 0.03,
+              "max_ms": 0.064
+            },
+            "cpu_submit": {
+              "mean_ms": 0.109043,
+              "p50_ms": 0.102,
+              "p95_ms": 0.203,
+              "p99_ms": 0.358,
+              "max_ms": 0.703
+            }
+          }
+        },
+        "peak_memory_footprint_bytes": 314721024,
+        "maximum_resident_set_size_bytes": 67043328
+      },
+      {
+        "repeat": 2,
+        "warm_mib": 0,
+        "benchmark": {
+          "schema": "render3d-benchmark-v2",
+          "scenario": "static",
+          "quality": "full",
+          "gpu_timestamp_lag_frames": 2,
+          "gpu_timing_window": "queries returned during measured CPU frames; GPU submissions lag by two frames",
+          "width": 1920,
+          "height": 1080,
+          "warmup_frames": 400,
+          "measured_frames": 1200,
+          "retained_frame_samples": 1200,
+          "volcomp_revision": "70320c58c922c6c3bcd62f9c209eeb3fa3a332b8",
+          "intervals": {
+            "startup": {
+              "wall_ms": 150.735,
+              "decoded": 0,
+              "jobs": 0,
+              "worker_ms": 0.0,
+              "failures": 0
+            },
+            "warmup": {
+              "wall_ms": 1551.768,
+              "decoded": 4212,
+              "jobs": 122,
+              "worker_ms": 476.277,
+              "failures": 0
+            },
+            "measured": {
+              "wall_ms": 3901.562,
+              "decoded": 1604,
+              "jobs": 96,
+              "worker_ms": 364.677,
+              "failures": 0
+            },
+            "final_flush": {
+              "wall_ms": 0.0,
+              "decoded": 0,
+              "jobs": 0,
+              "worker_ms": 0.0,
+              "failures": 0
+            }
+          },
+          "brick_state_measured_end": {
+            "gauges": {
+              "hot": 7300,
+              "hot_cap": 32768,
+              "page_entries": 10638,
+              "page_capacity": 131072,
+              "page_probe_max": 4,
+              "metadata_bytes": 3465728
+            },
+            "cumulative_totals": {
+              "slot_probes": 7934,
+              "compressed_reads": 0,
+              "compressed_bytes": 0
+            }
+          },
+          "pending_cell_frames": 0,
+          "brick_stream": {
+            "decoded": 1604,
+            "jobs": 96,
+            "failures": 0,
+            "mean_job_ms": 3.798719,
+            "levels": 3,
+            "lod_wanted": [
+              1,
+              1840,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "lod_requests": [
+              412494,
+              1065047,
+              100680,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "timings": {
+            "cpu_frame": {
+              "mean_ms": 3.250476,
+              "p50_ms": 3.29,
+              "p95_ms": 5.33,
+              "p99_ms": 5.933,
+              "max_ms": 9.036
+            },
+            "gpu_frame": {
+              "mean_ms": 3.229161,
+              "p50_ms": 3.249875,
+              "p95_ms": 5.326708,
+              "p99_ms": 5.85625,
+              "max_ms": 7.44675
+            },
+            "gpu_total": {
+              "mean_ms": 3.229161,
+              "p50_ms": 3.249875,
+              "p95_ms": 5.326708,
+              "p99_ms": 5.85625,
+              "max_ms": 7.44675
+            },
+            "gpu_raycast": {
+              "mean_ms": 3.166506,
+              "p50_ms": 3.190083,
+              "p95_ms": 5.281958,
+              "p99_ms": 5.721625,
+              "max_ms": 6.172959
+            },
+            "gpu_blit": {
+              "mean_ms": 0.002778,
+              "p50_ms": 0.001458,
+              "p95_ms": 0.00275,
+              "p99_ms": 0.018084,
+              "max_ms": 0.196167
+            },
+            "gpu_gui": {
+              "mean_ms": 0.059877,
+              "p50_ms": 0.062875,
+              "p95_ms": 0.070791,
+              "p99_ms": 0.079083,
+              "max_ms": 2.563541
+            },
+            "cpu_wait": {
+              "mean_ms": 2.725451,
+              "p50_ms": 2.756,
+              "p95_ms": 4.785,
+              "p99_ms": 5.475,
+              "max_ms": 8.488
+            },
+            "cpu_acquire": {
+              "mean_ms": 0.000101,
+              "p50_ms": 0.0,
+              "p95_ms": 0.001,
+              "p99_ms": 0.001,
+              "max_ms": 0.001
+            },
+            "cpu_record": {
+              "mean_ms": 0.015526,
+              "p50_ms": 0.015,
+              "p95_ms": 0.024,
+              "p99_ms": 0.036,
+              "max_ms": 0.091
+            },
+            "cpu_submit": {
+              "mean_ms": 0.126707,
+              "p50_ms": 0.119,
+              "p95_ms": 0.197,
+              "p99_ms": 0.363,
+              "max_ms": 0.616
+            }
+          }
+        },
+        "peak_memory_footprint_bytes": 305742496,
+        "maximum_resident_set_size_bytes": 53346304
+      }
+    ],
+    "medians": {
+      "128": {
+        "mean_frame_ms": 3.238523,
+        "p99_frame_ms": 6.218,
+        "peak_memory_footprint_mib": 297.625732421875
+      },
+      "0": {
+        "mean_frame_ms": 3.250476,
+        "p99_frame_ms": 5.933,
+        "peak_memory_footprint_mib": 291.6412658691406
+      }
+    },
+    "comparison_caveat": "Prior pass uses benchmarkv1 cumulative decode counts and misindexed CPU phase fields; compare cpu_frame and peak footprint, not CPU phase fields or measured-only counters directly. Both versions retain all1200 measured frame timings. Timed streaming detail varies; full-residency capture is separate.",
+    "equal_residency_capture": {
+      "command": "R3D_BRICKS_EAGER=1 render3d --bricks interior-1024.vcs --headless --pool64 --frames3 --size1280 720 --tf1 --depth1 --shot out.ppm",
+      "runs": [
+        {
+          "initialized_blocks": 237568,
+          "initialize_ms": 4230,
+          "image_sha256": "0db3980f06f2bb2a0a7b18e1b121a27edaa8317b08d3c6a711f13f547f3061df",
+          "byte_identical_to_baseline": true
+        },
+        {
+          "initialized_blocks": 237568,
+          "initialize_ms": 3511,
+          "image_sha256": "0db3980f06f2bb2a0a7b18e1b121a27edaa8317b08d3c6a711f13f547f3061df",
+          "byte_identical_to_baseline": true
+        }
+      ]
+    },
+    "short_timed_run": {
+      "schema": "render3d-benchmark-v2",
+      "scenario": "static",
+      "quality": "full",
+      "gpu_timestamp_lag_frames": 2,
+      "gpu_timing_window": "queries returned during measured CPU frames; GPU submissions lag by two frames",
+      "width": 1280,
+      "height": 720,
+      "warmup_frames": 0,
+      "measured_frames": 8731,
+      "retained_frame_samples": 8731,
+      "volcomp_revision": "70320c58c922c6c3bcd62f9c209eeb3fa3a332b8",
+      "intervals": {
+        "startup": {
+          "wall_ms": 155.688,
+          "decoded": 0,
+          "jobs": 0,
+          "worker_ms": 0.0,
+          "failures": 0
+        },
+        "warmup": {
+          "wall_ms": 0.0,
+          "decoded": 0,
+          "jobs": 0,
+          "worker_ms": 0.0,
+          "failures": 0
+        },
+        "measured": {
+          "wall_ms": 1000.357,
+          "decoded": 0,
+          "jobs": 0,
+          "worker_ms": 0.0,
+          "failures": 0
+        },
+        "final_flush": {
+          "wall_ms": 0.0,
+          "decoded": 0,
+          "jobs": 0,
+          "worker_ms": 0.0,
+          "failures": 0
+        }
+      },
+      "brick_state_measured_end": {
+        "gauges": {
+          "hot": 2982,
+          "hot_cap": 32768,
+          "page_entries": 2982,
+          "page_capacity": 131072,
+          "page_probe_max": 2,
+          "metadata_bytes": 3437056
+        },
+        "cumulative_totals": {
+          "slot_probes": 0,
+          "compressed_reads": 0,
+          "compressed_bytes": 0
+        }
+      },
+      "pending_cell_frames": 0,
+      "brick_stream": {
+        "decoded": 0,
+        "jobs": 0,
+        "failures": 0,
+        "mean_job_ms": 0.0,
+        "levels": 3,
+        "lod_wanted": [
+          0,
+          0,
+          1440,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "lod_requests": [
+          0,
+          0,
+          12572640,
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      "timings": {
+        "cpu_frame": {
+          "mean_ms": 0.114457,
+          "p50_ms": 0.107,
+          "p95_ms": 0.143,
+          "p99_ms": 0.281,
+          "max_ms": 2.071
+        },
+        "gpu_frame": {
+          "mean_ms": 0.018768,
+          "p50_ms": 0.016084,
+          "p95_ms": 0.02375,
+          "p99_ms": 0.042917,
+          "max_ms": 1.743834
+        },
+        "gpu_total": {
+          "mean_ms": 0.018768,
+          "p50_ms": 0.016084,
+          "p95_ms": 0.02375,
+          "p99_ms": 0.042917,
+          "max_ms": 1.743834
+        },
+        "gpu_raycast": {
+          "mean_ms": 0.007258,
+          "p50_ms": 0.006417,
+          "p95_ms": 0.010208,
+          "p99_ms": 0.014708,
+          "max_ms": 1.73875
+        },
+        "gpu_blit": {
+          "mean_ms": 0.005408,
+          "p50_ms": 0.004542,
+          "p95_ms": 0.01025,
+          "p99_ms": 0.013125,
+          "max_ms": 0.251208
+        },
+        "gpu_gui": {
+          "mean_ms": 0.006102,
+          "p50_ms": 0.004958,
+          "p95_ms": 0.011416,
+          "p99_ms": 0.013167,
+          "max_ms": 0.497583
+        },
+        "cpu_wait": {
+          "mean_ms": 0.032999,
+          "p50_ms": 0.027,
+          "p95_ms": 0.064,
+          "p99_ms": 0.199,
+          "max_ms": 1.977
+        },
+        "cpu_acquire": {
+          "mean_ms": 1.9e-05,
+          "p50_ms": 0.0,
+          "p95_ms": 0.0,
+          "p99_ms": 0.001,
+          "max_ms": 0.001
+        },
+        "cpu_record": {
+          "mean_ms": 0.001677,
+          "p50_ms": 0.002,
+          "p95_ms": 0.002,
+          "p99_ms": 0.006,
+          "max_ms": 0.19
+        },
+        "cpu_submit": {
+          "mean_ms": 0.017221,
+          "p50_ms": 0.018,
+          "p95_ms": 0.02,
+          "p99_ms": 0.023,
+          "max_ms": 0.281
+        }
+      }
+    }
+  },
+  "verification": {
+    "release": {
+      "passed": 31,
+      "skipped": 1
+    },
+    "asan_ubsan": {
+      "passed": 31,
+      "skipped": 1
+    },
+    "skip_reason": "Historical DCT band fixture absent for shard test. Synthetic DCT conversion tests passed.",
+    "native_import_python": "passed"
+  }
+}

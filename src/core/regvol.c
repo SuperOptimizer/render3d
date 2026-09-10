@@ -1,5 +1,7 @@
-#include "core/thread.h"
 #include "core/regvol.h"
+#include "core/cellset.h"
+#include "core/thread.h"
+#include <time.h>
 
 #include <fysics.h> /* fy_register_affine / fy_ncc_warped (angle: fysics dir) */
 #include <math.h>
@@ -23,9 +25,10 @@ static void m34_mul(double *o, const double *a, const double *b) {
   double t[12];
   for (int r = 0; r < 3; r++) {
     for (int c = 0; c < 3; c++)
-      t[r * 4 + c] =
-          a[r * 4 + 0] * b[0 * 4 + c] + a[r * 4 + 1] * b[1 * 4 + c] + a[r * 4 + 2] * b[2 * 4 + c];
-    t[r * 4 + 3] = a[r * 4 + 0] * b[3] + a[r * 4 + 1] * b[7] + a[r * 4 + 2] * b[11] + a[r * 4 + 3];
+      t[r * 4 + c] = a[r * 4 + 0] * b[0 * 4 + c] + a[r * 4 + 1] * b[1 * 4 + c] +
+                     a[r * 4 + 2] * b[2 * 4 + c];
+    t[r * 4 + 3] = a[r * 4 + 0] * b[3] + a[r * 4 + 1] * b[7] +
+                   a[r * 4 + 2] * b[11] + a[r * 4 + 3];
   }
   memcpy(o, t, sizeof t);
 }
@@ -33,26 +36,30 @@ static void m34_mul(double *o, const double *a, const double *b) {
 static void m34_apply(const double *a, const double *p, double *q) {
   double t[3];
   for (int r = 0; r < 3; r++)
-    t[r] = a[r * 4 + 0] * p[0] + a[r * 4 + 1] * p[1] + a[r * 4 + 2] * p[2] + a[r * 4 + 3];
+    t[r] = a[r * 4 + 0] * p[0] + a[r * 4 + 1] * p[1] + a[r * 4 + 2] * p[2] +
+           a[r * 4 + 3];
   memcpy(q, t, sizeof t);
 }
 
 static double m34_det(const double *a) {
-  return a[0] * (a[5] * a[10] - a[6] * a[9]) - a[1] * (a[4] * a[10] - a[6] * a[8]) +
+  return a[0] * (a[5] * a[10] - a[6] * a[9]) -
+         a[1] * (a[4] * a[10] - a[6] * a[8]) +
          a[2] * (a[4] * a[9] - a[5] * a[8]);
 }
 
 static int m34_invert(const double *a, double *o) {
   double d = m34_det(a);
-  if (fabs(d) < 1e-30) return -1;
+  if (fabs(d) < 1e-30)
+    return -1;
   double inv = 1.0 / d;
   double l[9] = {
-      (a[5] * a[10] - a[6] * a[9]) * inv,  (a[2] * a[9] - a[1] * a[10]) * inv,
-      (a[1] * a[6] - a[2] * a[5]) * inv,   (a[6] * a[8] - a[4] * a[10]) * inv,
-      (a[0] * a[10] - a[2] * a[8]) * inv,  (a[2] * a[4] - a[0] * a[6]) * inv,
-      (a[4] * a[9] - a[5] * a[8]) * inv,   (a[1] * a[8] - a[0] * a[9]) * inv,
+      (a[5] * a[10] - a[6] * a[9]) * inv, (a[2] * a[9] - a[1] * a[10]) * inv,
+      (a[1] * a[6] - a[2] * a[5]) * inv,  (a[6] * a[8] - a[4] * a[10]) * inv,
+      (a[0] * a[10] - a[2] * a[8]) * inv, (a[2] * a[4] - a[0] * a[6]) * inv,
+      (a[4] * a[9] - a[5] * a[8]) * inv,  (a[1] * a[8] - a[0] * a[9]) * inv,
       (a[0] * a[5] - a[1] * a[4]) * inv};
-  double t[12] = {l[0], l[1], l[2], 0, l[3], l[4], l[5], 0, l[6], l[7], l[8], 0};
+  double t[12] = {l[0], l[1], l[2], 0,    l[3], l[4],
+                  l[5], 0,    l[6], l[7], l[8], 0};
   t[3] = -(l[0] * a[3] + l[1] * a[7] + l[2] * a[11]);
   t[7] = -(l[3] * a[3] + l[4] * a[7] + l[5] * a[11]);
   t[11] = -(l[6] * a[3] + l[7] * a[7] + l[8] * a[11]);
@@ -71,7 +78,8 @@ static void m34_translate(double *o, double x, double y, double z) {
 static void m34_swap_order(const double *p, double *q) {
   double t[12];
   for (int i = 0; i < 3; i++) {
-    for (int j = 0; j < 3; j++) t[i * 4 + j] = p[(2 - i) * 4 + (2 - j)];
+    for (int j = 0; j < 3; j++)
+      t[i * 4 + j] = p[(2 - i) * 4 + (2 - j)];
     t[i * 4 + 3] = p[(2 - i) * 4 + 3];
   }
   memcpy(q, t, sizeof t);
@@ -154,10 +162,12 @@ double r3d_regvol_parse_um(const char *path) {
   const char *p = path;
   while ((p = strstr(p, "um")) != NULL) {
     const char *q = p; /* walk back over the number ending at "um" */
-    while (q > path && ((q[-1] >= '0' && q[-1] <= '9') || q[-1] == '.')) q--;
+    while (q > path && ((q[-1] >= '0' && q[-1] <= '9') || q[-1] == '.'))
+      q--;
     if (q != p) { /* "volume" has no digits before its "um" and skips here */
       double v = strtod(q, NULL);
-      if (v > 0.05 && v < 1000.0) return v;
+      if (v > 0.05 && v < 1000.0)
+        return v;
     }
     p += 2;
   }
@@ -166,9 +176,11 @@ double r3d_regvol_parse_um(const char *path) {
 
 /* ---- open / close -------------------------------------------------------- */
 
-int r3d_regvol_open(r3d_regvol *rv, const char *moving_root, const uint32_t fixed_dim[3]) {
+int r3d_regvol_open(r3d_regvol *rv, const char *moving_root,
+                    const uint32_t fixed_dim[3]) {
   memset(rv, 0, sizeof *rv);
-  if (r3d_cpuvol_open(&rv->mv, moving_root, 1024) != 0) return -1;
+  if (r3d_cpuvol_open(&rv->mv, moving_root, 1024) != 0)
+    return -1;
   snprintf(rv->root, sizeof rv->root, "%s", moving_root);
   memcpy(rv->fdim, fixed_dim, sizeof rv->fdim);
   m34_identity(rv->M);
@@ -182,7 +194,8 @@ int r3d_regvol_open(r3d_regvol *rv, const char *moving_root, const uint32_t fixe
 }
 
 void r3d_regvol_close(r3d_regvol *rv) {
-  if (!rv->open) return;
+  if (!rv->open)
+    return;
   if (rv->th_up) { /* let a running job finish; its result is dropped */
     pthread_join(rv->th, NULL);
     rv->th_up = false;
@@ -190,67 +203,142 @@ void r3d_regvol_close(r3d_regvol *rv) {
   r3d_cpuvol_close(&rv->mv);
   pthread_mutex_destroy(&rv->mu);
   free(rv->scratch);
+  free(rv->retry);
   memset(rv, 0, sizeof *rv);
+}
+
+/* Only incomplete outputs carry retry state; complete atlas slots retain
+ * their transform generation indefinitely. Direct-map collisions merely
+ * retry earlier: the renderer never stamps a complete key on partial data. */
+#define REG_RETRY_SLOTS 4096u
+#define REG_RETRY_NS 1000000000ull
+struct reg_retry {
+  uint32_t level, x, y, z, edge, gen;
+  uint64_t until;
+};
+static uint64_t reg_now_ns(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+static uint32_t reg_retry_index(uint32_t level, uint32_t x, uint32_t y,
+                                uint32_t z, uint32_t edge) {
+  return (r3d_cell_hash(x, y, z) ^ (level * 71u) ^ edge) &
+         (REG_RETRY_SLOTS - 1u);
+}
+static bool reg_retry_matches(const struct reg_retry *e, uint32_t level,
+                              uint32_t x, uint32_t y, uint32_t z, uint32_t edge,
+                              uint32_t gen) {
+  return e->until && e->level == level && e->x == x && e->y == y && e->z == z &&
+         e->edge == edge && e->gen == gen;
+}
+static bool reg_retry_wait(r3d_regvol *rv, uint32_t level, uint32_t x,
+                           uint32_t y, uint32_t z, uint32_t edge) {
+  bool wait = false;
+  pthread_mutex_lock(&rv->mu);
+  struct reg_retry *table = rv->retry;
+  if (table) {
+    struct reg_retry *e = &table[reg_retry_index(level, x, y, z, edge)];
+    wait = reg_retry_matches(e, level, x, y, z, edge, atomic_load(&rv->gen)) &&
+           reg_now_ns() < e->until;
+  }
+  pthread_mutex_unlock(&rv->mu);
+  return wait;
+}
+static void reg_retry_result(r3d_regvol *rv, uint32_t level, uint32_t x,
+                             uint32_t y, uint32_t z, uint32_t edge,
+                             uint32_t gen, bool complete) {
+  pthread_mutex_lock(&rv->mu);
+  if (!rv->retry && !complete)
+    rv->retry = calloc(REG_RETRY_SLOTS, sizeof(struct reg_retry));
+  struct reg_retry *table = rv->retry;
+  if (table) {
+    struct reg_retry *e = &table[reg_retry_index(level, x, y, z, edge)];
+    if (!complete)
+      *e = (struct reg_retry){
+          level, x, y, z, edge, gen, reg_now_ns() + REG_RETRY_NS};
+    else if (reg_retry_matches(e, level, x, y, z, edge, gen))
+      e->until = 0;
+  }
+  pthread_mutex_unlock(&rv->mu);
 }
 
 /* ---- renderer source: per-brick resample --------------------------------- */
 
 /* moving mip level whose voxel pitch best matches one output texel */
-static uint32_t reg_pick_level(const r3d_regvol *rv, const double *P, uint32_t level) {
+static uint32_t reg_pick_level(const r3d_regvol *rv, const double *P,
+                               uint32_t level) {
   double s = cbrt(fabs(m34_det(P)));
-  if (!(s > 1e-12)) s = 1.0;
+  if (!(s > 1e-12))
+    s = 1.0;
   double step = s * (double)(1u << level);
   int ml = (int)floor(log2(step) + 0.5);
-  if (ml < 0) ml = 0;
-  if ((uint32_t)ml >= rv->mv.nlev) ml = (int)rv->mv.nlev - 1;
+  if (ml < 0)
+    ml = 0;
+  if ((uint32_t)ml >= rv->mv.nlev)
+    ml = (int)rv->mv.nlev - 1;
   return (uint32_t)ml;
 }
 
 /* moving-space AABB (base voxels) of one fixed brick */
-static void reg_brick_aabb(const double *P, uint32_t level, uint32_t bx, uint32_t by,
-                           uint32_t bz, uint32_t edge, double mn[3], double mx[3]) {
+static void reg_brick_aabb(const double *P, uint32_t level, uint32_t bx,
+                           uint32_t by, uint32_t bz, uint32_t edge,
+                           double mn[3], double mx[3]) {
   for (int a = 0; a < 3; a++) {
     mn[a] = 1e300;
     mx[a] = -1e300;
   }
   for (int k = 0; k < 8; k++) {
-    double w[3] = {(double)(((uint64_t)bx * edge + ((k & 1) ? edge : 0)) << level),
-                   (double)(((uint64_t)by * edge + ((k & 2) ? edge : 0)) << level),
-                   (double)(((uint64_t)bz * edge + ((k & 4) ? edge : 0)) << level)};
+    double w[3] = {
+        (double)(((uint64_t)bx * edge + ((k & 1) ? edge : 0)) << level),
+        (double)(((uint64_t)by * edge + ((k & 2) ? edge : 0)) << level),
+        (double)(((uint64_t)bz * edge + ((k & 4) ? edge : 0)) << level)};
     double m[3];
     m34_apply(P, w, m);
     for (int a = 0; a < 3; a++) {
-      if (m[a] < mn[a]) mn[a] = m[a];
-      if (m[a] > mx[a]) mx[a] = m[a];
+      if (m[a] < mn[a])
+        mn[a] = m[a];
+      if (m[a] > mx[a])
+        mx[a] = m[a];
     }
   }
 }
 
-static uint32_t reg_srcgen(void *ctx, uint32_t level, uint32_t bx, uint32_t by, uint32_t bz, uint32_t edge) {
+static uint32_t reg_srcgen(void *ctx, uint32_t level, uint32_t bx, uint32_t by,
+                           uint32_t bz, uint32_t edge) {
   r3d_regvol *rv = ctx;
-  if (!rv->open) return 0;
+  if (!rv->open || reg_retry_wait(rv, level, bx, by, bz, edge))
+    return 0;
   double P[12];
   r3d_regvol_pull(rv, P);
   double mn[3], mx[3];
   reg_brick_aabb(P, level, bx, by, bz, edge, mn, mx);
   double dim[3] = {(double)rv->mv.nx, (double)rv->mv.ny, (double)rv->mv.nz};
   for (int a = 0; a < 3; a++)
-    if (mx[a] < 0.0 || mn[a] >= dim[a]) return 0; /* outside the moving scan */
+    if (mx[a] < 0.0 || mn[a] >= dim[a])
+      return 0; /* outside the moving scan */
   return rv->gen;
 }
 
-static double tri_scratch(const uint8_t *s, int64_t nx, int64_t ny, int64_t nz, double x,
-                          double y, double z) {
+static double tri_scratch(const uint8_t *s, int64_t nx, int64_t ny, int64_t nz,
+                          double x, double y, double z) {
   if (x <= -0.5 || y <= -0.5 || z <= -0.5 || x >= (double)nx - 0.5 ||
       y >= (double)ny - 0.5 || z >= (double)nz - 0.5)
     return 0.0;
-  int64_t x0 = (int64_t)floor(x), y0 = (int64_t)floor(y), z0 = (int64_t)floor(z);
-  if (x0 < 0) x0 = 0;
-  if (y0 < 0) y0 = 0;
-  if (z0 < 0) z0 = 0;
-  if (x0 > nx - 2) x0 = nx - 2;
-  if (y0 > ny - 2) y0 = ny - 2;
-  if (z0 > nz - 2) z0 = nz - 2;
+  int64_t x0 = (int64_t)floor(x), y0 = (int64_t)floor(y),
+          z0 = (int64_t)floor(z);
+  if (x0 < 0)
+    x0 = 0;
+  if (y0 < 0)
+    y0 = 0;
+  if (z0 < 0)
+    z0 = 0;
+  if (x0 > nx - 2)
+    x0 = nx - 2;
+  if (y0 > ny - 2)
+    y0 = ny - 2;
+  if (z0 > nz - 2)
+    z0 = nz - 2;
   double fx = x - (double)x0, fy = y - (double)y0, fz = z - (double)z0;
   fx = fx < 0 ? 0 : fx > 1 ? 1 : fx;
   fy = fy < 0 ? 0 : fy > 1 ? 1 : fy;
@@ -265,12 +353,13 @@ static double tri_scratch(const uint8_t *s, int64_t nx, int64_t ny, int64_t nz, 
   return c0 + fz * (c1 - c0);
 }
 
-static void reg_srcfetch(void *ctx, uint32_t level, uint32_t bx, uint32_t by, uint32_t bz,
-                         uint8_t *out, uint32_t edge) {
+static bool reg_srcfetch(void *ctx, uint32_t level, uint32_t bx, uint32_t by,
+                         uint32_t bz, uint8_t *out, uint32_t edge,
+                         bool status) {
   r3d_regvol *rv = ctx;
   if (!rv->open) {
     memset(out, 0, (edge * edge * edge));
-    return;
+    return true;
   }
   double P[12];
   r3d_regvol_pull(rv, P);
@@ -284,16 +373,21 @@ static void reg_srcfetch(void *ctx, uint32_t level, uint32_t bx, uint32_t by, ui
   bool empty = false;
   for (int a = 0; a < 3; a++) {
     double lo = mn[a] * linv - 1.5, hi = mx[a] * linv + 1.5;
-    if (lo < -1.0) lo = -1.0;
-    if (hi > ldim[a] + 1.0) hi = ldim[a] + 1.0;
+    if (lo < -1.0)
+      lo = -1.0;
+    if (hi > ldim[a] + 1.0)
+      hi = ldim[a] + 1.0;
     o0[a] = (int64_t)floor(lo);
     on[a] = (int64_t)ceil(hi) - o0[a] + 1;
-    if (on[a] < 3) empty = true;
+    if (on[a] < 3)
+      empty = true;
   }
-  if (empty || mx[0] < 0.0 || mx[1] < 0.0 || mx[2] < 0.0 || mn[0] >= ldim[0] * (double)(1u << ml) ||
-      mn[1] >= ldim[1] * (double)(1u << ml) || mn[2] >= ldim[2] * (double)(1u << ml)) {
+  if (empty || mx[0] < 0.0 || mx[1] < 0.0 || mx[2] < 0.0 ||
+      mn[0] >= ldim[0] * (double)(1u << ml) ||
+      mn[1] >= ldim[1] * (double)(1u << ml) ||
+      mn[2] >= ldim[2] * (double)(1u << ml)) {
     memset(out, 0, (edge * edge * edge));
-    return;
+    return true;
   }
   size_t need = (size_t)on[0] * (size_t)on[1] * (size_t)on[2];
   double base_step = (double)(1u << level);
@@ -304,8 +398,14 @@ static void reg_srcfetch(void *ctx, uint32_t level, uint32_t bx, uint32_t by, ui
       rv->scratch_cap = rv->scratch ? need : 0;
     }
     if (rv->scratch) {
-      r3d_cpuvol_read_block(&rv->mv, ml, o0[0], o0[1], o0[2], (uint32_t)on[0], (uint32_t)on[1],
-                            (uint32_t)on[2], rv->scratch);
+      bool complete = true;
+      if (status)
+        complete = r3d_cpuvol_read_block_status(
+            &rv->mv, ml, o0[0], o0[1], o0[2], (uint32_t)on[0], (uint32_t)on[1],
+            (uint32_t)on[2], rv->scratch);
+      else
+        r3d_cpuvol_read_block(&rv->mv, ml, o0[0], o0[1], o0[2], (uint32_t)on[0],
+                              (uint32_t)on[1], (uint32_t)on[2], rv->scratch);
       /* per-output-voxel moving coord via incremental adds along x */
       double dmx[3] = {P[0] * base_step, P[4] * base_step, P[8] * base_step};
       size_t o = 0;
@@ -316,21 +416,24 @@ static void reg_srcfetch(void *ctx, uint32_t level, uint32_t bx, uint32_t by, ui
                          (double)(((uint64_t)bz * edge + oz) << level)};
           double m[3];
           m34_apply(P, w, m);
-          double lx = m[0] * linv - (double)o0[0], ly = m[1] * linv - (double)o0[1],
+          double lx = m[0] * linv - (double)o0[0],
+                 ly = m[1] * linv - (double)o0[1],
                  lz = m[2] * linv - (double)o0[2];
           double sx = dmx[0] * linv, sy = dmx[1] * linv, sz = dmx[2] * linv;
           for (uint32_t ox = 0; ox < edge; ox++, o++) {
-            double v = tri_scratch(rv->scratch, on[0], on[1], on[2], lx, ly, lz);
+            double v =
+                tri_scratch(rv->scratch, on[0], on[1], on[2], lx, ly, lz);
             out[o] = (uint8_t)(v + 0.5);
             lx += sx;
             ly += sy;
             lz += sz;
           }
         }
-      return;
+      return complete;
     }
   }
   /* oversized footprint (extreme rotation/scale): per-sample fallback */
+  bool complete = true;
   size_t o = 0;
   for (uint32_t oz = 0; oz < edge; oz++)
     for (uint32_t oy = 0; oy < edge; oy++)
@@ -340,29 +443,65 @@ static void reg_srcfetch(void *ctx, uint32_t level, uint32_t bx, uint32_t by, ui
                        (double)(((uint64_t)bz * edge + oz) << level)};
         double m[3];
         m34_apply(P, w, m);
-        double v = r3d_cpuvol_tri(&rv->mv, ml, m, NULL);
+        double v;
+        if (status) {
+          int64_t origin[3];
+          double fraction[3];
+          for (int a = 0; a < 3; a++) {
+            double c = m[a] * linv;
+            origin[a] = (int64_t)floor(c);
+            fraction[a] = c - (double)origin[a];
+          }
+          uint8_t sample[8];
+          bool available = r3d_cpuvol_read_block_status(
+              &rv->mv, ml, origin[0], origin[1], origin[2], 2, 2, 2, sample);
+          complete = complete && available;
+          v = tri_scratch(sample, 2, 2, 2, fraction[0], fraction[1],
+                          fraction[2]);
+        } else
+          v = r3d_cpuvol_tri(&rv->mv, ml, m, NULL);
         out[o] = (uint8_t)(v + 0.5);
       }
+  return complete;
 }
 
-uint32_t r3d_regvol_srcgen(void *v, uint32_t l, uint32_t x, uint32_t y, uint32_t z) {
-  return reg_srcgen(v,l,x,y,z,128);
+uint32_t r3d_regvol_srcgen(void *v, uint32_t l, uint32_t x, uint32_t y,
+                           uint32_t z) {
+  return reg_srcgen(v, l, x, y, z, 128);
 }
-void r3d_regvol_srcfetch(void *v, uint32_t l, uint32_t x, uint32_t y, uint32_t z, uint8_t *out) {
-  reg_srcfetch(v,l,x,y,z,out,128);
+void r3d_regvol_srcfetch(void *v, uint32_t l, uint32_t x, uint32_t y,
+                         uint32_t z, uint8_t *out) {
+  (void)reg_srcfetch(v, l, x, y, z, out, 128, false);
 }
-uint32_t r3d_regvol_blockgen(void *v, uint32_t l, uint32_t x, uint32_t y, uint32_t z) {
-  return reg_srcgen(v,l,x,y,z,16);
+uint32_t r3d_regvol_blockgen(void *v, uint32_t l, uint32_t x, uint32_t y,
+                             uint32_t z) {
+  return reg_srcgen(v, l, x, y, z, 16);
 }
-void r3d_regvol_blockfetch(void *v, uint32_t l, uint32_t x, uint32_t y, uint32_t z, uint8_t *out) {
-  reg_srcfetch(v,l,x,y,z,out,16);
+void r3d_regvol_blockfetch(void *v, uint32_t l, uint32_t x, uint32_t y,
+                           uint32_t z, uint8_t *out) {
+  (void)reg_srcfetch(v, l, x, y, z, out, 16, false);
+}
+
+bool r3d_regvol_blockfetch_complete(void *v, uint32_t l, uint32_t x, uint32_t y,
+                                    uint32_t z, uint8_t *out) {
+  r3d_regvol *rv = v;
+  if (!rv->open) {
+    memset(out, 0, 4096);
+    return true;
+  }
+  uint32_t gen = atomic_load(&rv->gen);
+  bool complete = reg_srcfetch(v, l, x, y, z, out, 16, true);
+  complete = complete && gen == atomic_load(&rv->gen);
+  reg_retry_result(rv, l, x, y, z, 16, gen, complete);
+  return complete;
 }
 
 /* ---- transform.json ------------------------------------------------------ */
 
 static char *read_file(const char *path, size_t *n) {
   FILE *f = fopen(path, "rb");
-  if (!f) return NULL;
+  if (!f)
+    return NULL;
   fseek(f, 0, SEEK_END);
   long ln = ftell(f);
   fseek(f, 0, SEEK_SET);
@@ -374,7 +513,8 @@ static char *read_file(const char *path, size_t *n) {
   fclose(f);
   if (s) {
     s[ln] = 0;
-    if (n) *n = (size_t)ln;
+    if (n)
+      *n = (size_t)ln;
   }
   return s;
 }
@@ -382,7 +522,8 @@ static char *read_file(const char *path, size_t *n) {
 /* collect the first `want` numbers after `key` (tolerant of nesting/rows) */
 static int json_nums(const char *s, const char *key, double *out, int want) {
   const char *p = strstr(s, key);
-  if (!p) return -1;
+  if (!p)
+    return -1;
   p += strlen(key);
   int got = 0;
   while (*p && got < want) {
@@ -395,7 +536,8 @@ static int json_nums(const char *s, const char *key, double *out, int want) {
         continue;
       }
     }
-    if (*p == '}' && got > 0) break; /* ran off the array */
+    if (*p == '}' && got > 0)
+      break; /* ran off the array */
     p++;
   }
   return got == want ? 0 : -1;
@@ -403,7 +545,8 @@ static int json_nums(const char *s, const char *key, double *out, int want) {
 
 int r3d_regvol_load_json(r3d_regvol *rv, const char *path) {
   char *s = read_file(path, NULL);
-  if (!s) return -1;
+  if (!s)
+    return -1;
   double m[12];
   int rc = -1;
   if (json_nums(s, "\"pull_matrix_xyz\"", m, 12) == 0) {
@@ -436,17 +579,19 @@ int r3d_regvol_load_json(r3d_regvol *rv, const char *path) {
 int r3d_regvol_save_json(r3d_regvol *rv, const char *path) {
   double P[12], fwd[12];
   r3d_regvol_pull(rv, P);
-  if (m34_invert(P, fwd) != 0) return -1;
+  if (m34_invert(P, fwd) != 0)
+    return -1;
   FILE *f = fopen(path, "w");
-  if (!f) return -1;
+  if (!f)
+    return -1;
   fprintf(f, "{\n  \"transformation_matrix\": [\n");
   for (int r = 0; r < 3; r++)
-    fprintf(f, "    [%.12g, %.12g, %.12g, %.12g]%s\n", fwd[r * 4], fwd[r * 4 + 1],
-            fwd[r * 4 + 2], fwd[r * 4 + 3], r < 2 ? "," : "");
+    fprintf(f, "    [%.12g, %.12g, %.12g, %.12g]%s\n", fwd[r * 4],
+            fwd[r * 4 + 1], fwd[r * 4 + 2], fwd[r * 4 + 3], r < 2 ? "," : "");
   fprintf(f, "  ],\n  \"pull_matrix_xyz\": [\n");
   for (int r = 0; r < 3; r++)
-    fprintf(f, "    [%.12g, %.12g, %.12g, %.12g]%s\n", P[r * 4], P[r * 4 + 1], P[r * 4 + 2],
-            P[r * 4 + 3], r < 2 ? "," : "");
+    fprintf(f, "    [%.12g, %.12g, %.12g, %.12g]%s\n", P[r * 4], P[r * 4 + 1],
+            P[r * 4 + 2], P[r * 4 + 3], r < 2 ? "," : "");
   fprintf(f,
           "  ],\n  \"axis_order\": \"xyz\",\n"
           "  \"direction\": \"transformation_matrix maps moving->fixed voxels; "
@@ -469,15 +614,19 @@ static void *reg_worker(void *a) {
   r3d_cpuvol fx;
   bool fx_ok = false;
   int st = 3;
-  if (!ff || !mf || !u8) goto done;
-  if (r3d_cpuvol_open(&fx, rv->fixed_root, 768) != 0) goto done;
+  if (!ff || !mf || !u8)
+    goto done;
+  if (r3d_cpuvol_open(&fx, rv->fixed_root, 768) != 0)
+    goto done;
   fx_ok = true;
   {
     int64_t o0[3];
     for (int q = 0; q < 3; q++)
-      o0[q] = (int64_t)llround(rv->job_ctr[q] / (double)(1u << Lr)) - (int64_t)rv->job_half;
+      o0[q] = (int64_t)llround(rv->job_ctr[q] / (double)(1u << Lr)) -
+              (int64_t)rv->job_half;
     r3d_cpuvol_read_block(&fx, Lr, o0[0], o0[1], o0[2], n, n, n, u8);
-    for (size_t i = 0; i < vn; i++) ff[i] = (float)u8[i] * (1.0f / 255.0f);
+    for (size_t i = 0; i < vn; i++)
+      ff[i] = (float)u8[i] * (1.0f / 255.0f);
     uint32_t ml = reg_pick_level(rv, rv->job_P, Lr);
     size_t i = 0;
     for (uint32_t z = 0; z < n; z++)
@@ -501,7 +650,8 @@ static void *reg_worker(void *a) {
     }
     double mc[12];
     m34_identity(mc); /* correction, ROI coords, fysics (z,y,x) order */
-    if (fy_register_affine(ff, mf, (int)n, (int)n, (int)n, mc, rv->job_mode == 1) != 0)
+    if (fy_register_affine(ff, mf, (int)n, (int)n, (int)n, mc,
+                           rv->job_mode == 1) != 0)
       goto done;
     rv->ncc1 = fy_ncc_warped(ff, mf, (int)n, (int)n, (int)n, mc);
     /* compose the ROI-space correction into the pull map (base xyz coords):
@@ -511,17 +661,18 @@ static void *reg_worker(void *a) {
     double up = (double)(1u << Lr), dn = 1.0 / up;
     m34_translate(t, -(double)o0[0], -(double)o0[1], -(double)o0[2]);
     memcpy(sc, (double[12]){dn, 0, 0, 0, 0, dn, 0, 0, 0, 0, dn, 0}, sizeof sc);
-    m34_mul(t, t, sc);   /* T(-o0) S(dn) */
-    m34_mul(cx, cx, t);  /* C ... */
+    m34_mul(t, t, sc);  /* T(-o0) S(dn) */
+    m34_mul(cx, cx, t); /* C ... */
     m34_translate(t, (double)o0[0], (double)o0[1], (double)o0[2]);
-    m34_mul(cx, t, cx);  /* T(+o0) ... */
+    m34_mul(cx, t, cx); /* T(+o0) ... */
     memcpy(sc, (double[12]){up, 0, 0, 0, 0, up, 0, 0, 0, 0, up, 0}, sizeof sc);
     m34_mul(cx, sc, cx); /* S(up) ... */
     m34_mul(rv->job_Mnew, rv->job_P, cx);
     st = 2;
   }
 done:
-  if (fx_ok) r3d_cpuvol_close(&fx);
+  if (fx_ok)
+    r3d_cpuvol_close(&fx);
   free(ff);
   free(mf);
   free(u8);
@@ -529,9 +680,10 @@ done:
   return NULL;
 }
 
-int r3d_regvol_job_start(r3d_regvol *rv, const char *fixed_root, int mode, const double ctr[3],
-                         uint32_t half, uint32_t level) {
-  if (!rv->open || atomic_load(&rv->state) == 1) return -1;
+int r3d_regvol_job_start(r3d_regvol *rv, const char *fixed_root, int mode,
+                         const double ctr[3], uint32_t half, uint32_t level) {
+  if (!rv->open || atomic_load(&rv->state) == 1)
+    return -1;
   if (rv->th_up) {
     pthread_join(rv->th, NULL);
     rv->th_up = false;
@@ -553,9 +705,12 @@ int r3d_regvol_job_start(r3d_regvol *rv, const char *fixed_root, int mode, const
 
 int r3d_regvol_job_poll(r3d_regvol *rv, bool *ok) {
   int st = atomic_load(&rv->state);
-  if (st == 1) return 1;
-  if (ok) *ok = st != 3;
-  if (st == 0) return 0;
+  if (st == 1)
+    return 1;
+  if (ok)
+    *ok = st != 3;
+  if (st == 0)
+    return 0;
   if (rv->th_up) {
     pthread_join(rv->th, NULL);
     rv->th_up = false;

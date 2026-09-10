@@ -291,9 +291,15 @@ int r3d_vkctx_create(r3d_vkctx *c, const char *const *inst_exts, uint32_t n_inst
       .queueCount = 1,
       .pQueuePriorities = &prio,
   };
+  if (!f2.features.shaderStorageImageExtendedFormats) {
+    fprintf(stderr, "vk: R8 storage images require shaderStorageImageExtendedFormats\n");
+    return -1;
+  }
+  VkPhysicalDeviceFeatures en_features = {.shaderStorageImageExtendedFormats = VK_TRUE};
   VkDeviceCreateInfo dci = {
       .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
       .pNext = &en12,
+      .pEnabledFeatures = &en_features,
       .queueCreateInfoCount = 1,
       .pQueueCreateInfos = &qci,
       .enabledExtensionCount = ndev_exts,

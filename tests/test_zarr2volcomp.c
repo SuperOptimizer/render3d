@@ -15,6 +15,7 @@
 #include <unistd.h>
 
 #include "core/cpuvol.h"
+#include "codec/tifxyz.h"
 
 static int failures = 0;
 #define CHECK(cond)                                                   \
@@ -52,18 +53,19 @@ static int write_zarray(const char *mirror, uint32_t edge, uint32_t chunk) {
   return fclose(f) == 0 ? 0 : -1;
 }
 
-static int write_chunks(const char *mirror) {
-  uint8_t *buf = malloc(CHUNK_BYTES);
+static int write_chunks(const char *mirror, uint32_t chunk) {
+  size_t bytes = (size_t)chunk * chunk * chunk;
+  uint8_t *buf = malloc(bytes);
   if (!buf) return -1;
   int rc = 0;
   for (uint32_t cz = 0; cz < 2 && rc == 0; cz++)
     for (uint32_t cy = 0; cy < 2 && rc == 0; cy++)
       for (uint32_t cx = 0; cx < 2 && rc == 0; cx++) {
-        for (uint32_t z = 0; z < ZB; z++)
-          for (uint32_t y = 0; y < ZB; y++)
-            for (uint32_t x = 0; x < ZB; x++)
-              buf[((size_t)z * ZB + y) * ZB + x] =
-                  zpat(cx * ZB + x, cy * ZB + y, cz * ZB + z);
+        for (uint32_t z = 0; z < chunk; z++)
+          for (uint32_t y = 0; y < chunk; y++)
+            for (uint32_t x = 0; x < chunk; x++)
+              buf[((size_t)z * chunk + y) * chunk + x] =
+                  zpat(cx * chunk + x, cy * chunk + y, cz * chunk + z);
         char p[760];
         snprintf(p, sizeof p, "%s/0/%u", mirror, cz);
         if (mkdir(p, 0755) != 0 && errno != EEXIST) rc = -1;
@@ -71,7 +73,7 @@ static int write_chunks(const char *mirror) {
         if (rc == 0 && mkdir(p, 0755) != 0 && errno != EEXIST) rc = -1;
         snprintf(p, sizeof p, "%s/0/%u/%u/%u", mirror, cz, cy, cx);
         FILE *f = rc == 0 ? fopen(p, "wb") : NULL;
-        if (!f || fwrite(buf, 1, CHUNK_BYTES, f) != CHUNK_BYTES) rc = -1;
+        if (!f || fwrite(buf, 1, bytes, f) != bytes) rc = -1;
         if (f && fclose(f) != 0) rc = -1;
       }
   free(buf);
@@ -98,9 +100,9 @@ int main(int argc, char **argv) {
   snprintf(out, sizeof out, "%s/out", tmp);
   CHECK(mkdir(mirror, 0755) == 0);
   CHECK(write_zarray(mirror, ZDIM, ZB) == 0);
-  CHECK(write_chunks(mirror) == 0);
+  CHECK(write_chunks(mirror, ZB) == 0);
   char cmd[2048];
-  snprintf(cmd, sizeof cmd, "%s %s %s --threads 2 --volcomp-quality 2 --full-from 0 >%s/z.log 2>&1",
+  snprintf(cmd, sizeof cmd, "%s %s %s --threads 2 --mem-budget-mb 128 --volcomp-quality 2 --full-from 0 >%s/z.log 2>&1",
            argv[1], mirror, out, tmp);
   CHECK(system(cmd) == 0);
   /* the produced tree decodes back to the source voxels */
@@ -121,6 +123,51 @@ int main(int argc, char **argv) {
     CHECK(v.nx == ZDIM);
     r3d_cpuvol_close(&v);
   }
+  /*192³ source chunks overlap128³ outputs and the rolling band boundary.
+   * The old1GiB assembly ignored this128MiB budget. */
+  char odd[600], oddout[600];
+  snprintf(odd, sizeof odd, "%s/odd", tmp);
+  snprintf(oddout, sizeof oddout, "%s/oddout", tmp);
+  CHECK(mkdir(odd, 0755) == 0);
+  CHECK(write_zarray(odd, 384, 192) == 0);
+  CHECK(write_chunks(odd, 192) == 0);
+  snprintf(cmd, sizeof cmd, "%s %s %s --threads 8 --mem-budget-mb 128 --full-from 0 >%s/odd.log 2>&1",
+           argv[1], odd, oddout, tmp);
+  CHECK(system(cmd) == 0);
+  CHECK(r3d_cpuvol_open(&v, oddout, 16) == 0);
+  uint8_t *cross = malloc(80u * 40u * 40u);
+  CHECK(cross != NULL);
+  if (cross) {
+    r3d_cpuvol_read_block(&v, 0, 120, 180, 180, 80, 40, 40, cross);
+    double error = 0;
+    for (uint32_t z = 0; z < 40; z++)
+      for (uint32_t y = 0; y < 40; y++)
+        for (uint32_t x = 0; x < 80; x++)
+          error += fabs((double)cross[(z * 40u + y) * 80u + x] - zpat(x+120,y+180,z+180));
+    CHECK(error / (80.0 * 40.0 * 40.0) < 2.0);
+    free(cross);
+  }
+  r3d_cpuvol_close(&v);
+  /* Missing selective input cannot publish a partial shard after earlier
+   * rolling bands have already been encoded to the temporary file. */
+  char surface[600];
+  snprintf(surface, sizeof surface, "%s/surface", tmp);
+  float point = 192;
+  uint8_t metadata[] = "{\"scale\": [1, 1]}";
+  r3d_surface_data surf = {.w=1, .h=1, .plane={&point,&point,&point},
+                           .meta=metadata, .meta_len=sizeof metadata-1};
+  CHECK(r3d_surface_save_dir(surface, &surf) == 0);
+  snprintf(cmd, sizeof cmd, "%s %s %s/incomplete --threads 2 --mem-budget-mb 128 --full-from 1 --surface %s --pad 384 >%s/missing.log 2>&1",
+           argv[1], odd, tmp, surface, tmp);
+  char missing_path[700];
+  snprintf(missing_path, sizeof missing_path, "%s/0/1/1/1", odd);
+  CHECK(unlink(missing_path) == 0);
+  CHECK(system(cmd) != 0);
+  snprintf(missing_path, sizeof missing_path, "%s/incomplete/volcomp/L0/0_0_0.vcs", tmp);
+  CHECK(access(missing_path, F_OK) != 0);
+  snprintf(cmd, sizeof cmd, "%s %s %s/toosmall --threads 2 --mem-budget-mb 16 --full-from 0 >%s/budget.log 2>&1",
+           argv[1], odd, tmp, tmp);
+  CHECK(system(cmd) != 0);
   /* pathological chunk edge: rejected up front, no multi-GiB assembly */
   char bad[600];
   snprintf(bad, sizeof bad, "%s/bad", tmp);

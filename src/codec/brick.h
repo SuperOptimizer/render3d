@@ -14,4 +14,6 @@ int volcomp_brick_decode(const uint8_t *in, size_t n, uint8_t *dst,
                          uint32_t dim);
 int r3d_decode_block(const uint8_t *in, size_t n, uint32_t bz, uint32_t by,
                      uint32_t bx, uint8_t *dst);
+/* Validate header/tables and encoded substream bounds, without decoding voxels. */
+int r3d_validate_brick(const uint8_t *in, size_t n);
 #endif

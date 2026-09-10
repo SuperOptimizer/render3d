@@ -119,7 +119,7 @@ static inline int st_make_tree(const char *root, const uint32_t dim[3], uint32_t
           dim[2], dim[1], dim[0]);
   for (uint32_t l = 0; l < nlev; l++) {
     uint32_t d[3];
-    for (int a = 0; a < 3; a++) d[a] = l ? (dim[a] + 1u) / 2u : dim[a];
+    for (int a = 0; a < 3; a++) d[a] = (dim[a] >> l) + ((dim[a] & ((1u << l) - 1u)) != 0u);
     fprintf(f,
             "    {\"level\": %u, \"scale\": %u, \"shape\": [%u, %u, %u],"
             " \"shards\": [1, 1, 1], \"volcomp\": \"volcomp/L%u/{z}_{y}_{x}.vcs\"}%s\n",
@@ -130,7 +130,7 @@ static inline int st_make_tree(const char *root, const uint32_t dim[3], uint32_t
   for (uint32_t l = 0; l < nlev; l++) {
     uint32_t d[3], nb[3];
     for (int a = 0; a < 3; a++) {
-      d[a] = l ? (dim[a] + 1u) / 2u : dim[a];
+      d[a] = (dim[a] >> l) + ((dim[a] & ((1u << l) - 1u)) != 0u);
       nb[a] = (d[a] + ST_B - 1u) / ST_B;
     }
     if (st_write_level(root, l, nb, l >= content_min) != 0) return -1;
@@ -152,6 +152,8 @@ static inline void st_rm_tree(const char *root, uint32_t nlev) {
   unlink(p);
   snprintf(p, sizeof p, "%s/seed.raw", root);
   unlink(p); /* the renderer caches its coarsest-level decode here */
+  snprintf(p, sizeof p, "%s/seed-deblock.raw", root);
+  unlink(p);
   rmdir(root);
 }
 

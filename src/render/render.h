@@ -42,8 +42,10 @@ int r3d_clip_frame(r3d_renderer *r, double fx, double fy, uint64_t z0, r3d_frame
 
 /* Volume-compressor storage chunks (128^3) are CPU decoded into requested
  * 16^3 blocks and uploaded to the R8 atlas. warm_mb budgets shared compressed
- * chunks; pool_bpa budgets N^3 resident 16^3 GPU blocks. A standalone shard
+ * copies when nonzero (zero uses immutable mmap directly); pool_bpa budgets N^3 resident 16^3 GPU blocks. A standalone shard
  * that fits the pool uses identity residency; manifests stream by LOD. */
+/* Validate source metadata without changing the active renderer. */
+int r3d_bricks_validate(const char *path);
 int r3d_bricks_begin(r3d_renderer *r, const char *shard_path, uint32_t pool_bpa, uint32_t warm_mb);
 /* Overlay volume (e.g. 3D ink predictions): a second volcomp LOD tree with the
  * SAME shape/levels as the primary manifest. Its bricks share the page table
@@ -78,6 +80,12 @@ typedef struct r3d_label_src {
   void (*fetch)(void *user, uint32_t level, uint32_t bx, uint32_t by, uint32_t bz,
                 uint8_t *out);
   void *user;
+  /* Optional O(1) content revision. Must change for every source mutation.
+   * NULL retains bounded polling, including asynchronous source arrivals. */
+  uint64_t (*revision)(void *user);
+  /* Optional asynchronous source: false uploads provisional bytes without
+   * stamping the requested generation, then retries with bounded polling. */
+  bool (*fetch_complete)(void *user,uint32_t level,uint32_t bx,uint32_t by,uint32_t bz,uint8_t *out);
 } r3d_label_src;
 int r3d_bricks_labels(r3d_renderer *r, const r3d_label_src *src);
 /* Per-frame: re-upload up to `budget` resident slots whose label content
@@ -120,6 +128,8 @@ void r3d_bricks_params(const r3d_renderer *r, r3d_frame_params *p);
  * voxel pitch matches apparent magnification; gate = minimum visible voxel
  * value [0,1] (TF-aware, empty bricks below it never occupy slots); budget =
  * max bricks decoded this call. */
+/* Completed-worker-time budget, bounded to16..256 decoded blocks. */
+uint32_t r3d_bricks_stream_budget(r3d_renderer *r, bool moving);
 void r3d_bricks_stream(r3d_renderer *r, const float eye[3], const float fwd[3], float half_tan,
                        float pixel_cone, uint32_t slice_z0, uint32_t slice_depth, float gate,
                        uint32_t budget);
@@ -142,10 +152,15 @@ void r3d_bricks_extent(const r3d_renderer *r, float extent[3]);
 void r3d_bricks_shape(const r3d_renderer *r, uint32_t shape[3]);
 
 typedef struct r3d_bricks_stats {
-  uint32_t nb, hot, hot_cap;    /* volume bricks; resident slots; pool slots */
+  uint64_t nb;
+  uint32_t hot, hot_cap;    /* volume bricks; resident slots; pool slots */
   uint32_t warm_bricks;         /* compressed bricks in the warm cache */
   uint64_t warm_bytes, warm_cap;
   uint32_t inflight;            /* requests decoded this frame */
+  uint32_t page_probe_max, page_entries, page_capacity;
+  uint64_t slot_probes, compressed_reads, compressed_bytes;
+  uint64_t metadata_bytes; /* page tables and resident/candidate/warm index arrays */
+  uint32_t chunk_entries, candidate_capacity;
   uint64_t decoded, jobs, stream_ns; /* cumulative worker throughput/latency */
   uint32_t failures;
   uint32_t nlevels, lod_wanted[8]; /* latest projected-footprint desired set */
@@ -209,6 +224,7 @@ int r3d_surf_swap(r3d_renderer *r, uint32_t w, uint32_t h, const float *coords_r
  * view's LOD). The surf view raycasts this texture. Call _window each frame
  * with the wanted origin/pitch (rebuilds only on change), _mark when brick
  * residency improved, _params to fill the surf view's FrameParams mapping. */
+void r3d_surfvol_end(r3d_renderer *r);
 int r3d_surfvol_begin(r3d_renderer *r, uint32_t w, uint32_t h, uint32_t layers,
                       uint32_t nback, float sx, float sy);
 void r3d_surfvol_window(r3d_renderer *r, double u0, double v0, float step, float zoff0);

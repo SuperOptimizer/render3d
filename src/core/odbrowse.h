@@ -17,6 +17,8 @@ typedef struct r3d_odlist {
  * prefix e.g. "PHercParis4/volumes/" (empty string lists the root).
  * Returns 0 on success. */
 int r3d_odlist_fetch(const char *bucket_url, const char *prefix, r3d_odlist *out);
+/* Direct child directory links from an HTTP directory index. */
+int r3d_odlist_fetch_http(const char *base, const char *prefix, r3d_odlist *out);
 void r3d_odlist_free(r3d_odlist *l);
 
 #endif /* R3D_ODBROWSE_H */

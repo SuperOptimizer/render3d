@@ -63,6 +63,8 @@ static double fringe(const uint8_t *px, uint32_t w, uint32_t h, uint64_t *conten
 }
 
 int main(int argc, char **argv) {
+  /* Compare raw registration samples to raw CT, independent of display filters. */
+  setenv("R3D_DEBLOCK", "0", 1);
   if (argc != 2) {
     fprintf(stderr, "usage: test_overlay <render3d-binary>\n");
     return 77; /* skip */
