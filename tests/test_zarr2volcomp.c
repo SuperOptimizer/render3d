@@ -157,6 +157,13 @@ int main(int argc, char **argv) {
   r3d_surface_data surf = {.w=1, .h=1, .plane={&point,&point,&point},
                            .meta=metadata, .meta_len=sizeof metadata-1};
   CHECK(r3d_surface_save_dir(surface, &surf) == 0);
+  CHECK(point == 192); /* libtiff prediction must not mutate aliased planes */
+  r3d_surface_data saved = {0};
+  CHECK(r3d_surface_load_dir(surface, &saved) == 0);
+  if (saved.w == 1 && saved.h == 1)
+    for (unsigned a = 0; a < 3; a++) CHECK(saved.plane[a][0] == 192);
+  else CHECK(0);
+  r3d_surface_free(&saved);
   snprintf(cmd, sizeof cmd, "%s %s %s/incomplete --threads 2 --mem-budget-mb 128 --full-from 1 --surface %s --pad 384 >%s/missing.log 2>&1",
            argv[1], odd, tmp, surface, tmp);
   char missing_path[700];

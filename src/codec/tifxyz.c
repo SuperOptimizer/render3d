@@ -295,11 +295,23 @@ int r3d_surface_save_dir(const char *dir, const r3d_surface_data *t) {
     TIFFSetField(f, TIFFTAG_COMPRESSION, COMPRESSION_LZW);
     TIFFSetField(f, TIFFTAG_PREDICTOR, PREDICTOR_FLOATINGPOINT);
     TIFFSetField(f, TIFFTAG_ROWSPERSTRIP, 32);
-    for (uint32_t y = 0; y < t->h; y++)
-      if (TIFFWriteScanline(f, t->plane[a] + (size_t)y * t->w, y, 0) < 0) {
+    /* libtiff before 4.7.1 can apply prediction in place. Never hand it
+     * caller geometry: planes may alias and must survive saving unchanged. */
+    size_t row_bytes = (size_t)t->w * sizeof(float);
+    float *row = malloc(row_bytes);
+    if (!row) {
+      TIFFClose(f);
+      return -1;
+    }
+    for (uint32_t y = 0; y < t->h; y++) {
+      memcpy(row, t->plane[a] + (size_t)y * t->w, row_bytes);
+      if (TIFFWriteScanline(f, row, y, 0) < 0) {
+        free(row);
         TIFFClose(f);
         return -1;
       }
+    }
+    free(row);
     if (!TIFFWriteDirectory(f)) {
       TIFFClose(f);
       return -1;
