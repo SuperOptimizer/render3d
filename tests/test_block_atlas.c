@@ -94,7 +94,7 @@ int main(void) {
          st.page_capacity < 8u * st.hot_cap);
   assert(st.warm_cap==0 && st.warm_bytes==0);
   printf("sparse metadata: %llu virtual pages, %u chunk entries, %llu bytes\n",
-         st.nb,st.chunk_entries,(unsigned long long)st.metadata_bytes);
+         (unsigned long long)st.nb,st.chunk_entries,(unsigned long long)st.metadata_bytes);
   /* A far-away native block proves shader lookup uses the complete virtual
    * ID, not an atlas-sized/dense index or a truncated coordinate key. */
   char farpath[256];
