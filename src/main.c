@@ -6175,6 +6175,26 @@ int main(int argc, char **argv) {
                          "moving at most %.0f voxels along its own normal",
                          (double)low_cut, (double)mv_tr_snapd);
         }
+        { /* joint refine: every stopped tracer solved against the others
+           * (block coordinate descent with cross-sheet no-crossing + spacing) */
+          r3d_tracer_group grp = {0};
+          for (int s3 = 0; s3 < GT_MAX; s3++)
+            if (gts[s3].active && gts[s3].done && gts[s3].nset > 8 && grp.n < R3D_TR_GROUP_MAX)
+              grp.m[grp.n++] = &gts[s3].tr;
+          if (grp.n >= 2 && igButton("joint refine", (ImVec2){0, 0})) {
+            for (uint32_t gi = 0; gi < grp.n; gi++) r3d_tracer_stop(grp.m[gi]);
+            int rounds = r3d_tracer_group_refine(&grp, 3); /* blocking */
+            for (int s3 = 0; s3 < GT_MAX; s3++)
+              if (gts[s3].active) gts[s3].gen = UINT64_MAX; /* re-snapshot all */
+            printf("tracer: joint refine of %u sheets, %d round%s\n", grp.n, rounds,
+                   rounds == 1 ? "" : "s");
+            snprintf(mv_cd_status, sizeof mv_cd_status, "joint refine: %u sheets, %d rounds",
+                     grp.n, rounds);
+          }
+          if (grp.n >= 2 && igIsItemHovered(0))
+            igSetTooltip("re-solve the %u loaded sheets against each other:\n"
+                         "no crossing, spacing pulled toward the local sheet gap", grp.n);
+        }
         if (GT->origin[0]) { /* an edited surface: versions, never the source */
           igSetNextItemWidth(130);
           igSliderFloat("##reoptr", &mv_tr_reopt_r, 3.0f, 16.0f, "regrow radius %.0f", 0);

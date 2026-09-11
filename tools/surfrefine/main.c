@@ -16,7 +16,13 @@
  * the source or inside it) plus DIR.sfc, and a JSON report with before/after
  * QC and the flagged grid tiles (16x16, the segment-store tile size) whose
  * trusted-cell fraction is below 0.5 or that hold a fold/kink. --qc-only
- * loads, measures and reports without solving or saving. */
+ * loads, measures and reports without solving or saving.
+ *
+ *   surfrefine --pred ROOT --group A,B,... --out DIR [--rounds N] [--level L] [--threads N]
+ *
+ * loads several neighbouring surfaces and solves them jointly
+ * (r3d_tracer_group_refine: alternating per-sheet solves with cross-sheet
+ * no-crossing and spacing terms), then saves each as DIR/<name> (+ .sfc). */
 #include <errno.h>
 #include <math.h>
 #include <stdbool.h>
@@ -138,12 +144,118 @@ static int usage(void) {
           "usage: surfrefine --pred ROOT --in SURF --out DIR [--ct-root DIR --ct-cut V]\n"
           "                  [--ct-reach R] [--level L] [--subdivide N] [--no-refine]\n"
           "                  [--no-ctsnap] [--qc-only] [--cutoff C] [--flag-conf F]\n"
-          "                  [--report qc.json] [--threads N]\n");
+          "                  [--report qc.json] [--threads N]\n"
+          "       surfrefine --pred ROOT --group A,B,... --out DIR [--rounds N] [--level L]\n");
   return EXIT_FAILURE;
+}
+
+static const char *surf_base(const char *path, char *buf, size_t n) {
+  size_t len = strlen(path);
+  while (len > 1 && path[len - 1] == '/') len--;
+  size_t start = len;
+  while (start > 0 && path[start - 1] != '/') start--;
+  size_t bl = len - start < n - 1 ? len - start : n - 1;
+  memcpy(buf, path + start, bl);
+  buf[bl] = 0;
+  if (bl > 4 && !strcmp(buf + bl - 4, ".sfc")) buf[bl - 4] = 0;
+  else if (bl > 7 && !strcmp(buf + bl - 7, ".tifxyz")) buf[bl - 7] = 0;
+  return buf;
+}
+
+/* --group: joint refinement of N surfaces */
+static int run_group(const char *pred, const char *group, const char *out, int rounds,
+                     int level, int threads) {
+  char list[4096];
+  snprintf(list, sizeof list, "%s", group);
+  r3d_tracer_group g = {0};
+  static r3d_tracer tr[R3D_TR_GROUP_MAX];
+  char scratch[R3D_TR_GROUP_MAX][1200], name[R3D_TR_GROUP_MAX][256];
+  int rc = EXIT_FAILURE;
+  uint32_t n = 0;
+  for (char *tok = strtok(list, ","); tok && n < R3D_TR_GROUP_MAX; tok = strtok(NULL, ",")) {
+    scratch[n][0] = 0;
+    const char *src = tok;
+    r3d_surf_kind kind = r3d_surf_kind_of(tok);
+    if (kind == R3D_SURF_SFC) {
+      snprintf(scratch[n], sizeof scratch[n], "%s/surfrefine-grp-%ld-%u",
+               getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp", (long)getpid(), n);
+      if (r3d_surf_decode(tok, scratch[n], NULL, NULL)) {
+        fprintf(stderr, "surfrefine: cannot decode %s\n", tok);
+        goto done;
+      }
+      src = scratch[n];
+    } else if (kind != R3D_SURF_TIFXYZ) {
+      fprintf(stderr, "surfrefine: %s is not a surface\n", tok);
+      goto done;
+    }
+    if (path_within(out, tok)) {
+      fprintf(stderr, "surfrefine: --out must not be inside a group member\n");
+      goto done;
+    }
+    if (r3d_tracer_load(&tr[n], src, pred) != 0) {
+      fprintf(stderr, "surfrefine: cannot load %s\n", tok);
+      goto done;
+    }
+    if (level >= 0) tr[n].cfg.level = (uint32_t)level;
+    if (threads > 0) tr[n].cfg.max_threads = (uint32_t)threads;
+    surf_base(tok, name[n], sizeof name[n]);
+    g.m[n] = &tr[n];
+    n++;
+  }
+  g.n = n;
+  if (n < 2) {
+    fprintf(stderr, "surfrefine: --group needs at least two surfaces\n");
+    goto done;
+  }
+  double t0 = now_s();
+  int ran = r3d_tracer_group_refine(&g, rounds);
+  if (ran < 0) {
+    fprintf(stderr, "surfrefine: group refine failed\n");
+    goto done;
+  }
+  printf("surfrefine: joint refine of %u surfaces, %d round%s in %.1f s\n", n, ran,
+         ran == 1 ? "" : "s", now_s() - t0);
+  if (mkdir(out, 0755) != 0 && errno != EEXIST) {
+    fprintf(stderr, "surfrefine: cannot create %s\n", out);
+    goto done;
+  }
+  rc = EXIT_SUCCESS;
+  for (uint32_t i = 0; i < n; i++) {
+    char od[1400], sfc[1500];
+    snprintf(od, sizeof od, "%s/%s", out, name[i]);
+    if ((mkdir(od, 0755) != 0 && errno != EEXIST) ||
+        r3d_tracer_save(&tr[i], od, tr[i].cfg.thresh, false) != 0) {
+      fprintf(stderr, "surfrefine: save failed (%s)\n", od);
+      rc = EXIT_FAILURE;
+      continue;
+    }
+    if (r3d_surf_sibling(od, sfc, sizeof sfc) == 0) {
+      unlink(sfc);
+      if (r3d_surf_encode(od, sfc, r3d_surf_default_error(), NULL, NULL) != 0)
+        fprintf(stderr, "surfrefine: warning: .sfc encode failed for %s\n", od);
+    }
+    r3d_tracer_qc(&tr[i]);
+    printf("surfrefine: saved %s (%u points, folds %u kinks %u)\n", od, tr[i].nset,
+           atomic_load(&tr[i].qc_folds), atomic_load(&tr[i].qc_kinks));
+  }
+done:
+  for (uint32_t i = 0; i < n; i++) {
+    r3d_tracer_stop(&tr[i]);
+    r3d_tracer_free(&tr[i]);
+  }
+  for (uint32_t i = 0; i < R3D_TR_GROUP_MAX; i++)
+    if (i < n && scratch[i][0]) {
+      char cmd[1300];
+      snprintf(cmd, sizeof cmd, "rm -rf '%s'", scratch[i]);
+      (void)system(cmd);
+    }
+  return rc;
 }
 
 int main(int argc, char **argv) {
   const char *pred = NULL, *in = NULL, *out = NULL, *ct_root = NULL, *report = NULL;
+  const char *group = NULL;
+  int rounds = 3;
   double ct_cut = 128.0, ct_reach = 6.0, cutoff = -1.0;
   float flag_conf = 0.5f;
   int subdiv = 0, level = -1, threads = 0;
@@ -163,10 +275,16 @@ int main(int argc, char **argv) {
     else if (!strcmp(a, "--level") && more) level = atoi(argv[++i]);
     else if (!strcmp(a, "--threads") && more) threads = atoi(argv[++i]);
     else if (!strcmp(a, "--report") && more) report = argv[++i];
+    else if (!strcmp(a, "--group") && more) group = argv[++i];
+    else if (!strcmp(a, "--rounds") && more) rounds = atoi(argv[++i]);
     else if (!strcmp(a, "--no-refine")) do_refine = false;
     else if (!strcmp(a, "--no-ctsnap")) do_ctsnap = false;
     else if (!strcmp(a, "--qc-only")) qc_only = true;
     else return usage();
+  }
+  if (group) {
+    if (!pred || !out) return usage();
+    return run_group(pred, group, out, rounds, level, threads);
   }
   if (!in || (!qc_only && (!pred || !out))) return usage();
   if (subdiv < 0 || subdiv > 4) {

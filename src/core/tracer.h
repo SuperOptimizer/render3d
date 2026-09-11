@@ -121,6 +121,14 @@ typedef struct r3d_tracer {
   double wf_base;  /* field value at the seed (winding 0 reference) */
   void *sfx;      /* self-overlap hash (SET cell positions), rebuilt per
                    * generation; the anti-interpenetration hinge reads it */
+  void *gfx;      /* cross-sheet hash (Phase 3 joint refine): a SNAPSHOT of
+                   * the OTHER group members' SET positions + normals with
+                   * an owner tag, attached by r3d_tracer_group_refine for
+                   * the duration of one member's solve and detached after.
+                   * NULL for every single-tracer run, which is what keeps
+                   * those bit-identical: the no-crossing hinge and the
+                   * inter-sheet spacing term (TRF_XSPACE) are dead code
+                   * unless this pointer is set. Owned by the group. */
   void *don;      /* donor segments + spatial index (fusion), owned */
   uint32_t ndon;
   uint8_t *dsup;  /* [W*H] donor-support count per cell (0 = raw-traced) */
@@ -364,6 +372,39 @@ uint32_t r3d_tracer_fold_excise(r3d_tracer *t);
  * slant/bend) of a stopped tracer without solving: the baseline a refinement
  * pass is measured against. */
 void r3d_tracer_qc(r3d_tracer *t);
+
+/* ==================== joint multi-surface refine (Phase 3) ==============
+ * Several loaded sheets solved together by BLOCK COORDINATE DESCENT, not
+ * one joint system: each round every member re-runs the ordinary
+ * r3d_tracer_refine while the others are frozen, seeing them through a
+ * cross-sheet spatial hash attached for that turn only. Two residuals
+ * fire only while that hash is attached:
+ *   - no-crossing hinge: a cross-owner pair is ALWAYS "grid-far", so it
+ *     repels below 0.55 * the local sheet gap under the same normal
+ *     gating the self-overlap hinge uses (opposing normals = fold-back,
+ *     near-parallel = interpenetration);
+ *   - inter-sheet spacing (TRF_XSPACE): a cross-sheet neighbour found
+ *     along +/- the cell normal within 2*gap pulls |d| toward the gap,
+ *     weight 0.5, Cauchy-robustified like the wrap-spacing term.
+ * CALLER CONTRACT: every member must be a STOPPED tracer with nset > 0,
+ * and all members must share ONE winding frame — pass the SAME
+ * r3d_umbilicus to every member at start/load time. Windings from
+ * different umbilici are not comparable and the gap field (tr_om_at) a
+ * member reports for a neighbour's position would be meaningless. */
+#define R3D_TR_GROUP_MAX 8
+
+typedef struct r3d_tracer_group {
+  r3d_tracer *m[R3D_TR_GROUP_MAX];
+  uint32_t n;
+} r3d_tracer_group;
+
+/* Run `rounds` (<= 0 means 3) sweeps of block coordinate descent over the
+ * group. Returns the number of rounds actually run, or -1 on a bad group
+ * (empty, oversized, a running or empty member). Stops early — and
+ * returns the smaller count — when no cell of any member moved more than
+ * 0.1 voxels during a round. Blocking: each member's worker is joined
+ * before the next member starts. */
+int r3d_tracer_group_refine(r3d_tracer_group *g, int rounds);
 
 /* Synthetic self-check of the spiral winding frame + global fit (used by
  * the unit tests; no volume access). Returns 0 on success. */

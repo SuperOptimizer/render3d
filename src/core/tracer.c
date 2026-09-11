@@ -3094,6 +3094,87 @@ static void tr_sfx_build(r3d_tracer *t) {
   tr_sfx_free(old);
 }
 
+/* ============== cross-sheet index (Phase 3 joint refine) ==============
+ * A frozen SNAPSHOT of every OTHER group member's SET cells: world
+ * position, unit normal (zero when the cell's 4-neighbourhood could not
+ * define one) and the owner's index in the group. Snapshotting rather
+ * than pointing into the neighbours' live grids keeps the solve free of
+ * cross-tracer locking, and the neighbours are frozen for the duration
+ * anyway. Attached to t->gfx for exactly one member's refine, then
+ * detached and freed — so t->gfx is NULL in every single-tracer run and
+ * both cross-sheet residuals below are unreachable there. */
+static bool tr_cell_normal(const r3d_tracer *t, int i, int j, double n[3]);
+
+typedef struct tr_gfx {
+  double cs;
+  uint32_t nbuck; /* pow2 */
+  uint32_t *head, *next;
+  double *pos;  /* [nent*3] */
+  float *nrm;   /* [nent*3], 0,0,0 = no normal */
+  uint8_t *own; /* [nent] owner member index */
+  uint32_t nent, cap;
+} tr_gfx;
+
+static uint32_t tr_gfx_h(const tr_gfx *x, long cx, long cy, long cz) {
+  uint64_t h = (uint64_t)cx * 0x9E3779B185EBCA87ull ^
+               (uint64_t)cy * 0xC2B2AE3D27D4EB4Full ^ (uint64_t)cz * 0x165667B19E3779F9ull;
+  return (uint32_t)(h >> 32) & (x->nbuck - 1);
+}
+
+static void tr_gfx_free(tr_gfx *x) {
+  if (!x) return;
+  free(x->head);
+  free(x->next);
+  free(x->pos);
+  free(x->nrm);
+  free(x->own);
+  free(x);
+}
+
+/* allocate for up to `cap` entries with cell size `cs` (>= 8 vox) */
+static tr_gfx *tr_gfx_new(double cs, uint32_t cap) {
+  tr_gfx *x = calloc(1, sizeof *x);
+  if (!x) return NULL;
+  x->cs = cs < 8.0 ? 8.0 : cs;
+  uint32_t nb = 1;
+  while (nb < cap / 2 + 64) nb <<= 1;
+  if (nb > 1u << 21) nb = 1u << 21;
+  x->nbuck = nb;
+  x->cap = cap;
+  x->head = calloc(nb, sizeof *x->head);
+  x->next = malloc((size_t)cap * sizeof *x->next);
+  x->pos = malloc((size_t)cap * 3 * sizeof *x->pos);
+  x->nrm = malloc((size_t)cap * 3 * sizeof *x->nrm);
+  x->own = malloc((size_t)cap * sizeof *x->own);
+  if (!x->head || !x->next || !x->pos || !x->nrm || !x->own) {
+    tr_gfx_free(x);
+    return NULL;
+  }
+  return x;
+}
+
+/* append every SET cell of `src` (owner tag `own`) */
+static void tr_gfx_add_tracer(tr_gfx *x, const r3d_tracer *src, uint8_t own) {
+  uint64_t N = (uint64_t)src->W * src->H;
+  for (uint64_t k = 0; k < N && x->nent < x->cap; k++) {
+    if (src->state[k] != R3D_TR_SET) continue;
+    const double *P = src->pos + k * 3;
+    uint32_t e = x->nent;
+    memcpy(x->pos + (size_t)e * 3, P, 3 * sizeof *x->pos);
+    double n[3];
+    if (tr_cell_normal(src, (int)(k % src->W), (int)(k / src->W), n))
+      for (size_t a = 0; a < 3; a++) x->nrm[(size_t)e * 3 + a] = (float)n[a];
+    else
+      for (size_t a = 0; a < 3; a++) x->nrm[(size_t)e * 3 + a] = 0.0f;
+    x->own[e] = own;
+    uint32_t b = tr_gfx_h(x, (long)floor(P[0] / x->cs), (long)floor(P[1] / x->cs),
+                          (long)floor(P[2] / x->cs));
+    x->next[e] = x->head[b];
+    x->head[b] = e + 1;
+    x->nent++;
+  }
+}
+
 /* hinge residual against the nearest other-wrap cell; free point is x */
 /* unit surface normal at a grid cell from central differences; false when
  * the 4-neighbourhood is incomplete or degenerate */
@@ -3122,17 +3203,52 @@ static bool tr_cell_normal(const r3d_tracer *t, int i, int j, double n[3]) {
 static void tr_res_self(tr_nlsq *acc, const r3d_tracer *t, const double x[3],
                         size_t self_k) {
   const tr_sfx *sx = t->sfx;
-  if (!sx || !sx->nent) return;
+  const tr_gfx *gx = t->gfx;
+  if ((!sx || !sx->nent) && (!gx || !gx->nent)) return;
   double rmin = 0.55 * tr_om_at(t, x); /* per-region gap (G5a) */
-  double wself = (double)t->wind[self_k];
+  double wself = t->wind ? (double)t->wind[self_k] : 0.0;
   long c0[3], c1[3];
+  double hcs = sx && sx->nent ? sx->cs : gx->cs;
   for (int a = 0; a < 3; a++) {
-    c0[a] = (long)floor((x[a] - rmin) / sx->cs);
-    c1[a] = (long)floor((x[a] + rmin) / sx->cs);
+    c0[a] = (long)floor((x[a] - rmin) / hcs);
+    c1[a] = (long)floor((x[a] + rmin) / hcs);
   }
   double bd2 = rmin * rmin;
   const double *bq = NULL;
   uint32_t bk_hinge = 0;
+  /* cross-sheet candidates (joint refine only): a DIFFERENT sheet is
+   * unconditionally "grid-far" — there is no grid path between two
+   * tracers at all, so the grid-distance gate that protects a tight
+   * self-curl cannot apply. Anything from another member inside
+   * 0.55*gap is an interpenetration by construction. Normals still
+   * gate the push below, via bg_nrm. */
+  const float *bg_nrm = NULL;
+  bool bx_cross = false;
+  if (gx && gx->nent) {
+    long g0[3], g1[3];
+    for (int a = 0; a < 3; a++) {
+      g0[a] = (long)floor((x[a] - rmin) / gx->cs);
+      g1[a] = (long)floor((x[a] + rmin) / gx->cs);
+    }
+    for (long cz = g0[2]; cz <= g1[2]; cz++)
+      for (long cy = g0[1]; cy <= g1[1]; cy++)
+        for (long cx = g0[0]; cx <= g1[0]; cx++)
+          for (uint32_t e = gx->head[tr_gfx_h(gx, cx, cy, cz)]; e; e = gx->next[e - 1]) {
+            const double *Q = gx->pos + (size_t)(e - 1) * 3;
+            double d2 = 0;
+            for (int a = 0; a < 3; a++) {
+              double dd = x[a] - Q[a];
+              d2 += dd * dd;
+            }
+            if (d2 < bd2) {
+              bd2 = d2;
+              bq = Q;
+              bg_nrm = gx->nrm + (size_t)(e - 1) * 3;
+              bx_cross = true;
+            }
+          }
+  }
+  if (!sx || !sx->nent) goto hinge_push;
   for (long cz = c0[2]; cz <= c1[2]; cz++)
     for (long cy = c0[1]; cy <= c1[1]; cy++)
       for (long cx = c0[0]; cx <= c1[0]; cx++)
@@ -3161,8 +3277,11 @@ static void tr_res_self(tr_nlsq *acc, const r3d_tracer *t, const double x[3],
             bd2 = d2;
             bq = Q;
             bk_hinge = k;
+            bx_cross = false;
+            bg_nrm = NULL;
           }
         }
+hinge_push:
   if (bq) { /* too close to another part of the surface: decide by the
              * NORMALS whether this is a fold-back (opposing) before
              * pushing - a legitimately tight curl brings same-wrap cells
@@ -3174,13 +3293,29 @@ static void tr_res_self(tr_nlsq *acc, const r3d_tracer *t, const double x[3],
              * data and fold-hinge terms. */
     double n1[3], n2[3];
     bool ok1 = tr_cell_normal(t, (int)(self_k % t->W), (int)(self_k / t->W), n1);
-    bool ok2 = tr_cell_normal(t, (int)(bk_hinge % t->W), (int)(bk_hinge / t->W), n2);
+    bool ok2, fold_back, interpen;
+    if (bx_cross) {
+      /* cross-owner: the "grid distance" that would qualify an
+       * interpenetration is infinite, so the 400-vox grid-span test is
+       * satisfied by construction and only the normal gate arbitrates. */
+      double nl = 0.0;
+      if (bg_nrm)
+        for (int a = 0; a < 3; a++) nl += (double)bg_nrm[a] * (double)bg_nrm[a];
+      ok2 = nl > 0.25;
+      if (ok2)
+        for (int a = 0; a < 3; a++) n2[a] = (double)bg_nrm[a];
+      double ndot = ok1 && ok2 ? n1[0] * n2[0] + n1[1] * n2[1] + n1[2] * n2[2] : 0.0;
+      fold_back = ok1 && ok2 && ndot < -0.3;
+      interpen = ok1 && ok2 && ndot > 0.3;
+    } else {
+    ok2 = tr_cell_normal(t, (int)(bk_hinge % t->W), (int)(bk_hinge / t->W), n2);
     double ndot = ok1 && ok2 ? n1[0] * n2[0] + n1[1] * n2[1] + n1[2] * n2[2] : 0.0;
     int gdi = abs((int)(bk_hinge % t->W) - (int)(self_k % t->W));
     int gdj = abs((int)(bk_hinge / t->W) - (int)(self_k / t->W));
     int gd = gdi > gdj ? gdi : gdj;
-    bool fold_back = ok1 && ok2 && ndot < -0.3;
-    bool interpen = ok1 && ok2 && ndot > 0.3 && (double)gd * t->cfg.step > 400.0;
+    fold_back = ok1 && ok2 && ndot < -0.3;
+    interpen = ok1 && ok2 && ndot > 0.3 && (double)gd * t->cfg.step > 400.0;
+    }
     if (fold_back || interpen || (!ok1 || !ok2)) {
       double d = sqrt(bd2);
       if (d > 1e-6) {
@@ -3191,6 +3326,7 @@ static void tr_res_self(tr_nlsq *acc, const r3d_tracer *t, const double x[3],
       }
     }
   }
+  if (!sx || !sx->nent) return;
   /* two-sided wrap spacing (geometry-agnostic, unlike the global rho
    * model): the nearest cell exactly one winding away should sit ~omega
    * from here. Weak Cauchy pull — real gaps vary. */
@@ -3267,6 +3403,79 @@ static void tr_res_self(tr_nlsq *acc, const r3d_tracer *t, const double x[3],
       nq_add(acc, r * sc, J);
     }
   }
+}
+
+/* ---------- inter-sheet spacing (TRF_XSPACE, joint refine only) ----------
+ * The no-crossing hinge above only stops sheets from passing through
+ * each other; nothing yet says how far apart they should sit. Two
+ * neighbouring wraps of the same scroll are one sheet gap apart, the
+ * same quantity the wrap-spacing term enforces WITHIN a tracer — so the
+ * cross-sheet version is the same residual over the other members'
+ * cells: look along +/- this cell's own normal (the gap is measured
+ * across the sheet, not in any direction) for the nearest cross-sheet
+ * point within 2*gap, and pull |d| toward the gap. Cauchy-robustified
+ * at weight 0.5: real gaps vary and a distant outlier must not drag a
+ * whole neighbourhood.
+ * Unreachable without an attached group hash — t->gfx is NULL in every
+ * single-tracer run. */
+#define TR_W_XSPACE 0.5 /* default; R3D_XSPACE_W overrides (the synthetic
+                          * two-sheet fixture stalls at the hinge radius at
+                          * 0.5 and needs ~5 to reach the gap; real adjacent
+                          * wraps start near their gap, so tune on data) */
+static double tr_w_xspace(void) {
+  static double w = -1.0;
+  if (w < 0.0) {
+    const char *ev = getenv("R3D_XSPACE_W");
+    double v = ev ? strtod(ev, NULL) : 0.0;
+    w = v > 0.0 && v < 1e3 ? v : TR_W_XSPACE;
+  }
+  return w;
+}
+#define TR_XSPACE_CONE 0.5 /* |cos| gate: within ~60 deg of the normal */
+
+static void tr_res_xspace(tr_nlsq *acc, const r3d_tracer *t, const double x[3],
+                          size_t self_k) {
+  const tr_gfx *gx = t->gfx;
+  if (!gx || !gx->nent) return;
+  double gap = tr_om_at(t, x);
+  if (!(gap > 0.0)) return;
+  double n1[3];
+  if (!tr_cell_normal(t, (int)(self_k % t->W), (int)(self_k / t->W), n1)) return;
+  double reach = 2.0 * gap;
+  long c0[3], c1[3];
+  for (int a = 0; a < 3; a++) {
+    c0[a] = (long)floor((x[a] - reach) / gx->cs);
+    c1[a] = (long)floor((x[a] + reach) / gx->cs);
+  }
+  double bd2 = reach * reach;
+  const double *bq = NULL;
+  for (long cz = c0[2]; cz <= c1[2]; cz++)
+    for (long cy = c0[1]; cy <= c1[1]; cy++)
+      for (long cx = c0[0]; cx <= c1[0]; cx++)
+        for (uint32_t e = gx->head[tr_gfx_h(gx, cx, cy, cz)]; e; e = gx->next[e - 1]) {
+          const double *Q = gx->pos + (size_t)(e - 1) * 3;
+          double dv[3], d2 = 0;
+          for (int a = 0; a < 3; a++) {
+            dv[a] = Q[a] - x[a];
+            d2 += dv[a] * dv[a];
+          }
+          if (d2 >= bd2 || d2 < 1e-12) continue;
+          /* along +/- the normal only: an in-plane neighbour of another
+           * sheet says nothing about the gap between the sheets */
+          double dl = sqrt(d2);
+          double cosn = (dv[0] * n1[0] + dv[1] * n1[1] + dv[2] * n1[2]) / dl;
+          if (fabs(cosn) < TR_XSPACE_CONE) continue;
+          bd2 = d2;
+          bq = Q;
+        }
+  if (!bq) return;
+  double d = sqrt(bd2);
+  if (d < 1e-6) return;
+  double r = tr_w_xspace() * (d - gap) / gap;
+  double sc = sqrt(1.0 / (1.0 + r * r)); /* Cauchy(1), as the wrap term */
+  double J[3];
+  for (int a = 0; a < 3; a++) J[a] = sc * tr_w_xspace() * (x[a] - bq[a]) / (d * gap);
+  nq_add(acc, r * sc, J);
 }
 
 /* ================ winding-potential field (evolutor port) ================
@@ -3683,11 +3892,12 @@ enum {
   TRF_NCP = 16,
   TRF_WIND = 32,
   TRF_SURF = 64,
-  TRF_SELF = 128
+  TRF_SELF = 128,
+  TRF_XSPACE = 256 /* inter-sheet spacing; inert unless t->gfx is attached */
 };
 #define TRF_ALL \
   (TRF_DIST | TRF_STRAIGHT | TRF_SDIR | TRF_SPACE | TRF_NCP | TRF_WIND | TRF_SURF | \
-   TRF_SELF)
+   TRF_SELF | TRF_XSPACE)
 
 typedef struct tr_ctx {
   r3d_tracer *t;
@@ -4362,8 +4572,10 @@ static void tr_eval(tr_ctx *c, const double x[3], tr_nlsq *acc) {
     double Jz[3] = {0, 0, 10.0};
     nq_add(acc, 10.0 * (x[2] - zrow), Jz);
   }
-  if ((c->flags & TRF_SELF) && t->sfx)
+  if ((c->flags & TRF_SELF) && (t->sfx || t->gfx))
     tr_res_self(acc, t, x, (size_t)j * t->W + (size_t)i);
+  if ((c->flags & TRF_XSPACE) && t->gfx)
+    tr_res_xspace(acc, t, x, (size_t)j * t->W + (size_t)i);
   if ((c->flags & TRF_SURF) && t->don) {
     /* donor anchor (vc3d SurfaceLossD, w=0.1): pull toward the nearest
      * donor surface point, frozen for this evaluation; donors on a
@@ -5859,7 +6071,11 @@ static void tr_qc2(r3d_tracer *t, bool clamp_folds) {
     int bd = (int)(20.0 / t->cfg.step + 0.5);
     if (bd < 1) bd = 1;
     double arc = 2.0 * (double)bd * t->cfg.step;
-    float *rads = malloc(2u * (size_t)W * (size_t)H * sizeof *rads); /* two axes per cell */
+    /* two samples per cell (one per axis): a grid where EVERY cell has
+     * both arcs — a dense, fully-valid surface — fills 2*W*H, and a
+     * W*H buffer overflowed. Measured by the Phase 3 group fixture,
+     * whose synthetic sheets are exactly that dense. */
+    float *rads = malloc((size_t)W * (size_t)H * 2 * sizeof *rads);
     size_t nr = 0;
     if (rads) {
       for (int j = 0; j < H; j++)
@@ -8054,6 +8270,101 @@ int r3d_tracer_refine(r3d_tracer *t) {
   return 0;
 }
 
+/* ================== joint multi-surface refine (Phase 3) ==================
+ * Block coordinate descent: one member solves at a time, every other
+ * member frozen and visible to it only through a cross-sheet hash
+ * (tr_gfx) built from their SET positions + normals. The solver itself
+ * is unchanged — this is the ordinary r3d_tracer_refine with t->gfx set
+ * for the duration, which is exactly what makes the group path add
+ * nothing to single-tracer runs (t->gfx stays NULL there and both
+ * cross-sheet residuals are unreachable).
+ *
+ * Callers must pass the SAME r3d_umbilicus to every member (see the
+ * header): windings and the per-region gap field are only comparable
+ * inside one winding frame. */
+static double tr_group_cs(const r3d_tracer_group *g) {
+  /* hash cell = 2 * the largest member gap, floored at 8 vox, mirroring
+   * tr_sfx_build's rule so neighbourhood queries cover one gap */
+  double gs = 0.0;
+  for (uint32_t i = 0; i < g->n; i++) {
+    double o = tr_om_eff(g->m[i]);
+    if (o <= 0) o = g->m[i]->cfg.step;
+    if (o > gs) gs = o;
+  }
+  double cs = 2.0 * gs;
+  return cs < 8.0 ? 8.0 : cs;
+}
+
+int r3d_tracer_group_refine(r3d_tracer_group *g, int rounds) {
+  if (!g || g->n < 1 || g->n > R3D_TR_GROUP_MAX) return -1;
+  for (uint32_t i = 0; i < g->n; i++) {
+    r3d_tracer *t = g->m[i];
+    if (!t || t->running || !t->pos || !t->state || !t->nset) return -1;
+  }
+  if (rounds <= 0) rounds = 3;
+  double cs = tr_group_cs(g);
+  /* per-member position snapshot: the early-stop test is "no cell of any
+   * member moved more than MOVE_EPS during a whole round" */
+  const double MOVE_EPS = 0.1;
+  double *prev[R3D_TR_GROUP_MAX] = {0};
+  bool snap_ok = true;
+  for (uint32_t i = 0; i < g->n && snap_ok; i++) {
+    size_t n3 = (size_t)g->m[i]->W * g->m[i]->H * 3;
+    prev[i] = malloc(n3 * sizeof *prev[i]);
+    if (!prev[i]) snap_ok = false;
+  }
+  int done_rounds = 0;
+  for (int r = 0; r < rounds; r++) {
+    if (snap_ok)
+      for (uint32_t i = 0; i < g->n; i++)
+        memcpy(prev[i], g->m[i]->pos,
+               (size_t)g->m[i]->W * g->m[i]->H * 3 * sizeof *prev[i]);
+    for (uint32_t i = 0; i < g->n; i++) {
+      r3d_tracer *t = g->m[i];
+      uint32_t cap = 0;
+      for (uint32_t k = 0; k < g->n; k++)
+        if (k != i) cap += g->m[k]->nset;
+      tr_gfx *gx = cap ? tr_gfx_new(cs, cap) : NULL;
+      if (gx)
+        for (uint32_t k = 0; k < g->n; k++)
+          if (k != i) tr_gfx_add_tracer(gx, g->m[k], (uint8_t)k);
+      t->gfx = gx; /* the others are frozen: nobody else touches it */
+      if (r3d_tracer_refine(t) == 0) {
+        bool fin = false;
+        while (!fin) {
+          usleep(20000);
+          r3d_tracer_snapshot(t, NULL, NULL, NULL, NULL, NULL, &fin);
+        }
+        r3d_tracer_stop(t); /* join the worker before the next member */
+      }
+      t->gfx = NULL;
+      tr_gfx_free(gx);
+    }
+    done_rounds = r + 1;
+    if (!snap_ok) continue;
+    double maxmv = 0.0;
+    for (uint32_t i = 0; i < g->n; i++) {
+      const r3d_tracer *t = g->m[i];
+      uint64_t N = (uint64_t)t->W * t->H;
+      for (uint64_t k = 0; k < N; k++) {
+        if (t->state[k] != R3D_TR_SET) continue;
+        double d2 = 0;
+        for (uint64_t a = 0; a < 3; a++) {
+          double dd = t->pos[k * 3 + a] - prev[i][k * 3 + a];
+          d2 += dd * dd;
+        }
+        if (d2 > maxmv) maxmv = d2;
+      }
+    }
+    maxmv = sqrt(maxmv);
+    printf("tracer: group round %d/%d, max cell move %.3f vox\n", r + 1, rounds,
+           maxmv);
+    if (maxmv <= MOVE_EPS) break; /* converged: nothing left to trade */
+  }
+  for (uint32_t i = 0; i < g->n; i++) free(prev[i]);
+  return done_rounds;
+}
+
 int r3d_tracer_spiral_fill(r3d_tracer *t) {
   if (t->running || !t->pos || !t->nset) return -1;
   if (!atomic_load(&t->sp_valid)) return -1; /* needs a trusted fit */
@@ -8121,6 +8432,7 @@ void r3d_tracer_free(r3d_tracer *t) {
   free(t->dsup);
   free(t->uc);
   tr_sfx_free(t->sfx);
+  tr_gfx_free(t->gfx);
   tr_wf_free(t->wf);
   tr_dons_free(t->don);
   r3d_umbilicus_free(&t->umb);
