@@ -284,7 +284,7 @@ against an in-test TCP server.
 
 ### 2x2 multi-view (vc3d-style) on AWS open data
 
-`--multiview <tifxyz-dir>` opens the volume-cartographer layout: top-left the
+`--multiview <surface>` opens the volume-cartographer layout: top-left the
 flattened segment, top-right XY, bottom-left XZ, bottom-right YZ — all
 orthographic slice views over the `--bricks` LOD cache with a shared focus.
 Drag pans a view, wheel zooms about the cursor, Shift+wheel (or R/F) scrubs
@@ -303,8 +303,8 @@ slider spins the pair around the normal. Scrubbing moves in signed offsets
 from the focus. Ctrl+click re-anchors the frames at the new focus; XY stays
 axis-aligned.
 
-**Whole-corpus surfaces**: pack a scroll's tifxyz segments with
-`segpack <store-dir> [-q log2q] <tifxyz-dir>...` (volcomp-compressed `.tfx`
+**Whole-corpus surfaces**: pack a scroll's segments (`.sfc` files or tifxyz
+dirs) with `segpack <store-dir> [-q log2q] <surface>...` (volcomp-compressed `.tfx`
 grids + a manifest with per-tile AABBs), then add `--segments <store-dir>`:
 every surface crossing a plane view draws as a dimmed polyline under the
 active segment's curve. The frame loop only queries the tile index; a
@@ -341,9 +341,16 @@ polish. Undo/clear from the panel. Headless: `R3D_ANCHOR_TEST="x,y,z;x,y,z"`
 with `R3D_TRACE_TEST`, plus `R3D_REFINE_TEST=1` for a post-finish re-solve.
 
 Test data comes straight from the `vesuvius-challenge-open-data` S3 bucket
-(PHerc0172 pairs tifxyz segments with their exact source volume):
+(PHerc0172 pairs tifxyz segments with their exact source volume). Published
+surfaces are tifxyz; `tools/fetch_surface.sh` downloads one and converts it
+to the default `.sfc` surface type (see below), and any tifxyz path handed to
+`--multiview` is converted the same way on first open:
 
 ```sh
+tools/fetch_surface.sh PHercParis4 --list                        # segment ids
+tools/fetch_surface.sh PHercParis4 20230702185753 --list         # mesh variants
+tools/fetch_surface.sh PHercParis4 20230702185753 20260411134726-2.4um
+#   -> cache/od/segments/20230702185753-on-20260411134726-2.4um.sfc
 aws s3 cp --no-sign-request --recursive \
   "s3://vesuvius-challenge-open-data/PHerc0172/segments/<seg>/mesh/<id>.tifxyz/" \
   cache/PHerc0172-segments/w062/
@@ -519,40 +526,62 @@ The GUI supports independent blue/red head selection, including ink, surfaces,
 fibres and signed-distance fields. See [setup, controls and validation](docs/tsm-inference.md).
 
 
-## Compressed parametric surfaces (read-only)
+## Surfaces: .sfc by default, tifxyz converted on the fly
 
-Build the standalone [surface-compressor](https://github.com/SuperOptimizer/surface-compressor)
-converter and encode a tifxyz directory, then open the result with the matching
-CT volume:
+The [surface-compressor](https://github.com/SuperOptimizer/surface-compressor)
+container (`.sfc`, independent 64×64 floating-point DCT blocks with joint XYZ
+coding) is render3d's surface type. tifxyz directories (Volume Cartographer's
+`x/y/z.tif` + `meta.json`, the format of every surface published in the
+open-data bucket) stay readable everywhere and are re-encoded seamlessly:
 
 ```sh
-surface-compressor encode surface.tifxyz surface.sfc --error 0.1
+# any of these opens the same surface
 build/macos/render3d --bricks /path/to/manifest.json --multiview surface.sfc
-# Optional initial position, in global surface grid indices:
-build/macos/render3d --bricks /path/to/manifest.json --multiview surface.sfc --surface-center 12000 8000
+build/macos/render3d --bricks /path/to/manifest.json --multiview segment.tifxyz/
+build/macos/render3d --bricks /path/to/manifest.json --multiview cache/traced/my-trace
+# explicit conversion, either direction
+build/macos/surfconv encode segment.tifxyz [out.sfc] [--error 0.1]
+build/macos/surfconv decode surface.sfc restored.tifxyz
+build/macos/surfconv resolve segment.tifxyz    # prints the .sfc, encoding if stale
+build/macos/surfconv info surface.sfc          # dims, scale, valid points, bbox
+# Optional initial position for paged surfaces, in global grid indices:
+build/macos/render3d --bricks ... --multiview huge.sfc --surface-center 12000 8000
 ```
 
-You can also use **open segment → open compressed surface** in the GUI.
+Opening a tifxyz directory encodes its sibling `.sfc` (`foo.tifxyz` →
+`foo.sfc`, `cache/traced/x` → `cache/traced/x.sfc`) with the bundled codec and
+reuses it while it is newer than the planes and `meta.json`; a read-only
+source location falls back to `cache/sfc/<name>.sfc`. The encoder streams TIFF
+strips/tiles in 64-row bands, so memory is bounded by the grid width, and it
+publishes atomically (temporary sibling + rename). `meta.json` is stored
+verbatim as the container metadata; every other single-image TIFF in the
+directory (`mask.tif`, the tracer's `winding/generations/confidence.tif`) is
+kept as an exact auxiliary channel, and a `mask.tif` at an integer multiple of
+the grid resolution gates validity exactly like the reference converter.
+`surfconv decode` restores all of it. The Euclidean error budget is
+`R3D_SFC_ERROR` (default 0.1 voxel, the codec's tifxyz default). If the
+conversion fails the tifxyz planes are loaded directly, as before. Tracer
+working directories stay tifxyz (they carry the `tracer.json` resume sidecar)
+and convert on open like any other directory.
 
-The codec uses independent 64×64 floating-point DCT blocks. New files share entropy
-tables across blocks while retaining independent coefficient streams. The
-reader caches tables separately from decoded geometry and supports SFC
-container versions 1 through 4. The viewer decodes
-XYZ on the CPU into a 64 MiB block cache and uploads a maximum 1024×1024 geometry
-window. Dragging the flattened view moves that window through the surface. The
-**compressed surface** panel shows full dimensions, resident origin, cache use,
-and global grid coordinates for jumping to another area. Whole surface
-allocation is avoided; source dimensions and cache keys use 64-bit integers.
+Surfaces whose XYZ grid fits `R3D_SURFACE_FULL_MB` (default 512 MiB, i.e.
+~44 M grid points) decode whole into memory, so ink maps, supervision masks,
+SLIM flattening, the tracer and segment-store activation work unchanged.
+Larger surfaces page: the viewer decodes XYZ into a 64 MiB block cache and
+uploads at most a 1024×1024 geometry window. Dragging the flattened view moves
+that window through the surface, and the **compressed surface** panel shows
+full dimensions, resident origin, cache use and lets you jump to a global grid
+coordinate. Paged windows are read-only (plane intersections cover the
+resident window; no coarse whole-surface preview yet); editing controls stay
+visible but disabled. `--surface-center` always selects the paged mode.
 
-This first viewer integration is read-only. Plane intersections cover the
-resident window, and zooming out does not yet build a coarse whole-surface
-preview. A worker decodes and prepares new windows while the UI remains interactive. Ink-map editing
-and SLIM flattening remain available for ordinary tifxyz surfaces; their controls
-stay visible but are disabled for compressed windows. Existing tifxyz and .tfx
-readers are unchanged. The bundled surface-compressor 1.0.0 snapshot is pinned
-to its upstream revision and per-file hashes in `tools/surface-compressor/snapshot.json`.
-
-Compressed surfaces also support version-4 joint XYZ packets. The renderer
-requests all three components in one decode per 64×64 cache miss; affine/rotated
-packets carry their own parameters and entropy tables, with no neighboring
-patch dependency. Existing scalar surface files remain readable.
+The **open segment** popup takes a `.sfc` file or a tifxyz directory, and the
+data browser's **open segment** downloads the published tifxyz planes and runs
+`surfconv encode` as the last job step, so the viewer opens the `.sfc` (the
+planes are kept beside it). `segpack` ingests `.sfc` files and tifxyz
+directories alike. `tools/surface-compressor/` is a pinned 1.0.0 source
+snapshot (`snapshot.json` records the upstream commit and per-file hashes;
+`R3D_SURFCOMP_DIR` overrides it for codec development). The reader supports
+container versions 1 through 4 and joint version-4 XYZ packets: one decode per
+64×64 cache miss returns all three components, and no neighboring patch is
+needed.

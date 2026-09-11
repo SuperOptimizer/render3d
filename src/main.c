@@ -43,6 +43,7 @@ extern char **environ; /* argv-spawned browser jobs inherit the environment */
 #include "core/stats.h"
 #include "core/surface.h"
 #include "core/tifxyz.h"
+#include "core/surfconv.h"
 #include "core/tracer.h"
 #include "core/transfer.h"
 #include "core/umbilicus.h"
@@ -935,6 +936,28 @@ static int mv_build_grids(const r3d_tifxyz *s, float **coords_out, float **norma
   return 0;
 }
 
+/* tifxyz -> .sfc conversion runs inside the dataset setup (multi-second,
+ * synchronous): keep the window responsive and report progress. */
+static int surface_convert_progress(void *ud, uint64_t done, uint64_t total) {
+  int *last = ud;
+  SDL_PumpEvents();
+  int pct = total ? (int)(done * 100 / total) : 100;
+  if (pct / 10 != *last / 10) {
+    printf("surface: encoding %d%%\n", pct);
+    fflush(stdout);
+    *last = pct;
+  }
+  return 0;
+}
+/* Whole surfaces up to this many bytes of XYZ load into memory with the full
+ * feature set; larger ones page a bounded window through the .sfc reader. */
+static uint64_t surface_full_bytes(void) {
+  const char *e = getenv("R3D_SURFACE_FULL_MB");
+  double mb = e ? strtod(e, NULL) : 512.0;
+  if (!(mb >= 0) || mb > 65536.0) mb = 512.0;
+  return (uint64_t)(mb * 1048576.0);
+}
+
 /* One bounded prepared window per viewer; decoding and normal construction
  * stay off the UI thread. The file/cache remains alive until the job joins. */
 typedef struct surface_page_job {
@@ -1782,10 +1805,12 @@ static void od_browser_window(od_state *od, bool *open, char *next_bricks, size_
     od->act = 0;
   }
   if (od->act && !od->job_up) { /* probe -> spawn -> finish the pending action */
-    char probe[600];
-    snprintf(probe, sizeof probe, "%s/%s", od->tgt_dir,
-             od->act == 2 ? "meta.json" : "manifest.json");
-    if (od_file_exists(probe)) {
+    char probe[700];
+    if (od->act == 2) { /* the segment is ready once its .sfc exists */
+      if (r3d_surf_sibling(od->tgt_dir, probe, sizeof probe) != 0) probe[0] = 0;
+    } else
+      snprintf(probe, sizeof probe, "%s/manifest.json", od->tgt_dir);
+    if (probe[0] && od_file_exists(probe)) {
       switch (od->act) {
       case 1: /* volume: full dataset swap, dropping segment + overlays */
         snprintf(next_bricks, nb_cap, "%s/manifest.json", od->tgt_dir);
@@ -1798,7 +1823,7 @@ static void od_browser_window(od_state *od, bool *open, char *next_bricks, size_
       case 2: /* segment: re-swap the current volume with it; browser-picked
                * overlays (next_ovl/next_ink) survive the swap */
         if (cur_bricks) snprintf(next_bricks, nb_cap, "%s", cur_bricks);
-        snprintf(next_seg, ns_cap, "%s", od->tgt_dir);
+        snprintf(next_seg, ns_cap, "%s", probe);
         *swap = true;
         od_log(od, "segment ready - opening...");
         break;
@@ -1820,7 +1845,7 @@ static void od_browser_window(od_state *od, bool *open, char *next_bricks, size_
       }
       od->act = 0;
     } else if (od->spawned) {
-      od_log(od, od->act == 2 ? "segment download incomplete"
+      od_log(od, od->act == 2 ? "segment download or .sfc encode incomplete"
                               : "bootstrap produced no manifest");
       od->act = 0;
     } else {
@@ -2010,7 +2035,7 @@ static void od_browser_window(od_state *od, bool *open, char *next_bricks, size_
     igEndChild();
     if (od->sel_seg >= 0 && !od->variants_ok) od_request(od, 3);
     if (od->variants_ok && od->variants.ndirs) {
-      igText("segment mesh (tifxyz)");
+      igText("segment mesh (published tifxyz, opened as .sfc)");
       igBeginChild_Str("odvar", (ImVec2){0, 70}, ImGuiChildFlags_Borders, 0);
       char onvol[80];
       snprintf(onvol, sizeof onvol, "-on-%s", volid);
@@ -2033,21 +2058,25 @@ static void od_browser_window(od_state *od, bool *open, char *next_bricks, size_
         snprintf(od->tgt_dir, sizeof od->tgt_dir, "cache/od/segments/%s", nm[2]);
         snprintf(murl, sizeof murl, "%s/%s/segments/%s/mesh/%s", OD_BUCKET, nm[0], nm[1],
                  nm[2]);
-        /* four argv-spawned curls; meta.json lands staged and is renamed into
-         * place only after every file arrived, so the completion probe never
-         * sees a partial download */
+        /* four argv-spawned curls, then surfconv re-encodes the planes into
+         * the sibling .sfc the viewer opens. surfconv publishes atomically, so
+         * the completion probe (the .sfc) never sees a partial download */
         od_job_reset(od);
         static const char *const parts[4] = {"x.tif", "y.tif", "z.tif", "meta.json"};
         for (int k = 0; k < 4; k++) {
           char dst[700], src[1300];
-          snprintf(dst, sizeof dst, "%s/%s%s", od->tgt_dir, parts[k],
-                   k == 3 ? ".dl" : "");
+          snprintf(dst, sizeof dst, "%s/%s", od->tgt_dir, parts[k]);
           snprintf(src, sizeof src, "%s/%s", murl, parts[k]);
           const char *a[5] = {"curl", "-fsS", "-o", dst, src};
           od_job_step(od, a, 5);
         }
-        snprintf(od->fin_src, sizeof od->fin_src, "%s/meta.json.dl", od->tgt_dir);
-        snprintf(od->fin_dst, sizeof od->fin_dst, "%s/meta.json", od->tgt_dir);
+        {
+          char prog[600], sfc[700];
+          snprintf(prog, sizeof prog, "%s/surfconv", exe);
+          if (r3d_surf_sibling(od->tgt_dir, sfc, sizeof sfc) != 0) od->job_ovf = true;
+          const char *a[4] = {prog, "encode", od->tgt_dir, sfc};
+          od_job_step(od, a, 4);
+        }
         if (od->job_ovf) {
           od_log(od, "rejected: job arguments too long");
         } else if (!mkdir_p(od->tgt_dir)) {
@@ -2058,7 +2087,7 @@ static void od_browser_window(od_state *od, bool *open, char *next_bricks, size_
         } else {
           od->spawned = false;
           od->act = 2;
-          od_log(od, "downloading segment tifxyz...");
+          od_log(od, "downloading segment tifxyz, then encoding .sfc...");
         }
       }
     }
@@ -3198,28 +3227,54 @@ int main(int argc, char **argv) {
       return EXIT_FAILURE;
     }
     SDL_PumpEvents(); /* dataset swap: multi-second setup, stay responsive */
-    bool compressed_surface =
-        strlen(multiview_path) >= 4 &&
-        strcmp(multiview_path + strlen(multiview_path) - 4, ".sfc") == 0;
+    /* .sfc is the surface type: a tifxyz directory is re-encoded to its
+     * sibling .sfc first (reused while fresh). Surfaces within the in-memory
+     * budget load whole, keeping ink maps, flattening and the tracer; larger
+     * ones page a bounded geometry window through the reader. */
     int surface_loaded = -1;
-    if (compressed_surface) {
-      if (r3d_surface_open(multiview_path, 64u << 20, &mv_sfc) == 0) {
+    r3d_surf_kind surface_kind = r3d_surf_kind_of(multiview_path);
+    char surface_file[2048] = "";
+    if (surface_kind != R3D_SURF_NONE) {
+      int pct = -1;
+      if (r3d_surf_resolve(multiview_path, r3d_surf_default_error(),
+                           surface_convert_progress, &pct, surface_file,
+                           sizeof surface_file) != 0) {
+        fprintf(stderr, "surface: cannot convert %s to .sfc; using the tifxyz "
+                        "planes directly\n", multiview_path);
+        surface_file[0] = 0;
+      } else if (strcmp(surface_file, multiview_path) != 0)
+        printf("surface: %s -> %s\n", multiview_path, surface_file);
+    }
+    if (surface_file[0]) {
+      if (r3d_surface_open(surface_file, 64u << 20, &mv_sfc) == 0) {
         r3d_surface_get_info(mv_sfc, &mv_sfc_info);
-        uint32_t pw =
-            (uint32_t)(mv_sfc_info.width < 1024 ? mv_sfc_info.width : 1024);
-        uint32_t ph =
-            (uint32_t)(mv_sfc_info.height < 1024 ? mv_sfc_info.height : 1024);
-        mv_sfc_origin[0] = ((mv_sfc_info.width - pw) / 2) / 64 * 64;
-        mv_sfc_origin[1] = ((mv_sfc_info.height - ph) / 2) / 64 * 64;
-        surface_loaded = r3d_surface_window(mv_sfc, mv_sfc_origin[0],
-                                            mv_sfc_origin[1], pw, ph, &mv_seg);
+        uint64_t xyz_bytes = mv_sfc_info.width * mv_sfc_info.height * 12u;
+        if (!surface_center_given && xyz_bytes <= surface_full_bytes()) {
+          r3d_surface_close(mv_sfc);
+          mv_sfc = NULL;
+          surface_loaded = r3d_surf_load_sfc(surface_file, &mv_seg);
+        } else {
+          uint32_t pw =
+              (uint32_t)(mv_sfc_info.width < 1024 ? mv_sfc_info.width : 1024);
+          uint32_t ph =
+              (uint32_t)(mv_sfc_info.height < 1024 ? mv_sfc_info.height : 1024);
+          mv_sfc_origin[0] = ((mv_sfc_info.width - pw) / 2) / 64 * 64;
+          mv_sfc_origin[1] = ((mv_sfc_info.height - ph) / 2) / 64 * 64;
+          surface_loaded = r3d_surface_window(mv_sfc, mv_sfc_origin[0],
+                                              mv_sfc_origin[1], pw, ph, &mv_seg);
+          if (!surface_loaded)
+            printf("surface: %llu x %llu grid, paging a %u x %u window\n",
+                   (unsigned long long)mv_sfc_info.width,
+                   (unsigned long long)mv_sfc_info.height, pw, ph);
+        }
       }
       if (surface_loaded) {
-        fprintf(stderr, "cannot open compressed surface %s\n", multiview_path);
+        fprintf(stderr, "cannot open compressed surface %s\n", surface_file);
         r3d_surface_close(mv_sfc);
+        mv_sfc = NULL;
         return EXIT_FAILURE;
       }
-    } else
+    } else if (surface_kind == R3D_SURF_TIFXYZ)
       surface_loaded = r3d_tifxyz_load(&mv_seg, multiview_path);
     if (surface_loaded != 0) {
       /* virgin scroll, no segment yet: start with the close-segment empty
@@ -5052,18 +5107,15 @@ int main(int argc, char **argv) {
     }
     if (igBeginPopup("r3d_open_seg", 0)) {
       static char compressed_path[560] = "", compressed_error[160] = "";
-      igInputText("compressed surface (.sfc)", compressed_path,
+      igInputText("surface (.sfc or tifxyz dir)", compressed_path,
                   sizeof compressed_path, 0, NULL, NULL);
       igBeginDisabled(!bricks_path || !brick_is_lod || !compressed_path[0]);
-      if (igButton("open compressed surface", (ImVec2){0, 0})) {
-        r3d_surface_reader *check = NULL;
-        size_t len = strlen(compressed_path);
-        if (len < 4 || strcmp(compressed_path + len - 4, ".sfc") ||
-            r3d_surface_open(compressed_path, 4096 * 12, &check))
+      if (igButton("open surface", (ImVec2){0, 0})) {
+        /* a tifxyz directory is converted to its .sfc during the reload */
+        if (r3d_surf_kind_of(compressed_path) == R3D_SURF_NONE)
           snprintf(compressed_error, sizeof compressed_error,
-                   "Cannot open this compressed XYZ surface");
+                   "Not a .sfc surface or a tifxyz directory");
         else {
-          r3d_surface_close(check);
           snprintf(od_next_bricks, sizeof od_next_bricks, "%s", bricks_path);
           snprintf(od_next_seg, sizeof od_next_seg, "%s", compressed_path);
           od_swap = true;
@@ -5462,7 +5514,8 @@ int main(int argc, char **argv) {
                          (double)cs.limit / 1048576.0);
           igTextDisabled(
               "Drag to page through the surface. Plane intersections\n"
-              "cover the resident window. Editing requires tifxyz.");
+              "cover the resident window. Editing needs a surface that\n"
+              "fits in memory (R3D_SURFACE_FULL_MB).");
           igInputScalar("grid X", ImGuiDataType_U64, &mv_sfc_jump[0], NULL,
                         NULL, "%llu", 0);
           igInputScalar("grid Y", ImGuiDataType_U64, &mv_sfc_jump[1], NULL,

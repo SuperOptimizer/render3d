@@ -70,6 +70,7 @@ add_library(r3d_core STATIC
   src/core/input.c
   src/core/tifxyz.c
   src/core/surface.c
+  src/core/surfconv.c
   src/core/segtrace.c
   src/core/segstore.c
   src/core/cpuvol.c
@@ -240,6 +241,10 @@ add_executable(tifxyz-transform tools/tifxyz-transform/main.c)
 target_link_libraries(tifxyz-transform PRIVATE r3d_core m r3d_warnings r3d_sanitize)
 add_executable(segpack tools/segpack/main.c)
 target_link_libraries(segpack PRIVATE r3d_core r3d_warnings r3d_sanitize)
+add_executable(surfconv tools/surfconv/main.c)
+target_link_libraries(surfconv PRIVATE r3d_core r3d_warnings r3d_sanitize)
+add_executable(tifxyz-resample tools/tifxyz-resample/main.c)
+target_link_libraries(tifxyz-resample PRIVATE r3d_core TIFF::TIFF m r3d_warnings r3d_sanitize)
 add_executable(mkumb tools/mkumb/main.c)
 target_link_libraries(mkumb PRIVATE r3d_core r3d_warnings r3d_sanitize)
 
@@ -556,3 +561,8 @@ add_executable(test_surface_cache tests/test_surface_cache.c)
 target_link_libraries(test_surface_cache PRIVATE r3d_core r3d_warnings r3d_sanitize)
 add_test(NAME surface_cache COMMAND test_surface_cache)
 set_tests_properties(surface_cache PROPERTIES LABELS quick)
+add_executable(test_surfconv tests/test_surfconv.c)
+target_link_libraries(test_surfconv PRIVATE r3d_core TIFF::TIFF r3d_warnings r3d_sanitize)
+add_dependencies(test_surfconv surfconv)
+add_test(NAME surfconv COMMAND test_surfconv $<TARGET_FILE:surfconv>)
+set_tests_properties(surfconv PROPERTIES LABELS quick TIMEOUT 120)

@@ -1,4 +1,5 @@
 #include "core/segstore.h"
+#include "core/surfconv.h"
 
 #include <dirent.h>
 #include <math.h>
@@ -66,6 +67,8 @@ static uint64_t sgs_fnv1a(const void *p, size_t n) {
 static bool sgs_basename(const char *dir, char *out, size_t outsz) {
   size_t len = strlen(dir);
   while (len > 1 && dir[len - 1] == '/') len--; /* tolerate trailing slash */
+  if (len > 4 && strncmp(dir + len - 4, ".sfc", 4) == 0) len -= 4; /* a .sfc
+                                       * and its source dir share the identity */
   size_t end = len;
   while (len > 0 && dir[len - 1] != '/') len--;
   size_t n = end - len;
@@ -159,6 +162,8 @@ static int sgs_build_abort(r3d_segmeta *segs, r3d_segtile *tiles, sgs_nameset *n
 static time_t sgs_source_mtime(const char *dir) {
   static const char *comp[4] = {"x.tif", "y.tif", "z.tif", "meta.json"};
   time_t mx = 0;
+  struct stat sst;
+  if (stat(dir, &sst) == 0 && S_ISREG(sst.st_mode)) return sst.st_mtime; /* .sfc */
   for (int i = 0; i < 4; i++) {
     char p[1024];
     snprintf(p, sizeof p, "%s/%s", dir, comp[i]);
@@ -349,7 +354,7 @@ int r3d_segstore_build(const char *store_dir, const char *const *dirs, uint32_t 
   }
   for (uint32_t d = 0; d < ndirs; d++) {
     r3d_tifxyz s;
-    if (r3d_tifxyz_load(&s, dirs[d]) != 0) {
+    if (r3d_surf_load(dirs[d], &s) != 0) { /* .sfc or tifxyz dir */
       fprintf(stderr, "segstore: skipping %s (load failed)\n", dirs[d]);
       continue;
     }
