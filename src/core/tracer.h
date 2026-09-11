@@ -273,6 +273,16 @@ int r3d_tracer_spiral_fill(r3d_tracer *t);
 int r3d_tracer_ctsnap(r3d_tracer *t, const char *ct_root, double cutoff,
                       double low_cut);
 
+/* Build a stopped, refine-able tracer from an in-memory surface grid (the
+ * viewer's active segment): every valid point becomes a SET cell with
+ * confidence 1 and generation 1, step = 1/scale, no sidecar state. The
+ * result is the same "IMPORT ONLY" object r3d_tracer_load produces for a
+ * directory without tracer.json. pred_root is the prediction tree the
+ * solve-only passes sample. Returns 0 on success. */
+struct r3d_tifxyz;
+int r3d_tracer_import(r3d_tracer *t, const struct r3d_tifxyz *s,
+                      const char *pred_root);
+
 /* Load a saved trace (x/y/z.tif + optional winding/generations/
  * confidence.tif) back into a fresh tracer so it can be rewound,
  * refined, or grown. pred_root is the prediction tree growth would
@@ -349,6 +359,11 @@ int r3d_tracer_subdivide(r3d_tracer *t);
  * at every generation boundary — public for tests and for repairing
  * loaded traces. Stopped tracer only. Returns cells cut. */
 uint32_t r3d_tracer_fold_excise(r3d_tracer *t);
+
+/* Refresh the mesh QC counters (qc_folds/kinks/twist/area/bbox/fill/hole/
+ * slant/bend) of a stopped tracer without solving: the baseline a refinement
+ * pass is measured against. */
+void r3d_tracer_qc(r3d_tracer *t);
 
 /* Synthetic self-check of the spiral winding frame + global fit (used by
  * the unit tests; no volume access). Returns 0 on success. */

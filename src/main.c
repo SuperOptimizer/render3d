@@ -373,6 +373,36 @@ static float *inkmap_load(const char *path, uint32_t *w, uint32_t *h, uint32_t *
   return m;
 }
 
+/* canonical absolute form of a path that may not exist yet (resolved through
+ * its parent), so "is `inner` the same as or inside `outer`" survives ./ and
+ * double slashes. Versioned saves must never land in the surface they edit. */
+static void path_canon(const char *p, char *out, size_t n) {
+  if (realpath(p, out)) return;
+  char parent[2048], base[512];
+  snprintf(parent, sizeof parent, "%s", p);
+  size_t len = strlen(parent);
+  while (len > 1 && parent[len - 1] == '/') parent[--len] = 0;
+  char *sl = strrchr(parent, '/');
+  if (sl && sl != parent) {
+    snprintf(base, sizeof base, "%s", sl + 1);
+    *sl = 0;
+  } else {
+    snprintf(base, sizeof base, "%s", sl ? sl + 1 : parent);
+    snprintf(parent, sizeof parent, "%s", sl ? "/" : ".");
+  }
+  char pr[2048];
+  if (!realpath(parent, pr)) snprintf(pr, sizeof pr, "%s", parent);
+  snprintf(out, n, "%s/%s", pr, base);
+}
+static bool path_inside(const char *inner, const char *outer) {
+  char a[4096], b[4096];
+  path_canon(inner, a, sizeof a);
+  path_canon(outer, b, sizeof b);
+  size_t lb = strlen(b);
+  while (lb > 1 && b[lb - 1] == '/') b[--lb] = 0;
+  return strncmp(a, b, lb) == 0 && (a[lb] == 0 || a[lb] == '/');
+}
+
 /* Write the ink artifacts INTO a segment's tifxyz dir so the detection
  * travels with the surface: ink.inkmap (float, reload-exact) + ink.png
  * (8-bit view, scrollprize-style). Skips silently when the dir does not
@@ -2948,6 +2978,8 @@ int main(int argc, char **argv) {
        od_next_ink[640] = "", od_next_reg[640] = "";
   bool od_swap = false, od_attach_ovl = false, od_attach_ink = false,
        od_attach_reg = false;
+  double od_next_focus[3] = {0, 0, 0}; /* review queue: land on the flagged tile */
+  bool od_next_focus_on = false;
   bool swap_test_done=false;
   char active_bricks[2048]="",active_seg[2048]="";
   char previous_bricks[2048]="",previous_seg[2048]="";
@@ -3297,6 +3329,10 @@ int main(int argc, char **argv) {
     const float *mc = r3d_tifxyz_at(&mv_seg, mv_seg.w / 2, mv_seg.h / 2);
     if (r3d_tifxyz_valid(mc)) /* center the focus ON the sheet when possible */
       for (int a = 0; a < 3; a++) mv_focus[a] = (double)mc[a];
+    if (od_next_focus_on) { /* review queue: the flagged tile, not the center */
+      memcpy(mv_focus, od_next_focus, sizeof mv_focus);
+      od_next_focus_on = false;
+    }
     brick_depth = 0; /* multiview owns per-view slab clips */
     mode = R3D_MODE_FULL; /* volumetric slabs in every quadrant (Tab: MIP etc.) */
     mv_thick = 24;
@@ -3393,6 +3429,8 @@ int main(int argc, char **argv) {
     float *cf;
     uint64_t gen;
     uint32_t ring, nset;
+    char origin[640]; /* surface this tracer edits (path or store segment);
+                       * empty for a seeded trace */
   };
   static struct gtrace gts[GT_MAX]; /* static: r3d_tracer is large */
   memset(gts, 0, sizeof gts);
@@ -3454,6 +3492,54 @@ int main(int argc, char **argv) {
    * Ctrl+click in anchor mode; pushed to the tracer live) */
   double mv_anchor[R3D_TR_MAX_ANCHORS * 3];
   uint32_t mv_anchor_n = 0;
+  /* correction drag: Shift+LMB in a plane pane while an edited surface's
+   * tracer is displayed picks the nearest surface vertex and drags it to
+   * where the sheet should pass. Release = anchor at the target + re-solve
+   * (short drags) or, for long drags / Ctrl held, anchor + reopen-and-regrow
+   * around the dragged cell (a wrong-sheet capture is not a perturbation of
+   * the right geometry). */
+  bool mv_cd_on = false, mv_cd_release = false;
+  int mv_cd_view = -1;
+  int64_t mv_cd_cell = -1;
+  double mv_cd_from[3] = {0, 0, 0}, mv_cd_to[3] = {0, 0, 0};
+  float mv_tr_reopt_r = 6.0f;
+  char mv_cd_status[200] = "";
+  uint32_t mv_edit_test_frame = getenv("R3D_EDIT_TEST") ? (uint32_t)atoi(getenv("R3D_EDIT_TEST")) : 0;
+  /* review queue: flagged tiles from a surfrefine corpus report */
+  #define RQ_MAX 512
+  struct rq_item {
+    char name[96], sfc[640];
+    double c[3];
+    float trusted;
+  };
+  static struct rq_item rq[RQ_MAX];
+  static uint32_t rq_n = 0;
+  static char rq_path[640] = "cache/refined/corpus_report.json";
+  static char rq_status[200] = "";
+  /* import the ACTIVE surface into a free tracer slot for editing */
+  #define GT_IMPORT(ORIGIN) do { \
+    int free_slot = -1; \
+    for (int s3 = 0; s3 < GT_MAX; s3++) \
+      if (!gts[s3].active) { free_slot = s3; break; } \
+    if (free_slot >= 0 && n_overlays && mv_seg.nvalid > 8 && !mv_sfc) { \
+      gt_sel = free_slot; \
+      if (r3d_tracer_import(&GT->tr, &mv_seg, overlay_paths[overlay_sel]) == 0) { \
+        GT->harvest = false; \
+        mv_tr_view = true; \
+        free(GT->pos); free(GT->st); free(GT->cf); \
+        GT->pos = malloc((size_t)GT->tr.W * GT->tr.H * 3 * sizeof *GT->pos); \
+        GT->st = calloc((size_t)GT->tr.W * GT->tr.H, 1); \
+        GT->cf = calloc((size_t)GT->tr.W * GT->tr.H, sizeof *GT->cf); \
+        GT->gen = UINT64_MAX; /* first snapshot always copies */ \
+        GT->live_first = true; \
+        GT->ring = 1; GT->nset = GT->tr.nset; GT->done = true; \
+        GT->active = GT->pos && GT->st && GT->cf; \
+        snprintf(GT->origin, sizeof GT->origin, "%s", (ORIGIN) && (ORIGIN)[0] ? (ORIGIN) : "(active)"); \
+        if (mv_anchor_n) r3d_tracer_set_anchors(&GT->tr, mv_anchor, mv_anchor_n); \
+        printf("tracer: editing %s (%ux%u, %u points)\n", GT->origin, GT->tr.W, GT->tr.H, GT->nset); \
+      } \
+    } \
+  } while (0)
   uint64_t mv_tr_live_ns = 0;  /* last live swap (throttle) */
   double sgc_near_focus[3] = {1e30, 1e30, 1e30};
   uint32_t sgc_near[6];
@@ -3978,7 +4064,8 @@ int main(int argc, char **argv) {
       if (mv_drag_view >= 0 && MV_IS3D(mv_drag_view) &&
           (in.look[0] != 0.0f || in.look[1] != 0.0f)) {
         r3d_camera_orbit_drag(&cam, in.look[0] * 0.005f, in.look[1] * 0.005f);
-      } else if (mv_drag_view >= 0 && (in.look[0] != 0.0f || in.look[1] != 0.0f)) {
+      } else if (mv_drag_view >= 0 && !mv_cd_on &&
+                 (in.look[0] != 0.0f || in.look[1] != 0.0f)) {
         r3d_mview *dv = &mv[mv_drag_view];
         dv->cu -= (double)in.look[0] / dv->zoom;
         dv->cv -= (double)in.look[1] / dv->zoom;
@@ -4133,6 +4220,117 @@ int main(int argc, char **argv) {
             printf("tracer: anchor %u placed at (%.0f, %.0f, %.0f)\n", mv_anchor_n,
                    A[0], A[1], A[2]);
           }
+        }
+      }
+      if (mv_edit_test_frame && frame_index == mv_edit_test_frame) {
+        /* headless: import the active surface for editing at this frame */
+        GT_IMPORT(multiview_path);
+      }
+      { /* correction drag (see mv_cd_* above) */
+        bool edit_ok = GT->active && GT->done && GT->pos && mv_tr_view;
+        if (edit_ok && in.dragging && in.fast && !io->WantCaptureMouse) {
+          int av = mv_cd_on ? mv_cd_view : r3d_mv_hit(mv, in.mouse_xy[0], in.mouse_xy[1]);
+          if (av > 0 && !MV_IS3D(av) && av != R3D_MV_SEG) {
+            double u, vq, A[3];
+            r3d_mv_unproject(&mv[av], in.mouse_xy[0], in.mouse_xy[1], &u, &vq);
+            r3d_mv_b2w(mv_pb[av], mv_po[av], u, vq, mv[av].slice, A);
+            if (!mv_cd_on) {
+              double lim = 0.75 * GT->tr.cfg.step, best = lim * lim;
+              int64_t bk = -1;
+              uint64_t ncell = (uint64_t)GT->tr.W * GT->tr.H;
+              for (uint64_t k = 0; k < ncell; k++) {
+                if (GT->st[k] != R3D_TR_SET) continue;
+                double d2 = 0;
+                for (int a = 0; a < 3; a++) {
+                  double dd = GT->pos[k * 3 + (uint64_t)a] - A[a];
+                  d2 += dd * dd;
+                }
+                if (d2 < best) {
+                  best = d2;
+                  bk = (int64_t)k;
+                }
+              }
+              if (bk >= 0) {
+                mv_cd_on = true;
+                mv_cd_view = av;
+                mv_cd_cell = bk;
+                memcpy(mv_cd_from, GT->pos + (uint64_t)bk * 3, sizeof mv_cd_from);
+                memcpy(mv_cd_to, A, sizeof mv_cd_to);
+              }
+            } else {
+              memcpy(mv_cd_to, A, sizeof mv_cd_to);
+            }
+          }
+        }
+        if (edit_ok && mv_edit_test_frame && frame_index == mv_edit_test_frame + 10 &&
+            getenv("R3D_DRAG_TEST")) {
+          /* headless: "x,y,z>x,y,z" drags the vertex nearest the first
+           * point to the second (Ctrl semantics with a trailing "!") */
+          double dfrom[3], dto[3];
+          const char *dtest = getenv("R3D_DRAG_TEST");
+          if (sscanf(dtest, "%lf,%lf,%lf>%lf,%lf,%lf", &dfrom[0], &dfrom[1], &dfrom[2], &dto[0],
+                     &dto[1], &dto[2]) == 6) {
+            double best = 1e30;
+            int64_t bk = -1;
+            uint64_t ncell = (uint64_t)GT->tr.W * GT->tr.H;
+            for (uint64_t k = 0; k < ncell; k++) {
+              if (GT->st[k] != R3D_TR_SET) continue;
+              double d2 = 0;
+              for (int a = 0; a < 3; a++) {
+                double dd = GT->pos[k * 3 + (uint64_t)a] - dfrom[a];
+                d2 += dd * dd;
+              }
+              if (d2 < best) {
+                best = d2;
+                bk = (int64_t)k;
+              }
+            }
+            if (bk >= 0) {
+              mv_cd_on = true;
+              mv_cd_view = 1;
+              mv_cd_cell = bk;
+              memcpy(mv_cd_from, GT->pos + (uint64_t)bk * 3, sizeof mv_cd_from);
+              memcpy(mv_cd_to, dto, sizeof mv_cd_to);
+              mv_cd_release = true;
+            }
+          }
+        }
+        if (mv_cd_on && (!in.dragging || mv_cd_release)) { /* release: apply */
+          bool force_reopt = mv_cd_release ? strchr(getenv("R3D_DRAG_TEST"), '!') != NULL
+                                           : in.ctrl;
+          double d2 = 0;
+          for (int a = 0; a < 3; a++) {
+            double dd = mv_cd_to[a] - mv_cd_from[a];
+            d2 += dd * dd;
+          }
+          double dist = sqrt(d2);
+          bool big = force_reopt || dist >= 1.5 * GT->tr.cfg.step;
+          if (GT->active && dist > 0.25) {
+            r3d_tracer_stop(&GT->tr);
+            if (mv_anchor_n < R3D_TR_MAX_ANCHORS) {
+              memcpy(mv_anchor + (size_t)mv_anchor_n * 3, mv_cd_to, sizeof mv_cd_to);
+              mv_anchor_n++;
+            }
+            r3d_tracer_set_anchors(&GT->tr, mv_anchor, mv_anchor_n);
+            int rc0 = big ? r3d_tracer_reopt(&GT->tr, mv_cd_from, (int)mv_tr_reopt_r)
+                          : r3d_tracer_refine(&GT->tr);
+            if (rc0 == 0) {
+              GT->done = false;
+              GT->gen = 0;
+            }
+            snprintf(mv_cd_status, sizeof mv_cd_status,
+                     "%s cell (%u,%u) %.1f vox -> %s%s", big ? "regrow" : "re-solve",
+                     (unsigned)(mv_cd_cell % GT->tr.W), (unsigned)(mv_cd_cell / GT->tr.W),
+                     dist, big ? "anchor + reopen radius " : "anchor, refine",
+                     big ? "" : "");
+            printf("tracer: correction drag %.1f vox from (%.0f,%.0f,%.0f) to "
+                   "(%.0f,%.0f,%.0f): %s%s\n",
+                   dist, mv_cd_from[0], mv_cd_from[1], mv_cd_from[2], mv_cd_to[0],
+                   mv_cd_to[1], mv_cd_to[2], big ? "reopen + regrow" : "anchor + re-solve",
+                   rc0 ? " (FAILED to start)" : "");
+          }
+          mv_cd_on = false;
+          mv_cd_release = false;
         }
       }
       if (in.seed_place && !io->WantCaptureMouse) {
@@ -5589,6 +5787,85 @@ int main(int argc, char **argv) {
         bsurf_go = true;
       }
     }
+    if (gui_section("review", multiview_path != NULL, "Open a CT volume", 0)) {
+      /* flagged tiles from tools/surfrefine/batch.py: pick one to open that
+       * refined surface centred on the tile, ready for "edit active surface" */
+      igInputText("corpus report", rq_path, sizeof rq_path, 0, NULL, NULL);
+      if (igButton("load report", (ImVec2){0, 0})) {
+        rq_n = 0;
+        FILE *rf = fopen(rq_path, "rb");
+        char *js = NULL;
+        size_t jn = 0;
+        if (rf) {
+          fseek(rf, 0, SEEK_END);
+          long ln = ftell(rf);
+          fseek(rf, 0, SEEK_SET);
+          if (ln > 0 && ln < (64 << 20)) {
+            js = malloc((size_t)ln + 1);
+            if (js) {
+              jn = fread(js, 1, (size_t)ln, rf);
+              js[jn] = 0;
+            }
+          }
+          fclose(rf);
+        }
+        if (!js) {
+          snprintf(rq_status, sizeof rq_status, "cannot read %s", rq_path);
+        } else {
+          uint32_t nsurf = 0;
+          const char *q = js;
+          while ((q = strstr(q, "\"output\": \"")) != NULL && rq_n < RQ_MAX) {
+            q += 11;
+            const char *qe = strchr(q, '"');
+            if (!qe) break;
+            char outp[600];
+            size_t ol = (size_t)(qe - q) < sizeof outp - 1 ? (size_t)(qe - q) : sizeof outp - 1;
+            memcpy(outp, q, ol);
+            outp[ol] = 0;
+            nsurf++;
+            const char *fl = strstr(qe, "\"flagged\": [");
+            const char *end = strstr(qe, "\"flagged_count\"");
+            if (!fl || !end || fl > end) {
+              q = qe;
+              continue;
+            }
+            const char *c = fl;
+            while ((c = strstr(c, "\"center\": [")) != NULL && c < end && rq_n < RQ_MAX) {
+              struct rq_item *it = &rq[rq_n];
+              if (sscanf(c + 11, "%lf, %lf, %lf", &it->c[0], &it->c[1], &it->c[2]) == 3) {
+                const char *trq = strstr(c, "\"trusted\": ");
+                it->trusted = trq && trq < end ? (float)atof(trq + 11) : 0.0f;
+                const char *ob = strrchr(outp, '/');
+                snprintf(it->name, sizeof it->name, "%s", ob ? ob + 1 : outp);
+                if (r3d_surf_sibling(outp, it->sfc, sizeof it->sfc) == 0) rq_n++;
+              }
+              c += 11;
+            }
+            q = end;
+          }
+          free(js);
+          snprintf(rq_status, sizeof rq_status, "%u surfaces, %u flagged tiles", nsurf, rq_n);
+        }
+      }
+      if (rq_status[0]) igTextDisabled("%s", rq_status);
+      if (rq_n) {
+        igBeginChild_Str("rqlist", (ImVec2){0, 140}, ImGuiChildFlags_Borders, 0);
+        for (uint32_t ri = 0; ri < rq_n; ri++) {
+          char lbl[200];
+          snprintf(lbl, sizeof lbl, "%.60s  (%.0f, %.0f, %.0f) trusted %.2f##rq%u", rq[ri].name,
+                   rq[ri].c[0], rq[ri].c[1], rq[ri].c[2], (double)rq[ri].trusted, ri);
+          if (igSelectable_Bool(lbl, false, 0, (ImVec2){0, 0}) && bricks_path) {
+            snprintf(od_next_bricks, sizeof od_next_bricks, "%s", bricks_path);
+            snprintf(od_next_seg, sizeof od_next_seg, "%s", rq[ri].sfc);
+            memcpy(od_next_focus, rq[ri].c, sizeof od_next_focus);
+            od_next_focus_on = true;
+            od_swap = true;
+            running = false;
+          }
+        }
+        igEndChild();
+      }
+    }
     if (gui_section("tracer",multiview_path && n_overlays,"Load surface predictions to trace",0)) {
       const char *pr = overlay_paths[overlay_sel];
       const char *prb = strrchr(pr, '/');
@@ -5744,6 +6021,17 @@ int main(int argc, char **argv) {
         }
         igSameLine(0, 8);
         igTextDisabled("(uses the SELECTED overlay as predictions)");
+        if (have_free && mv_seg.nvalid > 8 && !mv_sfc &&
+            igButton("edit active surface", (ImVec2){0, 0})) {
+          /* the displayed segment becomes a stopped tracer: re-solve,
+           * corrections, CT snap, subdivide and versioned saves apply */
+          GT_IMPORT(sgc_active[0] ? sgc_active : multiview_path);
+        }
+        if (igIsItemHovered(0))
+          igSetTooltip("load the active surface into the tracer for refinement:\n"
+                       "re-solve to the predictions, Shift+drag a vertex in a plane\n"
+                       "pane to correct it, then save a new version (the original\n"
+                       "file is never overwritten)");
       } else {
         igText("ring %u/%u  %u point%s%s", GT->ring, GT->tr.cfg.max_ring, GT->nset,
                GT->nset == 1 ? "" : "s",
@@ -5886,6 +6174,71 @@ int main(int argc, char **argv) {
                          "papyrus/void edge (render low cut %.0f), each point\n"
                          "moving at most %.0f voxels along its own normal",
                          (double)low_cut, (double)mv_tr_snapd);
+        }
+        if (GT->origin[0]) { /* an edited surface: versions, never the source */
+          igSetNextItemWidth(130);
+          igSliderFloat("##reoptr", &mv_tr_reopt_r, 3.0f, 16.0f, "regrow radius %.0f", 0);
+          igSameLine(0, 6);
+          igTextDisabled("Shift+drag a vertex in a plane pane to correct (Ctrl: regrow)");
+          if (mv_cd_on)
+            igText("dragging cell %u,%u", (unsigned)(mv_cd_cell % GT->tr.W),
+                   (unsigned)(mv_cd_cell / GT->tr.W));
+          else if (mv_cd_status[0])
+            igTextDisabled("%s", mv_cd_status);
+          if (GT->done && GT->nset > 8 && igButton("save version", (ImVec2){0, 0})) {
+            r3d_tracer_stop(&GT->tr);
+            char base[200], td[320];
+            const char *ob = strrchr(GT->origin, '/');
+            snprintf(base, sizeof base, "%s", ob ? ob + 1 : GT->origin);
+            size_t bl = strlen(base);
+            while (bl && base[bl - 1] == '/') base[--bl] = 0;
+            if (bl > 4 && !strcmp(base + bl - 4, ".sfc")) base[bl - 4] = 0;
+            else if (bl > 7 && !strcmp(base + bl - 7, ".tifxyz")) base[bl - 7] = 0;
+            if (!base[0]) snprintf(base, sizeof base, "surface");
+            int v = 1;
+            for (; v < 1000; v++) {
+              snprintf(td, sizeof td, "cache/refined/%s-v%d", base, v);
+              struct stat vst;
+              if (stat(td, &vst) != 0) break;
+            }
+            if (GT->origin[0] != '(' && path_inside(td, GT->origin)) {
+              snprintf(mv_cd_status, sizeof mv_cd_status,
+                       "refusing to save inside the source surface");
+            } else if (mkdir_p(td) &&
+                       r3d_tracer_save(&GT->tr, td, mv_tr_thresh, mv_tr_fill) == 0) {
+              char sfc[700];
+              if (r3d_surf_resolve(td, r3d_surf_default_error(), NULL, NULL, sfc,
+                                   sizeof sfc) == 0) {
+                printf("tracer: saved version %s (%s); opening it\n", td, sfc);
+                snprintf(od_next_bricks, sizeof od_next_bricks, "%s", bricks_path);
+                snprintf(od_next_seg, sizeof od_next_seg, "%s", sfc);
+                od_swap = true;
+                running = false;
+              } else {
+                snprintf(mv_cd_status, sizeof mv_cd_status, "saved %s (no .sfc)", td);
+              }
+            } else {
+              snprintf(mv_cd_status, sizeof mv_cd_status, "save failed: %s", td);
+            }
+          }
+          if (igIsItemHovered(0))
+            igSetTooltip("write cache/refined/<name>-vN (tifxyz + .sfc) and open it;\n"
+                         "the surface you loaded is left untouched");
+          igSameLine(0, 8);
+          if (igButton("discard edits", (ImVec2){0, 0})) {
+            r3d_tracer_stop(&GT->tr);
+            r3d_tracer_free(&GT->tr);
+            free(GT->pos);
+            free(GT->st);
+            free(GT->cf);
+            GT->pos = NULL;
+            GT->st = NULL;
+            GT->cf = NULL;
+            GT->active = false;
+            GT->origin[0] = 0;
+            mv_tr_view = false;
+            mv_cd_status[0] = 0;
+          }
         }
         igSameLine(0, 8);
         if (GT->nset > 8 && igButton("save + activate", (ImVec2){0, 0})) {

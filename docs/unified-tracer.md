@@ -37,6 +37,10 @@ operators we already have, plus two missing operators (derive, arbitrate).
 | **derive** (gen_neighbor) | **stage 1** | wrap N -> initial wrap N±1 |
 | **arbitrate** (Lasagna maxflow) | stage 3 | global per-slice wrap assignment |
 | gap solve (spiral service) | stage 4 | solved per-point gaps replace the field |
+| **refine** (`surfrefine`: load, subdivide, solve to predictions, CT snap, QC, versioned save) | done | batch refinement of published surfaces; flags low-trust tiles |
+| **edit** (import active surface, Shift+drag corrections, save version) | done | operator repair of published surfaces in the viewer; review queue from the batch report |
+| **group** (`r3d_tracer_group_refine`: alternate per-sheet solves with cross-sheet no-crossing + spacing) | done | joint refinement of neighbouring wraps |
+| **export** (`tifxyz2obj`, `surfsamples`, `export_tsm_labels.py`) | done | refined surfaces back into TSM / villa training labels |
 
 ## The loop (stage 2 driver)
 

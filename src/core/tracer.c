@@ -5859,7 +5859,7 @@ static void tr_qc2(r3d_tracer *t, bool clamp_folds) {
     int bd = (int)(20.0 / t->cfg.step + 0.5);
     if (bd < 1) bd = 1;
     double arc = 2.0 * (double)bd * t->cfg.step;
-    float *rads = malloc((size_t)W * (size_t)H * sizeof *rads);
+    float *rads = malloc(2u * (size_t)W * (size_t)H * sizeof *rads); /* two axes per cell */
     size_t nr = 0;
     if (rads) {
       for (int j = 0; j < H; j++)
@@ -8847,4 +8847,58 @@ out:
     if (system(cmd) != 0) rc = rc == 0 ? 0 : rc;
   }
   return rc;
+}
+
+void r3d_tracer_qc(r3d_tracer *t) {
+  if (!t || !t->pos || t->running) return;
+  tr_qc2(t, false);
+}
+
+int r3d_tracer_import(r3d_tracer *t, const r3d_tifxyz *s, const char *pred_root) {
+  if (!t || !s || !s->xyz || s->w < 2 || s->h < 2 ||
+      (uint64_t)s->w * s->h > TR_MAX_CELLS)
+    return -1;
+  memset(t, 0, sizeof *t);
+  for (uint32_t a = 0; a < R3D_TR_MAX_ANCHORS; a++) t->anc_cell[a] = -1;
+  snprintf(t->root, sizeof t->root, "%s", pred_root ? pred_root : "");
+  t->cfg.step = s->sx > 1e-6f ? 1.0 / (double)s->sx : 20.0;
+  t->cfg.level = 1;
+  t->cfg.thresh = 0.35f;
+  t->W = s->w;
+  t->H = s->h;
+  uint64_t n = (uint64_t)s->w * s->h;
+  t->pos = calloc(n * 3, sizeof *t->pos);
+  t->state = calloc(n, 1);
+  t->conf = calloc(n, sizeof *t->conf);
+  t->wind = calloc(n, sizeof *t->wind);
+  t->werr = calloc(n, sizeof *t->werr);
+  t->gen_of = calloc(n, sizeof *t->gen_of);
+  t->excnt = calloc(n, sizeof *t->excnt);
+  t->xbl_k = calloc(TR_XBL_N, sizeof *t->xbl_k);
+  t->xbl_c = calloc(TR_XBL_N, sizeof *t->xbl_c);
+  if (!t->pos || !t->state || !t->conf || !t->wind || !t->werr || !t->gen_of ||
+      !t->excnt || !t->xbl_k || !t->xbl_c) {
+    r3d_tracer_free(t);
+    return -1;
+  }
+  for (uint64_t k = 0; k < n; k++) {
+    const float *p = s->xyz + k * 3;
+    if (!r3d_tifxyz_valid(p) || !(p[2] > 0.0f)) continue;
+    for (int a = 0; a < 3; a++) t->pos[k * 3 + (uint64_t)a] = (double)p[a];
+    t->state[k] = R3D_TR_SET;
+    t->conf[k] = 1.0f;
+    t->gen_of[k] = 1;
+    t->nset++;
+  }
+  uint32_t want = 1 + TR_LOAD_SLACK;
+  t->cfg.max_ring = s->w > 50 ? (s->w - 50) / 2 : 4;
+  if (t->cfg.max_ring < want) t->cfg.max_ring = want;
+  t->gens_done = 1;
+  t->ring = 1;
+  pthread_mutex_init(&t->mu, NULL);
+  r3d_umbilicus_init(&t->umb);
+  t->done = true;
+  printf("tracer: imported %ux%u surface (%u points, step %.2f) for refinement\n", s->w,
+         s->h, t->nset, t->cfg.step);
+  return t->nset ? 0 : -1;
 }

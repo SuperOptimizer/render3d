@@ -12,3 +12,4 @@ pyramid/
 imgui.ini
 __pycache__/
 *.pyc
+.claude/

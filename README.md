@@ -526,6 +526,21 @@ The GUI supports independent blue/red head selection, including ink, surfaces,
 fibres and signed-distance fields. See [setup, controls and validation](docs/tsm-inference.md).
 
 
+## Refining published surfaces
+
+`surfrefine` loads any surface into the tracer and runs the solve-only
+operators against a prediction tree (+ optional CT edge snap), writing a new
+versioned surface plus a QC report with flagged tiles; `tools/surfrefine/batch.py`
+does that over a corpus (local files or the dl.ash2txt.org `surfcomp/` mirror).
+In the viewer, **edit active surface** turns the displayed segment into a
+tracer: Shift+drag a vertex in a plane pane to correct it (short drags anchor
+and re-solve, long drags or Ctrl reopen-and-regrow the region), **joint refine**
+solves several loaded sheets against each other, and **save version** never
+overwrites the source. The **review** section walks the batch report's flagged
+tiles. `tifxyz2obj`, `surfsamples` and `export_tsm_labels.py` turn refined
+surfaces into villa OBJ labels and TSM label-store overrides. See
+[tools/surfrefine/README.md](tools/surfrefine/README.md).
+
 ## Surfaces: .sfc by default, tifxyz converted on the fly
 
 The [surface-compressor](https://github.com/SuperOptimizer/surface-compressor)
