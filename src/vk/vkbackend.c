@@ -4063,7 +4063,7 @@ static void *brdec_worker(void *arg) {
         memset(dst, 0, BR_RAW_BYTES);
         continue;
       }
-      fprintf(stderr, "bricks: decode failed b=%llu n=%zu%s\n", j->it[i].b, bn,
+      fprintf(stderr, "bricks: decode failed b=%llu n=%zu%s\n", (unsigned long long)j->it[i].b, bn,
               j->it[i].blob ? "" : " (cache tier)");
       atomic_store(&j->rc, -1);
       continue;
@@ -4571,7 +4571,7 @@ int r3d_bricks_begin(r3d_renderer *r, const char *shard_path, uint32_t pool_bpa,
       fprintf(stderr,
               "bricks: coarsest level (%llu bricks) nearly fills the %u^3 slot pool; "
               "streaming will be limited\n",
-              pinned - 384u, abpa);
+              (unsigned long long)(pinned - 384u), abpa);
   }
   if (abpa > max_abpa) abpa = max_abpa;
   if (!abpa) return -1;
@@ -4629,7 +4629,8 @@ int r3d_bricks_begin(r3d_renderer *r, const char *shard_path, uint32_t pool_bpa,
   /* page table + CPU residency state */
   uint32_t hdr = BR_PAGE_HEADER;
   if (nb > BR_MAX_PAGES) { /* checked before the add */
-    fprintf(stderr, "bricks: %llu virtual bricks exceeds the %llu-page budget\n", nb, BR_MAX_PAGES);
+    fprintf(stderr, "bricks: %llu virtual bricks exceeds the %llu-page budget\n",
+            (unsigned long long)nb, (unsigned long long)BR_MAX_PAGES);
     return -1;
   }
   uint32_t nslots = abpa * abpa * abpa;
@@ -4952,7 +4953,7 @@ int r3d_bricks_begin(r3d_renderer *r, const char *shard_path, uint32_t pool_bpa,
     if (r->bricks_lod)
       printf("bricks: streaming %llu LOD bricks through a %u^3-slot hot atlas "
              "(%llu MB warm tier, %s decode)\n",
-             nb, abpa, (unsigned long long)(r->bs.warm_cap >> 20),
+             (unsigned long long)nb, abpa, (unsigned long long)(r->bs.warm_cap >> 20),
              "CPU blocks");
     else
       printf("bricks: streaming %u^3 bricks through a %u^3-slot hot atlas "
