@@ -517,3 +517,42 @@ compare real-data startup, navigation and memory before and after this pass.
 Run multi-head 3D inference on visible CT regions with the Paris4 TSM checkpoint.
 The GUI supports independent blue/red head selection, including ink, surfaces,
 fibres and signed-distance fields. See [setup, controls and validation](docs/tsm-inference.md).
+
+
+## Compressed parametric surfaces (read-only)
+
+Build the standalone [surface-compressor](https://github.com/SuperOptimizer/surface-compressor)
+converter and encode a tifxyz directory, then open the result with the matching
+CT volume:
+
+```sh
+surface-compressor encode surface.tifxyz surface.sfc --error 0.1
+build/macos/render3d --bricks /path/to/manifest.json --multiview surface.sfc
+# Optional initial position, in global surface grid indices:
+build/macos/render3d --bricks /path/to/manifest.json --multiview surface.sfc --surface-center 12000 8000
+```
+
+You can also use **open segment → open compressed surface** in the GUI.
+
+The codec uses independent 64×64 floating-point DCT blocks. New files share entropy
+tables across blocks while retaining independent coefficient streams. The
+reader caches tables separately from decoded geometry and supports SFC
+container versions 1 through 4. The viewer decodes
+XYZ on the CPU into a 64 MiB block cache and uploads a maximum 1024×1024 geometry
+window. Dragging the flattened view moves that window through the surface. The
+**compressed surface** panel shows full dimensions, resident origin, cache use,
+and global grid coordinates for jumping to another area. Whole surface
+allocation is avoided; source dimensions and cache keys use 64-bit integers.
+
+This first viewer integration is read-only. Plane intersections cover the
+resident window, and zooming out does not yet build a coarse whole-surface
+preview. A worker decodes and prepares new windows while the UI remains interactive. Ink-map editing
+and SLIM flattening remain available for ordinary tifxyz surfaces; their controls
+stay visible but are disabled for compressed windows. Existing tifxyz and .tfx
+readers are unchanged. The bundled surface-compressor 1.0.0 snapshot is pinned
+to its upstream revision and per-file hashes in `tools/surface-compressor/snapshot.json`.
+
+Compressed surfaces also support version-4 joint XYZ packets. The renderer
+requests all three components in one decode per 64×64 cache miss; affine/rotated
+packets carry their own parameters and entropy tables, with no neighboring
+patch dependency. Existing scalar surface files remain readable.

@@ -49,6 +49,15 @@ find_library(BLOSC_LIB blosc REQUIRED)
 find_path(BLOSC_INCLUDE_DIR blosc.h REQUIRED)
 include_directories(SYSTEM ${BLOSC_INCLUDE_DIR}) # zarr v2 chunk decode (zarr2volcomp + net ingest)
 
+# Portable floating-point surface codec, pinned by snapshot.json so a clean
+# checkout builds without fetching a separate repository.
+set(R3D_SURFCOMP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/tools/surface-compressor" CACHE PATH
+    "surface-compressor source override")
+add_library(r3d_surfcomp STATIC ${R3D_SURFCOMP_DIR}/src/surfcomp.c)
+target_include_directories(r3d_surfcomp SYSTEM PUBLIC ${R3D_SURFCOMP_DIR})
+target_compile_options(r3d_surfcomp PRIVATE -ffast-math -fno-finite-math-only)
+target_link_libraries(r3d_surfcomp PUBLIC m PRIVATE r3d_sanitize)
+
 # --- core (backend-agnostic: math, camera, volume, transfer, stats) ---
 add_library(r3d_core STATIC
   src/core/stats.c
@@ -60,6 +69,7 @@ add_library(r3d_core STATIC
   src/core/view.c
   src/core/input.c
   src/core/tifxyz.c
+  src/core/surface.c
   src/core/segtrace.c
   src/core/segstore.c
   src/core/cpuvol.c
@@ -81,7 +91,7 @@ set_source_files_properties(src/core/tracer.c src/core/cpuvol.c
   PROPERTIES COMPILE_OPTIONS "-ffast-math;-funroll-loops")
 target_include_directories(r3d_core PUBLIC src)
 target_link_libraries(r3d_core PRIVATE r3d_warnings r3d_sanitize
-                               PUBLIC m Threads::Threads SDL3::SDL3 TIFF::TIFF
+                               PUBLIC r3d_surfcomp m Threads::Threads SDL3::SDL3 TIFF::TIFF
                                       CURL::libcurl ZLIB::ZLIB ${BLOSC_LIB})
 
 # --- volume-compressor (pinned portable CPU codec) ---
@@ -541,3 +551,7 @@ if(Python3_Interpreter_FOUND)
     ${CMAKE_SOURCE_DIR}/tests/test_inference_stream.py $<TARGET_FILE:inference_renderer_probe>)
   set_tests_properties(inference_stream PROPERTIES LABELS gpu TIMEOUT 30)
 endif()
+
+add_executable(test_surface_cache tests/test_surface_cache.c)
+target_link_libraries(test_surface_cache PRIVATE r3d_core r3d_warnings r3d_sanitize)
+add_test(NAME surface_cache COMMAND test_surface_cache)

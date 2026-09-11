@@ -1,0 +1,20 @@
+{
+  "upstream": "https://github.com/SuperOptimizer/surface-compressor",
+  "upstream_base_commit": "aba1682e61be20e4e547e5aeb6c185326faf486f",
+  "description": "Surface-compressor 1.0.0 source snapshot; upstream commit and per-file SHA256 pin the implementation.",
+  "sha256": {
+    "LICENSE": "de1157f72933091c34739dd8db3299034aedda27e6f0dc1033b264e570b77de2",
+    "surfcomp.h": "3a334622e9508417745abfc3ab2db67294c023f73acc926a4656f4718bbeb1f8",
+    "src/block_entropy.h": "117eaa5a55e0a33042c1bc6a1f305f4e4b9a434a4754a8eb1179a663bedaf924",
+    "src/cache.h": "05f3688ff884c7cedee319a9f2f0994ed27dbfd74257598b233ddb947b1a0dde",
+    "src/crc32.h": "6ab76bcd488c27b1d01cd4b8d3fb0f5d45a076194da620f87e380657f2f5320c",
+    "src/dct64.h": "85123d1ed146e5e2fd24d665922c5deb8ac84c6982e9b84f6857dc556d53b4a9",
+    "src/entropy.h": "1b90a1ce4ba6fdad60dbbcbc521d7d318897c5c8dc5ca54861413598f617f865",
+    "src/inpaint.h": "b6f360809b69b6fec4aad7a5800c54a6c7ec87201a95b73813d95c45c6cc2f5a",
+    "src/mask.h": "3229a7502af48b10d9824ff97a7793f6de008b448c15f720780aca587bb5aad3",
+    "src/scan64.h": "8ce046b38b6c649055680a3750174c7cc45d73a21139569fde0f9316357de392",
+    "src/select_entropy.h": "75eb01a6363288d8e49955c8ea7bef80329af66881b1c8fba1c64867ff711726",
+    "src/surfcomp.c": "13cda637053d5cd0cdca93fe661a04f1e334a9901a17c560d36317a74eeeacf1",
+    "src/xyz.h": "6d26c1277c25bc04b7e717ec9ccf792d531b3ea69bf3037670933b1b40e41d26"
+  }
+}

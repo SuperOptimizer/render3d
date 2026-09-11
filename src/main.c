@@ -25,30 +25,31 @@
 
 extern char **environ; /* argv-spawned browser jobs inherit the environment */
 
+#include "annotui.h"
 #include "cimgui.h"
+#include "core/bsurf.h"
 #include "core/camera.h"
-#include "core/odbrowse.h"
-#include "core/transfer.h"
-#include "core/volume.h"
+#include "core/cpuvol.h"
+#include "core/flatten.h"
+#include "core/inklive.h"
 #include "core/input.h"
+#include "core/labelvol.h"
 #include "core/mview.h"
+#include "core/odbrowse.h"
+#include "core/regvol.h"
 #include "core/screenshot.h"
 #include "core/segstore.h"
-#include "core/tracer.h"
-#include "core/bsurf.h"
-#include "core/flatten.h"
-#include "core/labelvol.h"
-#include "core/regvol.h"
-#include "core/cpuvol.h"
 #include "core/segtrace.h"
-#include "core/inklive.h"
 #include "core/stats.h"
+#include "core/surface.h"
 #include "core/tifxyz.h"
-#include "annotui.h"
-#include "core/view.h"
-#include "viewui.h"
+#include "core/tracer.h"
+#include "core/transfer.h"
 #include "core/umbilicus.h"
+#include "core/view.h"
+#include "core/volume.h"
 #include "render/render.h"
+#include "viewui.h"
 #include "vk/vkctx.h"
 
 #ifndef R3D_SPV_DIR
@@ -931,6 +932,61 @@ static int mv_build_grids(const r3d_tifxyz *s, float **coords_out, float **norma
     }
   *coords_out = co;
   *normals_out = no;
+  return 0;
+}
+
+/* One bounded prepared window per viewer; decoding and normal construction
+ * stay off the UI thread. The file/cache remains alive until the job joins. */
+typedef struct surface_page_job {
+  pthread_t thread;
+  atomic_bool done;
+  bool active, jump;
+  r3d_surface_reader *reader;
+  uint64_t origin[2];
+  uint32_t w, h;
+  double camera[2];
+  int rc;
+  r3d_tifxyz patch;
+  r3d_segrows rows;
+  float *coords, *normals;
+} surface_page_job;
+static void *surface_page_worker(void *arg) {
+  surface_page_job *j = arg;
+  j->rc = r3d_surface_window(j->reader, j->origin[0], j->origin[1], j->w, j->h,
+                             &j->patch);
+  if (!j->rc)
+    j->rc = r3d_segrows_build(&j->patch, &j->rows);
+  if (!j->rc)
+    j->rc = mv_build_grids(&j->patch, &j->coords, &j->normals);
+  atomic_store_explicit(&j->done, true, memory_order_release);
+  return NULL;
+}
+static void surface_page_clear(surface_page_job *j) {
+  if (j->active)
+    pthread_join(j->thread, NULL);
+  r3d_tifxyz_free(&j->patch);
+  r3d_segrows_free(&j->rows);
+  free(j->coords);
+  free(j->normals);
+  memset(j, 0, sizeof *j);
+}
+static int surface_page_start(surface_page_job *j, r3d_surface_reader *reader,
+                              const uint64_t origin[2], uint32_t w, uint32_t h,
+                              bool jump, const double camera[2]) {
+  if (j->active)
+    return -1;
+  j->reader = reader;
+  j->origin[0] = origin[0];
+  j->origin[1] = origin[1];
+  j->w = w;
+  j->h = h;
+  j->jump = jump;
+  j->camera[0] = camera[0];
+  j->camera[1] = camera[1];
+  atomic_init(&j->done, false);
+  if (pthread_create(&j->thread, NULL, surface_page_worker, j))
+    return -1;
+  j->active = true;
   return 0;
 }
 
@@ -2578,7 +2634,27 @@ int main(int argc, char **argv) {
   int annotation_prefetch = 5; /* annotation steps ahead; one slot is kept behind */
   int annotation_z_prefetch = 32; /* contiguous GPU-resident fine-scroll margin */
   bool vsz_given = false;
+  bool surface_center_given = false;
+  uint64_t surface_center[2] = {0, 0};
   for (int i = 1; i < argc; i++) {
+    if (strcmp(argv[i], "--surface-center") == 0) {
+      if (i + 2 >= argc) {
+        fprintf(stderr, "--surface-center needs grid X Y\n");
+        return EXIT_FAILURE;
+      }
+      for (int a = 0; a < 2; a++) {
+        char *end = NULL;
+        errno = 0;
+        const char *v = argv[i + 1 + a];
+        unsigned long long n = strtoull(v, &end, 10);
+        if (errno || !*v || *v == '-' || !end || *end) {
+          fprintf(stderr, "invalid surface grid coordinate\n");
+          return EXIT_FAILURE;
+        }
+        surface_center[a] = (uint64_t)n;
+      }
+      surface_center_given = true;
+    }
     if (i < argc - 1 && strcmp(argv[i], "--frames") == 0) exit_frames = (uint32_t)atoi(argv[i + 1]);
     if (i < argc - 1 && strcmp(argv[i], "--seconds") == 0) run_seconds = atof(argv[i + 1]);
     if (i < argc - 1 && strcmp(argv[i], "--warmup") == 0)
@@ -3055,6 +3131,15 @@ int main(int argc, char **argv) {
   /* vc3d-style 2x2 multi-view: flattened segment (TL, milestone C — an XY
    * overview until then) + XY/XZ/YZ ortho plane views, shared focus POI */
   r3d_tifxyz mv_seg = {0};
+  r3d_surface_reader *mv_sfc = NULL;
+  surface_page_job mv_sfc_job = {0};
+  uint64_t mv_sfc_retry = 0;
+  r3d_surface_info mv_sfc_info = {0};
+  uint64_t mv_sfc_origin[2] = {0, 0}, mv_sfc_jump[2] = {0, 0};
+  bool mv_sfc_go = surface_center_given;
+  if (surface_center_given)
+    memcpy(mv_sfc_jump, surface_center, sizeof mv_sfc_jump);
+  char mv_sfc_status[160] = "";
   bool sv_ready = false;
   r3d_mview mv[4] = {0};
   double mv_focus[3] = {0, 0, 0}; /* world voxels x,y,z */
@@ -3113,7 +3198,30 @@ int main(int argc, char **argv) {
       return EXIT_FAILURE;
     }
     SDL_PumpEvents(); /* dataset swap: multi-second setup, stay responsive */
-    if (r3d_tifxyz_load(&mv_seg, multiview_path) != 0) {
+    bool compressed_surface =
+        strlen(multiview_path) >= 4 &&
+        strcmp(multiview_path + strlen(multiview_path) - 4, ".sfc") == 0;
+    int surface_loaded = -1;
+    if (compressed_surface) {
+      if (r3d_surface_open(multiview_path, 64u << 20, &mv_sfc) == 0) {
+        r3d_surface_get_info(mv_sfc, &mv_sfc_info);
+        uint32_t pw =
+            (uint32_t)(mv_sfc_info.width < 1024 ? mv_sfc_info.width : 1024);
+        uint32_t ph =
+            (uint32_t)(mv_sfc_info.height < 1024 ? mv_sfc_info.height : 1024);
+        mv_sfc_origin[0] = ((mv_sfc_info.width - pw) / 2) / 64 * 64;
+        mv_sfc_origin[1] = ((mv_sfc_info.height - ph) / 2) / 64 * 64;
+        surface_loaded = r3d_surface_window(mv_sfc, mv_sfc_origin[0],
+                                            mv_sfc_origin[1], pw, ph, &mv_seg);
+      }
+      if (surface_loaded) {
+        fprintf(stderr, "cannot open compressed surface %s\n", multiview_path);
+        r3d_surface_close(mv_sfc);
+        return EXIT_FAILURE;
+      }
+    } else
+      surface_loaded = r3d_tifxyz_load(&mv_seg, multiview_path);
+    if (surface_loaded != 0) {
       /* virgin scroll, no segment yet: start with the close-segment empty
        * state — blank flattened pane, plane views centered on the volume,
        * ready for the tracer to grow the first patch */
@@ -3659,6 +3767,9 @@ int main(int argc, char **argv) {
           r3d_tifxyz_free(&mv_seg);
           r3d_segrows_free(&mv_rows);
           free(mv_normals);
+          surface_page_clear(&mv_sfc_job);
+          r3d_surface_close(mv_sfc);
+          mv_sfc = NULL;
           mv_seg = ns;
           mv_rows = nr;
           mv_normals = no;
@@ -4053,8 +4164,8 @@ int main(int argc, char **argv) {
       { /* supervision-mask painting: plain LMB drag over the FLATTENED pane
          * while the mask paint mode is on (plain LMB is idle there too) */
         bool mpainted = false;
-        if (g_smask_paint && mv_seg.w > 2 && in.lmb_held && !in.ctrl &&
-            !io->WantCaptureMouse) {
+        if (!mv_sfc && g_smask_paint && mv_seg.w > 2 && in.lmb_held &&
+            !in.ctrl && !io->WantCaptureMouse) {
           int av = r3d_mv_hit(mv, in.mouse_xy[0], in.mouse_xy[1]);
           if (av == R3D_MV_SEG) {
             double su, sv;
@@ -4203,6 +4314,93 @@ int main(int argc, char **argv) {
         }
       }
 
+      if (mv_sfc) {
+        /* The camera is local to the resident geometry window. Preserve its
+         * global position when replacing the window; snap origins to codec
+         * blocks so the XYZ cache reuses the overlapping area. */
+        double camera[2] = {mv[R3D_MV_SEG].cu, mv[R3D_MV_SEG].cv};
+        uint64_t next[2] = {mv_sfc_origin[0], mv_sfc_origin[1]};
+        uint64_t full[2] = {mv_sfc_info.width, mv_sfc_info.height};
+        uint32_t extent[2] = {mv_seg.w, mv_seg.h};
+        bool force = mv_sfc_go;
+        for (unsigned a = 0; a < 2; a++)
+          (void)r3d_surface_axis_window(
+              full[a], extent[a], mv_sfc_origin[a], camera[a],
+              force ? &mv_sfc_jump[a] : NULL, &next[a], &camera[a]);
+        if (mv_sfc_job.active &&
+            atomic_load_explicit(&mv_sfc_job.done, memory_order_acquire)) {
+          surface_page_job *j = &mv_sfc_job;
+          if (!j->rc && !app_surf_swap(renderer, j->w, j->h, j->coords,
+                                       j->normals, j->patch.sx, j->patch.sy)) {
+            r3d_tifxyz_free(&mv_seg);
+            r3d_segrows_free(&mv_rows);
+            free(mv_normals);
+            mv_seg = j->patch;
+            mv_rows = j->rows;
+            mv_normals = j->normals;
+            memset(&j->patch, 0, sizeof j->patch);
+            memset(&j->rows, 0, sizeof j->rows);
+            j->normals = NULL;
+            double shift[2];
+            for (unsigned a = 0; a < 2; a++)
+              shift[a] = mv_sfc_origin[a] >= j->origin[a]
+                             ? (double)(mv_sfc_origin[a] - j->origin[a])
+                             : -(double)(j->origin[a] - mv_sfc_origin[a]);
+            mv[R3D_MV_SEG].cu =
+                j->jump ? j->camera[0] : mv[R3D_MV_SEG].cu + shift[0];
+            mv[R3D_MV_SEG].cv =
+                j->jump ? j->camera[1] : mv[R3D_MV_SEG].cv + shift[1];
+            mv_sfc_origin[0] = j->origin[0];
+            mv_sfc_origin[1] = j->origin[1];
+            mv_align_ij[0] = mv_seg.w / 2;
+            mv_align_ij[1] = mv_seg.h / 2;
+            if (mv_aligned) {
+              uint32_t ij[2];
+              if (mv_nearest_surface(&mv_seg, mv_focus, ij)) {
+                mv_align_ij[0] = ij[0];
+                mv_align_ij[1] = ij[1];
+              }
+              if (!mv_seg_align(&mv_seg, mv_normals, mv_focus, mv_align_ij,
+                                mv_theta, mv_pb, mv_po)) {
+                mv_aligned = false;
+                mv_axis_reset(mv_pb, mv_po);
+              }
+              for (int a = 1; a < 4; a++)
+                r3d_mv_w2b(mv_pb[a], mv_po[a], mv_focus, &mv[a].cu, &mv[a].cv,
+                           &mv[a].slice);
+            }
+            mv_basis_gen++;
+            for (int a = 0; a < 4; a++) {
+              mv_ol[a].n = 0;
+              mv_ol_off[a].n = 0;
+              mv_ol_slice[a] = 1e30;
+            }
+            mv_ol_zoff = 1e30;
+            mv_sfc_status[0] = 0;
+          } else {
+            snprintf(mv_sfc_status, sizeof mv_sfc_status,
+                     "Surface window read/upload failed");
+            mv_sfc_retry = r3d_now_ns() + 1000000000ull;
+          }
+          surface_page_clear(j);
+          /* Camera/origin changed; recompute the next request next frame. */
+        } else if (!mv_sfc_job.active && r3d_now_ns() >= mv_sfc_retry) {
+          if (next[0] != mv_sfc_origin[0] || next[1] != mv_sfc_origin[1]) {
+            if (surface_page_start(&mv_sfc_job, mv_sfc, next, extent[0],
+                                   extent[1], force, camera)) {
+              snprintf(mv_sfc_status, sizeof mv_sfc_status,
+                       "Cannot start surface window worker");
+              mv_sfc_retry = r3d_now_ns() + 1000000000ull;
+            } else
+              mv_sfc_go = false;
+          } else if (force) {
+            mv[R3D_MV_SEG].cu = camera[0];
+            mv[R3D_MV_SEG].cv = camera[1];
+            mv_sfc_go = false;
+          }
+        }
+      }
+
       if (!mv_seg.nvalid && sv_ready) {
         r3d_surfvol_end(renderer);
         sv_ready = false;
@@ -4244,8 +4442,8 @@ int main(int argc, char **argv) {
          * page-table publication (the only moment the new bricks are actually
          * visible to the bake kernel); the old decode-counter poll here fired
          * a frame early, missed publications, and cost two stats locks/frame */
-        if (inklive_up && !inkmap_job && !inkmap_have && getenv("R3D_INKMAP_TEST") &&
-            mv_seg.w > 2 && mv_seg.nvalid > 16) {
+        if (inklive_up && !mv_sfc && !inkmap_job && !inkmap_have &&
+            getenv("R3D_INKMAP_TEST") && mv_seg.w > 2 && mv_seg.nvalid > 16) {
           {
             const char *tm = getenv("R3D_INKMAP_TTA"); /* mask override */
             if (tm) inkmap_tta = (uint32_t)strtoul(tm, NULL, 0);
@@ -4275,7 +4473,7 @@ int main(int argc, char **argv) {
                    inkmap_w, inkmap_h, im_ntx * im_nty);
           }
         }
-        if (inklive_up && !inkmap_job && ink_qn && seg_store_path) {
+        if (inklive_up && !mv_sfc && !inkmap_job && ink_qn && seg_store_path) {
           /* start the next background ink map (harvest chain, no TTA) */
           char dir2[320];
           snprintf(dir2, sizeof dir2, "cache/traced/%s", ink_q[0]);
@@ -4318,7 +4516,7 @@ int main(int argc, char **argv) {
           memmove(ink_q, ink_q + 1, (size_t)(ink_qn - 1) * sizeof ink_q[0]);
           ink_qn--;
         }
-        if (inklive_up && inkmap_have && !inkmap_job) {
+        if (inklive_up && !mv_sfc && inkmap_have && !inkmap_job) {
           /* a cached full-surface map exists: no live inference at all */
           if (!inkmap_uploaded &&
               r3d_surfvol_inkpred(renderer, inkmap, inkmap_w, inkmap_h, 0.0f, 0.0f,
@@ -4333,7 +4531,7 @@ int main(int argc, char **argv) {
               inkmap_uploaded)
             r3d_surfvol_inkpred(renderer, inkmap, inkmap_w, inkmap_h, 0.0f, 0.0f,
                                 (float)inkmap_up);
-        } else if (inklive_up && inkmap_job) {
+        } else if (inklive_up && !mv_sfc && inkmap_job) {
           /* full-map tile pass: one outstanding request at a time; each
            * finished tile stitches into the map (margins cropped) and the
            * partial map re-uploads so progress is visible */
@@ -4823,6 +5021,9 @@ int main(int argc, char **argv) {
         r3d_tifxyz_free(&mv_seg);
         r3d_segrows_free(&mv_rows);
         free(mv_normals);
+        surface_page_clear(&mv_sfc_job);
+        r3d_surface_close(mv_sfc);
+        mv_sfc = NULL;
         mv_seg = es;
         mv_rows = er;
         mv_normals = eno;
@@ -4850,6 +5051,31 @@ int main(int argc, char **argv) {
       running = false;
     }
     if (igBeginPopup("r3d_open_seg", 0)) {
+      static char compressed_path[560] = "", compressed_error[160] = "";
+      igInputText("compressed surface (.sfc)", compressed_path,
+                  sizeof compressed_path, 0, NULL, NULL);
+      igBeginDisabled(!bricks_path || !brick_is_lod || !compressed_path[0]);
+      if (igButton("open compressed surface", (ImVec2){0, 0})) {
+        r3d_surface_reader *check = NULL;
+        size_t len = strlen(compressed_path);
+        if (len < 4 || strcmp(compressed_path + len - 4, ".sfc") ||
+            r3d_surface_open(compressed_path, 4096 * 12, &check))
+          snprintf(compressed_error, sizeof compressed_error,
+                   "Cannot open this compressed XYZ surface");
+        else {
+          r3d_surface_close(check);
+          snprintf(od_next_bricks, sizeof od_next_bricks, "%s", bricks_path);
+          snprintf(od_next_seg, sizeof od_next_seg, "%s", compressed_path);
+          od_swap = true;
+          running = false;
+          compressed_error[0] = 0;
+          igCloseCurrentPopup();
+        }
+      }
+      igEndDisabled();
+      if (compressed_error[0])
+        igTextDisabled("%s", compressed_error);
+      igSeparator();
       if (sgc.open) {
         for (uint32_t si = 0; si < sgc.st.n; si++) {
           char lbl[96];
@@ -5219,6 +5445,34 @@ int main(int argc, char **argv) {
             }
           }
           if (annotation_status[0]) igTextDisabled("%s", annotation_status);
+        }
+        if (gui_section("compressed surface", mv_sfc != NULL,
+                        "Open a .sfc surface",
+                        ImGuiTreeNodeFlags_DefaultOpen)) {
+          r3d_surface_stats cs;
+          r3d_surface_get_stats(mv_sfc, &cs);
+          igText("surface %llu x %llu", (unsigned long long)mv_sfc_info.width,
+                 (unsigned long long)mv_sfc_info.height);
+          igTextDisabled("resident window: (%llu, %llu), %u x %u",
+                         (unsigned long long)mv_sfc_origin[0],
+                         (unsigned long long)mv_sfc_origin[1], mv_seg.w,
+                         mv_seg.h);
+          igTextDisabled("XYZ cache: %.1f / %.1f MiB",
+                         (double)cs.bytes / 1048576.0,
+                         (double)cs.limit / 1048576.0);
+          igTextDisabled(
+              "Drag to page through the surface. Plane intersections\n"
+              "cover the resident window. Editing requires tifxyz.");
+          igInputScalar("grid X", ImGuiDataType_U64, &mv_sfc_jump[0], NULL,
+                        NULL, "%llu", 0);
+          igInputScalar("grid Y", ImGuiDataType_U64, &mv_sfc_jump[1], NULL,
+                        NULL, "%llu", 0);
+          if (igButton("go to grid point", (ImVec2){0, 0}))
+            mv_sfc_go = true;
+          if (mv_sfc_job.active)
+            igTextDisabled("Loading surface window...");
+          if (mv_sfc_status[0])
+            igTextDisabled("%s", mv_sfc_status);
         }
         igTextDisabled("segment %ux%u  %llu valid points", mv_seg.w, mv_seg.h,
                        (unsigned long long)mv_seg.nvalid);
@@ -5654,7 +5908,8 @@ int main(int argc, char **argv) {
     if (gui_section("surfaces",multiview_path && sgc.open,"Open a segment store",0)) {
       { /* SLIM re-flattening of the active segment */
         int fst = atomic_load(&g_flat_state);
-        igBeginDisabled(fst == 1 || mv_seg.w <= 2 || sgc_active[0] == 0);
+        igBeginDisabled(mv_sfc || fst == 1 || mv_seg.w <= 2 ||
+                        sgc_active[0] == 0);
         if (igButton("flatten (SLIM)##flat", (ImVec2){0, 0}) && fst != 1 &&
             mv_seg.w > 2 && sgc_active[0]) {
           size_t nn = (size_t)mv_seg.w * mv_seg.h;
@@ -5865,7 +6120,10 @@ int main(int argc, char **argv) {
         if (i3_line[0]) igTextDisabled("%s", i3_line);
       }
     }
-    if (gui_section("live ink (2.5D surface)",inklive_up,"Connect a surface ink service",0)) {
+    if (gui_section("live ink (2.5D surface)", inklive_up && !mv_sfc,
+                    "Connect a surface ink service; compressed surfaces "
+                    "currently support viewing",
+                    0)) {
       igCheckbox("show ink on flattened view", &inklive_show);
       igBeginDisabled(inkmap_job);
       if (igCheckbox("verso (reverse side)##inkverso", &ink_verso)) {
@@ -6643,6 +6901,9 @@ int main(int argc, char **argv) {
             r3d_tifxyz_free(&mv_seg);
             r3d_segrows_free(&mv_rows);
             free(mv_normals);
+            surface_page_clear(&mv_sfc_job);
+            r3d_surface_close(mv_sfc);
+            mv_sfc = NULL;
             mv_seg = ts;
             mv_rows = trr;
             mv_normals = tno;
@@ -6992,6 +7253,9 @@ int main(int argc, char **argv) {
               r3d_tifxyz_free(&mv_seg);
               r3d_segrows_free(&mv_rows);
               free(mv_normals);
+              surface_page_clear(&mv_sfc_job);
+              r3d_surface_close(mv_sfc);
+              mv_sfc = NULL;
               mv_seg = ts;
               mv_rows = trr;
               mv_normals = tno;
@@ -8127,6 +8391,17 @@ int main(int argc, char **argv) {
   inkmap_acc = NULL;
   free(inkmap_wsum);
   inkmap_wsum = NULL;
+  surface_page_clear(&mv_sfc_job);
+  if (mv_sfc) {
+    r3d_surface_stats cs;
+    r3d_surface_get_stats(mv_sfc, &cs);
+    printf("surface cache: %llu hits, %llu misses, %llu bytes; window "
+           "%llu,%llu %ux%u\n",
+           (unsigned long long)cs.hits, (unsigned long long)cs.misses,
+           (unsigned long long)cs.bytes, (unsigned long long)mv_sfc_origin[0],
+           (unsigned long long)mv_sfc_origin[1], mv_seg.w, mv_seg.h);
+  }
+  r3d_surface_close(mv_sfc);
   if (multiview_path) {
     r3d_tifxyz_free(&mv_seg);
     r3d_segrows_free(&mv_rows);

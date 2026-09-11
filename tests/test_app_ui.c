@@ -7,6 +7,7 @@
 #define main r3d_application_main
 #include "../src/main.c"
 #undef main
+#include "surfcomp.h"
 
 static void wait_cache(sgcache *c, uint32_t index, bool activation) {
   uint64_t end = r3d_now_ns() + 3000000000ull;
@@ -162,7 +163,61 @@ static void section_availability(void) {
   igDestroyContext(ctx);
 }
 
+static void compressed_page_worker(void) {
+  char path[] = "/tmp/r3d-sfc-job-XXXXXX";
+  int fd = mkstemp(path);
+  assert(fd >= 0);
+  close(fd);
+  unlink(path);
+  sfc_channel c[3] = {0};
+  for (unsigned a = 0; a < 3; a++) {
+    c[a].name[0] = "xyz"[a];
+    c[a].width = c[a].height = 128;
+    c[a].dtype = SFC_F32;
+    c[a].flags = SFC_EXACT | SFC_COORDINATE;
+  }
+  const char meta[] = "{\"scale\":[1,1]}";
+  sfc_writer *writer = NULL;
+  assert(!sfc_create(path, c, 3, meta, strlen(meta), &writer));
+  float block[4096];
+  for (unsigned a = 0; a < 3; a++)
+    for (unsigned by = 0; by < 2; by++)
+      for (unsigned bx = 0; bx < 2; bx++) {
+        for (unsigned y = 0; y < 64; y++)
+          for (unsigned x = 0; x < 64; x++)
+            block[y * 64 + x] = a == 0   ? (float)(bx * 64 + x)
+                                : a == 1 ? (float)(by * 64 + y)
+                                         : 100.0f;
+        assert(!sfc_write_block(writer, block, 4, 256, NULL));
+      }
+  assert(!sfc_finish(writer));
+  r3d_surface_reader *reader = NULL;
+  assert(!r3d_surface_open(path, 8 * 4096 * 12, &reader));
+  surface_page_job j = {0};
+  uint64_t origin[2] = {64, 64};
+  double camera[2] = {32, 32};
+  assert(!surface_page_start(&j, reader, origin, 64, 64, false, camera));
+  uint64_t deadline = r3d_now_ns() + 3000000000ull;
+  while (!atomic_load_explicit(&j.done, memory_order_acquire)) {
+    assert(r3d_now_ns() < deadline);
+    r3d_surface_stats stats;
+    r3d_surface_get_stats(reader, &stats);
+    assert(stats.bytes <= stats.limit);
+    struct timespec delay = {.tv_nsec = 1000000};
+    nanosleep(&delay, NULL);
+  }
+  assert(!j.rc && j.patch.w == 64 && j.patch.nvalid == 4096);
+  assert(j.coords[0] == 64 && j.coords[1] == 64 && j.coords[2] == 100);
+  assert(fabsf(j.normals[2]) == 1);
+  surface_page_clear(&j);
+  assert(!surface_page_start(&j, reader, origin, 64, 64, false, camera));
+  surface_page_clear(&j); /* Closing while a request runs must join first. */
+  r3d_surface_close(reader);
+  unlink(path);
+}
+
 int main(void) {
+  compressed_page_worker();
   inference_binding();
   section_availability();
   corpus();
